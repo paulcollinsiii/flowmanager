@@ -1,0 +1,12 @@
+[package]
+name = "flowmanager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+kube = "4.2.0"
+restate-sdk = "0.12.1"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.0", features = ["full"] }
+twelf = "0.15.0"
