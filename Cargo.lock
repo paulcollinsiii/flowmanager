@@ -2880,6 +2880,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "proptest"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3605,7 +3619,17 @@ dependencies = [
 name = "sched-observe"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "hyper",
+ "hyper-util",
+ "k8s-openapi",
+ "kube",
+ "reqwest",
  "sched-model",
+ "sched-observe",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3626,7 +3650,13 @@ dependencies = [
 name = "sched-service"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "hyper",
+ "hyper-util",
+ "prometheus",
  "proptest",
+ "reqwest",
+ "restate-sdk",
  "sched-actuate",
  "sched-keda",
  "sched-model",
@@ -3634,7 +3664,11 @@ dependencies = [
  "sched-planner",
  "sched-sequencer",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

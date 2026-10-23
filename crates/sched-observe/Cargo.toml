@@ -5,3 +5,20 @@ edition = "2024"
 
 [dependencies]
 sched-model = { workspace = true }
+futures = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# A local HTTP test server, for tests in this and other crates.
+test-support = ["dep:hyper", "dep:hyper-util"]
+
+[dev-dependencies]
+sched-model = { workspace = true, features = ["test-support"] }
+sched-observe = { path = ".", features = ["test-support"] }
