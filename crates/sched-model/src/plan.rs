@@ -32,7 +32,7 @@ pub struct Intent {
     /// Hosts that must be powered up, and why.
     #[serde(default)]
     pub power_up: BTreeMap<ResourceId, PowerWant>,
-    /// Resources the user has reclaimed: intake stops and they are shut down, not woken.
+    /// Reclaimable resources the user has reclaimed (never a shared resource): intake stops and they are shut down, not woken.
     #[serde(default)]
     pub reclaim: BTreeSet<ResourceId>,
 }
@@ -46,6 +46,9 @@ pub enum WaitReason {
     /// A scheduling observation needed to prove no work is in flight is missing or stale.
     StaleDemand,
     Reclaimed,
+    /// A reclaim lease names a resource that cannot be reclaimed (shared, or without a
+    /// power section). It is ignored.
+    ReclaimUnsupported,
     HostNotUp,
     PoweringOn,
     ShuttingDown,

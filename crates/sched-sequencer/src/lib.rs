@@ -14,10 +14,13 @@
 //!    needs it, after `idle_grace`; the one override is a reclaim.
 //! 4. Power changes come only from the intent's `power_up` (manual requests, or classes
 //!    that may change power), and a host is powered down only if the scheduler took
-//!    responsibility for it.
+//!    responsibility for it. A reclaim lease applies only to an exclusive resource with a
+//!    power section; on any other resource it is ignored and reported as a wait.
 //! 5. Safety-critical steps need fresh observations; otherwise the sequencer waits.
 //! 8. Early switching happens only away from classes that declare it safe, or when forced,
-//!    and forced switches still give in-flight work its timeout.
+//!    and forced switches still give in-flight work its timeout. In-flight work is stopped
+//!    only on a forced switch (reclaim or manual model lease), class by class, each when
+//!    its own timeout has run out.
 
 mod exclusive;
 mod power;
@@ -103,8 +106,10 @@ impl Cx<'_> {
         self.snapshot.now
     }
 
+    /// Whether this resource is reclaimed. A reclaim only exists for an exclusive resource
+    /// with a power section; the intent cannot make it apply anywhere else.
     pub fn reclaimed(&self) -> bool {
-        self.intent.reclaim.contains(&self.res.id)
+        self.intent.reclaim.contains(&self.res.id) && self.config.supports_reclaim(&self.res.id)
     }
 }
 
@@ -113,6 +118,19 @@ fn resource_tick(
     prev: Option<&ResourceState>,
     steps: &mut Vec<Step>,
 ) -> Option<ResourceState> {
+    // A reclaim lease on a resource that cannot be reclaimed is ignored, visibly.
+    if !cx.config.supports_reclaim(&cx.res.id)
+        && cx
+            .snapshot
+            .leases
+            .iter()
+            .any(|l| l.resource == cx.res.id && l.is_reclaim() && l.is_active(cx.now()))
+    {
+        steps.push(Step::Wait {
+            resource: cx.res.id.clone(),
+            reason: WaitReason::ReclaimUnsupported,
+        });
+    }
     let mut st = match prev {
         Some(st) => st.clone(),
         None => power::initial(cx, steps)?,
@@ -137,19 +155,21 @@ fn allowed_set(config: &Config, state: &SchedState, intent: &Intent) -> AllowedS
         }
     }
     for class in config.classes() {
-        if class_allowed(class, state, intent) {
+        if class_allowed(config, class, state, intent) {
             set.classes.insert(class.id.clone());
         }
     }
     set
 }
 
-fn class_allowed(class: &ClassSpec, state: &SchedState, intent: &Intent) -> bool {
+fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent: &Intent) -> bool {
     class.requires.iter().all(|req| {
         let Some(st) = state.resource(&req.resource) else {
             return false;
         };
-        if !st.is_on() || intent.reclaim.contains(&req.resource) {
+        if !st.is_on()
+            || (intent.reclaim.contains(&req.resource) && config.supports_reclaim(&req.resource))
+        {
             return false;
         }
         match &req.model {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{HolderId, LeaseId, ModelId, ResourceId};
 use crate::time::Millis;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lease {
     pub id: LeaseId,
@@ -16,7 +16,7 @@ pub struct Lease {
     pub granted_at: Millis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LeaseKind {
     /// A reference-counted hold on a shared resource by a running consumer.

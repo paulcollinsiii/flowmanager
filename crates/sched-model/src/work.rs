@@ -43,32 +43,43 @@ pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> Cl
     let Some(demand) = &class.demand else {
         return ClassWork::NONE;
     };
-    let obs = snapshot
-        .observations
-        .iter()
+    // Only the newest timestamp counts; observations tied at it are merged conservatively
+    // (most ready, most in flight, oldest item), so snapshot order never matters. A newest
+    // observation that is stale or future-dated makes the class's demand unknown.
+    let group = snapshot
+        .newest_group(|v| matches!(v, ObservedValue::Demand { class: c, .. } if c == &class.id));
+    let group: Vec<_> = group
+        .into_iter()
         .filter(|o| o.source == demand.source)
-        .filter(|o| matches!(&o.value, ObservedValue::Demand { class: c, .. } if c == &class.id))
-        .max_by_key(|o| o.observed_at);
-    match obs {
-        Some(o) if o.age(snapshot.now) <= config.policy().max_age_for(&o.value) => match o.value {
-            ObservedValue::Demand {
-                ready,
-                in_flight,
-                oldest_ready_at,
-                ..
-            } => ClassWork {
-                ready,
-                in_flight,
-                oldest_ready_at,
-                known: true,
-            },
-            _ => ClassWork::NONE,
-        },
-        _ => ClassWork {
-            known: false,
-            ..ClassWork::NONE
-        },
+        .collect();
+    let unknown = ClassWork {
+        known: false,
+        ..ClassWork::NONE
+    };
+    let Some(first) = group.first() else {
+        return unknown;
+    };
+    if !first.is_fresh(snapshot.now, config.policy().max_age_for(&first.value)) {
+        return unknown;
     }
+    let mut work = ClassWork::NONE;
+    for o in &group {
+        if let ObservedValue::Demand {
+            ready,
+            in_flight,
+            oldest_ready_at,
+            ..
+        } = o.value
+        {
+            work.ready = work.ready.max(ready);
+            work.in_flight = work.in_flight.max(in_flight);
+            work.oldest_ready_at = match (work.oldest_ready_at, oldest_ready_at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+    work
 }
 
 /// Classes that require `model`, in configuration order.

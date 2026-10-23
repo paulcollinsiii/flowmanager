@@ -296,6 +296,13 @@ impl Config {
         &self.sources
     }
 
+    /// Whether a reclaim lease means anything for `id`: only an exclusive resource with a
+    /// power section can be taken back and shut down. Everywhere else a reclaim is ignored.
+    pub fn supports_reclaim(&self, id: &ResourceId) -> bool {
+        self.resource(id)
+            .is_some_and(|r| r.kind == ResourceKind::Exclusive && r.power.is_some())
+    }
+
     pub fn resource(&self, id: &ResourceId) -> Option<&ResourceSpec> {
         self.resources.iter().find(|r| &r.id == id)
     }

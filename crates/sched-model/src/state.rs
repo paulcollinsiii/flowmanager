@@ -27,6 +27,13 @@ pub struct WindDown {
     /// declares its own `kill_timeout`) and is then stopped.
     #[serde(default)]
     pub timeout: Option<Millis>,
+    /// Whether the forcing cause is a reclaim (rather than a manual model lease), so that a
+    /// different cause arriving later restarts the clock with its own timeout.
+    #[serde(default)]
+    pub reclaim: bool,
+    /// Classes already stopped. Each class is stopped once, when its own timeout expires.
+    #[serde(default)]
+    pub killed: BTreeSet<ClassId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

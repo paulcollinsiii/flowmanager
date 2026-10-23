@@ -43,6 +43,7 @@ impl Strategy for FifoExhaustive {
             .iter()
             .filter(active)
             .filter(|l| l.is_reclaim())
+            .filter(|l| config.supports_reclaim(&l.resource))
             .map(|l| l.resource.clone())
             .collect();
 
@@ -107,16 +108,17 @@ fn target_for(
             .filter(|l| l.resource == *resource && l.is_active(now))
     };
 
-    // The most recent manual request wins; interactive sessions are first come.
+    // The most recent manual request wins (then the lowest lease); interactive sessions are
+    // first come. The lease's own ordering breaks every tie, so snapshot order is moot.
     let manual = leases()
         .filter(|l| matches!(l.kind, LeaseKind::ManualModel { .. }))
-        .max_by(|a, b| (a.granted_at, &b.id).cmp(&(b.granted_at, &a.id)));
+        .max_by(|a, b| a.granted_at.cmp(&b.granted_at).then_with(|| b.cmp(a)));
     if let Some(l) = manual {
         return (l.pinned_model(now).cloned(), true);
     }
     let interactive = leases()
         .filter(|l| matches!(l.kind, LeaseKind::Interactive { .. }))
-        .min_by(|a, b| (a.granted_at, &a.id).cmp(&(b.granted_at, &b.id)));
+        .min_by(|a, b| a.granted_at.cmp(&b.granted_at).then_with(|| a.cmp(b)));
     if let Some(l) = interactive {
         return (l.pinned_model(now).cloned(), false);
     }

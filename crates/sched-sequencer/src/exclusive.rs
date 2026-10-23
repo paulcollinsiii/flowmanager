@@ -185,12 +185,32 @@ fn serving(
         }
     });
     let started = wind_down.is_none();
-    let wd = match wind_down {
-        // Switching from an unforced to a forced wind-down restarts the clock.
-        Some(w) if w.timeout.is_some() || base.is_none() => w,
-        _ => WindDown {
+    // The wind-down follows its cause. A different cause (a reclaim arriving during a
+    // manual-lease wind-down, or the reverse) restarts the clock with the new cause's
+    // timeout; losing the forcing cause (the lease was released) removes the timeout so
+    // nothing can be stopped any more. Classes already stopped stay recorded.
+    let wd = match (wind_down, base) {
+        (Some(w), Some(t)) if w.timeout.is_some() && w.reclaim == cx.reclaimed() => WindDown {
+            timeout: Some(t),
+            ..w
+        },
+        (Some(w), Some(t)) => WindDown {
             since: now,
-            timeout: base,
+            timeout: Some(t),
+            reclaim: cx.reclaimed(),
+            killed: w.killed,
+        },
+        (Some(w), None) => WindDown {
+            since: w.since,
+            timeout: None,
+            reclaim: false,
+            killed: w.killed,
+        },
+        (None, t) => WindDown {
+            since: now,
+            timeout: t,
+            reclaim: cx.reclaimed(),
+            killed: Default::default(),
         },
     };
     if started {
@@ -207,34 +227,61 @@ fn serving(
         wind_down: Some(wd.clone()),
     };
 
+    // Work that may still be running: in flight, or unknown, and not already stopped.
     let blockers: Vec<(&ClassSpec, bool)> = classes
         .iter()
         .zip(&works)
         .filter(|(c, w)| c.demand.is_some() && (w.in_flight > 0 || !w.known))
+        .filter(|(c, _)| !wd.killed.contains(&c.id))
         .map(|(c, w)| (*c, w.known))
         .collect();
-    if blockers.is_empty() {
-        return drain(cx, st, steps, &model);
-    }
+    // Each class is stopped when its own timeout runs out, not when the last one does.
     if let Some(timeout) = wd.timeout {
-        let expired =
-            |c: &ClassSpec| now >= wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout));
-        if blockers.iter().all(|(c, _)| expired(c)) {
-            for (c, _) in &blockers {
+        let mut wd = wd.clone();
+        let mut stopped = Vec::new();
+        for (c, _) in &blockers {
+            if now >= wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout)) {
                 steps.push(Step::KillInFlight {
                     class: c.id.clone(),
                 });
                 if c.recovery.is_some() {
                     st.pending_recovery.insert(c.id.clone());
                 }
+                wd.killed.insert(c.id.clone());
+                stopped.push(c.id.clone());
             }
+        }
+        if !stopped.is_empty() {
+            st.mode = ModePhase::Serving {
+                model: model.clone(),
+                since,
+                idle_since,
+                wind_down: Some(wd),
+            };
+        }
+        let remaining: Vec<_> = blockers
+            .iter()
+            .filter(|(c, _)| !stopped.contains(&c.id))
+            .collect();
+        if remaining.is_empty() {
             return drain(cx, st, steps, &model);
         }
+        return waiting(
+            cx,
+            steps,
+            blocked_reason(blockers.iter().filter(|(c, _)| !stopped.contains(&c.id))),
+        );
     }
-    let reason = if blockers.iter().all(|(_, known)| !known) {
+    if blockers.is_empty() {
+        return drain(cx, st, steps, &model);
+    }
+    waiting(cx, steps, blocked_reason(blockers.iter()))
+}
+
+fn blocked_reason<'a>(mut blockers: impl Iterator<Item = &'a (&'a ClassSpec, bool)>) -> WaitReason {
+    if blockers.all(|(_, known)| !known) {
         WaitReason::StaleDemand
     } else {
         WaitReason::InFlightWork
-    };
-    waiting(cx, steps, reason)
+    }
 }
