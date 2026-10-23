@@ -1,0 +1,306 @@
+//! Observations are filtered by subject AND by the source the config says supplies them
+//! before any reduction. A stray reading (right subject, wrong source) must neither wedge
+//! the scheduler nor make an unsafe step look safe, and the core and the independent
+//! invariant checker must agree on that.
+
+use sched_model::test_support::example_config;
+use sched_model::{
+    ClassId, Fidelity, Intent, Millis, ModelId, Observation, ObservedValue, ResourceId, SchedState,
+    Snapshot, Step, WaitReason,
+};
+use sched_sequencer::Decision;
+use sched_service::core::decide;
+use sched_service::invariants::check;
+
+const NOW: u64 = 90_000_000;
+
+fn obs(source: &str, at: u64, value: ObservedValue) -> Observation {
+    Observation {
+        source: source.into(),
+        observed_at: Millis(at),
+        fidelity: Fidelity::Event,
+        value,
+    }
+}
+
+fn pods(source: &str, model: &str, at: u64, p: u32) -> Observation {
+    obs(
+        source,
+        at,
+        ObservedValue::ModelPods {
+            model: ModelId::new(model),
+            pods: p,
+            ready_pods: p,
+        },
+    )
+}
+
+fn up(source: &str, res: &str, at: u64, up: bool) -> Observation {
+    obs(
+        source,
+        at,
+        ObservedValue::ResourceUp {
+            resource: ResourceId::new(res),
+            up,
+        },
+    )
+}
+
+fn demand(source: &str, class: &str, at: u64, ready: u64, oldest: Option<u64>) -> Observation {
+    obs(
+        source,
+        at,
+        ObservedValue::Demand {
+            class: ClassId::new(class),
+            ready,
+            in_flight: 0,
+            oldest_ready_at: oldest.map(Millis),
+        },
+    )
+}
+
+fn state(yaml: &str) -> SchedState {
+    let y = format!("description: s\nsnapshot: {{ now: 0 }}\nstate:\n  resources:\n{yaml}");
+    sched_model::Fixture::from_yaml(&y).unwrap().state
+}
+
+const IDLE: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n";
+const MANAGED_NFS: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: 1 }\n";
+
+const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
+const GPU_AND_NFS: [&str; 2] = ["cuda-central", "basestar-nfs"];
+/// Every demand class and the source that supplies it.
+const CLASSES: [(&str, &str); 7] = [
+    ("paperless-ocr", "paperless-ocr-pending"),
+    ("paperless-tagging", "paperless-post-ocr"),
+    ("speakr-transcription", "speakr-pending"),
+    ("speakr-summarization", "speakr-summaries"),
+    ("immich-ml", "immich-queues"),
+    ("backup", "backup-schedule"),
+    ("interactive-llm", "llm-sessions"),
+];
+
+/// Authoritative readings: zero pods everywhere, both hosts up, all queues empty except
+/// `busy`, which has `ready` items waiting.
+fn authoritative(busy: Option<(&str, u64)>) -> Vec<Observation> {
+    let mut o: Vec<_> = MODELS
+        .iter()
+        .map(|m| pods("cluster-pods", m, NOW, 0))
+        .collect();
+    o.extend(GPU_AND_NFS.iter().map(|r| up("cluster-pods", r, NOW, true)));
+    for (c, s) in CLASSES {
+        match busy {
+            Some((b, n)) if b == c => o.push(demand(s, c, NOW - 1000, n, Some(NOW - 5000))),
+            _ => o.push(demand(s, c, NOW - 1000, 0, None)),
+        }
+    }
+    o
+}
+
+/// Stray readings: every subject reported by a source the config does not say supplies it.
+fn strays() -> Vec<(String, Vec<Observation>)> {
+    let mut groups = Vec::new();
+    for (label, at) in [
+        ("current", NOW),
+        ("older", NOW - 2000),
+        ("future", NOW + 5000),
+    ] {
+        // Demand of each class from a different class's source, claiming lots of work, and
+        // claiming none.
+        for ready in [0u64, 9] {
+            let mut v = Vec::new();
+            for (c, own) in CLASSES {
+                for (_, other) in CLASSES.iter().filter(|(_, s)| *s != own) {
+                    v.push(demand(other, c, at, ready, (ready > 0).then_some(at - 10)));
+                }
+            }
+            groups.push((
+                format!("demand from other sources, {label}, ready={ready}"),
+                v,
+            ));
+        }
+        // Pod counts and reachability from an unknown source and from configured sources that
+        // cannot report cluster state, claiming pods present / hosts down, and the reverse.
+        for src in ["nowhere", "paperless-ocr-pending", "backup-schedule"] {
+            for (p, is_up) in [(5u32, false), (0, true)] {
+                let mut v: Vec<_> = MODELS.iter().map(|m| pods(src, m, at, p)).collect();
+                v.extend(GPU_AND_NFS.iter().map(|r| up(src, r, at, is_up)));
+                groups.push((format!("pods/up from {src}, {label}, pods={p}"), v));
+            }
+        }
+    }
+    groups
+}
+
+fn snapshot(observations: Vec<Observation>) -> Snapshot {
+    Snapshot {
+        config_generation: 0,
+        now: Millis(NOW),
+        observations,
+        leases: vec![],
+    }
+}
+
+fn violations(snap: &Snapshot, st: &SchedState, intent: &Intent, d: &Decision) -> Vec<String> {
+    check(&example_config(), snap, st, intent, d)
+}
+
+fn has_wait(d: &Decision, reason: WaitReason) -> bool {
+    d.steps
+        .iter()
+        .any(|s| matches!(s, Step::Wait { reason: r, .. } if *r == reason))
+}
+
+#[test]
+fn a_stray_demand_observation_does_not_wedge_the_decision() {
+    // The reported repro: 3 ready OCR items from the configured source, plus one demand
+    // observation of the same class from another source at the current time.
+    let config = example_config();
+    let st = state(IDLE);
+    let mut o = authoritative(Some(("paperless-ocr", 3)));
+    let (_, d) = decide(&config, &snapshot(o.clone()), &st).unwrap();
+    assert!(
+        d.steps
+            .iter()
+            .any(|s| matches!(s, Step::AllowModel { model, .. } if model.as_str() == "mineru")),
+        "baseline: {:?}",
+        d.steps
+    );
+    o.push(demand("speakr-pending", "paperless-ocr", NOW, 0, None));
+    let snap = snapshot(o);
+    let (intent, d) = decide(&config, &snap, &st).unwrap();
+    assert!(!has_wait(&d, WaitReason::StaleDemand), "{:?}", d.steps);
+    assert!(
+        d.steps
+            .iter()
+            .any(|s| matches!(s, Step::AllowModel { model, .. } if model.as_str() == "mineru")),
+        "{:?}",
+        d.steps
+    );
+    assert!(violations(&snap, &st, &intent, &d).is_empty());
+}
+
+#[test]
+fn stray_readings_never_change_the_decision_and_the_checker_agrees() {
+    let config = example_config();
+    // Scenarios: work waiting on an idle GPU; and an idle, managed NFS host that may power
+    // down; and a loaded-nothing host with a quiet system.
+    let scenarios = vec![
+        ("ocr waiting", Some(("paperless-ocr", 3)), IDLE),
+        (
+            "transcription waiting",
+            Some(("speakr-transcription", 2)),
+            IDLE,
+        ),
+        ("quiet, managed nfs", None, MANAGED_NFS),
+    ];
+    let mut compared = 0;
+    for (name, busy, st) in scenarios {
+        let st = state(st);
+        let base = snapshot(authoritative(busy));
+        let (base_intent, base_d) = decide(&config, &base, &st).unwrap();
+        assert!(
+            violations(&base, &st, &base_intent, &base_d).is_empty(),
+            "{name}: baseline"
+        );
+        assert!(
+            !base_d.steps.iter().any(|s| matches!(
+                s,
+                Step::Wait {
+                    reason: WaitReason::StaleDemand | WaitReason::StaleObservation,
+                    ..
+                }
+            )),
+            "{name}: baseline waits on stale data: {:?}",
+            base_d.steps
+        );
+        for (label, stray) in strays() {
+            let mut o = authoritative(busy);
+            o.extend(stray);
+            let snap = snapshot(o);
+            let (intent, d) = decide(&config, &snap, &st).unwrap();
+            assert_eq!(base_intent, intent, "{name} / {label}: intent changed");
+            assert_eq!(base_d, d, "{name} / {label}: decision changed");
+            let v = violations(&snap, &st, &intent, &d);
+            assert!(v.is_empty(), "{name} / {label}: checker disagrees: {v:?}");
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 3 * strays().len());
+    assert_eq!(strays().len(), 24);
+}
+
+fn step_allow(model: &str) -> Step {
+    Step::AllowModel {
+        resource: ResourceId::new("cuda-central"),
+        model: ModelId::new(model),
+    }
+}
+
+fn run_check(snap: &Snapshot, st: &SchedState, steps: Vec<Step>) -> Vec<String> {
+    let d = Decision {
+        steps,
+        allowed: Default::default(),
+        state: SchedState::default(),
+    };
+    violations(snap, st, &Intent::default(), &d)
+}
+
+#[test]
+fn the_checker_does_not_accept_stray_readings_as_proof_of_safety() {
+    let st = state(IDLE);
+    // Allowing mineru needs fresh zero pods of the other models. Here the authoritative
+    // reading of llm is stale and only a stray source says "zero, just now".
+    let mut o = authoritative(None);
+    o.retain(
+        |x| !matches!(&x.value, ObservedValue::ModelPods { model, .. } if model.as_str() == "llm"),
+    );
+    o.push(pods("cluster-pods", "llm", NOW - 10 * 60_000, 0));
+    o.push(pods("nowhere", "llm", NOW, 0));
+    o.push(pods("paperless-ocr-pending", "llm", NOW, 0));
+    let v = run_check(&snapshot(o), &st, vec![step_allow("mineru")]);
+    assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
+
+    // Powering off the NFS host needs a fresh up observation and zero pods. Strays that say
+    // "up, no pods" cannot stand in for them.
+    let mut o = authoritative(None);
+    o.retain(|x| !matches!(x.value, ObservedValue::ResourceUp { .. }));
+    o.push(up("nowhere", "basestar-nfs", NOW, true));
+    let v = run_check(
+        &snapshot(o),
+        &state(MANAGED_NFS),
+        vec![Step::PowerOff {
+            resource: ResourceId::new("basestar-nfs"),
+        }],
+    );
+    assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
+
+    // A newer "no work" reading of the class from another source does not hide the work the
+    // configured source reports.
+    let mut o = authoritative(Some(("backup", 2)));
+    o.push(demand("speakr-pending", "backup", NOW, 0, None));
+    let v = run_check(
+        &snapshot(o),
+        &state(MANAGED_NFS),
+        vec![Step::PowerOff {
+            resource: ResourceId::new("basestar-nfs"),
+        }],
+    );
+    assert!(
+        v.iter().any(|m| m.contains("has or may have work")),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn the_checker_is_not_wedged_by_stray_readings_either() {
+    // A correct decision made on authoritative data stays clean when strays are present
+    // (future-dated and older ones included).
+    let st = state(IDLE);
+    let mut o = authoritative(None);
+    o.push(pods("nowhere", "llm", NOW + 5000, 3));
+    o.push(pods("paperless-ocr-pending", "llm", NOW, 3));
+    o.push(up("nowhere", "cuda-central", NOW + 5000, false));
+    let v = run_check(&snapshot(o), &st, vec![step_allow("mineru")]);
+    assert!(v.is_empty(), "{v:?}");
+}

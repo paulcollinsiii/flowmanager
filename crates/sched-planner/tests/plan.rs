@@ -588,3 +588,40 @@ fn a_reclaim_lease_on_a_shared_host_is_dropped_by_the_planner() {
     let f = fixture(&[], &[&reclaim], None);
     assert!(run(&f).reclaim.contains(&ResourceId::new(G)));
 }
+
+#[test]
+fn a_reclaim_removes_the_power_wants_of_the_reclaimed_host_only() {
+    let host = ResourceId::new(G);
+    let nfs = ResourceId::new("basestar-nfs");
+    let manual_host =
+        format!("{{ id: h, resource: {G}, granted_at: 0, kind: {{ type: manual_host }} }}");
+    let manual_model = format!(
+        "{{ id: m, resource: {G}, granted_at: 0, kind: {{ type: manual_model, model: llm }} }}"
+    );
+    let nfs_host = "{ id: n, resource: basestar-nfs, granted_at: 0, kind: { type: manual_host } }";
+    let reclaim = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: reclaim }} }}");
+    let backup = demand("backup", "backup-schedule", 1, 0, None);
+
+    // Without the reclaim, both manual leases want the host powered.
+    let f = fixture(&[], &[&manual_host, &manual_model], None);
+    assert_eq!(run(&f).power_up.get(&host), Some(&PowerWant::Manual));
+
+    // With it, intake stops and no want to power the reclaimed host survives, whatever
+    // leases ask for it.
+    let f = fixture(
+        std::slice::from_ref(&backup),
+        &[&manual_host, &manual_model, &reclaim, nfs_host],
+        None,
+    );
+    let i = run(&f);
+    assert!(i.reclaim.contains(&host));
+    assert!(
+        !i.power_up.contains_key(&host),
+        "reclaimed host still has a power want: {:?}",
+        i.power_up
+    );
+    assert_eq!(i.models[&host], None);
+    assert!(i.forced.contains(&host));
+    // Other resources keep theirs.
+    assert_eq!(i.power_up.get(&nfs), Some(&PowerWant::Manual));
+}

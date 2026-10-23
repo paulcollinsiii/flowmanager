@@ -37,6 +37,12 @@ impl Observation {
 
     /// Whether the observation may be relied on: no older than `max_age` and not dated in
     /// the future (a future timestamp means a skewed clock, so it proves nothing).
+    ///
+    /// Observation timestamps must be assigned by the scheduler at the moment it receives
+    /// an observation, never copied from the observed system, so that clock skew between
+    /// systems cannot occur. A future-dated newest observation therefore only happens if
+    /// the scheduler's own clock steps backwards, and until the clock catches up it makes
+    /// the data unknown (see `Snapshot::fresh_model_pods`).
     pub fn is_fresh(&self, now: Millis, max_age: Millis) -> bool {
         self.observed_at <= now && now.saturating_sub(self.observed_at) <= max_age
     }
