@@ -85,9 +85,10 @@ fn fixture_yaml(
         y.push_str(&format!("    - {l}\n"));
     }
     y.push_str("state:\n  resources:\n");
-    y.push_str(&format!(
-        "    basestar-nfs: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }} }}\n"
-    ));
+    y.push_str(
+        "    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }
+",
+    );
     match serving {
         Some((model, since, idle)) => {
             let idle = idle.map_or(String::new(), |i| format!(", idle_since: {i}"));
@@ -204,7 +205,15 @@ fn nfs_down_makes_classes_unrunnable() {
 fn yield_table() {
     // (name, serving model, served ms, idle_since, observations, expected)
     let h = 60 * MIN;
-    let cases: Vec<(&str, &str, u64, Option<u64>, Vec<String>, Option<&str>)> = vec![
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        u64,
+        Option<u64>,
+        Vec<String>,
+        Option<&'a str>,
+    );
+    let cases: Vec<Case> = vec![
         (
             "exhaustive: keeps serving with other fresh work",
             "mineru",
@@ -416,7 +425,7 @@ fn power_wants() {
     assert_eq!(run(&f).power_up.get(&nfs), Some(&PowerWant::Manual));
 
     let backup = demand("backup", "backup-schedule", 1, 0, None);
-    let f = fixture(&[backup.clone()], &[], None);
+    let f = fixture(std::slice::from_ref(&backup), &[], None);
     assert_eq!(run(&f).power_up.get(&nfs), Some(&PowerWant::Workload));
 
     let f = fixture(&[backup], &[host], None);
@@ -466,4 +475,15 @@ fn rejects_generation_mismatch_and_unknown_strategy() {
     assert_eq!(err, PlanError::UnknownStrategy("round-robin".into()));
     assert!(err.to_string().contains("fifo-exhaustive"));
     assert!(strategy_names().contains(&"fifo-exhaustive"));
+}
+
+#[test]
+fn bundled_fixture_with_state_yields_to_the_starved_queue() {
+    let config = example_config();
+    let f = sched_model::test_support::fixture("serving-with-starved-queue");
+    let intent = plan(&config, &f.snapshot, &f.state).unwrap();
+    assert_eq!(
+        intent.models[&ResourceId::new(G)],
+        Some(ModelId::new("whisperx"))
+    );
 }

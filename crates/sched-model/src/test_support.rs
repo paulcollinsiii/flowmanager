@@ -21,6 +21,10 @@ pub const FIXTURES: &[(&str, &str)] = &[
         include_str!("../fixtures/ocr-loaded-transcription-waiting.yaml"),
     ),
     (
+        "serving-with-starved-queue",
+        include_str!("../fixtures/serving-with-starved-queue.yaml"),
+    ),
+    (
         "stale-pod-observation",
         include_str!("../fixtures/stale-pod-observation.yaml"),
     ),
@@ -221,5 +225,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.snapshot.leases.len(), 0);
+    }
+
+    #[test]
+    fn resource_up_needs_a_power_section() {
+        let yaml = EXAMPLE_CONFIG.replace(
+            "    power:\n      actuator: ssh_power\n      params: { host: basestar }\n",
+            "",
+        );
+        let yaml = yaml.replace("    may_change_power: true\n", "");
+        assert_ne!(yaml, EXAMPLE_CONFIG);
+        let config = Config::from_yaml(&yaml).unwrap();
+        let fx = "description: x\nsnapshot:\n  now: 10\n  observations:\n    - { source: cluster-pods, observed_at: 5, fidelity: event, value: { type: resource_up, resource: basestar-nfs, up: true } }\n";
+        let msg = Fixture::from_yaml_checked(fx, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("has no power section"), "{msg}");
+        assert!(
+            Fixture::from_yaml_checked(&fx.replace("basestar-nfs", "cuda-central"), &config)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn fixture_state_and_reclaim_are_checked() {
+        let cfg = example_config();
+        let bad = "description: x\nsnapshot:\n  config_generation: 4\n  now: 10\n  leases:\n    - { id: r, resource: basestar-nfs, granted_at: 1, kind: { type: reclaim } }\nstate:\n  resources:\n    ghost: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: immich-ml, since: 0 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: loading, model: llm, since: 0 } }\n";
+        let msg = Fixture::from_yaml_checked(bad, &cfg)
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "does not match the config generation",
+            "reclaim on resource",
+            "unknown resource \"ghost\"",
+            "a shared resource has no model mode",
+            "does not belong to this resource",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
+        // immich-ml does belong to cuda-central; only the NFS entry is wrong there.
+        assert_eq!(msg.matches("does not belong to this resource").count(), 1);
     }
 }

@@ -1,0 +1,14 @@
+description: mineru has served for an hour with OCR work left; transcription has waited past the age threshold.
+snapshot:
+  now: 1800000000000
+  observations:
+    - { source: cluster-pods, observed_at: 1799999995000, fidelity: event, value: { type: model_pods, model: mineru, pods: 1, ready_pods: 1 } }
+    - { source: paperless-ocr-pending, observed_at: 1799999990000, fidelity: polled, value: { type: demand, class: paperless-ocr, ready: 3, in_flight: 1, oldest_ready_at: 1799999000000 } }
+    - { source: speakr-pending, observed_at: 1799999990000, fidelity: event, value: { type: demand, class: speakr-transcription, ready: 1, oldest_ready_at: 1799990000000 } }
+    - { source: cluster-pods, observed_at: 1799999995000, fidelity: event, value: { type: resource_up, resource: basestar-nfs, up: true } }
+  leases: []
+state:
+  resources:
+    cuda-central:
+      power: { phase: "on", since: 1799990000000 }
+      mode: { phase: serving, model: mineru, since: 1799996400000 }

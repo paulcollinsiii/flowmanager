@@ -721,4 +721,57 @@ sources:
             );
         }
     }
+
+    #[test]
+    fn lease_duration_boundary() {
+        let ok = VALID.replace("interactive_ttl: 10m", "interactive_ttl: 1d");
+        assert!(Config::from_yaml(&ok).is_ok());
+        let over = VALID.replace("interactive_ttl: 10m", "interactive_ttl: 86400001");
+        assert!(has(&problems(&over), "policy.interactive_ttl"));
+        let ok = VALID.replace(
+            "drain_timeout: 5m",
+            "drain_timeout: 5m\n  reclaim_timeout: 1d",
+        );
+        assert!(Config::from_yaml(&ok).is_ok());
+    }
+
+    #[test]
+    fn reclaim_and_kill_timeouts_are_validated() {
+        let y = VALID.replace(
+            "drain_timeout: 5m",
+            "drain_timeout: 5m\n  reclaim_timeout: 0",
+        );
+        assert!(has(
+            &problems(&y),
+            "policy.reclaim_timeout: must be greater than zero"
+        ));
+        let y = VALID.replace(
+            "drain_timeout: 5m",
+            "drain_timeout: 5m\n  reclaim_timeout: 2d",
+        );
+        assert!(has(&problems(&y), "policy.reclaim_timeout"));
+        let y = VALID.replace("    priority: 10", "    kill_timeout: 0\n    priority: 10");
+        assert!(has(&problems(&y), "classes[c1].kill_timeout"));
+        let y = VALID.replace(
+            "    priority: 10",
+            "    kill_timeout: 30s\n    priority: 10",
+        );
+        let c = Config::from_yaml(&y).unwrap();
+        assert_eq!(
+            c.class(&"c1".into()).unwrap().kill_timeout,
+            Some(crate::Millis(30_000))
+        );
+        assert_eq!(c.policy().reclaim_timeout(), c.policy().drain_timeout);
+    }
+
+    #[test]
+    fn generation_is_stamped() {
+        assert_eq!(Config::from_yaml(VALID).unwrap().generation(), 0);
+        assert_eq!(
+            Config::from_yaml_with_generation(VALID, 9)
+                .unwrap()
+                .generation(),
+            9
+        );
+    }
 }
