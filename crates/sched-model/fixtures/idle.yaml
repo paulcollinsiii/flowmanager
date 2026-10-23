@@ -1,0 +1,12 @@
+description: No demand, no leases, nothing running.
+snapshot:
+  now: 1800000000000
+  observations:
+    - source: cluster-pods
+      observed_at: 1799999998000
+      fidelity: event
+      value: { type: resource_up, resource: cuda-central, up: false }
+    - source: paperless-ocr-pending
+      observed_at: 1799999990000
+      fidelity: polled
+      value: { type: demand, class: paperless-ocr, ready: 0 }

@@ -1,0 +1,263 @@
+//! The configuration schema and its loader.
+//!
+//! The spec types are plain data. A [`Config`] can only be obtained through
+//! [`Config::from_yaml`], which validates every reference and policy value first, so a
+//! `Config` that exists is a valid one.
+
+use serde::{Deserialize, Serialize};
+use serde_yaml_ng::Value;
+
+use crate::ids::{ClassId, ModelId, ResourceId, SourceId};
+use crate::time::Millis;
+use crate::validate::{self, Problem};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    /// Holds at most one mode (model) at a time.
+    Exclusive,
+    /// Any number of holders, tracked by reference count.
+    Shared,
+}
+
+/// How a host's power is changed. The actuator kind lives in code; its parameters here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PowerSpec {
+    pub actuator: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceSpec {
+    pub id: ResourceId,
+    pub kind: ResourceKind,
+    /// Absent for resources the scheduler never powers (always on).
+    #[serde(default)]
+    pub power: Option<PowerSpec>,
+}
+
+/// A mode of an exclusive resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSpec {
+    pub id: ModelId,
+    pub resource: ResourceId,
+    /// Estimated time to load; used as the cost of switching to this model.
+    pub load_time: Millis,
+    /// Names of the scaled workloads that implement this model.
+    pub workloads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Preemptibility {
+    /// Must not be interrupted; the scheduler waits for in-flight work.
+    None,
+    /// Intake can be paused; in-flight work finishes.
+    PauseIntake,
+    /// In-flight work can be killed and safely retried.
+    Kill,
+}
+
+/// One resource a class needs, and for an exclusive resource, which model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Requirement {
+    pub resource: ResourceId,
+    /// Required for exclusive resources, forbidden for shared ones.
+    #[serde(default)]
+    pub model: Option<ModelId>,
+}
+
+/// Where a class's demand is observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandRef {
+    pub source: SourceId,
+}
+
+/// An action to run after in-flight work is killed. The kind lives in code.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverySpec {
+    pub action: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassSpec {
+    pub id: ClassId,
+    pub requires: Vec<Requirement>,
+    /// Higher wins when choosing which ready model to load next.
+    pub priority: u32,
+    pub preemptibility: Preemptibility,
+    /// Whether this class may cause its resources to be powered on or off.
+    #[serde(default)]
+    pub may_change_power: bool,
+    /// Absent for classes with no demand of their own; they run whenever their
+    /// requirements are up (for example services that only need the NFS share).
+    #[serde(default)]
+    pub demand: Option<DemandRef>,
+    #[serde(default)]
+    pub recovery: Option<RecoverySpec>,
+}
+
+/// Adapter kinds. Implementations live in `sched-observe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    KubernetesWatch,
+    HttpJson,
+    Sql,
+    Prometheus,
+    Webhook,
+    Schedule,
+    Session,
+}
+
+/// An adapter instance. `params` is opaque here; the adapter kind interprets it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSpec {
+    pub id: SourceId,
+    pub kind: SourceKind,
+    /// Interval of the slow periodic resync that backs up events.
+    pub resync: Millis,
+    #[serde(default)]
+    pub params: Value,
+}
+
+/// Tunable scheduling parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Name of the planner strategy.
+    pub strategy: String,
+    /// Minimum time a model stays loaded before it may be switched away from.
+    pub min_dwell: Millis,
+    /// Maximum time a model keeps serving while other queues wait.
+    pub max_dwell: Millis,
+    /// Idle time before unloading a model or releasing a host.
+    pub idle_grace: Millis,
+    /// Age of the oldest ready item on another queue that forces a switch.
+    pub age_threshold: Millis,
+    /// Oldest acceptable observation for scheduling inputs such as queue depth.
+    pub demand_max_age: Millis,
+    /// Oldest acceptable observation for safety-critical checks.
+    pub safety_max_age: Millis,
+    /// Lifetime of an interactive lease before it must be renewed.
+    pub interactive_ttl: Millis,
+    /// How long in-flight jobs may run after a reclaim or manual lease cuts batch work short.
+    pub drain_timeout: Millis,
+}
+
+/// Unvalidated shape of the configuration file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    policy: PolicyConfig,
+    #[serde(default)]
+    resources: Vec<ResourceSpec>,
+    #[serde(default)]
+    models: Vec<ModelSpec>,
+    #[serde(default)]
+    classes: Vec<ClassSpec>,
+    #[serde(default)]
+    sources: Vec<SourceSpec>,
+}
+
+/// A validated configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Config {
+    policy: PolicyConfig,
+    resources: Vec<ResourceSpec>,
+    models: Vec<ModelSpec>,
+    classes: Vec<ClassSpec>,
+    sources: Vec<SourceSpec>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("cannot parse configuration: {0}")]
+    Parse(#[from] serde_yaml_ng::Error),
+    #[error("{}", format_problems(.0))]
+    Invalid(Vec<Problem>),
+}
+
+fn format_problems(problems: &[Problem]) -> String {
+    let mut out = format!("invalid configuration ({} problem(s)):", problems.len());
+    for p in problems {
+        out.push_str("\n  - ");
+        out.push_str(&p.to_string());
+    }
+    out
+}
+
+impl Config {
+    /// Parses and validates. Returns every problem found, never a partially valid value.
+    pub fn from_yaml(text: &str) -> Result<Config, ConfigError> {
+        let raw: RawConfig = serde_yaml_ng::from_str(text)?;
+        let config = Config {
+            policy: raw.policy,
+            resources: raw.resources,
+            models: raw.models,
+            classes: raw.classes,
+            sources: raw.sources,
+        };
+        let problems = validate::validate(&config);
+        if problems.is_empty() {
+            Ok(config)
+        } else {
+            Err(ConfigError::Invalid(problems))
+        }
+    }
+
+    pub fn policy(&self) -> &PolicyConfig {
+        &self.policy
+    }
+
+    pub fn resources(&self) -> &[ResourceSpec] {
+        &self.resources
+    }
+
+    pub fn models(&self) -> &[ModelSpec] {
+        &self.models
+    }
+
+    pub fn classes(&self) -> &[ClassSpec] {
+        &self.classes
+    }
+
+    pub fn sources(&self) -> &[SourceSpec] {
+        &self.sources
+    }
+
+    pub fn resource(&self, id: &ResourceId) -> Option<&ResourceSpec> {
+        self.resources.iter().find(|r| &r.id == id)
+    }
+
+    pub fn model(&self, id: &ModelId) -> Option<&ModelSpec> {
+        self.models.iter().find(|m| &m.id == id)
+    }
+
+    pub fn class(&self, id: &ClassId) -> Option<&ClassSpec> {
+        self.classes.iter().find(|c| &c.id == id)
+    }
+
+    pub fn source(&self, id: &SourceId) -> Option<&SourceSpec> {
+        self.sources.iter().find(|s| &s.id == id)
+    }
+
+    /// Models belonging to `resource`, in configuration order.
+    pub fn models_of<'a>(
+        &'a self,
+        resource: &'a ResourceId,
+    ) -> impl Iterator<Item = &'a ModelSpec> {
+        self.models.iter().filter(move |m| &m.resource == resource)
+    }
+}

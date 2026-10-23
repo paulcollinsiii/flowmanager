@@ -1,0 +1,25 @@
+description: A manual LLM lease and an interactive lease are held while batch OCR work is queued.
+snapshot:
+  now: 1800000000000
+  observations:
+    - source: cluster-pods
+      observed_at: 1799999997000
+      fidelity: event
+      value: { type: model_pods, model: llm, pods: 1, ready_pods: 1 }
+    - source: paperless-ocr-pending
+      observed_at: 1799999940000
+      fidelity: polled
+      value: { type: demand, class: paperless-ocr, ready: 12, oldest_ready_at: 1799990000000 }
+  leases:
+    - id: user-llm
+      resource: cuda-central
+      granted_at: 1799999000000
+      kind: { type: manual_model, model: llm }
+    - id: webui-session
+      resource: cuda-central
+      granted_at: 1799999500000
+      kind: { type: interactive, model: llm, expires_at: 1800000300000 }
+    - id: user-nfs
+      resource: basestar-nfs
+      granted_at: 1799998000000
+      kind: { type: manual_host }

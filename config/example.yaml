@@ -1,0 +1,162 @@
+# Example scheduler configuration describing the current workloads.
+# Service-specific names live here only; the crates treat them as opaque ids.
+# Durations accept plain milliseconds or a suffix: ms, s, m, h, d.
+
+policy:
+  strategy: fifo-drain
+  min_dwell: 5m
+  max_dwell: 2h
+  idle_grace: 10m
+  age_threshold: 30m
+  demand_max_age: 10m
+  safety_max_age: 30s
+  interactive_ttl: 15m
+  drain_timeout: 10m
+
+resources:
+  - id: cuda-central
+    kind: exclusive
+    power:
+      actuator: wake_on_lan
+      params: { mac: "00:00:00:00:00:01", shutdown: ssh_forced_command }
+  - id: basestar-nfs
+    kind: shared
+    power:
+      actuator: ssh_power
+      params: { host: basestar }
+
+models:
+  - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru] }
+  - { id: llm, resource: cuda-central, load_time: 90s, workloads: [ollama] }
+  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx] }
+  - { id: immich-ml, resource: cuda-central, load_time: 45s, workloads: [immich-machine-learning-gpu] }
+
+classes:
+  - id: paperless-ocr
+    requires:
+      - { resource: cuda-central, model: mineru }
+      - { resource: basestar-nfs }
+    priority: 50
+    preemptibility: pause_intake
+    demand: { source: paperless-ocr-pending }
+
+  - id: paperless-tagging
+    requires:
+      - { resource: cuda-central, model: llm }
+      - { resource: basestar-nfs }
+    priority: 50
+    preemptibility: pause_intake
+    demand: { source: paperless-post-ocr }
+
+  - id: speakr-transcription
+    requires:
+      - { resource: cuda-central, model: whisperx }
+      - { resource: basestar-nfs }
+    priority: 60
+    # speakr marks interrupted jobs failed; they are re-queued through its API.
+    preemptibility: kill
+    demand: { source: speakr-pending }
+    recovery:
+      action: requeue_failed
+      params: { source: speakr-pending }
+
+  - id: speakr-summarization
+    requires:
+      - { resource: cuda-central, model: llm }
+      - { resource: basestar-nfs }
+    priority: 60
+    preemptibility: pause_intake
+    demand: { source: speakr-summaries }
+
+  - id: immich-ml
+    requires:
+      - { resource: cuda-central, model: immich-ml }
+      - { resource: basestar-nfs }
+    # An accelerator only: a CPU replica always serves, so it ranks below work that would wait.
+    priority: 10
+    # immich leaves interrupted work pending and easy to find.
+    preemptibility: kill
+    demand: { source: immich-queues }
+
+  - id: backup
+    requires:
+      - { resource: basestar-nfs }
+    priority: 70
+    preemptibility: none
+    may_change_power: true
+    demand: { source: backup-schedule }
+
+  - id: interactive-llm
+    requires:
+      - { resource: cuda-central, model: llm }
+    priority: 100
+    preemptibility: none
+    demand: { source: llm-sessions }
+
+  # NFS-only services: no demand of their own; they run whenever NFS is up.
+  - id: paperless-ngx
+    requires:
+      - { resource: basestar-nfs }
+    priority: 0
+    preemptibility: none
+
+  - id: immich-server
+    requires:
+      - { resource: basestar-nfs }
+    priority: 0
+    preemptibility: none
+
+sources:
+  - id: cluster-pods
+    kind: kubernetes_watch
+    resync: 10s
+    params: { namespaces: [ai, media, docs], observe: [pods, nodes] }
+
+  - id: paperless-ocr-pending
+    kind: http_json
+    resync: 60s
+    params:
+      url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=ocr-pending
+      count_field: count
+      oldest_field: results[0].added
+      webhook: { path: /hooks/paperless }
+
+  - id: paperless-post-ocr
+    kind: http_json
+    resync: 60s
+    params:
+      url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=post-ocr
+      count_field: count
+      oldest_field: results[0].added
+      webhook: { path: /hooks/paperless }
+
+  - id: speakr-pending
+    kind: http_json
+    resync: 60s
+    params:
+      url: http://speakr.media.svc:8899/api/v1/recordings?status=pending
+      include_failed_connection_errors: true
+      webhook: { path: /hooks/speakr }
+
+  - id: speakr-summaries
+    kind: http_json
+    resync: 60s
+    params:
+      url: http://speakr.media.svc:8899/api/v1/recordings?status=summarizing
+      webhook: { path: /hooks/speakr }
+
+  - id: immich-queues
+    kind: http_json
+    resync: 120s
+    params:
+      url: http://immich-server.media.svc:2283/api/jobs
+      count_field: waiting
+
+  - id: backup-schedule
+    kind: schedule
+    resync: 60s
+    params: { cron: "0 3 * * 0" }
+
+  - id: llm-sessions
+    kind: session
+    resync: 30s

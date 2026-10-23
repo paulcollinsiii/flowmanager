@@ -1,0 +1,12 @@
+description: The only pod observation for the loaded model is far older than the safety bound.
+snapshot:
+  now: 1800000000000
+  observations:
+    - source: cluster-pods
+      observed_at: 1799999000000
+      fidelity: polled
+      value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 }
+    - source: speakr-pending
+      observed_at: 1799999990000
+      fidelity: event
+      value: { type: demand, class: speakr-transcription, ready: 1, oldest_ready_at: 1799999900000 }

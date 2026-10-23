@@ -1,0 +1,25 @@
+description: mineru is serving OCR with more queued, while an older transcription backlog waits.
+snapshot:
+  now: 1800000000000
+  observations:
+    - source: cluster-pods
+      observed_at: 1799999995000
+      fidelity: event
+      value: { type: model_pods, model: mineru, pods: 1, ready_pods: 1 }
+    - source: cluster-pods
+      observed_at: 1799999995000
+      fidelity: event
+      value: { type: resource_up, resource: cuda-central, up: true }
+    - source: paperless-ocr-pending
+      observed_at: 1799999950000
+      fidelity: polled
+      value: { type: demand, class: paperless-ocr, ready: 3, in_flight: 1, oldest_ready_at: 1799999000000 }
+    - source: speakr-pending
+      observed_at: 1799999960000
+      fidelity: event
+      value: { type: demand, class: speakr-transcription, ready: 2, oldest_ready_at: 1799990000000 }
+  leases:
+    - id: hold-ocr
+      resource: basestar-nfs
+      granted_at: 1799990000000
+      kind: { type: shared_hold, holder: paperless-ocr }
