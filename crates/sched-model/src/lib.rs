@@ -22,7 +22,7 @@ pub use config::{
     ClassSpec, Config, ConfigError, DemandRef, ModelSpec, PolicyConfig, PowerSpec, Preemptibility,
     RecoverySpec, Requirement, ResourceKind, ResourceSpec, SourceKind, SourceSpec,
 };
-pub use fixture::Fixture;
+pub use fixture::{Fixture, FixtureError};
 pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};
 pub use lease::{Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};

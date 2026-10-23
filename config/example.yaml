@@ -58,7 +58,7 @@ classes:
     demand: { source: speakr-pending }
     recovery:
       action: requeue_failed
-      params: { source: speakr-pending }
+      source: speakr-pending
 
   - id: speakr-summarization
     requires:

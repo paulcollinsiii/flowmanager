@@ -84,6 +84,10 @@ pub struct DemandRef {
 #[serde(deny_unknown_fields)]
 pub struct RecoverySpec {
     pub action: String,
+    /// Source the action works against (for example, where failed items are listed).
+    /// Validated to exist. `params` must not carry references to other entries.
+    #[serde(default)]
+    pub source: Option<SourceId>,
     #[serde(default)]
     pub params: Value,
 }
@@ -120,6 +124,22 @@ pub enum SourceKind {
     Session,
 }
 
+impl SourceKind {
+    /// Whether this kind of source can report queue demand for a workload class.
+    /// Kubernetes watches report pods and nodes, and webhook receivers only mark another
+    /// source dirty; neither yields a demand count.
+    pub fn can_supply_demand(self) -> bool {
+        matches!(
+            self,
+            SourceKind::HttpJson
+                | SourceKind::Sql
+                | SourceKind::Prometheus
+                | SourceKind::Schedule
+                | SourceKind::Session
+        )
+    }
+}
+
 /// An adapter instance. `params` is opaque here; the adapter kind interprets it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +151,9 @@ pub struct SourceSpec {
     #[serde(default)]
     pub params: Value,
 }
+
+/// Longest accepted `interactive_ttl` and `drain_timeout`.
+pub const MAX_LEASE_DURATION: Millis = Millis(86_400_000);
 
 /// Tunable scheduling parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

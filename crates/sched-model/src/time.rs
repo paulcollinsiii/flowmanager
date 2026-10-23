@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Milliseconds: a unix timestamp when used as an instant, a length when used as a duration.
@@ -13,7 +14,7 @@ impl Millis {
     pub const ZERO: Millis = Millis(0);
 
     pub const fn from_secs(secs: u64) -> Self {
-        Millis(secs * 1000)
+        Millis(secs.saturating_mul(1000))
     }
 
     pub const fn as_u64(self) -> u64 {
@@ -28,23 +29,28 @@ impl Millis {
         Millis(self.0.saturating_add(other.0))
     }
 
-    /// Parses `1500`, `1500ms`, `30s`, `5m`, `2h` or `1d`. A bare number is milliseconds.
+    /// Parses `1500`, `1500ms`, `30s`, `5m`, `2h` or `1d`: ASCII digits immediately
+    /// followed by an optional unit, no spaces or separators. A bare number is milliseconds.
     pub fn parse(text: &str) -> Result<Millis, String> {
-        let text = text.trim();
+        const HINT: &str = "expected digits with an optional unit (ms, s, m, h, d), e.g. \"30s\"; no spaces, signs or separators";
         let split = text
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(text.len());
         let (digits, unit) = text.split_at(split);
         let value: u64 = digits
             .parse()
-            .map_err(|_| format!("invalid duration {text:?}: expected a number with an optional unit (ms, s, m, h, d)"))?;
-        let factor: u64 = match unit.trim() {
+            .map_err(|_| format!("invalid duration {text:?}: {HINT}"))?;
+        let factor: u64 = match unit {
             "" | "ms" => 1,
             "s" => 1000,
             "m" => 60_000,
             "h" => 3_600_000,
             "d" => 86_400_000,
-            other => return Err(format!("invalid duration {text:?}: unknown unit {other:?}")),
+            _ => {
+                return Err(format!(
+                    "invalid duration {text:?}: unknown unit {unit:?}; {HINT}"
+                ));
+            }
         };
         value
             .checked_mul(factor)
@@ -67,16 +73,29 @@ impl Serialize for Millis {
 
 impl<'de> Deserialize<'de> for Millis {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Number(u64),
-            Text(String),
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = Millis;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a duration: a whole number of milliseconds or a string like \"30s\" (units ms, s, m, h, d)")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Millis, E> {
+                Ok(Millis(v))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Millis, E> {
+                u64::try_from(v)
+                    .map(Millis)
+                    .map_err(|_| E::custom(format!("duration {v} must not be negative")))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Millis, E> {
+                Millis::parse(v).map_err(E::custom)
+            }
         }
-        match Raw::deserialize(deserializer)? {
-            Raw::Number(n) => Ok(Millis(n)),
-            Raw::Text(s) => Millis::parse(&s).map_err(serde::de::Error::custom),
-        }
+        deserializer.deserialize_any(V)
     }
 }
 
@@ -102,6 +121,40 @@ mod tests {
         assert!(Millis::parse("5x").is_err());
         assert!(Millis::parse("-5s").is_err());
         assert!(Millis::parse("99999999999999999999d").is_err());
+        assert!(Millis::parse("5 m").is_err());
+        assert!(Millis::parse(" 5m").is_err());
+        assert!(
+            Millis::parse("1_000")
+                .unwrap_err()
+                .contains("no spaces, signs or separators")
+        );
+    }
+
+    #[test]
+    fn from_secs_saturates() {
+        assert_eq!(Millis::from_secs(u64::MAX), Millis(u64::MAX));
+    }
+
+    #[test]
+    fn yaml_rejects_non_durations_with_clear_message() {
+        for bad in ["true", "1.5", "-3", "null", "[1]"] {
+            let err = serde_yaml_ng::from_str::<Millis>(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains("untagged"), "{bad}: {err}");
+        }
+        assert!(
+            serde_yaml_ng::from_str::<Millis>("-3")
+                .unwrap_err()
+                .to_string()
+                .contains("must not be negative")
+        );
+        assert!(
+            serde_yaml_ng::from_str::<Millis>("true")
+                .unwrap_err()
+                .to_string()
+                .contains("expected a duration")
+        );
     }
 
     #[test]

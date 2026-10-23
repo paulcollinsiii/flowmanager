@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::config::{Config, ConfigError};
+use crate::config::Config;
 use crate::fixture::Fixture;
 
 /// The example configuration describing every current workload.
@@ -43,7 +43,7 @@ pub fn fixture(name: &str) -> Fixture {
 pub fn load_config_file(path: impl AsRef<Path>) -> Result<Config, String> {
     let text = std::fs::read_to_string(path.as_ref())
         .map_err(|e| format!("{}: {e}", path.as_ref().display()))?;
-    Config::from_yaml(&text).map_err(|e: ConfigError| e.to_string())
+    Config::from_yaml(&text).map_err(|e| e.to_string())
 }
 
 /// Loads a fixture from a file and checks it against `config`.
@@ -105,6 +105,98 @@ mod tests {
         ] {
             assert!(msg.contains(needle), "missing {needle:?} in {msg}");
         }
+    }
+
+    fn check_msgs(obs: &str, leases: &str) -> String {
+        let yaml = format!(
+            "description: x\nsnapshot:\n  now: 1000\n  observations:\n{obs}  leases:\n{leases}"
+        );
+        match Fixture::from_yaml_checked(&yaml, &example_config()) {
+            Err(e @ crate::fixture::FixtureError::Inconsistent(_)) => e.to_string(),
+            other => format!("OK-or-parse: {other:?}"),
+        }
+    }
+
+    fn demand(class: &str, source: &str, rest: &str) -> String {
+        format!(
+            "    - {{ source: {source}, observed_at: 900, fidelity: polled, value: {{ type: demand, class: {class}, {rest} }} }}\n"
+        )
+    }
+
+    #[test]
+    fn rejects_inconsistent_observations() {
+        let m = check_msgs(
+            &demand("paperless-ngx", "immich-queues", "ready: 1"),
+            "    []\n",
+        );
+        assert!(m.contains("has no demand source"), "{m}");
+        let m = check_msgs(
+            &demand("paperless-ocr", "immich-queues", "ready: 1"),
+            "    []\n",
+        );
+        assert!(
+            m.contains("takes demand from source \"paperless-ocr-pending\""),
+            "{m}"
+        );
+        let m = check_msgs(
+            &demand(
+                "paperless-ocr",
+                "paperless-ocr-pending",
+                "ready: 0, oldest_ready_at: 10",
+            ),
+            "    []\n",
+        );
+        assert!(m.contains("nothing is ready"), "{m}");
+        let m = check_msgs(
+            &demand(
+                "paperless-ocr",
+                "paperless-ocr-pending",
+                "ready: 1, oldest_ready_at: 950",
+            ),
+            "    []\n",
+        );
+        assert!(m.contains("is after observed_at"), "{m}");
+        let dup = demand("paperless-ocr", "paperless-ocr-pending", "ready: 1")
+            + &demand("paperless-ocr", "paperless-ocr-pending", "ready: 2");
+        assert!(check_msgs(&dup, "    []\n").contains("duplicate observation"));
+        let pods = "    - { source: cluster-pods, observed_at: 900, fidelity: event, value: { type: model_pods, model: llm, pods: 1, ready_pods: 2 } }\n";
+        assert!(check_msgs(pods, "    []\n").contains("ready_pods (2) exceeds pods (1)"));
+        let up = "    - { source: cluster-pods, observed_at: 900, fidelity: event, value: { type: resource_up, resource: cuda-central, up: true } }\n";
+        assert!(!check_msgs(up, "    []\n").contains("problem"));
+    }
+
+    #[test]
+    fn rejects_inconsistent_leases() {
+        let none = "    []\n";
+        let m = check_msgs(
+            none,
+            "    - { id: a, resource: cuda-central, granted_at: 2000, kind: { type: manual_host } }\n",
+        );
+        assert!(m.contains("granted_at (2000ms) is after now"), "{m}");
+        let m = check_msgs(
+            none,
+            "    - { id: a, resource: cuda-central, granted_at: 500, kind: { type: interactive, model: llm, expires_at: 400 } }\n",
+        );
+        assert!(m.contains("not after granted_at"), "{m}");
+        let two = "    - { id: a, resource: cuda-central, granted_at: 5, kind: { type: manual_model, model: llm } }\n    - { id: b, resource: cuda-central, granted_at: 5, kind: { type: manual_model, model: whisperx } }\n";
+        assert!(check_msgs(none, two).contains("conflict"));
+        let m = check_msgs(
+            none,
+            "    - { id: a, resource: cuda-central, granted_at: 5, kind: { type: shared_hold, holder: h } }\n",
+        );
+        assert!(m.contains("non-shared resource"), "{m}");
+    }
+
+    #[test]
+    fn fixture_errors_use_fixture_wording() {
+        let e = Fixture::from_yaml("description: x\nsnapshot: {}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("cannot parse fixture"), "{e}");
+        assert!(
+            check_msgs(&demand("ghost", "immich-queues", "ready: 1"), "    []\n")
+                .starts_with("fixture disagrees")
+        );
     }
 
     #[test]
