@@ -15,11 +15,11 @@ use sched_model::{
 use sched_sequencer::Decision;
 
 /// Observations matching `pred` at the newest timestamp, if that timestamp is usable.
-fn newest<'a>(
-    snap: &'a Snapshot,
+fn newest(
+    snap: &Snapshot,
     max_age: Millis,
     pred: impl Fn(&ObservedValue) -> bool,
-) -> Option<Vec<&'a ObservedValue>> {
+) -> Option<Vec<&ObservedValue>> {
     let all: Vec<_> = snap
         .observations
         .iter()

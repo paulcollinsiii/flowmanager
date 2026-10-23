@@ -487,3 +487,85 @@ fn bundled_fixture_with_state_yields_to_the_starved_queue() {
         Some(ModelId::new("whisperx"))
     );
 }
+
+fn winner(obs: &[String], config: &Config) -> Option<String> {
+    let f = fixture(obs, &[], None);
+    let i = plan(config, &f.snapshot, &f.state).unwrap();
+    i.models[&ResourceId::new(G)]
+        .as_ref()
+        .map(|m| m.as_str().to_string())
+}
+
+#[test]
+fn work_without_a_timestamp_counts_as_newest() {
+    // Tagging (llm, cheaper to load) has no timestamp; ocr (mineru) has waited a minute.
+    // The same tier is decided by age first, so the timestamped queue wins.
+    let untimed = demand("paperless-tagging", "paperless-post-ocr", 1, 0, None);
+    assert_eq!(
+        winner(&[untimed.clone(), ocr(1, T - MIN)], &example_config()).as_deref(),
+        Some("mineru")
+    );
+    // And the other way round, an untimed ocr loses to a timestamped tagging.
+    let untimed_ocr = demand("paperless-ocr", "paperless-ocr-pending", 1, 0, None);
+    assert_eq!(
+        winner(&[untimed_ocr, tagging(1, T - MIN)], &example_config()).as_deref(),
+        Some("llm")
+    );
+}
+
+#[test]
+fn ties_fall_to_load_time_before_id() {
+    // Same tier (60), same age. whisperx loads in 60s, llm in 90s; "llm" sorts first by id,
+    // so only the load-time rule picks whisperx.
+    let obs = [transcription(1, T - 5 * MIN), summarization(1, T - 5 * MIN)];
+    assert_eq!(winner(&obs, &example_config()).as_deref(), Some("whisperx"));
+}
+
+#[test]
+fn equal_load_time_falls_to_the_lower_id() {
+    // Make llm and mineru equally expensive; ocr (mineru) is listed first in the config, so
+    // only the id rule picks llm.
+    let yaml = EXAMPLE_CONFIG.replace("load_time: 90s", "load_time: 120s");
+    assert_ne!(yaml, EXAMPLE_CONFIG);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let obs = [ocr(1, T - 5 * MIN), tagging(1, T - 5 * MIN)];
+    let f = fixture(&obs, &[], None);
+    let i = plan(&config, &f.snapshot, &f.state).unwrap();
+    assert_eq!(i.models[&ResourceId::new(G)], Some(ModelId::new("llm")));
+}
+
+#[test]
+fn snapshot_order_never_changes_the_intent() {
+    // Conflicting manual leases and interactive leases, listed in every order.
+    let a = format!(
+        "{{ id: a, resource: {G}, granted_at: 5, kind: {{ type: manual_model, model: llm }} }}"
+    );
+    let b = format!(
+        "{{ id: b, resource: {G}, granted_at: 5, kind: {{ type: manual_model, model: whisperx }} }}"
+    );
+    let c = format!(
+        "{{ id: c, resource: {G}, granted_at: 1, kind: {{ type: manual_model, model: mineru }} }}"
+    );
+    let orders = [
+        [&a, &b, &c],
+        [&a, &c, &b],
+        [&b, &a, &c],
+        [&b, &c, &a],
+        [&c, &a, &b],
+        [&c, &b, &a],
+    ];
+    let intents: Vec<Intent> = orders
+        .iter()
+        .map(|o| {
+            let y = fixture_yaml(&[], &[o[0].as_str(), o[1].as_str(), o[2].as_str()], None);
+            let f = Fixture::from_yaml(&y).unwrap();
+            run(&f)
+        })
+        .collect();
+    assert!(intents.windows(2).all(|w| w[0] == w[1]));
+    // Same grant time: the lowest lease id wins.
+    assert_eq!(
+        intents[0].models[&ResourceId::new(G)],
+        Some(ModelId::new("llm"))
+    );
+}
