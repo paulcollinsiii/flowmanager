@@ -332,6 +332,23 @@ fn sources(c: &Config, p: &mut Problems) {
                 ),
             );
         }
+        for message in crate::source_params::problems(s) {
+            p.add(format!("{at}.params"), message);
+        }
+        for r in s
+            .kube_watch_params()
+            .ok()
+            .flatten()
+            .iter()
+            .flat_map(|k| k.nodes.keys())
+        {
+            if c.resource(r).is_none() {
+                p.add(
+                    format!("{at}.params.nodes"),
+                    format!("unknown resource \"{r}\""),
+                );
+            }
+        }
         for cap in &s.observe {
             if !s.kind.can_supply(*cap) {
                 p.add(

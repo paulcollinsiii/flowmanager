@@ -111,7 +111,14 @@ sources:
     kind: kubernetes_watch
     resync: 10s
     observe: [pods, reachability]
-    params: { namespaces: [ai, media, docs] }
+    params:
+      namespaces: [ai, media, docs]
+      # Pod label whose value is the model's workload name (models[].workloads).
+      workload_label: app.kubernetes.io/name
+      # Resource -> Kubernetes node name. Only listed resources get reachability.
+      nodes: { cuda-central: cuda-central }
+      # Consecutive agreeing checks (one per resync) before a host's up/down flips.
+      reachability_confirmations: 3
 
   # basestar is not a Kubernetes node: its reachability comes from a blackbox probe
   # (ssh/icmp) scraped through Prometheus, not from the cluster watch.
@@ -123,14 +130,19 @@ sources:
       url: http://prometheus.monitoring.svc:9090
       query: probe_success{instance="basestar"}
 
+  # Secrets are never in this file: `auth` names an environment variable (or a mounted
+  # file) that holds the token.
   - id: paperless-ocr-pending
     kind: http_json
     observe: [demand]
     resync: 60s
     params:
-      url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=ocr-pending
-      count_field: count
-      oldest_field: results[0].added
+      timeout: 10s
+      auth: { header: Authorization, prefix: "Token ", env: PAPERLESS_API_TOKEN }
+      requests:
+        # page_size=1: only the `count` of the document list is used.
+        - url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=ocr-pending&page_size=1
+          count: /count
       webhook: { path: /hooks/paperless }
 
   - id: paperless-post-ocr
@@ -138,18 +150,33 @@ sources:
     observe: [demand]
     resync: 60s
     params:
-      url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=post-ocr
-      count_field: count
-      oldest_field: results[0].added
+      timeout: 10s
+      auth: { header: Authorization, prefix: "Token ", env: PAPERLESS_API_TOKEN }
+      requests:
+        - url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=post-ocr&page_size=1
+          count: /count
       webhook: { path: /hooks/paperless }
 
+  # Jobs fail rather than queue while whisperX is unloaded, so recordings that failed with
+  # a connection error count as pending demand, together with the pending ones. Recordings
+  # being processed are in-flight work. (Field names follow speakr's v1 API; check them
+  # against the deployed version.)
   - id: speakr-pending
     kind: http_json
     observe: [demand]
     resync: 60s
     params:
-      url: http://speakr.media.svc:8899/api/v1/recordings?status=pending
-      include_failed_connection_errors: true
+      timeout: 10s
+      auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
+      requests:
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=100
+          length: /recordings
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100
+          length: /recordings
+          where: { field: /error_message, contains: connection }
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=processing&per_page=100
+          length: /recordings
+          counts_as: in_flight
       webhook: { path: /hooks/speakr }
 
   - id: speakr-summaries
@@ -157,7 +184,11 @@ sources:
     observe: [demand]
     resync: 60s
     params:
-      url: http://speakr.media.svc:8899/api/v1/recordings?status=summarizing
+      timeout: 10s
+      auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
+      requests:
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=summarizing&per_page=100
+          length: /recordings
       webhook: { path: /hooks/speakr }
 
   - id: immich-queues
@@ -165,8 +196,9 @@ sources:
     observe: [demand]
     resync: 120s
     params:
-      url: http://immich-server.media.svc:2283/api/jobs
-      count_field: waiting
+      requests:
+        - url: http://immich-server.media.svc:2283/api/jobs
+          count: /waiting
 
   - id: backup-schedule
     kind: schedule

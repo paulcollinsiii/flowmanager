@@ -12,6 +12,7 @@ pub mod ids;
 pub mod lease;
 pub mod observation;
 pub mod plan;
+pub mod source_params;
 pub mod state;
 pub mod store;
 pub mod time;
@@ -30,6 +31,9 @@ pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};
 pub use lease::{Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};
 pub use plan::{AllowedSet, Intent, PowerWant, Step, WaitReason};
+pub use source_params::{
+    AuthSpec, CountsAs, ElementFilter, HttpJsonParams, KubeWatchParams, RequestSpec,
+};
 pub use state::{ModePhase, PowerPhase, ResourceState, SchedState, WindDown};
 pub use store::ConfigStore;
 pub use time::Millis;
