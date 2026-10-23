@@ -58,10 +58,24 @@ pub enum ObservedValue {
     ResourceUp { resource: ResourceId, up: bool },
 }
 
+impl ObservedValue {
+    /// Safety-critical values (pod counts, host reachability) gate irreversible steps and
+    /// are held to `safety_max_age`; everything else is a scheduling input.
+    pub fn is_safety_critical(&self) -> bool {
+        matches!(
+            self,
+            ObservedValue::ModelPods { .. } | ObservedValue::ResourceUp { .. }
+        )
+    }
+}
+
 /// Everything the planner and sequencer see for one tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    /// The config generation this tick is pinned to.
+    #[serde(default)]
+    pub config_generation: u64,
     pub now: Millis,
     #[serde(default)]
     pub observations: Vec<Observation>,
@@ -83,6 +97,30 @@ impl Snapshot {
     /// The newest reachability observation for `resource`.
     pub fn resource_up(&self, resource: &ResourceId) -> Option<&Observation> {
         self.newest(|v| matches!(v, ObservedValue::ResourceUp { resource: r, .. } if r == resource))
+    }
+
+    /// Pod counts `(pods, ready_pods)` for `model` if observed within `max_age`.
+    pub fn fresh_model_pods(&self, model: &ModelId, max_age: Millis) -> Option<(u32, u32)> {
+        let o = self
+            .model_pods(model)
+            .filter(|o| o.age(self.now) <= max_age)?;
+        match o.value {
+            ObservedValue::ModelPods {
+                pods, ready_pods, ..
+            } => Some((pods, ready_pods)),
+            _ => None,
+        }
+    }
+
+    /// Reachability of `resource` if observed within `max_age`.
+    pub fn fresh_resource_up(&self, resource: &ResourceId, max_age: Millis) -> Option<bool> {
+        let o = self
+            .resource_up(resource)
+            .filter(|o| o.age(self.now) <= max_age)?;
+        match o.value {
+            ObservedValue::ResourceUp { up, .. } => Some(up),
+            _ => None,
+        }
     }
 
     fn newest(&self, pred: impl Fn(&ObservedValue) -> bool) -> Option<&Observation> {

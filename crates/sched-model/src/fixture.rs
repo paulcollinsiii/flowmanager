@@ -15,6 +15,7 @@ use crate::config::{Config, ResourceKind};
 use crate::ids::{ResourceId, SourceId};
 use crate::lease::LeaseKind;
 use crate::observation::{ObservedValue, Snapshot};
+use crate::state::SchedState;
 use crate::validate::Problem;
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +44,9 @@ pub struct Fixture {
     /// What situation the snapshot captures.
     pub description: String,
     pub snapshot: Snapshot,
+    /// The sequencer state at the start of the tick; empty if the scheduler has just started.
+    #[serde(default)]
+    pub state: SchedState,
 }
 
 impl Fixture {
@@ -72,6 +76,45 @@ impl Fixture {
             })
         };
         let snap = &self.snapshot;
+        if snap.config_generation != config.generation() {
+            add(
+                "snapshot.config_generation",
+                format!(
+                    "{} does not match the config generation {}",
+                    snap.config_generation,
+                    config.generation()
+                ),
+            );
+        }
+        for (id, st) in &self.state.resources {
+            let at = format!("state.resources[{id}]");
+            let Some(res) = config.resource(id) else {
+                add(&at, format!("unknown resource {:?}", id.as_str()));
+                continue;
+            };
+            if res.power.is_none() && !st.is_on() {
+                add(
+                    &at,
+                    "resource has no power section but is not on".to_string(),
+                );
+            }
+            if let Some(m) = st.mode.allowed_model().or(match &st.mode {
+                crate::state::ModePhase::Draining { model, .. } => Some(model),
+                _ => None,
+            }) && config.model(m).is_none_or(|spec| &spec.resource != id)
+            {
+                add(
+                    &at,
+                    format!(
+                        "mode refers to model {:?} that does not belong to this resource",
+                        m.as_str()
+                    ),
+                );
+            }
+            if res.kind == ResourceKind::Shared && st.mode != crate::state::ModePhase::Idle {
+                add(&at, "a shared resource has no model mode".to_string());
+            }
+        }
 
         let mut seen: HashSet<(&SourceId, String)> = HashSet::new();
         for (i, o) in snap.observations.iter().enumerate() {
@@ -212,6 +255,17 @@ impl Fixture {
                         l.resource.as_str()
                     ),
                 ),
+                LeaseKind::Reclaim
+                    if res.kind != ResourceKind::Exclusive || res.power.is_none() =>
+                {
+                    add(
+                        &at,
+                        format!(
+                            "reclaim on resource {:?}, which is not an exclusive resource with a power section",
+                            l.resource.as_str()
+                        ),
+                    )
+                }
                 LeaseKind::ManualHost if res.power.is_none() => add(
                     &at,
                     format!(

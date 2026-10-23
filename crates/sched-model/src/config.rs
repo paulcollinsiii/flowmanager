@@ -109,6 +109,10 @@ pub struct ClassSpec {
     pub demand: Option<DemandRef>,
     #[serde(default)]
     pub recovery: Option<RecoverySpec>,
+    /// How long this class's in-flight work may run once a forced switch starts.
+    /// Defaults to the policy's reclaim or drain timeout.
+    #[serde(default)]
+    pub kill_timeout: Option<Millis>,
 }
 
 /// Adapter kinds. Implementations live in `sched-observe`.
@@ -175,8 +179,28 @@ pub struct PolicyConfig {
     pub safety_max_age: Millis,
     /// Lifetime of an interactive lease before it must be renewed.
     pub interactive_ttl: Millis,
-    /// How long in-flight jobs may run after a reclaim or manual lease cuts batch work short.
+    /// How long in-flight jobs may run after a manual model lease cuts batch work short.
     pub drain_timeout: Millis,
+    /// How long in-flight jobs may run after a reclaim. Defaults to `drain_timeout`.
+    #[serde(default)]
+    pub reclaim_timeout: Option<Millis>,
+}
+
+impl PolicyConfig {
+    /// The effective reclaim timeout.
+    pub fn reclaim_timeout(&self) -> Millis {
+        self.reclaim_timeout.unwrap_or(self.drain_timeout)
+    }
+
+    /// The oldest an observation of this kind may be and still be used: safety-critical
+    /// kinds are held to `safety_max_age`, scheduling inputs to `demand_max_age`.
+    pub fn max_age_for(&self, value: &crate::observation::ObservedValue) -> Millis {
+        if value.is_safety_critical() {
+            self.safety_max_age
+        } else {
+            self.demand_max_age
+        }
+    }
 }
 
 /// Unvalidated shape of the configuration file.
@@ -197,6 +221,7 @@ struct RawConfig {
 /// A validated configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    generation: u64,
     policy: PolicyConfig,
     resources: Vec<ResourceSpec>,
     models: Vec<ModelSpec>,
@@ -224,8 +249,14 @@ fn format_problems(problems: &[Problem]) -> String {
 impl Config {
     /// Parses and validates. Returns every problem found, never a partially valid value.
     pub fn from_yaml(text: &str) -> Result<Config, ConfigError> {
+        Self::from_yaml_with_generation(text, 0)
+    }
+
+    /// As [`Config::from_yaml`], stamping the config generation that ticks are pinned to.
+    pub fn from_yaml_with_generation(text: &str, generation: u64) -> Result<Config, ConfigError> {
         let raw: RawConfig = serde_yaml_ng::from_str(text)?;
         let config = Config {
+            generation,
             policy: raw.policy,
             resources: raw.resources,
             models: raw.models,
@@ -238,6 +269,11 @@ impl Config {
         } else {
             Err(ConfigError::Invalid(problems))
         }
+    }
+
+    /// The generation of this config; a snapshot must carry the same value.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn policy(&self) -> &PolicyConfig {

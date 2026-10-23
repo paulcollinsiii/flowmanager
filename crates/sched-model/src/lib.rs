@@ -12,8 +12,10 @@ pub mod ids;
 pub mod lease;
 pub mod observation;
 pub mod plan;
+pub mod state;
 pub mod time;
 pub mod validate;
+pub mod work;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -26,6 +28,8 @@ pub use fixture::{Fixture, FixtureError};
 pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};
 pub use lease::{Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};
-pub use plan::{Intent, Step};
+pub use plan::{AllowedSet, Intent, PowerWant, Step, WaitReason};
+pub use state::{ModePhase, PowerPhase, ResourceState, SchedState, WindDown};
 pub use time::Millis;
 pub use validate::Problem;
+pub use work::{ClassWork, class_work, classes_of_model, host_is_up};

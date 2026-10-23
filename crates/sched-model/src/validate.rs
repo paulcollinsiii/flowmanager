@@ -89,13 +89,19 @@ fn policy(c: &Config, p: &mut Problems) {
     for (name, value) in [
         ("interactive_ttl", pol.interactive_ttl),
         ("drain_timeout", pol.drain_timeout),
-    ] {
+    ]
+    .into_iter()
+    .chain(pol.reclaim_timeout.map(|t| ("reclaim_timeout", t)))
+    {
         if value > MAX_LEASE_DURATION {
             p.add(
                 format!("policy.{name}"),
                 format!("{value} exceeds the maximum of {MAX_LEASE_DURATION} (1 day)"),
             );
         }
+    }
+    if pol.reclaim_timeout == Some(Millis::ZERO) {
+        p.add("policy.reclaim_timeout", "must be greater than zero");
     }
     for (name, value) in positive {
         if value == Millis::ZERO {
@@ -257,6 +263,14 @@ fn classes(c: &Config, p: &mut Problems) {
                 ),
                 Some(_) => {}
             }
+        }
+        if let Some(t) = k.kill_timeout
+            && (t == Millis::ZERO || t > MAX_LEASE_DURATION)
+        {
+            p.add(
+                format!("{at}.kill_timeout"),
+                format!("{t} must be greater than zero and at most {MAX_LEASE_DURATION}"),
+            );
         }
         if let Some(r) = &k.recovery {
             if r.action.trim().is_empty() {

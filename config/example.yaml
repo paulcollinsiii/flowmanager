@@ -3,7 +3,7 @@
 # Durations accept plain milliseconds or a suffix: ms, s, m, h, d.
 
 policy:
-  strategy: fifo-drain
+  strategy: fifo-exhaustive
   min_dwell: 5m
   max_dwell: 2h
   idle_grace: 10m
