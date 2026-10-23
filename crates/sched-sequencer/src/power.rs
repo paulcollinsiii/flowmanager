@@ -16,7 +16,7 @@ pub(crate) fn initial(cx: &Cx, steps: &mut Vec<Step>) -> Option<ResourceState> {
     }
     match cx
         .snapshot
-        .fresh_resource_up(&cx.res.id, cx.config.policy().safety_max_age)
+        .fresh_resource_up(cx.config, &cx.res.id, cx.config.policy().safety_max_age)
     {
         Some(true) => Some(ResourceState::new(PowerPhase::On { since: now })),
         Some(false) => Some(ResourceState::new(PowerPhase::Off)),
@@ -33,9 +33,9 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         return;
     }
     let now = cx.now();
-    let Some(up) = cx
-        .snapshot
-        .fresh_resource_up(&cx.res.id, cx.config.policy().safety_max_age)
+    let Some(up) =
+        cx.snapshot
+            .fresh_resource_up(cx.config, &cx.res.id, cx.config.policy().safety_max_age)
     else {
         return;
     };
@@ -171,7 +171,11 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
 /// Shuts the host down, provided the observations that make it safe are fresh.
 fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
     let max_age = cx.config.policy().safety_max_age;
-    if cx.snapshot.fresh_resource_up(&cx.res.id, max_age) != Some(true) {
+    if cx
+        .snapshot
+        .fresh_resource_up(cx.config, &cx.res.id, max_age)
+        != Some(true)
+    {
         wait(cx, steps, WaitReason::StaleObservation);
         return;
     }

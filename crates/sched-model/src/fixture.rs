@@ -209,6 +209,15 @@ impl Fixture {
                     if config.model(model).is_none() {
                         add(&at, format!("unknown model {:?}", model.as_str()));
                     }
+                    if source.is_some() && !config.supplies_cluster_state(&o.source) {
+                        add(
+                            &at,
+                            format!(
+                                "source {:?} cannot supply pod counts (the scheduler ignores them)",
+                                o.source.as_str()
+                            ),
+                        );
+                    }
                     if ready_pods > pods {
                         add(
                             &at,
@@ -216,17 +225,28 @@ impl Fixture {
                         );
                     }
                 }
-                ObservedValue::ResourceUp { resource, .. } => match config.resource(resource) {
-                    None => add(&at, format!("unknown resource {:?}", resource.as_str())),
-                    Some(r) if r.power.is_none() => add(
-                        &at,
-                        format!(
-                            "resource {:?} has no power section (always on), so its up state is not observed",
-                            resource.as_str()
+                ObservedValue::ResourceUp { resource, .. } => {
+                    if source.is_some() && !config.supplies_cluster_state(&o.source) {
+                        add(
+                            &at,
+                            format!(
+                                "source {:?} cannot supply host reachability (the scheduler ignores it)",
+                                o.source.as_str()
+                            ),
+                        );
+                    }
+                    match config.resource(resource) {
+                        None => add(&at, format!("unknown resource {:?}", resource.as_str())),
+                        Some(r) if r.power.is_none() => add(
+                            &at,
+                            format!(
+                                "resource {:?} has no power section (always on), so its up state is not observed",
+                                resource.as_str()
+                            ),
                         ),
-                    ),
-                    Some(_) => {}
-                },
+                        Some(_) => {}
+                    }
+                }
             }
         }
 

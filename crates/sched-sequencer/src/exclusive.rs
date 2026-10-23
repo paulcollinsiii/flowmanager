@@ -46,7 +46,7 @@ fn waiting(cx: &Cx, steps: &mut Vec<Step>, reason: WaitReason) -> bool {
 fn zero_pods(cx: &Cx, model: &ModelId) -> Result<bool, WaitReason> {
     match cx
         .snapshot
-        .fresh_model_pods(model, cx.config.policy().safety_max_age)
+        .fresh_model_pods(cx.config, model, cx.config.policy().safety_max_age)
     {
         Some((pods, _)) => Ok(pods == 0),
         None => Err(WaitReason::StaleObservation),
@@ -90,7 +90,7 @@ fn loading(
     }
     match cx
         .snapshot
-        .fresh_model_pods(model, cx.config.policy().safety_max_age)
+        .fresh_model_pods(cx.config, model, cx.config.policy().safety_max_age)
     {
         Some((_, ready)) if ready >= 1 => {
             st.mode = ModePhase::Serving {

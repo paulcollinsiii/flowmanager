@@ -43,15 +43,13 @@ pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> Cl
     let Some(demand) = &class.demand else {
         return ClassWork::NONE;
     };
-    // Only the newest timestamp counts; observations tied at it are merged conservatively
-    // (most ready, most in flight, oldest item), so snapshot order never matters. A newest
-    // observation that is stale or future-dated makes the class's demand unknown.
-    let group = snapshot
-        .newest_group(|v| matches!(v, ObservedValue::Demand { class: c, .. } if c == &class.id));
-    let group: Vec<_> = group
-        .into_iter()
-        .filter(|o| o.source == demand.source)
-        .collect();
+    // Observations are filtered by class AND the class's configured demand source before
+    // the newest timestamp is chosen, so an observation of this class from another source
+    // is ignored and cannot make the demand unknown. Only the newest timestamp then counts;
+    // observations tied at it are merged conservatively (most ready, most in flight, oldest
+    // item), so snapshot order never matters. A newest observation that is stale or
+    // future-dated makes the class's demand unknown.
+    let group = snapshot.demand_group(&demand.source, &class.id);
     let unknown = ClassWork {
         known: false,
         ..ClassWork::NONE
@@ -111,7 +109,7 @@ pub fn host_is_up(
     match state.resource(resource) {
         Some(st) => st.is_on(),
         None => snapshot
-            .fresh_resource_up(resource, config.policy().safety_max_age)
+            .fresh_resource_up(config, resource, config.policy().safety_max_age)
             .unwrap_or(false),
     }
 }

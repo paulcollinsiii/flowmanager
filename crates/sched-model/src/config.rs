@@ -142,6 +142,11 @@ impl SourceKind {
                 | SourceKind::Session
         )
     }
+
+    /// Whether this kind of source can report pod counts and host reachability.
+    pub fn can_supply_cluster_state(self) -> bool {
+        matches!(self, SourceKind::KubernetesWatch)
+    }
 }
 
 /// An adapter instance. `params` is opaque here; the adapter kind interprets it.
@@ -313,6 +318,13 @@ impl Config {
 
     pub fn class(&self, id: &ClassId) -> Option<&ClassSpec> {
         self.classes.iter().find(|c| &c.id == id)
+    }
+
+    /// Whether `id` is a configured source whose readings of pod counts and host
+    /// reachability are honoured. Readings from any other source are ignored.
+    pub fn supplies_cluster_state(&self, id: &SourceId) -> bool {
+        self.source(id)
+            .is_some_and(|s| s.kind.can_supply_cluster_state())
     }
 
     pub fn source(&self, id: &SourceId) -> Option<&SourceSpec> {

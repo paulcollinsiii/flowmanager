@@ -207,12 +207,16 @@ mod tests {
     fn fixture_queries_find_newest() {
         let f = fixture("ocr-loaded-transcription-waiting");
         let s = &f.snapshot;
-        assert!(s.demand(&"paperless-ocr".into()).is_some());
+        let cfg = example_config();
+        assert!(s.demand(&cfg, &"paperless-ocr".into()).is_some());
         assert_eq!(
-            s.model_pods(&"mineru".into()).unwrap().age(s.now).as_u64(),
+            s.model_pods(&cfg, &"mineru".into())
+                .unwrap()
+                .age(s.now)
+                .as_u64(),
             5000
         );
-        assert!(s.model_pods(&"llm".into()).is_none());
+        assert!(s.model_pods(&cfg, &"llm".into()).is_none());
     }
 
     #[test]

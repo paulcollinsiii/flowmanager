@@ -190,7 +190,7 @@ pub(crate) fn others_zero(cx: &Cx, except: Option<&ModelId>) -> Result<(), WaitR
         .models_of(&cx.res.id)
         .filter(|m| Some(&m.id) != except)
     {
-        match cx.snapshot.fresh_model_pods(&m.id, max_age) {
+        match cx.snapshot.fresh_model_pods(cx.config, &m.id, max_age) {
             None => return Err(WaitReason::StaleObservation),
             Some((0, _)) => {}
             Some(_) => return Err(WaitReason::OtherModelPresent),

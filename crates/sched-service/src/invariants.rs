@@ -10,19 +10,28 @@ use std::collections::BTreeSet;
 
 use sched_model::{
     ClassId, ClassSpec, Config, Intent, LeaseKind, Millis, ModePhase, ModelId, ObservedValue,
-    ResourceId, ResourceKind, SchedState, Snapshot, Step,
+    ResourceId, ResourceKind, SchedState, Snapshot, SourceKind, Step,
 };
 use sched_sequencer::Decision;
 
 /// Observations matching `pred` at the newest timestamp, if that timestamp is usable.
-fn newest(
-    snap: &Snapshot,
+/// Pod counts and reachability are read only from configured `kubernetes_watch` sources (the
+/// same rule as the core, restated here), and the filter by subject and source comes before
+/// the newest timestamp is chosen.
+fn newest<'a>(
+    config: &Config,
+    snap: &'a Snapshot,
     max_age: Millis,
     pred: impl Fn(&ObservedValue) -> bool,
-) -> Option<Vec<&ObservedValue>> {
+) -> Option<Vec<&'a ObservedValue>> {
     let all: Vec<_> = snap
         .observations
         .iter()
+        .filter(|o| {
+            config
+                .source(&o.source)
+                .is_some_and(|s| s.kind == SourceKind::KubernetesWatch)
+        })
         .filter(|o| pred(&o.value))
         .collect();
     let latest = all.iter().map(|o| o.observed_at.as_u64()).max()?;
@@ -37,8 +46,9 @@ fn newest(
     )
 }
 
-fn pods_zero(snap: &Snapshot, model: &ModelId, max_age: Millis) -> bool {
+fn pods_zero(config: &Config, snap: &Snapshot, model: &ModelId, max_age: Millis) -> bool {
     newest(
+        config,
         snap,
         max_age,
         |v| matches!(v, ObservedValue::ModelPods { model: m, .. } if m == model),
@@ -49,8 +59,9 @@ fn pods_zero(snap: &Snapshot, model: &ModelId, max_age: Millis) -> bool {
     })
 }
 
-fn host_up(snap: &Snapshot, res: &ResourceId, max_age: Millis) -> bool {
+fn host_up(config: &Config, snap: &Snapshot, res: &ResourceId, max_age: Millis) -> bool {
     newest(
+        config,
         snap,
         max_age,
         |v| matches!(v, ObservedValue::ResourceUp { resource, .. } if resource == res),
@@ -163,7 +174,7 @@ pub fn check(
             // 2. A model is allowed only when every other model is observed at zero pods.
             Step::AllowModel { resource, model } => {
                 for other in config.models_of(resource).filter(|m| &m.id != model) {
-                    if !pods_zero(snapshot, &other.id, safety) {
+                    if !pods_zero(config, snapshot, &other.id, safety) {
                         out.push(format!(
                             "invariant 2: allowed {model} without fresh zero pods of {}",
                             other.id
@@ -238,13 +249,13 @@ pub fn check(
                         ));
                     }
                 }
-                if !host_up(snapshot, resource, safety) {
+                if !host_up(config, snapshot, resource, safety) {
                     out.push(format!(
                         "invariant 5: powered off {resource} without a fresh up observation"
                     ));
                 }
                 for m in config.models_of(resource) {
-                    if !pods_zero(snapshot, &m.id, safety) {
+                    if !pods_zero(config, snapshot, &m.id, safety) {
                         out.push(format!(
                             "invariant 5: powered off {resource} without fresh zero pods of {}",
                             m.id
