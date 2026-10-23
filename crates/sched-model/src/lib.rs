@@ -22,8 +22,8 @@ pub mod work;
 pub mod test_support;
 
 pub use config::{
-    ClassSpec, Config, ConfigError, DemandRef, ModelSpec, PolicyConfig, PowerSpec, Preemptibility,
-    RecoverySpec, Requirement, ResourceKind, ResourceSpec, SourceKind, SourceSpec,
+    Capability, ClassSpec, Config, ConfigError, DemandRef, ModelSpec, PolicyConfig, PowerSpec,
+    Preemptibility, RecoverySpec, Requirement, ResourceKind, ResourceSpec, SourceKind, SourceSpec,
 };
 pub use fixture::{Fixture, FixtureError};
 pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};

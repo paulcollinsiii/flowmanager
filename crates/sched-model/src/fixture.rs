@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ResourceKind};
+use crate::config::{Capability, Config, ResourceKind};
 use crate::ids::{ResourceId, SourceId};
 use crate::lease::LeaseKind;
 use crate::observation::{ObservedValue, Snapshot};
@@ -175,12 +175,13 @@ impl Fixture {
                             Some(_) => {}
                         },
                     }
-                    if let Some(s) = source
-                        && !s.kind.can_supply_demand()
-                    {
+                    if source.is_some() && !config.source_observes(&o.source, Capability::Demand) {
                         add(
                             &at,
-                            format!("source {:?} cannot supply demand", o.source.as_str()),
+                            format!(
+                                "source {:?} does not declare the demand capability",
+                                o.source.as_str()
+                            ),
                         );
                     }
                     if *ready == 0 && oldest_ready_at.is_some() {
@@ -209,11 +210,11 @@ impl Fixture {
                     if config.model(model).is_none() {
                         add(&at, format!("unknown model {:?}", model.as_str()));
                     }
-                    if source.is_some() && !config.supplies_cluster_state(&o.source) {
+                    if source.is_some() && !config.source_observes(&o.source, Capability::Pods) {
                         add(
                             &at,
                             format!(
-                                "source {:?} cannot supply pod counts (the scheduler ignores them)",
+                                "source {:?} does not declare the pods capability (the scheduler ignores its pod counts)",
                                 o.source.as_str()
                             ),
                         );
@@ -226,11 +227,13 @@ impl Fixture {
                     }
                 }
                 ObservedValue::ResourceUp { resource, .. } => {
-                    if source.is_some() && !config.supplies_cluster_state(&o.source) {
+                    if source.is_some()
+                        && !config.source_observes(&o.source, Capability::Reachability)
+                    {
                         add(
                             &at,
                             format!(
-                                "source {:?} cannot supply host reachability (the scheduler ignores it)",
+                                "source {:?} does not declare the reachability capability (the scheduler ignores its readings)",
                                 o.source.as_str()
                             ),
                         );

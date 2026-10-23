@@ -110,10 +110,22 @@ sources:
   - id: cluster-pods
     kind: kubernetes_watch
     resync: 10s
-    params: { namespaces: [ai, media, docs], observe: [pods, nodes] }
+    observe: [pods, reachability]
+    params: { namespaces: [ai, media, docs] }
+
+  # basestar is not a Kubernetes node: its reachability comes from a blackbox probe
+  # (ssh/icmp) scraped through Prometheus, not from the cluster watch.
+  - id: basestar-probe
+    kind: prometheus
+    observe: [reachability]
+    resync: 10s
+    params:
+      url: http://prometheus.monitoring.svc:9090
+      query: probe_success{instance="basestar"}
 
   - id: paperless-ocr-pending
     kind: http_json
+    observe: [demand]
     resync: 60s
     params:
       url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=ocr-pending
@@ -123,6 +135,7 @@ sources:
 
   - id: paperless-post-ocr
     kind: http_json
+    observe: [demand]
     resync: 60s
     params:
       url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=post-ocr
@@ -132,6 +145,7 @@ sources:
 
   - id: speakr-pending
     kind: http_json
+    observe: [demand]
     resync: 60s
     params:
       url: http://speakr.media.svc:8899/api/v1/recordings?status=pending
@@ -140,6 +154,7 @@ sources:
 
   - id: speakr-summaries
     kind: http_json
+    observe: [demand]
     resync: 60s
     params:
       url: http://speakr.media.svc:8899/api/v1/recordings?status=summarizing
@@ -147,6 +162,7 @@ sources:
 
   - id: immich-queues
     kind: http_json
+    observe: [demand]
     resync: 120s
     params:
       url: http://immich-server.media.svc:2283/api/jobs
@@ -154,9 +170,11 @@ sources:
 
   - id: backup-schedule
     kind: schedule
+    observe: [demand]
     resync: 60s
     params: { cron: "0 3 * * 0" }
 
   - id: llm-sessions
     kind: session
+    observe: [demand]
     resync: 30s

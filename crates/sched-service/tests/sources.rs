@@ -304,3 +304,59 @@ fn the_checker_is_not_wedged_by_stray_readings_either() {
     let v = run_check(&snapshot(o), &st, vec![step_allow("mineru")]);
     assert!(v.is_empty(), "{v:?}");
 }
+
+/// Reachability of a host outside the cluster comes from a probe source, declared as such.
+#[test]
+fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
+    use sched_model::test_support::EXAMPLE_CONFIG;
+    let text = EXAMPLE_CONFIG.replace(
+        "  - id: basestar-probe\n    kind: prometheus\n",
+        "  - id: basestar-probe\n    kind: http_json\n",
+    );
+    assert_ne!(text, EXAMPLE_CONFIG);
+    let config = sched_model::Config::from_yaml(&text).unwrap();
+    let lease = sched_model::Lease {
+        id: "user".into(),
+        resource: ResourceId::new("basestar-nfs"),
+        kind: sched_model::LeaseKind::ManualHost,
+        granted_at: Millis(0),
+    };
+    // Only the probe reports on basestar-nfs; the cluster watch does not.
+    let mut o: Vec<_> = authoritative(None)
+        .into_iter()
+        .filter(|x| {
+            !matches!(&x.value, ObservedValue::ResourceUp { resource, .. } if resource.as_str() == "basestar-nfs")
+        })
+        .collect();
+    o.push(up("basestar-probe", "basestar-nfs", NOW, true));
+    let mut snap = snapshot(o);
+    snap.leases = vec![lease];
+    // The scheduler has not seen either host yet, so it starts from the observations.
+    let st = SchedState::default();
+    let (intent, d) = decide(&config, &snap, &st).unwrap();
+    assert!(!has_wait(&d, WaitReason::StaleObservation), "{:?}", d.steps);
+    // NFS is up, so its classes are allowed rather than waiting on an unknown host.
+    assert!(
+        d.allowed.classes.iter().any(|c| c.as_str() == "backup"),
+        "{:?}",
+        d.allowed
+    );
+    assert!(check(&config, &snap, &st, &intent, &d).is_empty());
+    // The probe reporting the host down makes the manual lease power it on.
+    for x in snap.observations.iter_mut() {
+        if x.source.as_str() == "basestar-probe" {
+            x.value = ObservedValue::ResourceUp {
+                resource: ResourceId::new("basestar-nfs"),
+                up: false,
+            };
+        }
+    }
+    let (_, d) = decide(&config, &snap, &st).unwrap();
+    assert!(
+        d.steps.iter().any(
+            |s| matches!(s, Step::PowerOn { resource } if resource.as_str() == "basestar-nfs")
+        ),
+        "{:?}",
+        d.steps
+    );
+}

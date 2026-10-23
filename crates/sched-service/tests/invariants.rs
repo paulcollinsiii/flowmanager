@@ -273,3 +273,74 @@ fn killing_a_class_with_nothing_in_flight_is_a_violation() {
         "{v:?}"
     );
 }
+
+fn pods_obs(model: &str, pods: u32) -> sched_model::Observation {
+    sched_model::Observation {
+        source: "cluster-pods".into(),
+        observed_at: Millis(NOW),
+        fidelity: sched_model::Fidelity::Event,
+        value: sched_model::ObservedValue::ModelPods {
+            model: ModelId::new(model),
+            pods,
+            ready_pods: pods,
+        },
+    }
+}
+
+#[test]
+fn tied_pod_readings_count_as_zero_only_when_every_reading_is_zero() {
+    let allow = || Step::AllowModel {
+        resource: ResourceId::new("cuda-central"),
+        model: ModelId::new("mineru"),
+    };
+    // Zero and one pod of llm at the same newest instant, in both orders: not zero.
+    for tied in [
+        vec![pods_obs("llm", 0), pods_obs("llm", 1)],
+        vec![pods_obs("llm", 1), pods_obs("llm", 0)],
+    ] {
+        let mut obs = zero_pods_and_up(&["cuda-central"]);
+        obs.retain(|o| {
+            !matches!(&o.value, sched_model::ObservedValue::ModelPods { model, .. } if model.as_str() == "llm")
+        });
+        obs.extend(tied);
+        let v = run(&snap(obs, vec![]), &SchedState::default(), vec![allow()]);
+        assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
+    }
+    // Two zero readings are zero.
+    let mut obs = zero_pods_and_up(&["cuda-central"]);
+    obs.push(pods_obs("llm", 0));
+    let v = run(&snap(obs, vec![]), &SchedState::default(), vec![allow()]);
+    assert!(v.is_empty(), "{v:?}");
+}
+
+#[test]
+fn tied_reachability_readings_count_as_up_only_when_every_reading_is_up() {
+    let off = || Step::PowerOff {
+        resource: ResourceId::new("cuda-central"),
+    };
+    let reclaim = || vec![lease("r", "cuda-central", LeaseKind::Reclaim)];
+    let up = |v: bool| sched_model::Observation {
+        source: "cluster-pods".into(),
+        observed_at: Millis(NOW),
+        fidelity: sched_model::Fidelity::Event,
+        value: sched_model::ObservedValue::ResourceUp {
+            resource: ResourceId::new("cuda-central"),
+            up: v,
+        },
+    };
+    let base = || {
+        let mut o = zero_pods_and_up(&[]);
+        o.push(up(true));
+        o
+    };
+    let mut o = base();
+    o.push(up(false));
+    let v = run(&snap(o, reclaim()), &SchedState::default(), vec![off()]);
+    assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
+    let v = run(
+        &snap(base(), reclaim()),
+        &SchedState::default(),
+        vec![off()],
+    );
+    assert!(v.is_empty(), "{v:?}");
+}

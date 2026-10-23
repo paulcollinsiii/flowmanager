@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Capability, Config};
 use crate::ids::{ClassId, ModelId, ResourceId, SourceId};
 use crate::lease::Lease;
 use crate::time::Millis;
@@ -118,9 +118,9 @@ impl Snapshot {
 
     /// Pod counts `(pods, ready_pods)` for `model` if the newest observation is fresh.
     ///
-    /// Only observations from configured sources that can report cluster state
-    /// (`SourceKind::can_supply_cluster_state`) are considered; they are filtered by subject
-    /// and source BEFORE the newest timestamp is chosen. A reading from any other source is
+    /// Only observations from configured sources that declare the `pods` capability in
+    /// their `observe` list (`resource_up` readings: `reachability`) are considered; they
+    /// are filtered by subject and source BEFORE the newest timestamp is chosen. A reading from any other source is
     /// ignored entirely: it can neither make the data fresh nor stale, so a stray reading
     /// can never wedge the scheduler, and since it never replaces the authoritative reading
     /// it cannot make a step look safe that the authoritative source says is unsafe. If no
@@ -196,14 +196,14 @@ impl Snapshot {
 
     fn pods_group(&self, config: &Config, model: &ModelId) -> Vec<&Observation> {
         self.newest_group(|o| {
-            config.supplies_cluster_state(&o.source)
+            config.source_observes(&o.source, Capability::Pods)
                 && matches!(&o.value, ObservedValue::ModelPods { model: m, .. } if m == model)
         })
     }
 
     fn up_group(&self, config: &Config, resource: &ResourceId) -> Vec<&Observation> {
         self.newest_group(|o| {
-            config.supplies_cluster_state(&o.source)
+            config.source_observes(&o.source, Capability::Reachability)
                 && matches!(&o.value, ObservedValue::ResourceUp { resource: r, .. } if r == resource)
         })
     }
@@ -376,11 +376,11 @@ mod tests {
 
     use crate::test_support::EXAMPLE_CONFIG;
 
-    /// The example config plus a second cluster-state source, so ties can cross sources.
+    /// The example config plus a second source declaring pods and reachability, so ties can cross sources.
     fn two_cluster_sources() -> Config {
         let text = EXAMPLE_CONFIG.replace(
             "sources:\n  - id: cluster-pods\n",
-            "sources:\n  - id: cluster-pods-b\n    kind: kubernetes_watch\n    resync: 10s\n  - id: cluster-pods\n",
+            "sources:\n  - id: cluster-pods-b\n    kind: kubernetes_watch\n    observe: [pods, reachability]\n    resync: 10s\n  - id: cluster-pods\n",
         );
         assert_ne!(text, EXAMPLE_CONFIG);
         Config::from_yaml(&text).expect("config with a second cluster source is valid")
@@ -480,7 +480,7 @@ mod tests {
         let cfg = two_cluster_sources();
         let m = ModelId::from("mineru");
         let h = ResourceId::from("cuda-central");
-        // Unknown source, and a configured source that cannot report cluster state.
+        // Unknown source, and a configured source that does not declare the capability.
         for stray in ["nowhere", "paperless-ocr-pending"] {
             // Newer strays do not hide a fresh authoritative reading ...
             let s = snap(vec![
@@ -593,5 +593,28 @@ mod tests {
             s.fresh_model_pods(&cfg, &"mineru".into(), Millis(500)),
             Some((0, 0))
         );
+    }
+
+    #[test]
+    fn each_capability_is_honoured_only_from_sources_declaring_it() {
+        let text = EXAMPLE_CONFIG.replace(
+            "sources:\n  - id: cluster-pods\n",
+            "sources:\n  - id: pods-only\n    kind: kubernetes_watch\n    observe: [pods]\n    resync: 10s\n  - id: cluster-pods\n",
+        );
+        let cfg = Config::from_yaml(&text).unwrap();
+        let (m, h) = (ModelId::from("mineru"), ResourceId::from("cuda-central"));
+        // `basestar-probe` declares only reachability; `pods-only` only pods.
+        let s = snap(vec![
+            pods_from("basestar-probe", Fidelity::Event, 990, 0, 0),
+            up_from("pods-only", Fidelity::Event, 990, true),
+        ]);
+        assert_eq!(s.fresh_model_pods(&cfg, &m, Millis(500)), None);
+        assert_eq!(s.fresh_resource_up(&cfg, &h, Millis(500)), None);
+        let s = snap(vec![
+            pods_from("pods-only", Fidelity::Event, 990, 2, 2),
+            up_from("basestar-probe", Fidelity::Event, 990, true),
+        ]);
+        assert_eq!(s.fresh_model_pods(&cfg, &m, Millis(500)), Some((2, 2)));
+        assert_eq!(s.fresh_resource_up(&cfg, &h, Millis(500)), Some(true));
     }
 }

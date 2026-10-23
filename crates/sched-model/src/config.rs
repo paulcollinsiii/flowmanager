@@ -129,23 +129,45 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
-    /// Whether this kind of source can report queue demand for a workload class.
-    /// Kubernetes watches report pods and nodes, and webhook receivers only mark another
-    /// source dirty; neither yields a demand count.
-    pub fn can_supply_demand(self) -> bool {
-        matches!(
-            self,
-            SourceKind::HttpJson
-                | SourceKind::Sql
-                | SourceKind::Prometheus
-                | SourceKind::Schedule
-                | SourceKind::Session
-        )
+    /// Whether this kind of source can technically supply `capability`. A source may only
+    /// declare capabilities its kind can supply (checked at load). Webhook receivers only
+    /// mark another source dirty and supply nothing themselves.
+    pub fn can_supply(self, capability: Capability) -> bool {
+        use Capability::*;
+        match self {
+            SourceKind::KubernetesWatch => matches!(capability, Pods | Reachability),
+            SourceKind::HttpJson | SourceKind::Prometheus => {
+                matches!(capability, Reachability | Demand)
+            }
+            SourceKind::Sql | SourceKind::Schedule | SourceKind::Session => {
+                matches!(capability, Demand)
+            }
+            SourceKind::Webhook => false,
+        }
     }
+}
 
-    /// Whether this kind of source can report pod counts and host reachability.
-    pub fn can_supply_cluster_state(self) -> bool {
-        matches!(self, SourceKind::KubernetesWatch)
+/// What a source is declared to report. This declaration, not the source's kind, decides
+/// which observations the scheduler accepts from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Pod counts of models (`model_pods`).
+    Pods,
+    /// Whether a powered host is reachable and up (`resource_up`): kubelet/node readiness
+    /// for cluster nodes, an SSH or ping probe for hosts outside the cluster.
+    Reachability,
+    /// Queue demand of workload classes (`demand`).
+    Demand,
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Capability::Pods => "pods",
+            Capability::Reachability => "reachability",
+            Capability::Demand => "demand",
+        })
     }
 }
 
@@ -157,6 +179,9 @@ pub struct SourceSpec {
     pub kind: SourceKind,
     /// Interval of the slow periodic resync that backs up events.
     pub resync: Millis,
+    /// What this source reports. Observations of a kind it does not declare are ignored.
+    #[serde(default)]
+    pub observe: std::collections::BTreeSet<Capability>,
     #[serde(default)]
     pub params: Value,
 }
@@ -320,11 +345,11 @@ impl Config {
         self.classes.iter().find(|c| &c.id == id)
     }
 
-    /// Whether `id` is a configured source whose readings of pod counts and host
-    /// reachability are honoured. Readings from any other source are ignored.
-    pub fn supplies_cluster_state(&self, id: &SourceId) -> bool {
+    /// Whether `id` is a configured source that declares `capability`. Observations of that
+    /// kind from any other source are ignored.
+    pub fn source_observes(&self, id: &SourceId, capability: Capability) -> bool {
         self.source(id)
-            .is_some_and(|s| s.kind.can_supply_cluster_state())
+            .is_some_and(|s| s.observe.contains(&capability))
     }
 
     pub fn source(&self, id: &SourceId) -> Option<&SourceSpec> {

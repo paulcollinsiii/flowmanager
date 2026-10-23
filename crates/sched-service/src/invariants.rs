@@ -9,17 +9,19 @@
 use std::collections::BTreeSet;
 
 use sched_model::{
-    ClassId, ClassSpec, Config, Intent, LeaseKind, Millis, ModePhase, ModelId, ObservedValue,
-    ResourceId, ResourceKind, SchedState, Snapshot, SourceKind, Step,
+    Capability, ClassId, ClassSpec, Config, Intent, LeaseKind, Millis, ModePhase, ModelId,
+    ObservedValue, ResourceId, ResourceKind, SchedState, Snapshot, Step,
 };
 use sched_sequencer::Decision;
 
 /// Observations matching `pred` at the newest timestamp, if that timestamp is usable.
-/// Pod counts and reachability are read only from configured `kubernetes_watch` sources (the
-/// same rule as the core, restated here), and the filter by subject and source comes before
-/// the newest timestamp is chosen.
+/// Pod counts and reachability are read only from configured sources whose `observe` list
+/// declares `cap` (the same rule as the core, restated here from the config rather than
+/// from the source kind), and the filter by subject and source comes before the newest
+/// timestamp is chosen.
 fn newest<'a>(
     config: &Config,
+    cap: Capability,
     snap: &'a Snapshot,
     max_age: Millis,
     pred: impl Fn(&ObservedValue) -> bool,
@@ -30,7 +32,7 @@ fn newest<'a>(
         .filter(|o| {
             config
                 .source(&o.source)
-                .is_some_and(|s| s.kind == SourceKind::KubernetesWatch)
+                .is_some_and(|s| s.observe.contains(&cap))
         })
         .filter(|o| pred(&o.value))
         .collect();
@@ -49,6 +51,7 @@ fn newest<'a>(
 fn pods_zero(config: &Config, snap: &Snapshot, model: &ModelId, max_age: Millis) -> bool {
     newest(
         config,
+        Capability::Pods,
         snap,
         max_age,
         |v| matches!(v, ObservedValue::ModelPods { model: m, .. } if m == model),
@@ -62,6 +65,7 @@ fn pods_zero(config: &Config, snap: &Snapshot, model: &ModelId, max_age: Millis)
 fn host_up(config: &Config, snap: &Snapshot, res: &ResourceId, max_age: Millis) -> bool {
     newest(
         config,
+        Capability::Reachability,
         snap,
         max_age,
         |v| matches!(v, ObservedValue::ResourceUp { resource, .. } if resource == res),

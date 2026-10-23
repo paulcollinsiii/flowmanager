@@ -232,6 +232,51 @@ mod tests {
     }
 
     #[test]
+    fn fixtures_accept_readings_only_from_sources_declaring_the_capability() {
+        let cfg = example_config();
+        let obs = |source: &str, value: &str| {
+            format!(
+                "description: x\nsnapshot:\n  now: 1000\n  observations:\n    - {{ source: {source}, observed_at: 900, fidelity: event, value: {value} }}\n"
+            )
+        };
+        let pods = "{ type: model_pods, model: llm, pods: 1, ready_pods: 1 }";
+        let up = "{ type: resource_up, resource: cuda-central, up: true }";
+        let dem = "{ type: demand, class: paperless-ocr, ready: 1 }";
+        // A pods reading from a source that declares only demand, or only reachability.
+        for src in ["paperless-ocr-pending", "basestar-probe"] {
+            let m = Fixture::from_yaml_checked(&obs(src, pods), &cfg)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                m.contains("does not declare the pods capability"),
+                "{src}: {m}"
+            );
+        }
+        // Reachability from a source that does not declare it.
+        let m = Fixture::from_yaml_checked(&obs("paperless-ocr-pending", up), &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            m.contains("does not declare the reachability capability"),
+            "{m}"
+        );
+        // Demand from a source that does not declare it.
+        let m = Fixture::from_yaml_checked(&obs("cluster-pods", dem), &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("does not declare the demand capability"), "{m}");
+        // The declaring sources pass, including a non-Kubernetes source for reachability.
+        assert!(Fixture::from_yaml_checked(&obs("cluster-pods", pods), &cfg).is_ok());
+        assert!(Fixture::from_yaml_checked(&obs("cluster-pods", up), &cfg).is_ok());
+        assert!(Fixture::from_yaml_checked(&obs("basestar-probe", up), &cfg).is_ok());
+        // A typo in the source id is reported, not silently ignored.
+        let m = Fixture::from_yaml_checked(&obs("cluster-pod", pods), &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("unknown source \"cluster-pod\""), "{m}");
+    }
+
+    #[test]
     fn resource_up_needs_a_power_section() {
         let yaml = EXAMPLE_CONFIG.replace(
             "    power:\n      actuator: ssh_power\n      params: { host: basestar }\n",

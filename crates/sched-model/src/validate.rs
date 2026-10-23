@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::config::{Config, MAX_LEASE_DURATION, ResourceKind, SourceKind};
+use crate::config::{Capability, Config, MAX_LEASE_DURATION, ResourceKind};
 use crate::time::Millis;
 
 /// One validation failure: where it is and what is wrong.
@@ -253,12 +253,11 @@ fn classes(c: &Config, p: &mut Problems) {
                     format!("{at}.demand"),
                     format!("references unknown source {:?}", d.source.as_str()),
                 ),
-                Some(s) if !s.kind.can_supply_demand() => p.add(
+                Some(s) if !s.observe.contains(&Capability::Demand) => p.add(
                     format!("{at}.demand"),
                     format!(
-                        "source {:?} is of kind {:?}, which cannot supply demand",
-                        d.source.as_str(),
-                        s.kind
+                        "source {:?} does not declare the demand capability (observe: [demand])",
+                        d.source.as_str()
                     ),
                 ),
                 Some(_) => {}
@@ -296,6 +295,28 @@ fn classes(c: &Config, p: &mut Problems) {
 
 fn sources(c: &Config, p: &mut Problems) {
     let pol = c.policy();
+    let declared = |cap: Capability| c.sources().iter().any(|s| s.observe.contains(&cap));
+    // Without a declared source the safety-critical readings would never exist and every
+    // decision would wait on stale observations, so refuse such a config at load.
+    for m in c.models() {
+        if c.resource(&m.resource)
+            .is_some_and(|r| r.kind == ResourceKind::Exclusive)
+            && !declared(Capability::Pods)
+        {
+            p.add(
+                format!("models[{}]", m.id),
+                "no source declares the pods capability (observe: [pods]), so its pod count could never be observed",
+            );
+        }
+    }
+    for r in c.resources().iter().filter(|r| r.power.is_some()) {
+        if !declared(Capability::Reachability) {
+            p.add(
+                format!("resources[{}]", r.id),
+                "has a power section but no source declares the reachability capability (observe: [reachability]), so its host state could never be observed",
+            );
+        }
+    }
     for s in c.sources() {
         let at = format!("sources[{}]", s.id);
         if s.resync == Millis::ZERO {
@@ -311,11 +332,24 @@ fn sources(c: &Config, p: &mut Problems) {
                 ),
             );
         }
-        if s.kind == SourceKind::KubernetesWatch && s.resync > pol.safety_max_age {
+        for cap in &s.observe {
+            if !s.kind.can_supply(*cap) {
+                p.add(
+                    &at,
+                    format!(
+                        "kind {:?} cannot supply the {cap} capability listed in observe",
+                        s.kind
+                    ),
+                );
+            }
+        }
+        if (s.observe.contains(&Capability::Pods) || s.observe.contains(&Capability::Reachability))
+            && s.resync > pol.safety_max_age
+        {
             p.add(
                 &at,
                 format!(
-                    "resync ({}) exceeds policy.safety_max_age ({}); safety-critical observations would always be stale",
+                    "resync ({}) exceeds policy.safety_max_age ({}); its pods/reachability observations would always be stale",
                     s.resync, pol.safety_max_age
                 ),
             );
@@ -353,8 +387,8 @@ classes:
     demand: { source: s1 }
     recovery: { action: requeue }
 sources:
-  - { id: s1, kind: http_json, resync: 30s }
-  - { id: k8s, kind: kubernetes_watch, resync: 10s }
+  - { id: s1, kind: http_json, resync: 30s, observe: [demand] }
+  - { id: k8s, kind: kubernetes_watch, resync: 10s, observe: [pods, reachability] }
   - { id: hook, kind: webhook, resync: 30s }
 "#;
 
@@ -557,6 +591,82 @@ sources:
     }
 
     #[test]
+    fn rejects_a_config_where_no_source_declares_pods() {
+        // Same kinds as before, but nothing declares the capability: the old inference from
+        // kind would have accepted this and then waited on stale pods forever.
+        let y = VALID.replace("observe: [pods, reachability]", "observe: [reachability]");
+        let ps = problems(&y);
+        assert!(
+            has(&ps, "models[m1]: no source declares the pods capability"),
+            "{ps:?}"
+        );
+        assert!(
+            has(&ps, "models[m2]: no source declares the pods capability"),
+            "{ps:?}"
+        );
+        // Swapping the kind away from kubernetes_watch: still no pods source.
+        let y = VALID.replace(
+            "kind: kubernetes_watch, resync: 10s, observe: [pods, reachability]",
+            "kind: http_json, resync: 10s, observe: [reachability]",
+        );
+        assert!(has(&problems(&y), "no source declares the pods capability"));
+    }
+
+    #[test]
+    fn rejects_a_config_where_no_source_declares_reachability() {
+        let y = VALID.replace("observe: [pods, reachability]", "observe: [pods]");
+        let ps = problems(&y);
+        assert!(
+            has(
+                &ps,
+                "resources[gpu]: has a power section but no source declares the reachability capability"
+            ),
+            "{ps:?}"
+        );
+        assert!(has(&ps, "resources[nfs]: has a power section"), "{ps:?}");
+        assert!(!has(&ps, "resources[gpu2]"), "{ps:?}");
+    }
+
+    #[test]
+    fn reachability_may_come_from_a_non_kubernetes_source() {
+        let y = VALID
+            .replace("observe: [pods, reachability]", "observe: [pods]")
+            .replace(
+                "  - { id: hook,",
+                "  - { id: probe, kind: http_json, resync: 10s, observe: [reachability] }\n  - { id: hook,",
+            );
+        assert!(Config::from_yaml(&y).is_ok());
+        let y = y.replace("id: probe, kind: http_json", "id: probe, kind: prometheus");
+        assert!(Config::from_yaml(&y).is_ok());
+    }
+
+    #[test]
+    fn rejects_capabilities_the_kind_cannot_supply() {
+        let ps = problems(&VALID.replace(
+            "id: hook, kind: webhook, resync: 30s",
+            "id: hook, kind: webhook, resync: 30s, observe: [demand]",
+        ));
+        assert!(
+            has(
+                &ps,
+                "sources[hook]: kind Webhook cannot supply the demand capability"
+            ),
+            "{ps:?}"
+        );
+        let ps = problems(&VALID.replace(
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+            "{ id: s1, kind: sql, resync: 30s, observe: [demand, pods] }",
+        ));
+        assert!(
+            has(
+                &ps,
+                "sources[s1]: kind Sql cannot supply the pods capability"
+            ),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
     fn rejects_demand_from_sources_that_cannot_supply_it() {
         for id in ["k8s", "hook"] {
             let y = VALID.replace(
@@ -564,8 +674,13 @@ sources:
                 &format!("demand: {{ source: {id} }}"),
             );
             let ps = problems(&y);
-            assert!(has(&ps, &format!("source \"{id}\" is of kind")), "{ps:?}");
-            assert!(has(&ps, "cannot supply demand"), "{ps:?}");
+            assert!(
+                has(
+                    &ps,
+                    &format!("source \"{id}\" does not declare the demand capability")
+                ),
+                "{ps:?}"
+            );
         }
         for kind in ["sql", "prometheus", "schedule", "session"] {
             let y = VALID.replace(
@@ -690,7 +805,10 @@ sources:
     #[test]
     fn rejects_resync_problems() {
         assert!(has(
-            &problems(&VALID.replace("resync: 30s }\n  - { id: k8s", "resync: 0 }\n  - { id: k8s")),
+            &problems(&VALID.replace(
+                "resync: 30s, observe: [demand] }",
+                "resync: 0, observe: [demand] }"
+            )),
             "resync must be greater than zero"
         ));
         let ps = problems(&VALID.replace(

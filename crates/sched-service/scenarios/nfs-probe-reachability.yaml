@@ -1,0 +1,75 @@
+description: "Reachability of basestar comes only from the Prometheus probe source (not a Kubernetes node), never from the cluster watch. A manual host lease wakes NFS; a shared hold then a release keep it up until no hold remains and idle grace has passed."
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: basestar-probe, value: { type: resource_up, resource: basestar-nfs, up: false } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    leases:
+      - { id: user-nfs, resource: basestar-nfs, granted_at: 100000000, kind: { type: manual_host } }
+    expect:
+      steps: [{ type: power_on, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 100005000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: powering_on }]
+      allowed: { models: [], classes: [] }
+  # NFS observed up: NFS-only classes are allowed.
+  - at: 100030000
+    refresh: true
+    observe:
+      - { source: basestar-probe, value: { type: resource_up, resource: basestar-nfs, up: true } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+  # Manual lease swapped for a shared hold: still held.
+  - at: 100060000
+    refresh: true
+    leases:
+      - { id: hold-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: shared_hold, holder: backup-run } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+  # A long time later the hold still keeps the host up.
+  - at: 101260000
+    refresh: true
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+  # Released: the idle clock starts.
+  - at: 101270000
+    refresh: true
+    leases: []
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+  # One second short of idle_grace.
+  - at: 101869000
+    refresh: true
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+  # Idle grace over: power down.
+  - at: 101870000
+    refresh: true
+    expect:
+      steps: [{ type: power_off, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 101900000
+    refresh: true
+    observe:
+      - { source: basestar-probe, value: { type: resource_up, resource: basestar-nfs, up: false } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [] }

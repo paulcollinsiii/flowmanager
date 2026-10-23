@@ -33,11 +33,12 @@ scenarios! {
     interactive_pin => "interactive-pin.yaml",
     readiness_precedence => "readiness-precedence.yaml",
     idle_release => "idle-release.yaml",
+    nfs_probe_reachability => "nfs-probe-reachability.yaml",
 }
 
 #[test]
 fn every_scenario_file_has_a_test() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
     let count = std::fs::read_dir(dir).unwrap().count();
-    assert_eq!(count, 9, "add new scenario files to the scenarios! list");
+    assert_eq!(count, 10, "add new scenario files to the scenarios! list");
 }
