@@ -313,6 +313,11 @@ fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
         "  - id: basestar-probe\n    kind: prometheus\n",
         "  - id: basestar-probe\n    kind: http_json\n",
     );
+    // The prometheus-shaped params would not be valid http_json params.
+    let text = text.replace(
+        "    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n",
+        "",
+    );
     assert_ne!(text, EXAMPLE_CONFIG);
     let config = sched_model::Config::from_yaml(&text).unwrap();
     let lease = sched_model::Lease {
