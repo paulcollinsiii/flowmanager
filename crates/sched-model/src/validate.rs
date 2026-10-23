@@ -628,6 +628,96 @@ sources:
     }
 
     #[test]
+    fn kinds_can_supply_exactly_the_documented_capabilities() {
+        use crate::config::{Capability::*, SourceKind::*};
+        let table = [
+            (KubernetesWatch, [true, true, false]),
+            (HttpJson, [false, true, true]),
+            (Prometheus, [false, true, true]),
+            (Sql, [false, false, true]),
+            (Schedule, [false, false, true]),
+            (Session, [false, false, true]),
+            (Webhook, [false, false, false]),
+        ];
+        for (kind, [pods, reach, demand]) in table {
+            assert_eq!(kind.can_supply(Pods), pods, "{kind:?} pods");
+            assert_eq!(
+                kind.can_supply(Reachability),
+                reach,
+                "{kind:?} reachability"
+            );
+            assert_eq!(kind.can_supply(Demand), demand, "{kind:?} demand");
+        }
+    }
+
+    #[test]
+    fn rejects_declaring_capabilities_through_a_config() {
+        // kubernetes_watch cannot declare demand; http_json and prometheus cannot declare pods.
+        let ps = problems(&VALID.replace(
+            "kind: kubernetes_watch, resync: 10s, observe: [pods, reachability]",
+            "kind: kubernetes_watch, resync: 10s, observe: [pods, reachability, demand]",
+        ));
+        assert!(
+            has(
+                &ps,
+                "sources[k8s]: kind KubernetesWatch cannot supply the demand capability"
+            ),
+            "{ps:?}"
+        );
+        for kind in ["http_json", "prometheus"] {
+            let ps = problems(&VALID.replace(
+                "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+                &format!("{{ id: s1, kind: {kind}, resync: 30s, observe: [demand, pods] }}"),
+            ));
+            assert!(
+                has(&ps, "cannot supply the pods capability"),
+                "{kind}: {ps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_safety_resync_limit_applies_to_pods_and_to_reachability_sources_alike() {
+        // safety_max_age is 30s in VALID; 45s is within demand_max_age.
+        let probe = |observe: &str, resync: &str| {
+            let kind = if observe == "pods" {
+                "kubernetes_watch"
+            } else {
+                "prometheus"
+            };
+            VALID.replace(
+                "  - { id: hook,",
+                &format!("  - {{ id: probe, kind: {kind}, resync: {resync}, observe: [{observe}] }}\n  - {{ id: hook,"),
+            )
+        };
+        for observe in ["reachability", "pods"] {
+            let ok = probe(observe, "30s");
+            assert!(Config::from_yaml(&ok).is_ok(), "{observe}");
+            let ps = problems(&probe(observe, "45s"));
+            assert!(
+                has(
+                    &ps,
+                    "sources[probe]: resync (45000ms) exceeds policy.safety_max_age"
+                ),
+                "{observe}: {ps:?}"
+            );
+        }
+        // A demand-only source is held only to demand_max_age.
+        assert!(Config::from_yaml(&probe("demand", "45s")).is_ok());
+    }
+
+    #[test]
+    fn observe_is_a_set_so_duplicates_are_harmless() {
+        let y = VALID.replace(
+            "observe: [pods, reachability]",
+            "observe: [pods, reachability, pods, pods]",
+        );
+        let c = Config::from_yaml(&y).unwrap();
+        let k8s = c.source(&"k8s".into()).unwrap();
+        assert_eq!(k8s.observe.len(), 2);
+    }
+
+    #[test]
     fn reachability_may_come_from_a_non_kubernetes_source() {
         let y = VALID
             .replace("observe: [pods, reachability]", "observe: [pods]")

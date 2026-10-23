@@ -360,3 +360,173 @@ fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
         d.steps
     );
 }
+
+/// The example config plus a second source declaring pods and reachability.
+fn two_cluster_sources() -> sched_model::Config {
+    use sched_model::test_support::EXAMPLE_CONFIG;
+    let text = EXAMPLE_CONFIG.replace(
+        "sources:\n  - id: cluster-pods\n",
+        "sources:\n  - id: cluster-pods-b\n    kind: kubernetes_watch\n    observe: [pods, reachability]\n    resync: 10s\n  - id: cluster-pods\n",
+    );
+    assert_ne!(text, EXAMPLE_CONFIG);
+    sched_model::Config::from_yaml(&text).unwrap()
+}
+
+fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut out = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let head = rest.remove(i);
+        for mut p in permutations(&rest) {
+            p.insert(0, head.clone());
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn without_llm_pods(mut o: Vec<Observation>) -> Vec<Observation> {
+    o.retain(
+        |x| !matches!(&x.value, ObservedValue::ModelPods { model, .. } if model.as_str() == "llm"),
+    );
+    o
+}
+
+#[test]
+fn an_older_nonzero_pod_count_from_one_source_blocks_allowing_and_the_checker_agrees() {
+    let config = two_cluster_sources();
+    let st = state(IDLE);
+    let base = without_llm_pods(authoritative(Some(("paperless-ocr", 3))));
+    let readings = [
+        pods("cluster-pods", "llm", NOW - 2000, 2),
+        pods("cluster-pods-b", "llm", NOW - 1000, 0),
+    ];
+    // The same with the sources swapped, so neither source order hides the bug.
+    let swapped = [
+        pods("cluster-pods-b", "llm", NOW - 2000, 2),
+        pods("cluster-pods", "llm", NOW - 1000, 0),
+    ];
+    for order in permutations(&swapped) {
+        let mut o = base.clone();
+        o.extend(order);
+        let snap = snapshot(o);
+        let (intent, d) = decide(&config, &snap, &st).unwrap();
+        assert!(!d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })));
+        assert!(check(&config, &snap, &st, &intent, &d).is_empty());
+        let v = run_check_with(&config, &snap, &st, vec![step_allow("mineru")]);
+        assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
+    }
+    // A stale reading from either source makes the model's pods unknown to the checker.
+    for stale_src in ["cluster-pods", "cluster-pods-b"] {
+        let other = if stale_src == "cluster-pods" {
+            "cluster-pods-b"
+        } else {
+            "cluster-pods"
+        };
+        let mut o = base.clone();
+        o.push(pods(stale_src, "llm", NOW - 10 * 60_000, 0));
+        o.push(pods(other, "llm", NOW - 1000, 0));
+        let v = run_check_with(&config, &snapshot(o), &st, vec![step_allow("mineru")]);
+        assert!(
+            v.iter().any(|m| m.contains("invariant 2")),
+            "{stale_src}: {v:?}"
+        );
+    }
+    let mut first = None;
+    for order in permutations(&readings) {
+        let mut o = base.clone();
+        o.extend(order);
+        let snap = snapshot(o);
+        let (intent, d) = decide(&config, &snap, &st).unwrap();
+        assert!(
+            !d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })),
+            "{:?}",
+            d.steps
+        );
+        assert!(has_wait(&d, WaitReason::OtherModelPresent), "{:?}", d.steps);
+        assert!(check(&config, &snap, &st, &intent, &d).is_empty());
+        match &first {
+            None => first = Some(d),
+            Some(f) => assert_eq!(f, &d, "order changed the decision"),
+        }
+    }
+    // Once both sources agree on zero, mineru is allowed again (and the checker agrees).
+    let mut o = base.clone();
+    o.push(pods("cluster-pods", "llm", NOW - 500, 0));
+    o.push(pods("cluster-pods-b", "llm", NOW - 1000, 0));
+    let snap = snapshot(o);
+    let (intent, d) = decide(&config, &snap, &st).unwrap();
+    assert!(d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })));
+    assert!(check(&config, &snap, &st, &intent, &d).is_empty());
+
+    // The checker, given the unsafe decision directly, flags it (and does so from the
+    // declared sources of the config, in any order).
+    for order in permutations(&readings) {
+        let mut o = base.clone();
+        o.extend(order);
+        let v = run_check_with(&config, &snapshot(o), &st, vec![step_allow("mineru")]);
+        assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
+    }
+}
+
+fn run_check_with(
+    config: &sched_model::Config,
+    snap: &Snapshot,
+    st: &SchedState,
+    steps: Vec<Step>,
+) -> Vec<String> {
+    let d = Decision {
+        steps,
+        allowed: Default::default(),
+        state: SchedState::default(),
+    };
+    check(config, snap, st, &Intent::default(), &d)
+}
+
+#[test]
+fn an_older_down_reading_from_one_source_blocks_power_off_and_the_checker_agrees() {
+    let config = two_cluster_sources();
+    let mut base = authoritative(None);
+    base.retain(|x| !matches!(&x.value, ObservedValue::ResourceUp { .. }));
+    base.push(up("cluster-pods", "cuda-central", NOW, true));
+    let readings = [
+        up("cluster-pods", "basestar-nfs", NOW - 2000, false),
+        up("cluster-pods-b", "basestar-nfs", NOW - 1000, true),
+    ];
+    let swapped = [
+        up("cluster-pods-b", "basestar-nfs", NOW - 2000, false),
+        up("cluster-pods", "basestar-nfs", NOW - 1000, true),
+    ];
+    for order in permutations(&readings)
+        .into_iter()
+        .chain(permutations(&swapped))
+    {
+        let mut o = base.clone();
+        o.extend(order);
+        let v = run_check_with(
+            &config,
+            &snapshot(o),
+            &state(MANAGED_NFS),
+            vec![Step::PowerOff {
+                resource: ResourceId::new("basestar-nfs"),
+            }],
+        );
+        assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
+    }
+    // Both up and fresh: the checker accepts the power-off on the reachability criterion.
+    let mut o = base.clone();
+    o.push(up("cluster-pods", "basestar-nfs", NOW - 2000, true));
+    o.push(up("cluster-pods-b", "basestar-nfs", NOW - 1000, true));
+    let v = run_check_with(
+        &config,
+        &snapshot(o),
+        &state(MANAGED_NFS),
+        vec![Step::PowerOff {
+            resource: ResourceId::new("basestar-nfs"),
+        }],
+    );
+    assert!(!v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
+}

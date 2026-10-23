@@ -104,85 +104,104 @@ impl Snapshot {
         self.demand_group(source, class).pop()
     }
 
-    /// The newest pod-count observation for `model` from a source that can report cluster
-    /// state.
+    /// A canonical newest pod-count observation for `model` among declaring sources. Not a
+    /// safe reading on its own; `fresh_model_pods` is.
     pub fn model_pods(&self, config: &Config, model: &ModelId) -> Option<&Observation> {
-        self.pods_group(config, model).pop()
+        self.pods_groups(config, model).into_iter().flatten().max()
     }
 
-    /// The newest reachability observation for `resource` from a source that can report
-    /// cluster state.
+    /// A canonical newest reachability observation for `resource` among declaring sources.
+    /// Not a safe reading on its own; `fresh_resource_up` is.
     pub fn resource_up(&self, config: &Config, resource: &ResourceId) -> Option<&Observation> {
-        self.up_group(config, resource).pop()
+        self.up_groups(config, resource).into_iter().flatten().max()
     }
 
-    /// Pod counts `(pods, ready_pods)` for `model` if the newest observation is fresh.
+    /// Pod counts `(pods, ready_pods)` for `model`, or `None` when they are unknown.
     ///
     /// Only observations from configured sources that declare the `pods` capability in
-    /// their `observe` list (`resource_up` readings: `reachability`) are considered; they
-    /// are filtered by subject and source BEFORE the newest timestamp is chosen. A reading from any other source is
-    /// ignored entirely: it can neither make the data fresh nor stale, so a stray reading
-    /// can never wedge the scheduler, and since it never replaces the authoritative reading
-    /// it cannot make a step look safe that the authoritative source says is unsafe. If no
-    /// authoritative reading exists the answer is `None` (unknown), never a stray's value.
+    /// their `observe` list are considered, filtered by subject and source BEFORE any
+    /// reduction. Readings from any other source are ignored entirely: they can neither
+    /// make the data fresh nor stale, so a stray reading cannot wedge the scheduler or
+    /// stand in for a missing authoritative reading.
     ///
-    /// Observations are reduced independently of their order in the snapshot: only the
-    /// newest timestamp counts, and observations tied at it, whatever their source or
-    /// fidelity, are read conservatively (the highest pod count, the lowest ready count).
-    /// If the newest is stale or future-dated, the answer is `None` even when an older
-    /// observation looks fresh.
+    /// Reduction is two-level and independent of snapshot order:
+    /// 1. Within each declaring source only its newest timestamp counts; readings tied at
+    ///    it (any fidelity) are merged conservatively (highest pod count, lowest ready
+    ///    count).
+    /// 2. Across sources the per-source results are combined conservatively. A source's
+    ///    reading is never shadowed by a newer reading from another source. If the newest
+    ///    reading of ANY declaring source that has reported on the model is stale or
+    ///    future-dated, the answer is `None` (unknown), even if other sources are fresh.
+    ///    Otherwise the highest pod count and the lowest ready count over all sources win,
+    ///    so a fresh nonzero from any source defeats a zero from another.
+    ///
+    /// A declaring source that has never reported on this model is ignored: coverage is
+    /// checked per config at load, not per subject.
     ///
     /// Freshness rule and clock skew: an observation dated after `now` is never fresh, and
-    /// the newest one decides, so a future-dated reading makes the data unknown until the
-    /// clock catches up. This is accepted: observation timestamps must be assigned by the
-    /// scheduler at the moment it receives the observation (not copied from the observed
-    /// system), so that clock skew between systems cannot occur in the first place.
+    /// a source's newest one decides, so a future-dated reading makes the data unknown
+    /// until the clock catches up. This is accepted: observation timestamps must be
+    /// assigned by the scheduler at the moment it receives the observation (not copied from
+    /// the observed system), so that clock skew between systems cannot occur in the first
+    /// place.
     pub fn fresh_model_pods(
         &self,
         config: &Config,
         model: &ModelId,
         max_age: Millis,
     ) -> Option<(u32, u32)> {
-        let group = self.pods_group(config, model);
-        let first = group.first()?;
-        if !first.is_fresh(self.now, max_age) {
+        let groups = self.pods_groups(config, model);
+        if groups.is_empty() {
             return None;
         }
         let mut pods = 0;
         let mut ready = u32::MAX;
-        for o in &group {
-            if let ObservedValue::ModelPods {
-                pods: p,
-                ready_pods: r,
-                ..
-            } = o.value
-            {
-                pods = pods.max(p);
-                ready = ready.min(r);
+        for group in &groups {
+            if !group[0].is_fresh(self.now, max_age) {
+                return None;
+            }
+            for o in group {
+                if let ObservedValue::ModelPods {
+                    pods: p,
+                    ready_pods: r,
+                    ..
+                } = o.value
+                {
+                    pods = pods.max(p);
+                    ready = ready.min(r);
+                }
             }
         }
         Some((pods, ready))
     }
 
-    /// Reachability of `resource` if the newest observation is fresh, with the same source
-    /// filtering and freshness rule as `fresh_model_pods`. Observations tied at the newest
-    /// timestamp that disagree read as "not up".
+    /// Reachability of `resource`, or `None` when unknown, with the same source filtering
+    /// (`reachability` capability), two-level reduction and freshness rule as
+    /// `fresh_model_pods`. The host reads as up only if every reading of every declaring
+    /// source that has reported on it is fresh and up; a fresh "down" from any source, or
+    /// disagreeing readings tied at a source's newest timestamp, read as "not up". A stale
+    /// or future-dated newest reading from any reporting source makes it `None`.
+    /// "Not up" and "unknown" both block power-off, and neither allows anything.
     pub fn fresh_resource_up(
         &self,
         config: &Config,
         resource: &ResourceId,
         max_age: Millis,
     ) -> Option<bool> {
-        let group = self.up_group(config, resource);
-        let first = group.first()?;
-        if !first.is_fresh(self.now, max_age) {
+        let groups = self.up_groups(config, resource);
+        if groups.is_empty() {
             return None;
         }
-        Some(
-            group
+        let mut all_up = true;
+        for group in &groups {
+            if !group[0].is_fresh(self.now, max_age) {
+                return None;
+            }
+            all_up &= group
                 .iter()
-                .all(|o| matches!(o.value, ObservedValue::ResourceUp { up: true, .. })),
-        )
+                .all(|o| matches!(o.value, ObservedValue::ResourceUp { up: true, .. }));
+        }
+        Some(all_up)
     }
 
     /// Newest-timestamp demand observations for `class` from `source`, the source its
@@ -194,18 +213,34 @@ impl Snapshot {
         })
     }
 
-    fn pods_group(&self, config: &Config, model: &ModelId) -> Vec<&Observation> {
-        self.newest_group(|o| {
+    fn pods_groups(&self, config: &Config, model: &ModelId) -> Vec<Vec<&Observation>> {
+        self.newest_per_source(|o| {
             config.source_observes(&o.source, Capability::Pods)
                 && matches!(&o.value, ObservedValue::ModelPods { model: m, .. } if m == model)
         })
     }
 
-    fn up_group(&self, config: &Config, resource: &ResourceId) -> Vec<&Observation> {
-        self.newest_group(|o| {
+    fn up_groups(&self, config: &Config, resource: &ResourceId) -> Vec<Vec<&Observation>> {
+        self.newest_per_source(|o| {
             config.source_observes(&o.source, Capability::Reachability)
                 && matches!(&o.value, ObservedValue::ResourceUp { resource: r, .. } if r == resource)
         })
+    }
+
+    /// For each source with a matching observation, in source order, that source's newest
+    /// group (see `newest_group`). Sources are reduced separately so that a newer reading
+    /// from one never hides an older reading from another.
+    fn newest_per_source(&self, pred: impl Fn(&Observation) -> bool) -> Vec<Vec<&Observation>> {
+        let sources: std::collections::BTreeSet<&SourceId> = self
+            .observations
+            .iter()
+            .filter(|o| pred(o))
+            .map(|o| &o.source)
+            .collect();
+        sources
+            .into_iter()
+            .map(|src| self.newest_group(|o| &o.source == src && pred(o)))
+            .collect()
     }
 
     /// The observations matching `pred` (which must already select subject, value kind and
@@ -616,5 +651,86 @@ mod tests {
         ]);
         assert_eq!(s.fresh_model_pods(&cfg, &m, Millis(500)), Some((2, 2)));
         assert_eq!(s.fresh_resource_up(&cfg, &h, Millis(500)), Some(true));
+    }
+
+    #[test]
+    fn an_older_reading_from_one_source_is_not_shadowed_by_a_newer_one_from_another() {
+        let cfg = two_cluster_sources();
+        let (m, h) = (ModelId::from("mineru"), ResourceId::from("cuda-central"));
+        let ev = Fidelity::Event;
+        // Pods: A still reports pods at 800, B says zero at 900.
+        let readings = [
+            pods_from("cluster-pods", ev, 800, 2, 1),
+            pods_from("cluster-pods-b", ev, 900, 0, 0),
+            pods_from("cluster-pods-b", Fidelity::Polled, 900, 0, 0),
+        ];
+        for order in all_orders(&readings) {
+            let s = snap(order);
+            assert_eq!(s.fresh_model_pods(&cfg, &m, Millis(500)), Some((2, 0)));
+        }
+        // The other way round.
+        for order in all_orders(&[
+            pods_from("cluster-pods", ev, 900, 0, 0),
+            pods_from("cluster-pods-b", ev, 800, 3, 3),
+        ]) {
+            let s = snap(order);
+            assert_eq!(s.fresh_model_pods(&cfg, &m, Millis(500)), Some((3, 0)));
+        }
+        // A stale or future-dated newest reading from any reporting source: unknown, even
+        // though the other source is fresh (and whichever of the two is nonzero).
+        for (a, b) in [
+            (
+                pods_from("cluster-pods", ev, 100, 2, 2),
+                pods_from("cluster-pods-b", ev, 900, 0, 0),
+            ),
+            (
+                pods_from("cluster-pods", ev, 900, 0, 0),
+                pods_from("cluster-pods-b", ev, 100, 0, 0),
+            ),
+            (
+                pods_from("cluster-pods", ev, 900, 0, 0),
+                pods_from("cluster-pods-b", ev, 1200, 0, 0),
+            ),
+        ] {
+            for s in both_orders(a, b) {
+                assert_eq!(s.fresh_model_pods(&cfg, &m, Millis(500)), None);
+            }
+        }
+        // A declaring source that never reported on the model is ignored.
+        let s = snap(vec![pods_from("cluster-pods-b", ev, 900, 0, 0)]);
+        assert_eq!(s.fresh_model_pods(&cfg, &m, Millis(500)), Some((0, 0)));
+
+        // Reachability: any fresh "down" wins whichever source is newer; stale is unknown.
+        for (a, b, want) in [
+            (
+                up_from("cluster-pods", ev, 800, false),
+                up_from("cluster-pods-b", ev, 900, true),
+                Some(false),
+            ),
+            (
+                up_from("cluster-pods", ev, 900, true),
+                up_from("cluster-pods-b", ev, 800, false),
+                Some(false),
+            ),
+            (
+                up_from("cluster-pods", ev, 800, true),
+                up_from("cluster-pods-b", ev, 900, true),
+                Some(true),
+            ),
+            (
+                up_from("cluster-pods", ev, 100, true),
+                up_from("cluster-pods-b", ev, 900, true),
+                None,
+            ),
+            (
+                up_from("cluster-pods", ev, 900, false),
+                up_from("cluster-pods-b", ev, 1200, true),
+                None,
+            ),
+        ] {
+            for s in both_orders(a, b) {
+                assert_eq!(s.fresh_resource_up(&cfg, &h, Millis(500)), want);
+            }
+        }
     }
 }

@@ -6,19 +6,21 @@
 //! data types and config accessors with the code it checks. It re-uses none of
 //! `sched_model`'s query helpers (`class_work`, `fresh_*`, `holds_host`, ...).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sched_model::{
     Capability, ClassId, ClassSpec, Config, Intent, LeaseKind, Millis, ModePhase, ModelId,
-    ObservedValue, ResourceId, ResourceKind, SchedState, Snapshot, Step,
+    Observation, ObservedValue, ResourceId, ResourceKind, SchedState, Snapshot, SourceId, Step,
 };
 use sched_sequencer::Decision;
 
-/// Observations matching `pred` at the newest timestamp, if that timestamp is usable.
-/// Pod counts and reachability are read only from configured sources whose `observe` list
-/// declares `cap` (the same rule as the core, restated here from the config rather than
-/// from the source kind), and the filter by subject and source comes before the newest
-/// timestamp is chosen.
+/// Readings matching `pred` from sources declaring `cap`, reduced per source and then
+/// across sources, restated here independently of the core: each declaring source
+/// contributes only its own newest timestamp, and if the newest reading of any source that
+/// has reported is stale or future-dated the result is `None`; otherwise every contributed
+/// reading is returned, so callers can require all of them to be safe. The filter by
+/// subject and by declared source comes before any newest timestamp is chosen, and the
+/// declaration is read from the config's `observe` list, never from the source kind.
 fn newest<'a>(
     config: &Config,
     cap: Capability,
@@ -26,26 +28,31 @@ fn newest<'a>(
     max_age: Millis,
     pred: impl Fn(&ObservedValue) -> bool,
 ) -> Option<Vec<&'a ObservedValue>> {
-    let all: Vec<_> = snap
-        .observations
-        .iter()
-        .filter(|o| {
-            config
-                .source(&o.source)
-                .is_some_and(|s| s.observe.contains(&cap))
-        })
-        .filter(|o| pred(&o.value))
-        .collect();
-    let latest = all.iter().map(|o| o.observed_at.as_u64()).max()?;
-    if latest > snap.now.as_u64() || snap.now.as_u64() - latest > max_age.as_u64() {
+    let mut per_source: BTreeMap<&SourceId, Vec<&Observation>> = BTreeMap::new();
+    for o in &snap.observations {
+        let declares = config
+            .source(&o.source)
+            .is_some_and(|s| s.observe.contains(&cap));
+        if declares && pred(&o.value) {
+            per_source.entry(&o.source).or_default().push(o);
+        }
+    }
+    if per_source.is_empty() {
         return None;
     }
-    Some(
-        all.iter()
-            .filter(|o| o.observed_at.as_u64() == latest)
-            .map(|o| &o.value)
-            .collect(),
-    )
+    let mut out = Vec::new();
+    for all in per_source.values() {
+        let latest = all.iter().map(|o| o.observed_at.as_u64()).max()?;
+        if latest > snap.now.as_u64() || snap.now.as_u64() - latest > max_age.as_u64() {
+            return None;
+        }
+        out.extend(
+            all.iter()
+                .filter(|o| o.observed_at.as_u64() == latest)
+                .map(|o| &o.value),
+        );
+    }
+    Some(out)
 }
 
 fn pods_zero(config: &Config, snap: &Snapshot, model: &ModelId, max_age: Millis) -> bool {
