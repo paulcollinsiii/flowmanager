@@ -1,0 +1,16 @@
+[package]
+name = "sched-model"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[features]
+# Bundled example config and fixtures, plus file loading, for tests in other crates.
+test-support = []

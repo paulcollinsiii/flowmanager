@@ -1,0 +1,10 @@
+[package]
+name = "sched-sequencer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sched-model = { workspace = true }
+
+[dev-dependencies]
+sched-model = { workspace = true, features = ["test-support"] }

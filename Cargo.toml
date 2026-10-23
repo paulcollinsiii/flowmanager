@@ -1,3 +1,19 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_yaml_ng = "0.10"
+thiserror = "2"
+proptest = "1"
+sched-model = { path = "crates/sched-model" }
+sched-planner = { path = "crates/sched-planner" }
+sched-sequencer = { path = "crates/sched-sequencer" }
+sched-observe = { path = "crates/sched-observe" }
+sched-actuate = { path = "crates/sched-actuate" }
+sched-keda = { path = "crates/sched-keda" }
+
 [package]
 name = "flowmanager"
 version = "0.1.0"

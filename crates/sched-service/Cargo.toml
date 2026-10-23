@@ -1,0 +1,12 @@
+[package]
+name = "sched-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sched-model = { workspace = true }
+sched-observe = { workspace = true }
+sched-actuate = { workspace = true }
+sched-keda = { workspace = true }
+sched-planner = { workspace = true }
+sched-sequencer = { workspace = true }
