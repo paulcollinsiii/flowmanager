@@ -1,0 +1,61 @@
+description: "A manual LLM lease cuts batch work short with a timeout, loads the LLM, pins it against starved batch work, and on release the LLM yields after idle grace."
+initial_state:
+  resources:
+    cuda-central:
+      power: { phase: "on", since: 92800000 }
+      mode: { phase: serving, model: mineru, since: 97000000 }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 1, ready_pods: 1 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 3, in_flight: 1, oldest_ready_at: 99940000 } }
+    leases:
+      - { id: user-llm, resource: cuda-central, granted_at: 100000000, kind: { type: manual_model, model: llm } }
+    expect:
+      steps: [{ type: pause_intake, class: paperless-ocr }, { type: wait, resource: cuda-central, reason: in_flight_work }]
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server] }
+  - at: 100600000
+    refresh: true
+    expect:
+      steps: [{ type: kill_in_flight, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }]
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+  - at: 100605000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+    expect:
+      steps: [{ type: allow_model, resource: cuda-central, model: llm }]
+      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server] }
+  - at: 100610000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 1, ready_pods: 1 } }
+    expect:
+      steps: []
+      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-tagging, speakr-summarization, interactive-llm] }
+  # Batch OCR is starved but the manual lease pins the LLM.
+  - at: 103600000
+    refresh: true
+    expect:
+      steps: []
+      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-tagging, speakr-summarization, interactive-llm] }
+  # Released; the LLM has been idle past grace, so the starved OCR queue gets the GPU.
+  - at: 104300000
+    refresh: true
+    leases: []
+    expect:
+      steps: [{ type: pause_intake, class: paperless-tagging }, { type: pause_intake, class: speakr-summarization }, { type: pause_intake, class: interactive-llm }, { type: drain_model, resource: cuda-central, model: llm }]
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }

@@ -10,3 +10,9 @@ sched-actuate = { workspace = true }
 sched-keda = { workspace = true }
 sched-planner = { workspace = true }
 sched-sequencer = { workspace = true }
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+
+[dev-dependencies]
+sched-model = { workspace = true, features = ["test-support"] }
+proptest = { workspace = true }

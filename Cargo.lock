@@ -3626,12 +3626,15 @@ dependencies = [
 name = "sched-service"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "sched-actuate",
  "sched-keda",
  "sched-model",
  "sched-observe",
  "sched-planner",
  "sched-sequencer",
+ "serde",
+ "serde_yaml_ng",
 ]
 
 [[package]]
