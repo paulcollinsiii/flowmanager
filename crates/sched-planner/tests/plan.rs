@@ -569,3 +569,22 @@ fn snapshot_order_never_changes_the_intent() {
         Some(ModelId::new("llm"))
     );
 }
+
+#[test]
+fn a_reclaim_lease_on_a_shared_host_is_dropped_by_the_planner() {
+    let reclaim = "{ id: r, resource: basestar-nfs, granted_at: 0, kind: { type: reclaim } }";
+    let host = "{ id: h, resource: basestar-nfs, granted_at: 0, kind: { type: manual_host } }";
+    let y = fixture_yaml(&[], &[reclaim, host], None);
+    // The fixture checker rejects the reclaim; the planner must cope with it anyway.
+    let f = Fixture::from_yaml(&y).unwrap();
+    let i = run(&f);
+    assert!(i.reclaim.is_empty());
+    assert_eq!(
+        i.power_up.get(&ResourceId::new("basestar-nfs")),
+        Some(&PowerWant::Manual)
+    );
+    // A reclaim on the exclusive host is kept.
+    let reclaim = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: reclaim }} }}");
+    let f = fixture(&[], &[&reclaim], None);
+    assert!(run(&f).reclaim.contains(&ResourceId::new(G)));
+}

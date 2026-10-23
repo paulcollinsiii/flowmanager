@@ -275,8 +275,8 @@ mod tests {
         let class = config.class(&"paperless-ocr".into()).unwrap();
         let mut s = snap(vec![
             demand(900, 0, 0, None),
-            demand(900, 3, 1, Some(500)),
-            demand(900, 1, 0, Some(300)),
+            demand(900, 3, 0, Some(500)),
+            demand(900, 1, 2, Some(300)),
         ]);
         s.now = Millis(1000);
         let a = class_work(&config, &s, class);
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(a, class_work(&config, &s, class));
         assert_eq!(
             (a.ready, a.in_flight, a.oldest_ready_at, a.known),
-            (3, 1, Some(Millis(300)), true)
+            (3, 2, Some(Millis(300)), true)
         );
 
         let future = snap(vec![demand(1001, 0, 0, None)]);
