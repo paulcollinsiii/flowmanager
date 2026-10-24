@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn an_observable_source_configured_without_params_is_labelled_as_such() {
         let y = EXAMPLE_CONFIG.replace(
-            "    params:\n      requests:\n        - url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting\n",
+            "    params:\n      timeout: 10s\n      auth: { header: x-api-key, env: IMMICH_API_KEY }\n      requests:\n        - url: http://immich-server.media.svc:2283/api/queues/smartSearch\n          count: /statistics/waiting\n          also:\n            - { count: /statistics/delayed, counts_as: ready }\n            - { count: /statistics/active, counts_as: in_flight }\n        - url: http://immich-server.media.svc:2283/api/queues/faceDetection\n          count: /statistics/waiting\n          also:\n            - { count: /statistics/delayed, counts_as: ready }\n            - { count: /statistics/active, counts_as: in_flight }\n        - url: http://immich-server.media.svc:2283/api/queues/ocr\n          count: /statistics/waiting\n          also:\n            - { count: /statistics/delayed, counts_as: ready }\n            - { count: /statistics/active, counts_as: in_flight }\n",
             "",
         );
         assert_ne!(y, EXAMPLE_CONFIG);

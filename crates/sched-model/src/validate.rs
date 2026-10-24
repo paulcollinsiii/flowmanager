@@ -349,6 +349,14 @@ fn sources(c: &Config, p: &mut Problems) {
                 );
             }
         }
+        if let Ok(Some(prom)) = s.prometheus_params()
+            && c.resource(&prom.resource).is_none()
+        {
+            p.add(
+                format!("{at}.params.resource"),
+                format!("unknown resource \"{}\"", prom.resource),
+            );
+        }
         for cap in &s.observe {
             if !s.kind.can_supply(*cap) {
                 p.add(
