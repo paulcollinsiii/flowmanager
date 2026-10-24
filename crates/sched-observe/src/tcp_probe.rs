@@ -3,23 +3,32 @@
 //! host or service. It sends no data: a connection is closed as soon as it is made.
 //!
 //! - The connect succeeds: up.
-//! - The connection is refused, or nothing answers within the timeout: down. A refusal
-//!   comes from the host itself (it is there, the port is closed); silence is what a host
-//!   that is off looks like.
+//! - The host does not answer, or answers no: down. That is a refused connection, no answer
+//!   before the deadline, or "no route to host" (`EHOSTUNREACH`, which is what Linux reports
+//!   for an address on the local network that does not answer ARP, as a powered-off host
+//!   does, after about 3s, and sooner while an earlier ARP resolution of it is pending).
 //! - Anything else is a failed read and is reported as one, never as "down": the name does
-//!   not resolve or its lookup outlasts the timeout, it resolves to no address, or the
-//!   connect fails another way (no route to host, network unreachable, an address that
-//!   cannot be connected to, a local error). None of these says the host is off.
+//!   not resolve or its lookup outlasts the deadline, it resolves to no address, or the
+//!   connect fails another way ("network unreachable", that is no route at all, an address
+//!   that cannot be connected to, a local error). None of these says the host is off.
 //!
-//! A name resolving to several addresses is tried address by address, in the resolver's
-//! order, within one connect timeout: the first connection is up; otherwise any refusal or
-//! the timeout is down; only when every address failed another way is the read failed.
+//! One probe takes at most `timeout`: the name lookup and the connects share one deadline.
+//! A lookup that is slow leaves the connects less time.
+//!
+//! A name resolving to several addresses is probed at all of them at once, within that
+//! deadline: up as soon as any connects; down only if every address answered down; a
+//! failed read if none connected and at least one failed another way. So a probe never
+//! reads down while an address that would have connected before the deadline was left
+//! untried.
 
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use sched_model::{Fidelity, ObservedValue, SourceSpec, TcpProbeParams};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use sched_model::{Fidelity, Millis, ObservedValue, SourceSpec, TcpProbeParams};
+use tokio::time::Instant;
 
 use crate::kube_watch::Debouncer;
 use crate::{Report, ReportTx};
@@ -28,12 +37,8 @@ use crate::{Report, ReportTx};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reading {
     Up,
-    /// Down, and why: a refusal or the timeout.
+    /// Down, and why: refused, no answer, or no route to the host.
     Down(String),
-}
-
-fn timeout_of(params: &TcpProbeParams) -> Duration {
-    Duration::from_millis(params.timeout.as_u64())
 }
 
 /// `host:port` as written in the params (an IPv6 address is bracketed).
@@ -45,82 +50,98 @@ fn target(params: &TcpProbeParams) -> String {
     }
 }
 
-/// The addresses `params.host` names. A failed or slow lookup is an error.
-async fn resolve(params: &TcpProbeParams) -> Result<Vec<SocketAddr>, String> {
+/// The addresses `params.host` names, looked up before `deadline`. A failed or slow lookup
+/// is an error.
+async fn resolve(params: &TcpProbeParams, deadline: Instant) -> Result<Vec<SocketAddr>, String> {
     let at = target(params);
     let lookup = tokio::net::lookup_host((params.host.as_str(), params.port));
-    let addrs: Vec<SocketAddr> = match tokio::time::timeout(timeout_of(params), lookup).await {
-        Err(_) => {
-            return Err(format!(
-                "{at}: name lookup did not finish within {}; not treated as down",
-                params.timeout
-            ));
-        }
-        Ok(Err(e)) => {
-            return Err(format!(
-                "{at}: cannot resolve {:?}: {e}; not treated as down",
-                params.host
-            ));
-        }
-        Ok(Ok(addrs)) => addrs.collect(),
-    };
-    if addrs.is_empty() {
-        return Err(format!(
-            "{at}: {:?} resolves to no address; not treated as down",
+    match tokio::time::timeout_at(deadline, lookup).await {
+        Err(_) => Err(format!(
+            "{at}: name lookup did not finish within the probe's {} timeout; not treated as down",
+            params.timeout
+        )),
+        Ok(Err(e)) => Err(format!(
+            "{at}: cannot resolve {:?}: {e}; not treated as down",
             params.host
-        ));
+        )),
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
     }
-    Ok(addrs)
 }
 
-/// Whether a connect error says the host is down (it refused), rather than that the probe
-/// could not tell.
-fn is_down(e: &io::Error) -> bool {
+/// Whether a connect error is the host answering no or not answering (down), rather than
+/// the probe being unable to tell (a failed read).
+pub fn means_down(e: &io::Error) -> bool {
     matches!(
         e.kind(),
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut | io::ErrorKind::HostUnreachable
     )
 }
 
-/// Connects to each of `addrs` in turn until one connects, all within `timeout`.
-pub async fn connect_any(addrs: &[SocketAddr], timeout: Duration) -> Result<Reading, String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut down = None;
-    let mut errors = Vec::new();
-    for addr in addrs {
-        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
-            // Dropping the stream closes the connection; nothing is sent.
-            Ok(Ok(_stream)) => return Ok(Reading::Up),
-            Ok(Err(e)) if is_down(&e) => down = Some(format!("{addr}: {e}")),
-            Ok(Err(e)) => errors.push(format!("{addr}: {e}")),
-            Err(_) => {
-                down = Some(format!(
-                    "{addr}: no answer within {}ms",
-                    timeout.as_millis()
-                ));
-                break;
-            }
-        }
-    }
-    match down {
-        Some(why) => Ok(Reading::Down(why)),
-        None => Err(format!(
-            "{}; not treated as down",
-            if errors.is_empty() {
-                "no address to connect to".to_string()
-            } else {
-                errors.join("; ")
-            }
-        )),
+/// What one address answered.
+enum Answer {
+    Connected,
+    Down(String),
+    Failed(String),
+}
+
+async fn answer(addr: SocketAddr, deadline: Instant, timeout: Millis) -> Answer {
+    match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+        // Dropping the stream closes the connection; nothing is sent.
+        Ok(Ok(_stream)) => Answer::Connected,
+        Ok(Err(e)) if means_down(&e) => Answer::Down(e.to_string()),
+        Ok(Err(e)) => Answer::Failed(e.to_string()),
+        Err(_) => Answer::Down(format!("no answer within the probe's {timeout} timeout")),
     }
 }
 
-/// One probe: the raw (not debounced) reading, or why there is none.
+/// Connects to all of `addrs` at once, each until `deadline`; `target` is what they were
+/// resolved from and `timeout` the probe's timeout, both for the messages.
+pub async fn connect_all(
+    target: &str,
+    addrs: &[SocketAddr],
+    deadline: Instant,
+    timeout: Millis,
+) -> Result<Reading, String> {
+    if addrs.is_empty() {
+        return Err(format!(
+            "{target}: resolves to no address; not treated as down"
+        ));
+    }
+    // Name the address only when it is not simply the target itself.
+    let alone = addrs.len() == 1 && addrs[0].to_string() == target;
+    let line = |addr: SocketAddr, why: String| {
+        if alone { why } else { format!("{addr}: {why}") }
+    };
+    let mut pending: FuturesUnordered<_> = addrs
+        .iter()
+        .map(|&addr| async move { (addr, answer(addr, deadline, timeout).await) })
+        .collect();
+    let (mut down, mut failed) = (Vec::new(), Vec::new());
+    while let Some((addr, answer)) = pending.next().await {
+        match answer {
+            // The other attempts are dropped, which closes them.
+            Answer::Connected => return Ok(Reading::Up),
+            Answer::Down(why) => down.push(line(addr, why)),
+            Answer::Failed(why) => failed.push(line(addr, why)),
+        }
+    }
+    if failed.is_empty() {
+        Ok(Reading::Down(format!("{target}: {}", down.join("; "))))
+    } else {
+        failed.extend(down);
+        Err(format!(
+            "{target}: {}; not treated as down",
+            failed.join("; ")
+        ))
+    }
+}
+
+/// One probe, finished within the params' timeout: the raw (not debounced) reading, or
+/// why there is none.
 pub async fn read(params: &TcpProbeParams) -> Result<Reading, String> {
-    let addrs = resolve(params).await?;
-    connect_any(&addrs, timeout_of(params))
-        .await
-        .map_err(|e| format!("{}: {e}", target(params)))
+    let deadline = Instant::now() + Duration::from_millis(params.timeout.as_u64());
+    let addrs = resolve(params, deadline).await?;
+    connect_all(&target(params), &addrs, deadline, params.timeout).await
 }
 
 /// One source's observer state: the debounce of its readings.
@@ -184,9 +205,8 @@ mod tests {
     use super::*;
     use crate::{ObserverState, Observers, SpawnOptions, observer_state};
     use sched_model::test_support::{EXAMPLE_CONFIG, example_config};
-    use sched_model::{Config, Millis, ResourceId};
+    use sched_model::{Config, ResourceId};
     use std::net::{Ipv4Addr, TcpListener as StdListener};
-    use std::time::Instant;
     use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
     const LOCALHOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -283,28 +303,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_connection_is_down() {
+    async fn a_refused_connection_is_down_and_names_the_target_once() {
         let (_held, port) = refusing_port();
         let (_, params) = example_probe("127.0.0.1", port);
         match read(&params).await {
-            Ok(Reading::Down(why)) => assert!(why.contains("refused"), "{why}"),
+            Ok(Reading::Down(why)) => {
+                assert!(why.contains("refused"), "{why}");
+                assert!(why.starts_with(&format!("127.0.0.1:{port}: ")), "{why}");
+                assert_eq!(why.matches("127.0.0.1").count(), 1, "{why}");
+            }
+            other => panic!("expected down, got {other:?}"),
+        }
+        // Resolved from a name, the address it connected to is named after the target.
+        let (_, params) = example_probe("localhost", port);
+        match read(&params).await {
+            Ok(Reading::Down(why)) => {
+                assert!(why.starts_with(&format!("localhost:{port}: ")), "{why}")
+            }
+            // Where localhost also resolves to ::1 and IPv6 is unavailable, that address
+            // fails another way and the read fails; it is still not "up".
+            Err(e) => assert!(e.contains("not treated as down"), "{e}"),
             other => panic!("expected down, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn no_answer_within_the_timeout_is_down() {
+    async fn no_answer_within_the_timeout_is_down_and_the_probe_keeps_to_its_timeout() {
         let (_listener, _held, port) = silent_port().await;
-        let (_, params) = example_probe("127.0.0.1", port);
+        for host in ["127.0.0.1", "localhost"] {
+            let (_, params) = example_probe(host, port);
+            let started = Instant::now();
+            let result = read(&params).await;
+            let took = started.elapsed();
+            if host == "127.0.0.1" {
+                match result {
+                    Ok(Reading::Down(why)) => assert_eq!(
+                        why,
+                        format!("127.0.0.1:{port}: no answer within the probe's 300ms timeout")
+                    ),
+                    other => panic!("expected down, got {other:?}"),
+                }
+            }
+            // The lookup and the connect share the one deadline: the whole probe gives up at
+            // the timeout, not at the kernel's own connect timeout and not later.
+            assert!(took >= Duration::from_millis(290), "{host}: {took:?}");
+            assert!(took < Duration::from_millis(500), "{host}: {took:?}");
+        }
+    }
+
+    #[test]
+    fn refused_timed_out_and_no_route_to_host_are_down_other_errors_are_not() {
+        use io::ErrorKind::*;
+        for kind in [ConnectionRefused, TimedOut, HostUnreachable] {
+            assert!(means_down(&io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            NetworkUnreachable,
+            AddrNotAvailable,
+            PermissionDenied,
+            InvalidInput,
+            Unsupported,
+            Other,
+        ] {
+            assert!(!means_down(&io::Error::from(kind)), "{kind:?}");
+        }
+        // The errno values Linux returns for them.
+        if cfg!(target_os = "linux") {
+            for (errno, down) in [
+                (111, true),  // ECONNREFUSED
+                (110, true),  // ETIMEDOUT
+                (113, true),  // EHOSTUNREACH
+                (101, false), // ENETUNREACH
+                (99, false),  // EADDRNOTAVAIL
+                (97, false),  // EAFNOSUPPORT
+                (13, false),  // EACCES
+            ] {
+                let e = io::Error::from_raw_os_error(errno);
+                assert_eq!(means_down(&e), down, "errno {errno}: {e}");
+            }
+        }
+    }
+
+    /// Run with `TCP_PROBE_UNANSWERED_ADDR=<ip> cargo test -p sched-observe -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs TCP_PROBE_UNANSWERED_ADDR: an unused address on a directly attached subnet (nothing answers its ARP); takes about 3s"]
+    async fn an_address_nothing_answers_arp_for_is_down() {
+        let host = std::env::var("TCP_PROBE_UNANSWERED_ADDR")
+            .expect("set TCP_PROBE_UNANSWERED_ADDR to an unused address on a local subnet");
+        let (_, mut params) = example_probe(&host, 51049);
+        // Longer than the kernel's ARP failure (about 3s), so "no route to host" comes first.
+        params.timeout = Millis(5_000);
         let started = Instant::now();
-        match read(&params).await {
-            Ok(Reading::Down(why)) => assert!(why.contains("no answer within 300ms"), "{why}"),
+        let result = read(&params).await;
+        let took = started.elapsed();
+        eprintln!("{host}: {result:?} after {took:?}");
+        match result {
+            Ok(Reading::Down(why)) => assert!(
+                why.contains("No route to host") || why.contains("no answer"),
+                "{why}"
+            ),
             other => panic!("expected down, got {other:?}"),
         }
-        // It gave up at the timeout, not at the kernel's own connect timeout.
-        let took = started.elapsed();
-        assert!(took >= Duration::from_millis(290), "{took:?}");
-        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(took < Duration::from_millis(5_200), "{took:?}");
     }
 
     #[tokio::test]
@@ -312,7 +412,7 @@ mod tests {
         // `.invalid` never resolves (RFC 6761).
         let (spec, params) = example_probe("basestar.invalid", 2049);
         let e = read(&params).await.unwrap_err();
-        assert!(e.contains("basestar.invalid:2049"), "{e}");
+        assert!(e.starts_with("basestar.invalid:2049: "), "{e}");
         assert!(
             e.contains("cannot resolve") || e.contains("name lookup did not finish"),
             "{e}"
@@ -329,7 +429,8 @@ mod tests {
         for host in ["255.255.255.255", "224.0.0.1"] {
             let (_, params) = example_probe(host, 2049);
             let e = read(&params).await.unwrap_err();
-            assert!(e.contains(&format!("{host}:2049")), "{e}");
+            assert!(e.starts_with(&format!("{host}:2049: ")), "{e}");
+            assert_eq!(e.matches(host).count(), 1, "{e}");
             assert!(e.contains("not treated as down"), "{e}");
         }
         // A name the resolver rejects.
@@ -337,37 +438,64 @@ mod tests {
         assert!(read(&params).await.is_err());
     }
 
+    /// `connect_all` with a deadline `ms` from now.
+    async fn connect(addrs: &[SocketAddr], ms: u64) -> Result<Reading, String> {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        connect_all("probe-target:1", addrs, deadline, Millis(ms)).await
+    }
+
     #[tokio::test]
-    async fn several_addresses_are_tried_in_turn() {
+    async fn several_addresses_are_probed_at_once() {
         let listener = TcpListener::bind((LOCALHOST, 0)).await.unwrap();
         let open: SocketAddr = listener.local_addr().unwrap();
         let (_held, refusing) = refusing_port();
         let refusing = SocketAddr::from((LOCALHOST, refusing));
-        let unusable = SocketAddr::from((Ipv4Addr::BROADCAST, 2049));
-        let t = Duration::from_millis(300);
-        // Any address connecting is up, whatever the others did.
-        assert_eq!(
-            connect_any(&[unusable, refusing, open], t).await,
-            Ok(Reading::Up)
-        );
-        // A refusal is down even when another address could not be tried.
-        assert!(matches!(
-            connect_any(&[unusable, refusing], t).await,
-            Ok(Reading::Down(_))
-        ));
-        // Only unusable addresses: a failed read.
-        let e = connect_any(&[unusable, unusable], t).await.unwrap_err();
-        assert!(e.contains("not treated as down"), "{e}");
-        assert!(connect_any(&[], t).await.is_err());
-        // The timeout covers all addresses together: a silent first address uses it up.
         let (_l, _h, silent) = silent_port().await;
         let silent = SocketAddr::from((LOCALHOST, silent));
-        let started = Instant::now();
-        match connect_any(&[silent, open], t).await {
-            Ok(Reading::Down(why)) => assert!(why.contains("no answer"), "{why}"),
+        let unusable = SocketAddr::from((Ipv4Addr::BROADCAST, 2049));
+        // Any address connecting is up, whatever the others did, and in whichever order.
+        for addrs in [
+            [unusable, refusing, open],
+            [silent, refusing, open],
+            [open, silent, unusable],
+            [silent, silent, open],
+        ] {
+            let started = Instant::now();
+            assert_eq!(connect(&addrs, 300).await, Ok(Reading::Up), "{addrs:?}");
+            // It does not wait for a silent address first.
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "{addrs:?}: {:?}",
+                started.elapsed()
+            );
+        }
+        // Down only when every address answered down.
+        match connect(&[refusing, silent], 300).await {
+            Ok(Reading::Down(why)) => {
+                assert!(why.starts_with("probe-target:1: "), "{why}");
+                assert!(why.contains(&format!("{refusing}: ")), "{why}");
+                assert!(why.contains(&format!("{silent}: no answer")), "{why}");
+            }
             other => panic!("expected down, got {other:?}"),
         }
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // An address that failed another way makes it a failed read, even beside a refusal.
+        for addrs in [
+            vec![unusable, refusing],
+            vec![silent, unusable],
+            vec![unusable, unusable],
+        ] {
+            let e = connect(&addrs, 300).await.unwrap_err();
+            assert!(e.contains("not treated as down"), "{addrs:?}: {e}");
+            assert!(e.contains(&format!("{unusable}: ")), "{e}");
+        }
+        assert!(connect(&[], 300).await.unwrap_err().contains("no address"));
+        // All of them within the one deadline: three silent addresses take one timeout.
+        let started = Instant::now();
+        assert!(matches!(
+            connect(&[silent, silent, silent], 300).await,
+            Ok(Reading::Down(_))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[tokio::test]

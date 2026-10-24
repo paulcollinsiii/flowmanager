@@ -122,16 +122,17 @@ sources:
 
   # basestar is not a Kubernetes node: its reachability comes from a TCP connect probe,
   # the same check power.py makes (a plain connect to the NFS port, 2049). Each resync
-  # makes one connect to host:port, closing the connection at once:
+  # makes one connect to host:port, closing the connection at once. `timeout` bounds the
+  # whole probe, name lookup included.
   # - connected: up.
-  # - connection refused, or no answer within `timeout`: down.
+  # - the host does not answer or answers no: down. That is connection refused, no answer
+  #   within `timeout`, or "no route to host" (what Linux reports, after about 3s, for an
+  #   address on the local network that does not answer ARP, as a powered-off basestar).
   # - anything else is a failed read (the reading goes stale), never "down": the name does
-  #   not resolve (or its lookup takes longer than `timeout`), an unusable address, or any
-  #   other error, such as "no route to host" or "network unreachable".
-  # Keep `timeout` below about 3s: with default neighbour settings (3 ARP requests 1s
-  # apart) Linux reports a host on the local network that does not answer ARP, such as a
-  # powered-off basestar, as "no route to host" after about 3s. With 2s that host times
-  # out first and reads as down; with a longer timeout it would be a failed read instead.
+  #   not resolve (or its lookup does not finish within `timeout`), "network unreachable"
+  #   (no route at all), an unusable address, or any other local error.
+  # If the name has several addresses, all are tried at once: up if any connects, down
+  # only if every one answered down, otherwise a failed read.
   # It checks that the host accepts connections on the port, not that the NFS export works.
   # Only basestar-nfs gets reachability from this source.
   - id: basestar-probe

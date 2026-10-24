@@ -301,9 +301,10 @@ pub const MIN_TCP_PROBE_TIMEOUT: Millis = Millis(100);
 pub const MAX_TCP_PROBE_TIMEOUT: Millis = Millis(60_000);
 
 /// Params of a `tcp_probe` source: one TCP connect to `host:port` per resync says whether
-/// one resource's host is up. A connection is up; a refused connection, or no answer within
-/// `timeout`, is down. Anything else (the name does not resolve, an unusable address, any
-/// other error) is a failed read, never "down".
+/// one resource's host is up. A connection is up; a refused connection, no answer within
+/// `timeout`, or "no route to host" (the host does not answer) is down. Anything else (the
+/// name does not resolve, "network unreachable", an unusable address, any other error) is a
+/// failed read, never "down".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TcpProbeParams {
@@ -312,7 +313,7 @@ pub struct TcpProbeParams {
     pub port: u16,
     /// The resource whose reachability the connect result is.
     pub resource: ResourceId,
-    /// How long the connect may take; also bounds the name lookup.
+    /// How long one probe may take, name lookup and connect together.
     #[serde(default = "default_tcp_probe_timeout")]
     pub timeout: Millis,
     /// Consecutive agreeing readings (one per resync) before a reported up/down flips, as
