@@ -4,8 +4,9 @@
 //!
 //! The query must return exactly one series whose value is `1` (up) or `0` (down).
 //! Everything else (an HTTP or Prometheus error, a result that is not a vector, no series,
-//! several series, any other value) is a failed read and is reported as one, never as
-//! "down": a missing or ambiguous reading says nothing about the host.
+//! several series, any other value, including `-0`) is a failed read and is reported as
+//! one, never as "down": a missing or ambiguous reading says nothing about the host.
+//! `1.0` and `0.0` are the same numbers as `1` and `0` and are accepted.
 
 use std::time::Duration;
 
@@ -98,9 +99,11 @@ pub fn reading(doc: &Value) -> Result<bool, String> {
         .and_then(|v| v.get(1))
         .and_then(Value::as_str)
         .ok_or("the series has no [time, \"value\"] pair")?;
+    // Negative zero (`"-0"`, as Prometheus formats it) is refused: probe_success never
+    // produces it, and it means a negated expression, whose `"-1"` is refused as well.
     match text.trim().parse::<f64>() {
         Ok(1.0) => Ok(true),
-        Ok(0.0) => Ok(false),
+        Ok(v) if v == 0.0 && v.is_sign_positive() => Ok(false),
         _ => Err(format!(
             "the series value {:?} is neither 0 nor 1",
             text.chars().take(64).collect::<String>()
@@ -338,10 +341,13 @@ mod tests {
         assert_eq!(reading(&body(r#""1""#)), Ok(true));
         assert_eq!(reading(&body(r#""0""#)), Ok(false));
         assert_eq!(reading(&body(r#""1.0""#)), Ok(true));
+        assert_eq!(reading(&body(r#""0.0""#)), Ok(false));
         for bad in [
             r#""2""#,
             r#""0.5""#,
             r#""-1""#,
+            r#""-0""#,
+            r#""-0.0""#,
             r#""NaN""#,
             r#""+Inf""#,
             r#""up""#,
@@ -434,6 +440,7 @@ mod tests {
         check(vector(&["1", "0", "1"]), "returned 3 series").await;
         check(vector(&["2"]), "neither 0 nor 1").await;
         check(vector(&["0.5"]), "neither 0 nor 1").await;
+        check(vector(&["-0"]), "neither 0 nor 1").await;
         check(vector(&["NaN"]), "neither 0 nor 1").await;
         check(vector(&["yes"]), "neither 0 nor 1").await;
         check(

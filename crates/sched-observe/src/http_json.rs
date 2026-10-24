@@ -79,9 +79,10 @@ pub enum ExtractError {
     /// The `where` field is in none of the (non-empty) array's items, so the filter would
     /// silently match nothing.
     FilterFieldMissing(String),
-    /// An item's `where` field holds a value of another JSON type than the filter compares
-    /// (for example a number where a boolean is expected), so the filter would silently
-    /// match nothing. `null` is not a mismatch: it is an item that does not match.
+    /// An item's `where` field (or the response's `when` field) holds a value of another
+    /// JSON type than the condition compares (for example a number where a boolean is
+    /// expected), so it would silently match nothing. For `where`, `null` is not a
+    /// mismatch: it is an item that does not match.
     FilterTypeMismatch {
         field: String,
         expected: &'static str,
@@ -102,7 +103,7 @@ impl std::fmt::Display for ExtractError {
             ),
             ExtractError::FilterTypeMismatch { field, expected } => write!(
                 f,
-                "the where field {field:?} holds a value that is not a {expected}, so the filter cannot compare it; check the field against the API"
+                "the field {field:?} holds a value that is not a {expected}, so the condition on it cannot be checked; check the field against the API"
             ),
             ExtractError::AtLimit(n) => write!(
                 f,
@@ -112,17 +113,30 @@ impl std::fmt::Display for ExtractError {
     }
 }
 
-/// Whether the filter compares a boolean (`equals: true|false`); otherwise it compares text.
-fn compares_bool(filter: &ElementFilter) -> bool {
-    filter.contains.is_none() && matches!(filter.equals, Some(FilterValue::Bool(_)))
+/// The JSON type the filter compares, by name: `contains` compares text, `equals` its
+/// value's type.
+fn filter_type(filter: &ElementFilter) -> &'static str {
+    match (&filter.contains, &filter.equals) {
+        (None, Some(v)) => v.json_type(),
+        _ => "string",
+    }
 }
 
-/// The JSON type the filter compares, by name.
-fn filter_type(filter: &ElementFilter) -> &'static str {
-    if compares_bool(filter) {
-        "boolean"
-    } else {
-        "string"
+/// Whether `value` is `expected`, by JSON type and value (numbers compared numerically).
+fn value_equals(value: &Value, expected: &FilterValue) -> bool {
+    match expected {
+        FilterValue::Text(t) => value.as_str() == Some(t.as_str()),
+        FilterValue::Bool(b) => value.as_bool() == Some(*b),
+        FilterValue::Number(n) => value.as_f64() == Some(*n),
+    }
+}
+
+/// Whether `value` has the JSON type named by `json_type`.
+fn has_type(value: &Value, json_type: &str) -> bool {
+    match json_type {
+        "boolean" => value.is_boolean(),
+        "number" => value.is_number(),
+        _ => value.is_string(),
     }
 }
 
@@ -134,19 +148,48 @@ fn matches(filter: &ElementFilter, element: &Value) -> bool {
         (Some(needle), _) => value
             .as_str()
             .is_some_and(|text| text.to_lowercase().contains(&needle.to_lowercase())),
-        (None, Some(FilterValue::Text(exact))) => value.as_str() == Some(exact.as_str()),
-        (None, Some(FilterValue::Bool(b))) => value.as_bool() == Some(*b),
+        (None, Some(expected)) => value_equals(value, expected),
         (None, None) => false,
     }
 }
 
 /// Whether `value` (present at the filter's field) has the type the filter compares.
 fn comparable(filter: &ElementFilter, value: &Value) -> bool {
-    if compares_bool(filter) {
-        value.is_boolean()
-    } else {
-        value.is_string()
+    has_type(value, filter_type(filter))
+}
+
+/// Whether the response is to be counted: `true` without a `when`, else whether its field
+/// equals the value. A missing field or one of another JSON type is an error.
+pub fn condition_holds(doc: &Value, req: &RequestSpec) -> Result<bool, ExtractError> {
+    let Some(w) = &req.when else {
+        return Ok(true);
+    };
+    let value = doc
+        .pointer(&w.field)
+        .ok_or_else(|| ExtractError::Missing(w.field.clone()))?;
+    if !has_type(value, w.equals.json_type()) {
+        return Err(ExtractError::FilterTypeMismatch {
+            field: w.field.clone(),
+            expected: w.equals.json_type(),
+        });
     }
+    Ok(value_equals(value, &w.equals))
+}
+
+/// Every number one response contributes: the request's own and its `also` numbers, or
+/// none when its `when` condition does not hold.
+pub fn request_numbers(
+    doc: &Value,
+    req: &RequestSpec,
+) -> Result<Vec<(CountsAs, u64)>, ExtractError> {
+    if !condition_holds(doc, req)? {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![(req.counts_as, extract(doc, req)?)];
+    for e in &req.also {
+        out.push((e.counts_as, extract_number(doc, &e.count)?));
+    }
+    Ok(out)
 }
 
 /// The number one request contributes: the value at `count`, or the number of elements of
@@ -395,16 +438,9 @@ pub async fn poll_at(
             Ok(d) => d,
             Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         };
-        let numbers = std::iter::once(extract(&doc, req).map(|n| (req.counts_as, n))).chain(
-            req.also
-                .iter()
-                .map(|e| extract_number(&doc, &e.count).map(|n| (e.counts_as, n))),
-        );
-        for n in numbers {
-            match n {
-                Ok(part) => parts.push(part),
-                Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
-            }
+        match request_numbers(&doc, req) {
+            Ok(numbers) => parts.extend(numbers),
+            Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         }
     }
     let (ready, in_flight) = totals(&parts);
@@ -482,6 +518,7 @@ mod tests {
             max_items: None,
             also: Vec::new(),
             since: None,
+            when: None,
         }
     }
 
@@ -569,8 +606,9 @@ mod tests {
     }
     /// The clock reading speakr's failed-recordings window is dated from in these tests.
     const NOW: Millis = Millis(1_700_000_000_000);
-    /// The example's failed-recordings request at [`NOW`]: the window is the last 6h.
-    const SPEAKR_FAILED: &str = "/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc&updated_since=2023-11-14T16%3A13%3A20Z";
+    /// The example's failed-recordings request at [`NOW`] (2023-11-14T22:13:20Z): the
+    /// window is the last 15m.
+    const SPEAKR_FAILED: &str = "/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc&updated_since=2023-11-14T21%3A58%3A20Z";
 
     /// A speakr v1 list item as `GET /api/v1/recordings` returns it (the fields the
     /// adapter could look at, plus a few it does not).
@@ -1001,7 +1039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_example_failed_request_only_asks_for_the_last_6h_using_the_clock_it_is_given() {
+    async fn the_example_failed_request_only_asks_for_the_last_15m_using_the_clock_it_is_given() {
         let server = TestServer::start().await;
         let (spec, params, classes) = example_source("speakr-pending", &server);
         server.set(SPEAKR_STATS, stats(0, 0, 0));
@@ -1021,7 +1059,7 @@ mod tests {
         assert!(
             server.requests()[3]
                 .0
-                .ends_with("&updated_since=2023-11-14T17%3A13%3A20Z"),
+                .ends_with("&updated_since=2023-11-14T22%3A58%3A20Z"),
             "{:?}",
             server.requests()
         );
@@ -1104,8 +1142,20 @@ mod tests {
 
     /// An immich `GET /api/queues/{name}` body (immich v2.4.0 and later).
     fn immich_queue(name: &str, waiting: u64, delayed: u64, active: u64) -> Reply {
+        immich_queue_paused(name, false, waiting, delayed, active)
+    }
+
+    /// As [`immich_queue`], paused or not. From v4.0 a paused queue's jobs are reported
+    /// under `waiting` (the deprecated `paused` statistic stays 0).
+    fn immich_queue_paused(
+        name: &str,
+        paused: bool,
+        waiting: u64,
+        delayed: u64,
+        active: u64,
+    ) -> Reply {
         Reply::json(&format!(
-            r#"{{"name": "{name}", "isPaused": false, "statistics": {{"active": {active}, "completed": 1204, "failed": 3, "delayed": {delayed}, "waiting": {waiting}, "paused": 0}}}}"#
+            r#"{{"name": "{name}", "isPaused": {paused}, "statistics": {{"active": {active}, "completed": 1204, "failed": 3, "delayed": {delayed}, "waiting": {waiting}, "paused": 0}}}}"#
         ))
     }
 
@@ -1150,6 +1200,135 @@ mod tests {
         );
         // The key goes in its own header only, with no prefix and no Authorization header.
         assert!(server.requests().iter().all(|(_, auth)| auth.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_paused_immich_queue_counts_as_zero_and_an_unreadable_pause_flag_fails() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("immich-queues", &server);
+        let client = build_client(&params).unwrap();
+        server.set(
+            "/api/queues/smartSearch",
+            immich_queue_paused("smartSearch", true, 40, 2, 1),
+        );
+        server.set(
+            "/api/queues/faceDetection",
+            immich_queue("faceDetection", 2, 1, 1),
+        );
+        server.set("/api/queues/ocr", immich_queue_paused("ocr", true, 7, 0, 0));
+        // Only faceDetection counts: (2+1) ready, 1 running.
+        assert_eq!(
+            demand(&poll(&client, &spec, &params, &classes, &immich_env).await),
+            (3, 1)
+        );
+        // Every queue paused: no demand at all, but still an observation (known zero).
+        server.set(
+            "/api/queues/faceDetection",
+            immich_queue_paused("faceDetection", true, 2, 1, 1),
+        );
+        assert_eq!(
+            demand(&poll(&client, &spec, &params, &classes, &immich_env).await),
+            (0, 0)
+        );
+        // No isPaused, a null one or a non-boolean one: a failure, not a guess either way.
+        for body in [
+            r#"{"name": "ocr", "statistics": {"active": 0, "delayed": 0, "waiting": 4}}"#,
+            r#"{"name": "ocr", "isPaused": null, "statistics": {"active": 0, "delayed": 0, "waiting": 4}}"#,
+            r#"{"name": "ocr", "isPaused": "false", "statistics": {"active": 0, "delayed": 0, "waiting": 4}}"#,
+        ] {
+            server.set("/api/queues/ocr", Reply::json(body));
+            match poll(&client, &spec, &params, &classes, &immich_env).await {
+                Report::Failed { error, .. } => {
+                    assert!(
+                        error.contains("request 2") && error.contains("/isPaused"),
+                        "{error}"
+                    )
+                }
+                other => panic!("{body}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_when_condition_gates_every_number_of_its_response() {
+        let mut r = req(Some("/a"), None, None);
+        r.also = vec![sched_model::ExtraCount {
+            count: "/b".into(),
+            counts_as: CountsAs::InFlight,
+        }];
+        r.when = Some(sched_model::ResponseCondition {
+            field: "/s/state".into(),
+            equals: "on".into(),
+        });
+        let d = doc(r#"{"s": {"state": "on"}, "a": 2, "b": 3}"#);
+        assert_eq!(
+            request_numbers(&d, &r),
+            Ok(vec![(CountsAs::Ready, 2), (CountsAs::InFlight, 3)])
+        );
+        // Not holding: nothing is read, so even missing numbers do not matter.
+        let d = doc(r#"{"s": {"state": "off"}}"#);
+        assert_eq!(request_numbers(&d, &r), Ok(vec![]));
+        assert_eq!(
+            request_numbers(&doc(r#"{"a": 2, "b": 3}"#), &r),
+            Err(ExtractError::Missing("/s/state".into()))
+        );
+        assert_eq!(
+            request_numbers(&doc(r#"{"s": {"state": 1}, "a": 2, "b": 3}"#), &r),
+            Err(ExtractError::FilterTypeMismatch {
+                field: "/s/state".into(),
+                expected: "string"
+            })
+        );
+        // Numbers compare numerically.
+        r.when = Some(sched_model::ResponseCondition {
+            field: "/v".into(),
+            equals: 2.0.into(),
+        });
+        assert_eq!(
+            request_numbers(&doc(r#"{"v": 2, "a": 1, "b": 0}"#), &r)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            request_numbers(&doc(r#"{"v": 2.0, "a": 1, "b": 0}"#), &r)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            request_numbers(&doc(r#"{"v": 3, "a": 1, "b": 0}"#), &r),
+            Ok(vec![])
+        );
+        // Without a condition, the numbers are read as before.
+        r.when = None;
+        assert_eq!(
+            request_numbers(&doc(r#"{"a": 1, "b": 0}"#), &r),
+            Ok(vec![(CountsAs::Ready, 1), (CountsAs::InFlight, 0)])
+        );
+    }
+
+    #[test]
+    fn where_equals_matches_numbers_numerically_and_never_text() {
+        let r = req(
+            None,
+            Some(""),
+            Some(ElementFilter {
+                field: "/n".into(),
+                contains: None,
+                equals: Some(123.0.into()),
+            }),
+        );
+        let d = doc(r#"[{"n": 123}, {"n": 123.0}, {"n": 124}, {"n": null}, {}]"#);
+        assert_eq!(extract(&d, &r), Ok(2));
+        // The text "123" is not the number 123: a type mismatch fails the poll.
+        assert_eq!(
+            extract(&doc(r#"[{"n": 123}, {"n": "123"}]"#), &r),
+            Err(ExtractError::FilterTypeMismatch {
+                field: "/n".into(),
+                expected: "number"
+            })
+        );
     }
 
     #[tokio::test]

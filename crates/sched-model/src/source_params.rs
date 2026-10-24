@@ -61,13 +61,72 @@ pub enum CountsAs {
     InFlight,
 }
 
-/// A value a `where` filter compares a field with exactly: text (`equals: FAILED`) or a
-/// boolean (`equals: false`). A quoted `"false"` is text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A value a `where` or `when` condition compares a field with exactly. An unquoted YAML
+/// scalar keeps its type: `equals: false` is the JSON boolean, `equals: 3` the JSON number 3
+/// (compared numerically, so `3` matches `3.0`), `equals: FAILED` text. Quote a scalar to
+/// compare it as text: `equals: "false"`, `equals: "3"`. The field must have the same JSON
+/// type as the value.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum FilterValue {
     Bool(bool),
+    /// Always finite (`.nan` and `.inf` are refused when the config is read).
+    Number(f64),
     Text(String),
+}
+
+// Sound because a `Number` is never NaN (see `Deserialize`), so equality is reflexive.
+impl Eq for FilterValue {}
+
+impl FilterValue {
+    /// The JSON type this value compares with, by name.
+    pub fn json_type(&self) -> &'static str {
+        match self {
+            FilterValue::Bool(_) => "boolean",
+            FilterValue::Number(_) => "number",
+            FilterValue::Text(_) => "string",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FilterValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = FilterValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string, a boolean or a number to compare the field with")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<FilterValue, E> {
+                Ok(FilterValue::Bool(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<FilterValue, E> {
+                Ok(FilterValue::Number(v as f64))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<FilterValue, E> {
+                Ok(FilterValue::Number(v as f64))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<FilterValue, E> {
+                if v.is_finite() {
+                    Ok(FilterValue::Number(v))
+                } else {
+                    Err(E::custom(format!(
+                        "{v} cannot be compared with; use a finite number"
+                    )))
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<FilterValue, E> {
+                Ok(FilterValue::Text(v.to_string()))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 impl From<&str> for FilterValue {
@@ -82,7 +141,27 @@ impl From<bool> for FilterValue {
     }
 }
 
-/// Keeps only the array elements whose field matches.
+impl From<f64> for FilterValue {
+    fn from(n: f64) -> Self {
+        FilterValue::Number(n)
+    }
+}
+
+/// Counts a response only when one of its fields has a given value: when it does not, the
+/// request (its own number and every `also` number) contributes zero. A response without
+/// the field, or with a value of another JSON type, fails the poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseCondition {
+    /// JSON pointer into the response.
+    pub field: String,
+    pub equals: FilterValue,
+}
+
+/// Keeps only the array elements whose field matches. An element whose field holds a
+/// non-null value of another JSON type than the filter compares fails the poll (the
+/// source's demand becomes unknown) rather than silently not matching; `null` or a missing
+/// field is simply no match.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElementFilter {
@@ -91,7 +170,7 @@ pub struct ElementFilter {
     /// Case-insensitive substring match of a string field.
     #[serde(default)]
     pub contains: Option<String>,
-    /// Exact match of a string or boolean field (the field must have the same JSON type).
+    /// Exact match of a string, boolean or number field (see [`FilterValue`]).
     #[serde(default)]
     pub equals: Option<FilterValue>,
 }
@@ -148,6 +227,10 @@ pub struct RequestSpec {
     /// Only items changed within a window ending now (see [`SinceSpec`]).
     #[serde(default)]
     pub since: Option<SinceSpec>,
+    /// Count this response only if a field of it has a given value (see
+    /// [`ResponseCondition`]).
+    #[serde(default)]
+    pub when: Option<ResponseCondition>,
 }
 
 /// Where the value of an authentication header comes from. Never the config itself.
@@ -319,6 +402,9 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
             out.push(format!(
                 "{at} is identical to requests[{j}]; it would be counted twice"
             ));
+        }
+        if let Some(w) = &r.when {
+            out.extend(pointer_problem(&w.field).map(|m| format!("{at}.when: {m}")));
         }
         if let Some(f) = &r.filter {
             if r.length.is_none() {
@@ -505,7 +591,7 @@ mod tests {
         let since = failed.since.as_ref().unwrap();
         assert_eq!(
             (since.param.as_str(), since.ago),
-            ("updated_since", crate::Millis(6 * 3_600_000))
+            ("updated_since", crate::Millis(15 * 60_000))
         );
         let immich = c
             .source(&"immich-queues".into())
@@ -529,6 +615,13 @@ mod tests {
             .collect();
         assert_eq!(queues, ["smartSearch", "faceDetection", "ocr"]);
         for r in &immich.requests {
+            assert_eq!(
+                r.when,
+                Some(super::ResponseCondition {
+                    field: "/isPaused".into(),
+                    equals: super::FilterValue::Bool(false),
+                })
+            );
             assert_eq!(r.count.as_deref(), Some("/statistics/waiting"));
             assert_eq!(r.counts_as, super::CountsAs::Ready);
             let also: Vec<_> = r
@@ -877,5 +970,67 @@ mod tests {
             "  - id: basestar-probe\n    kind: prometheus\n    observe: [demand]\n",
         ));
         assert!(has(&ps, "observe must include reachability"), "{ps:?}");
+    }
+
+    #[test]
+    fn where_equals_numbers_are_numbers_and_unusable_values_say_what_is_expected() {
+        let failed = "where: { field: /has_summary, equals: false }";
+        let equals = |v: &str| {
+            Config::from_yaml(
+                &EXAMPLE_CONFIG.replace(failed, &format!("where: {{ field: /n, equals: {v} }}")),
+            )
+            .map(|c| {
+                c.source(&"speakr-pending".into())
+                    .unwrap()
+                    .http_json_params()
+                    .unwrap()
+                    .unwrap()
+                    .requests[1]
+                    .filter
+                    .clone()
+                    .unwrap()
+                    .equals
+                    .unwrap()
+            })
+        };
+        assert_eq!(equals("123").unwrap(), super::FilterValue::Number(123.0));
+        assert_eq!(equals("-4").unwrap(), super::FilterValue::Number(-4.0));
+        assert_eq!(equals("1.5").unwrap(), super::FilterValue::Number(1.5));
+        assert_eq!(equals("\"123\"").unwrap(), "123".into());
+        assert_eq!(equals("\"true\"").unwrap(), "true".into());
+        assert_eq!(equals("true").unwrap(), true.into());
+        // `~` (null) is no value at all.
+        let e = equals("~").unwrap_err().to_string();
+        assert!(e.contains("exactly one of contains and equals"), "{e}");
+        for bad in ["[1, 2]", "{ a: 1 }", ".nan", ".inf"] {
+            let e = equals(bad).unwrap_err().to_string();
+            assert!(
+                e.contains("a string, a boolean or a number") || e.contains("finite number"),
+                "{bad}: {e}"
+            );
+            assert!(!e.contains("untagged"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn when_conditions_are_validated() {
+        let when = "when: { field: /isPaused, equals: false }";
+        assert_eq!(EXAMPLE_CONFIG.matches(when).count(), 3);
+        let ps = problems_of(&EXAMPLE_CONFIG.replacen(
+            when,
+            "when: { field: isPaused, equals: false }",
+            1,
+        ));
+        assert!(has(&ps, ".when: JSON pointer \"isPaused\""), "{ps:?}");
+        let ps = problems_of(&EXAMPLE_CONFIG.replacen(when, "when: { field: /isPaused }", 1));
+        assert!(has(&ps, "missing field `equals`"), "{ps:?}");
+        let ps = problems_of(&EXAMPLE_CONFIG.replacen(
+            when,
+            "when: { field: /isPaused, contains: x, equals: false }",
+            1,
+        ));
+        assert!(has(&ps, "unknown field `contains`"), "{ps:?}");
+        let text = EXAMPLE_CONFIG.replacen(when, "when: { field: /state, equals: active }", 1);
+        assert!(Config::from_yaml(&text).is_ok());
     }
 }
