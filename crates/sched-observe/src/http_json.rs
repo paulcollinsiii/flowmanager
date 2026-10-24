@@ -474,8 +474,12 @@ mod tests {
         for r in &mut params.requests {
             let at = r.url.find("/api/").unwrap();
             r.url = server.url(&r.url[at..]);
-            // Tests that do not care about the window ask for the plain URL.
-            r.since = None;
+        }
+        if id == "speakr-pending" {
+            // The example no longer reads failed recordings (they are not observable through
+            // speakr's list API); the adapter features it exercised are kept under test with
+            // this fixture request.
+            params.requests.push(failed_fixture(server));
         }
         let classes = config
             .classes()
@@ -484,6 +488,26 @@ mod tests {
             .map(|c| c.id.clone())
             .collect();
         (spec, params, classes)
+    }
+
+    /// A request listing failed recordings whose `error_message` mentions a connection: the
+    /// shape of the request the example used before M2 dropped it. Exercises `where`,
+    /// `max_items` and the missing-field safeguard.
+    fn failed_fixture(server: &TestServer) -> RequestSpec {
+        RequestSpec {
+            url: server.url(SPEAKR_FAILED),
+            count: None,
+            length: Some("/recordings".into()),
+            filter: Some(ElementFilter {
+                field: "/error_message".into(),
+                contains: Some("connection".into()),
+                equals: None,
+            }),
+            counts_as: CountsAs::Ready,
+            max_items: Some(100),
+            also: Vec::new(),
+            since: None,
+        }
     }
 
     const SPEAKR_STATS: &str = "/api/v1/stats";
@@ -900,15 +924,10 @@ mod tests {
     async fn the_example_failed_request_only_asks_for_the_last_day_using_the_clock_it_is_given() {
         let server = TestServer::start().await;
         let (spec, mut params, classes) = example_source("speakr-pending", &server);
-        // Put the example's window back (the helper strips it).
-        let original = example_config()
-            .source(&"speakr-pending".into())
-            .unwrap()
-            .http_json_params()
-            .unwrap()
-            .unwrap();
-        params.requests[1].since = original.requests[1].since.clone();
-        assert!(params.requests[1].since.is_some());
+        params.requests[1].since = Some(sched_model::SinceSpec {
+            param: "updated_since".into(),
+            ago: Millis(86_400_000),
+        });
         server.set(SPEAKR_STATS, stats(0, 0, 0));
         let windowed = format!("{SPEAKR_FAILED}&updated_since=2023-11-13T22%3A13%3A20Z");
         server.set(

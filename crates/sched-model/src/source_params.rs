@@ -224,6 +224,18 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
         }
         for (k, e) in r.also.iter().enumerate() {
             out.extend(pointer_problem(&e.count).map(|m| format!("{at}.also[{k}]: {m}")));
+            // The same number counted twice would silently double it.
+            let primary =
+                r.count.as_deref() == Some(e.count.as_str()) && r.counts_as == e.counts_as;
+            let earlier = r.also[..k]
+                .iter()
+                .any(|o| o.count == e.count && o.counts_as == e.counts_as);
+            if primary || earlier {
+                out.push(format!(
+                    "{at}.also[{k}] repeats {} (same pointer and counts_as); it would be counted twice",
+                    if primary { "the request's own count" } else { "an earlier also entry" }
+                ));
+            }
         }
         if let Some(sc) = &r.since {
             let plain = !sc.param.is_empty()
@@ -234,6 +246,16 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
             if !plain {
                 out.push(format!(
                     "{at}.since.param {:?} must be a plain query parameter name",
+                    sc.param
+                ));
+            }
+            let query = r.url.split_once('?').map_or("", |(_, q)| q);
+            if query
+                .split('&')
+                .any(|kv| kv.split('=').next() == Some(sc.param.as_str()))
+            {
+                out.push(format!(
+                    "{at}.url already has a {:?} parameter; since would add a second one",
                     sc.param
                 ));
             }
@@ -361,7 +383,7 @@ mod tests {
         let c = example_config();
         let speakr = c.source(&"speakr-pending".into()).unwrap();
         let p = speakr.http_json_params().unwrap().unwrap();
-        assert_eq!(p.requests.len(), 2);
+        assert_eq!(p.requests.len(), 1);
         assert_eq!(p.requests[0].also.len(), 2);
         assert_eq!(
             p.auth.as_ref().unwrap().env.as_deref(),
@@ -462,6 +484,34 @@ mod tests {
             &format!("{url}\n        - {url}\n          also: [{{ count: /active }}]"),
         );
         assert!(Config::from_yaml(&three).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_also_entry_that_repeats_a_number_and_a_since_param_already_in_the_url() {
+        let url = "url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting";
+        let with = |extra: &str| EXAMPLE_CONFIG.replace(url, &format!("{url}\n{extra}"));
+        let ps = problems_of(&with("          also: [{ count: /waiting }]"));
+        assert!(
+            has(&ps, "also[0] repeats the request's own count"),
+            "{ps:?}"
+        );
+        let ps = problems_of(&with("          also: [{ count: /a }, { count: /a }]"));
+        assert!(has(&ps, "also[1] repeats an earlier also entry"), "{ps:?}");
+        // Same pointer but counted on the other side is a different number being read.
+        let ok = with("          also: [{ count: /waiting, counts_as: in_flight }]");
+        assert!(Config::from_yaml(&ok).is_ok());
+        let dup_since = EXAMPLE_CONFIG.replace(
+            "url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting",
+            "url: http://immich-server.media.svc:2283/api/jobs?a=1&updated_since=x\n          count: /waiting\n          since: { param: updated_since, ago: 1h }",
+        );
+        let ps = problems_of(&dup_since);
+        assert!(
+            has(&ps, "already has a \"updated_since\" parameter"),
+            "{ps:?}"
+        );
+        // A parameter that merely shares a prefix is fine.
+        let ok = dup_since.replace("updated_since=x", "updated_since_x=x");
+        assert!(Config::from_yaml(&ok).is_ok());
     }
 
     #[test]

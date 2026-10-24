@@ -32,6 +32,8 @@ struct Fake {
     garbage_once_nodes: Arc<AtomicBool>,
     /// Every pod watch answers with a garbage line and ends.
     garbage_always: Arc<AtomicBool>,
+    /// Pod watches 1-3 fail at once, the 4th lives 450 ms and then fails, later ones hang.
+    scripted: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -42,14 +44,24 @@ impl Fake {
         let garbage_once = Arc::new(AtomicBool::new(false));
         let garbage_once_nodes = Arc::new(AtomicBool::new(false));
         let garbage_always = Arc::new(AtomicBool::new(false));
+        let scripted = Arc::new(AtomicBool::new(false));
+        let watch_calls = Arc::new(AtomicUsize::new(0));
         let (w, p, g, ga) = (
             watches.clone(),
             pods.clone(),
             garbage_once.clone(),
             garbage_always.clone(),
         );
+        let (sc, wc) = (scripted.clone(), watch_calls.clone());
         server.set_dynamic("/api/v1/namespaces/ai/pods", move |query| {
             if query.contains("watch=true") {
+                if sc.load(Ordering::SeqCst) {
+                    return match wc.fetch_add(1, Ordering::SeqCst) {
+                        0..=2 => Reply::json("this is not json\n"),
+                        3 => Reply::json("this is not json\n").delayed(Duration::from_millis(450)),
+                        _ => Reply::hanging("").tracked(&w),
+                    };
+                }
                 if g.swap(false, Ordering::SeqCst) || ga.load(Ordering::SeqCst) {
                     return Reply::json("this is not json\n");
                 }
@@ -80,6 +92,7 @@ impl Fake {
             garbage_once,
             garbage_once_nodes,
             garbage_always,
+            scripted,
         }
     }
 
@@ -661,4 +674,81 @@ async fn restart_throttling_survives_a_restart_caused_by_a_reload() {
         after.lock().unwrap().after_exit(quick),
         Duration::from_millis(200)
     );
+}
+
+#[tokio::test]
+async fn the_watch_backoff_starts_over_only_after_a_healthy_run() {
+    let fake = Fake::start().await;
+    fake.scripted.store(true, Ordering::SeqCst);
+    let (spec, params, models) = source();
+    let (tx, mut rx) = mpsc::channel(4096);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let timing = Timing {
+        backoff_initial: Duration::from_millis(100),
+        backoff_max: Duration::from_millis(400),
+        client_retry: Duration::from_millis(20),
+    };
+    let task = tokio::spawn(run_with_client(
+        spec,
+        params,
+        models,
+        fake.client(),
+        tx,
+        timing,
+    ));
+    let lists = || -> Vec<std::time::Instant> {
+        fake.server
+            .requests()
+            .iter()
+            .zip(fake.server.request_times())
+            .filter(|((k, _), _)| {
+                k.starts_with("/api/v1/namespaces/ai/pods?") && !k.contains("watch=true")
+            })
+            .map(|(_, t)| t)
+            .collect()
+    };
+    wait_for("five lists", || lists().len() >= 5).await;
+    let l = lists();
+    // Lists 1-3 fail at once (waits of 100, 200, 400 ms). The 4th watcher lives 450 ms, past
+    // backoff_max, then fails: that was a healthy run, so the wait before list 5 starts over
+    // at 100 ms (about 550 ms after list 4, not 850).
+    let after_healthy = l[4] - l[3];
+    assert!(
+        after_healthy >= Duration::from_millis(450),
+        "{after_healthy:?}"
+    );
+    assert!(
+        after_healthy < Duration::from_millis(750),
+        "the backoff was not reset after a healthy run: {after_healthy:?}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn backoff_state_of_a_source_removed_from_the_config_is_dropped() {
+    let fake = Fake::start().await;
+    let (tx, mut rx) = mpsc::channel(4096);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let opts = SpawnOptions {
+        kube_client: Some(fake.client()),
+        kube_timing: FAST,
+        ..SpawnOptions::default()
+    };
+    let base = EXAMPLE_CONFIG.replace("namespaces: [ai, media, docs]", "namespaces: [ai]");
+    let mut observers = Observers::default();
+    observers.update(&Config::from_yaml(&base).unwrap(), &tx, &opts);
+    let immich = sched_model::SourceId::new("immich-queues");
+    assert!(observers.backoff_for(&immich).is_some());
+
+    // Remove the source (and the class that took its demand from it).
+    let without = base
+        .replace("    demand: { source: immich-queues }\n", "")
+        .replace(
+            "  - id: immich-queues\n    kind: http_json\n    observe: [demand]\n    resync: 120s\n    params:\n      requests:\n        - url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting\n\n",
+            "",
+        );
+    assert_ne!(without, base);
+    observers.update(&Config::from_yaml(&without).unwrap(), &tx, &opts);
+    assert!(observers.backoff_for(&immich).is_none());
+    assert!(observers.backoff_for(&"cluster-pods".into()).is_some());
 }

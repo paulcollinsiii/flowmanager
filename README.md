@@ -83,8 +83,8 @@ restate deployments register http://localhost:9080
   All three still mean "not idle". A source that has reported once and then goes quiet is
   always `demand_unknown`. Dashboards or alerts on the old name need updating.
 - **Bounding `http_json` by age**: a request may carry `since: { param, ago }`; each poll
-  appends `param=<now - ago>` (ISO 8601 UTC, from the scheduler's clock). The example uses it so
-  speakr's never-deleted failed recordings stop counting as demand after 24h.
+  appends `param=<now - ago>` (ISO 8601 UTC, from the scheduler's clock). The example config
+  does not currently use it (see Known blind spots); the adapter feature stays.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - Handlers: `observe` (push observations; dated on receipt, never by the sender), `tick`,
@@ -114,3 +114,24 @@ sequencer wait for effects that never happen. The consequences, stated plainly:
 What shadow output does show well: which model the planner wants given current demand, whether
 inputs are fresh (`inputs` with an age per source and capability, `inf` for a capability that
 never reported), and whether a source is failing (`sched_source_errors_total`).
+
+## Known blind spots
+
+What shadow output (and the M2 sources) cannot see or get wrong. Read these before trusting a
+"no demand" or "idle" line.
+
+- **Failed speakr transcription jobs are invisible.** speakr stores a failure in the
+  recording's `transcription` field (`ERROR_JSON:{...}`), not in `error_message`, and its list
+  API exposes only `has_transcription`. Retries are immediate (3 attempts), so when whisperX is
+  unloaded, jobs fail within seconds and then vanish from the demand the scheduler sees. They
+  are not counted as demand in M2. Tracked for M7 (the `requeue_failed` recovery needs a
+  per-recording detail fetch of the error, or a count of FAILED recordings).
+- **Queued speakr summary, merge and stitch jobs count as transcription demand.** The speakr
+  `/stats` queue counts jobs of every type, so this is a deliberate, conservative overcount.
+- **speakr `/stats` is scoped to the token's user.** Recordings of other users are not seen.
+- **"Reported, then silent" memory resets on restart.** The scheduler remembers that a source
+  has reported only in memory; after a restart a silent push-fed source reads as
+  "never pushed" (`demand_unsupported` / `demand_unpolled`) until it reports again.
+- **Shadow output is stateless** (fresh sequencer state every tick): no dwell, idle grace,
+  drain, pause or power-off steps appear. See "What shadow output can and cannot show".
+- **The Restate ingress is trusted-network only.** The handlers have no authentication.
