@@ -49,10 +49,29 @@ What is carried out and what is not:
   (`Shared::subscribe_allowed`, a `watch::Receiver<Option<PublishedAllowed>>`, `None` until
   the first tick of the process). The KEDA scaler that serves it is a later phase; until it
   exists nothing outside the process reads the set.
-- **Power on, power off, stopping in-flight work and recovery actions have no actuator.**
-  The sequencer still takes these steps (its state moves on as if they happened), and each
-  one is reported as not executed: listed in the tick's `not_executed`, marked
-  `[NOT EXECUTED: ...]` in the reason, and logged as a warning. See Known blind spots.
+- **Power is manual.** Each powered resource has `power.control: manual | managed`
+  (default `manual`; the example config says `manual` for both hosts). Under `manual` the
+  scheduler never emits a power step and never takes responsibility for a host's power:
+  its power phase is what is observed (a fresh "up" reads on, a fresh "down" off), and work
+  that needs a host that is off waits (`wait ... the host is not up`) for a person to power
+  it on, including a manual model lease. A powering-on or shutting-down phase left in the
+  persisted state by managed control converges to the observed phase. `managed` (the
+  scheduler powers hosts on and off) is for M4, with the power actuators.
+- **Stopping in-flight work and recovery actions have no actuator** (nor do power steps
+  under `managed`). The sequencer still takes these steps (its state moves on as if they
+  happened), and each one is reported as not executed: listed in the tick's
+  `not_executed`, marked `[NOT EXECUTED: ...]` in the reason, and logged as a warning. See
+  Known blind spots.
+- **Demand that can never be observed counts as none.** A class whose demand source has no
+  observer in this build (a `schedule` or `session` source, for example) or is an
+  observable kind configured without `params`, and that has never reported, counts as
+  having **no demand**: it does not keep a model loaded or a host held. Since `observe` is
+  ingress-private, nothing outside Restate can push to such a source, so its demand could
+  never arrive (before M3 P1 it read as unknown, and the example's `interactive-llm`, fed
+  by the `llm-sessions` session source, kept the LLM loaded forever). Such classes are
+  still listed apart in the tick (`unsupported_demand`, `unpolled_demand`) and its kinds
+  (`demand_unsupported`, `demand_unpolled`). A source that has reported before (in any
+  process; the set is persisted) and then goes silent stays unknown: busy, not idle.
 - Every observer is read-only.
 
 Run it locally against a Restate server:
@@ -77,24 +96,60 @@ The object keeps its state in Restate, under these keys:
 
 | Key | Holds |
 | --- | --- |
-| `sched_state` | The sequencer state: per resource the power phase (off, powering on, on, shutting down) and mode phase (idle, loading, serving with its wind-down, draining), with when each began. |
-| `leases` | The lease book: the leases held and the counter lease ids are drawn from. |
-| `reported_sources` | Which configured sources have ever reported values. |
-| `last_decision` | The latest tick report (what `last_decision` returns). |
-| `backstop_epoch` | The current backstop chain. |
+| `scheduler_state` | Versioned document: the sequencer state (per resource the power phase: off, powering on, on, shutting down; and mode phase: idle, loading, serving with its wind-down, draining; with when each began) and which configured sources have ever reported values. |
+| `lease_book` | Versioned document: the leases held and the counter lease ids are drawn from. |
+| `backstop_epoch` | The current backstop chain (a number). |
 
-A tick loads `sched_state`, `leases` and `reported_sources`, decides inside a journaled
-step (`ctx.run`, named `decide`), stores the new state, and only then publishes the allowed
-set in process. A retried or replayed invocation gets the journaled decision back instead
-of deciding again, so what is published and what is stored agree. A tick that fails (no
-decision) keeps the previous state and the previous publication.
+A tick loads `scheduler_state` and `lease_book`, decides inside a journaled step
+(`ctx.run`, named `decide`), stores the new `scheduler_state`, and only then publishes the
+allowed set in process. A retried or replayed invocation gets the journaled decision back
+instead of deciding again, so what is published and what is stored agree; a replayed tick
+is published and logged again (`replayed=true`) but not counted again in the metrics. A
+tick whose core fails (no decision) keeps the previous state and the previous publication.
+The full tick report is journaled once (as the step's result): `last_decision` returns the
+latest report this process published, kept in memory, so it is `null` after a restart
+until the first tick (the backstop ticks within seconds).
+
+### Versions, and recovering the persisted state
+
+Each document is stored as `{"version": N, "data": ...}`; this build reads and writes
+version 1 of both. A document that cannot be decoded, or that has another version (written
+by a newer build, say, before a rollback), is not reset and does not fail the invocation
+(Restate would retry it forever and block every exclusive handler, the lease handlers
+included). Instead:
+
+- the tick reports an error (kind `error`, the key and the problem in `error` and the
+  reason), logs it at error level, counts it in `sched_persisted_state_errors_total{key}`,
+  stores nothing and **publishes nothing**, so the scaler keeps what it had;
+- the lease handlers keep working if only `scheduler_state` is unreadable; if `lease_book`
+  is, they (and `leases`) answer `503` naming this section.
+
+To recover, either deploy the build that wrote the document, or discard it. Discarding
+`scheduler_state` restarts the sequencer from observation (a model with pods is seen again
+and no other model is allowed while it has them); discarding `lease_book` drops every lease.
+The handler returns what was stored, so keep a copy:
+
+```sh
+curl -X POST localhost:8080/Scheduler/main/discard_state \
+  -H 'content-type: application/json' -d '{"key": "scheduler_state"}'
+# A document that reads fine is refused (409) unless "force": true.
+```
+
+With the Restate CLI (1.8): `restate state get Scheduler main` shows every key;
+`restate state clear Scheduler/main` deletes all of the object's state (both documents and
+the backstop epoch; re-arm the backstop by restarting the binary); one key alone is removed
+with `restate state patch` and a JSON Patch `remove` operation (see `restate state patch
+--help`).
+
+When a later change alters a document's shape in a way this build cannot read, bump its
+version (`persist::STATE_VERSION`, `persist::LEASES_VERSION`).
 
 The observation cache is not persisted: it lives in the process. After a restart the
 scheduler continues from the persisted state (a model that was draining is still draining,
 a serving model keeps its dwell clock) and holds every safety-critical step (allowing a
 model, powering off) until the observers have reported fresh readings again. Which sources
-had reported before is seeded from `reported_sources`, so a push-fed source that went
-silent before the restart still reads as `demand_unknown`, not as never reported.
+had reported before is seeded from `scheduler_state`, so a source that went silent before
+the restart still reads as `demand_unknown` (busy), not as never reported (no demand).
 
 ## Handlers
 
@@ -102,13 +157,14 @@ All are called as `POST {ingress}/Scheduler/main/{handler}`.
 
 | Handler | Ingress | What it does |
 | --- | --- | --- |
-| `tick` | yes | One decision; returns the tick report. |
+| `tick` | yes | One decision; answers `{config_generation, at, kinds, error}` (the report is in `last_decision`). |
 | `arm_backstop` | yes | Starts a new backstop chain (the binary calls it). |
 | `backstop` | yes | One link of the chain; not meant to be called by hand. |
-| `last_decision` | yes (shared) | The latest tick report, without waiting behind a tick. |
+| `last_decision` | yes (shared) | The latest tick report this process published (`null` until its first tick), without waiting behind a tick. |
 | `acquire_model_lease` | yes | Acquires a manual model lease. |
 | `release_lease` | yes | Releases a lease by id. |
 | `leases` | yes (shared) | Every lease held. |
+| `discard_state` | yes | Recovery: discards an unreadable persisted document (see above). |
 | `observe` | **no** (ingress-private) | Pushed observations, from other Restate handlers only. |
 
 `observe` is registered as private: the ingress answers
@@ -132,8 +188,9 @@ the model stays loaded however much other work waits. Rules:
 - A lease whose model or resource later disappears from the config is kept but ignored
   (listed in the tick's `ignored_leases` and logged).
 - Other lease kinds (interactive, reclaim, manual host power, shared holds) have no API yet.
-- A manual model lease also asks for its host to be up, and the scheduler then takes
-  responsibility for powering it down later (see Known blind spots).
+- A manual model lease also asks for its host to be up. Under `power.control: manual` this
+  only means it waits until a person powers the host on; under `managed` (M4) the scheduler
+  powers the host on and later takes responsibility for powering it down.
 
 ```sh
 # Pin the LLM.
@@ -157,7 +214,9 @@ curl -X POST localhost:8080/Scheduler/main/last_decision
 `/metrics` on `--metrics-listen`, the complete set (checked against a scrape and the
 registrations in `metrics.rs`; labelled counters appear after their first event):
 
-- `sched_tick_decisions_total{kind}`: ticks by decision kind.
+- `sched_tick_decisions_total{kind}`: ticks by decision kind (a replayed tick is not counted again).
+- `sched_persisted_state_errors_total{key}`: ticks and lease requests that could not read a
+  persisted document (`scheduler_state`, `lease_book`); alert on any increase.
 - `sched_resource_phase_age_seconds{resource,axis,phase}`: how long each resource has been
   in its current phase at the last tick, one series per axis: `axis="power"` with `phase`
   `off`, `powering_on`, `on` or `shutting_down`, and `axis="mode"` with `phase` `idle`,
@@ -192,8 +251,9 @@ Notes:
   no observer in this build, e.g. schedule and session sources, and nothing has ever pushed
   to it) and `demand_unpolled` (an observable kind configured without `params`: nothing polls
   it and nothing has pushed to it). `sched_source_has_observer{source}` is 0 for the last two.
-  All three still mean "not idle". A source that has reported once and then goes quiet is
-  always `demand_unknown`, also after a restart. The counter was called
+  `demand_unknown` means "not idle"; `demand_unsupported` and `demand_unpolled` count as no
+  demand (see above) and can appear together with `idle`. A source that has reported once
+  and then goes quiet is always `demand_unknown`, also after a restart. The counter was called
   `sched_decisions_total` in the first cut; dashboards on the old name need updating.
 - **Bounding `http_json` by age**: a request may carry `since: { param, ago }`; each poll
   appends `param=<now - ago>` (ISO 8601 UTC, from the scheduler's clock). The example config
@@ -209,31 +269,34 @@ Notes:
   number after `equals:` was compared as text.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
-- **Unknown is not idle**: if a class's demand source never reported or is stale, the tick is
-  `demand_unknown` (listed in `unknown_demand`), never `idle`.
+- **Unknown is not idle**: if a class's demand source should be reporting (an observer runs
+  for it, or it has reported before) and is silent or stale, the tick is `demand_unknown`
+  (listed in `unknown_demand`), never `idle`.
 
 ## Known blind spots
 
 Read these before trusting a "no demand" or "idle" line, or a phase.
 
-- **Power, kill and recovery steps are not executed.** The sequencer records them as taken:
-  - `PowerOn` moves the host to "powering on"; it reads as on once it is observed up (a
-    person has to power it on: manual power only).
-  - `PowerOff` moves the host to "shutting down". A host that stays up is not read back as
-    on (only a host seen down moves on, to off), so it stays "shutting down" and no model
-    is allowed on it until it is seen down. The scheduler takes power-off responsibility for
-    a host once a manual model lease asked for it to be up (or once it emitted a power-on
-    for it), and powers it off after `idle_grace` with no model loaded, no lease holding
-    it and every class on it showing known, zero demand.
-    With the example config this cannot happen yet, because `llm-sessions` (a `session`
-    source with no observer, which nothing can push to through the ingress) keeps the
-    interactive LLM's demand unknown. Watch `sched_resource_phase_age_seconds{phase="shutting_down"}`.
-    Pinned by the test `known_gap_an_unexecuted_power_off_leaves_a_running_gpu_shutting_down`.
+- **Kill and recovery steps are not executed** (nor power steps, which only appear under
+  `power.control: managed`). The sequencer records them as taken:
   - `KillInFlight` marks the class as stopped and stops waiting for it; the model is drained
     in the same tick. The in-flight work actually ends when KEDA scales the model's pods to
     zero, which the sequencer waits for before allowing the next model.
   - `RunRecovery` is emitted once, after the drained model reaches zero pods, and then
     forgotten: failed jobs (speakr) stay failed until re-queued by hand.
+  - Under `managed` without an actuator (not a supported setup before M4): `PowerOn` moves
+    the host to "powering on" until it is seen up; `PowerOff` moves it to "shutting down",
+    and a host that stays up is never read back as on, so nothing is allowed on it until it
+    is seen down. Under `manual` neither step is ever emitted.
+- **Removing a loaded model from the config stalls the GPU.** The removed model stays in
+  the allowed set until the planner releases it after `idle_grace`; it is then drained, and
+  the sequencer waits forever (`stale_observation`) on a pod count it no longer accepts, so
+  other work is not scheduled. Put the model back (it then drains normally), or, once its
+  pods are gone, discard `scheduler_state` (see Versions, and recovering the persisted
+  state). A later phase removes pod-count gating, since Kubernetes enforces GPU exclusivity.
+- **Demand that cannot be observed is treated as none.** A `schedule` or `session` source
+  (backup, interactive LLM) that never reported counts as no demand, so the scheduler will
+  not keep the LLM loaded for interactive use or NFS up for a backup it cannot see.
 - **Failed speakr transcriptions count as demand for 15 minutes.** `speakr-pending` lists
   FAILED recordings updated in the last 15m and counts those with `has_summary: false` as
   ready `speakr-transcription` work (speakr stores a failed summary's error in `summary`,
