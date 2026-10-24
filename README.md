@@ -42,9 +42,40 @@ external scaler. It runs as the `Scheduler` Restate virtual object (key `main`);
 snapshot, then planner, then sequencer, then publication and a log line with the decision,
 its reason, the config generation and each input's age (per source and capability).
 
+**GPU exclusivity is Kubernetes' job (deployment requirement).** Every GPU workload must
+request `nvidia.com/gpu: 1`, the device plugin must expose exactly one GPU on cuda-central
+(no time-slicing, no MIG), and the GPU node must be tainted so only those workloads land
+there. The scheduler decides from queues, leases and policy only, never from pod state, and
+publishes at most one model per exclusive resource. When it switches, the old model leaves
+the allowed set and the new one enters it in the same tick; the new pod stays pending in
+Kubernetes until the old one has released the GPU. Pod counts from the cluster watch are
+kept as observations (`sched_observation_age_seconds{capability="pods"}`) for information
+only. Host reachability still decides: no model is allowed on a host observed off, and
+allowing one (alone or in a switch) needs a fresh "up" reading of its host.
+
+How a model is chosen and kept:
+
+- A model is **serving from the tick it is allowed**. `min_dwell` is counted from that tick,
+  so it includes the time its pods take to load (and to wait for the previous model's pods).
+- **When** to switch is decided from the queues and leases: a busy model yields only after
+  `min_dwell`, only past `max_dwell` or when another queue is older than `age_threshold`,
+  and only if none of its busy classes is unpreemptible; an idle one after `idle_grace`; in-flight work (as its queue reports it)
+  is awaited, or, on a forced switch (manual model lease, reclaim), given `drain_timeout`
+  (or a class's `kill_timeout`) and then stopped. Only the pod-based gating is gone.
+- A **model removed from the config** while it is allowed leaves the allowed set at the
+  next tick after the reload (no dwell, grace or wind-down). Persisted state naming a model
+  the config no longer has does not block the resource.
+- **Gate classes**: a requirement on an exclusive resource without a model means only
+  "that host is up". A class with such a requirement must have no demand source and never
+  influences which model is chosen. The example's `paperless-gpt` requires cuda-central
+  and basestar-nfs up: paperless-gpt's deployment scales on it, so it runs only while both
+  hosts are up. Consumers are not gated for GPU contention: switching a model away
+  mid-job is safe for paperless-gpt (it reprocesses the document), speakr (the job is
+  marked failed, and re-queued later) and immich (its CPU replica takes over).
+
 What is carried out and what is not:
 
-- **Allowing, draining and pausing** take effect through the allowed set: KEDA converges
+- **Allowing and withdrawing a model** take effect through the allowed set: KEDA converges
   replicas on it. The set is published in process on a `tokio::sync::watch` channel
   (`Shared::subscribe_allowed`, a `watch::Receiver<Option<PublishedAllowed>>`, `None` until
   the first tick of the process). The KEDA scaler that serves it is a later phase; until it
@@ -62,6 +93,12 @@ What is carried out and what is not:
   happened), and each one is reported as not executed: listed in the tick's
   `not_executed`, marked `[NOT EXECUTED: ...]` in the reason, and logged as a warning. See
   Known blind spots.
+- **Pausing intake stops nobody.** A `pause_intake` step takes a demand class (say
+  `paperless-ocr`) out of the allowed set when its model starts winding down, but no
+  consumer scales on a demand class (consumers are gated on gate classes, by host
+  readiness, if at all). So it is listed in `not_executed` as well, with its own note: the
+  consumer keeps taking work, its queue's in-flight count may stay up until the queue is
+  empty, and an unforced wind-down can last that long.
 - **Demand that can never be observed counts as none.** A class whose demand source has no
   observer in this build (a `schedule` or `session` source, for example) or is an
   observable kind configured without `params`, and that has never reported, counts as
@@ -96,7 +133,7 @@ The object keeps its state in Restate, under these keys:
 
 | Key | Holds |
 | --- | --- |
-| `scheduler_state` | Versioned document: the sequencer state (per resource the power phase: off, powering on, on, shutting down; and mode phase: idle, loading, serving with its wind-down, draining; with when each began) and which configured sources have ever reported values. |
+| `scheduler_state` | Versioned document: the sequencer state (per resource the power phase: off, powering on, on, shutting down; and mode phase: idle, or serving with its wind-down; with when each began) and which configured sources have ever reported values. |
 | `lease_book` | Versioned document: the leases held and the counter lease ids are drawn from. |
 | `backstop_epoch` | The current backstop chain (a number). |
 
@@ -113,7 +150,10 @@ until the first tick (the backstop ticks within seconds).
 ### Versions, and recovering the persisted state
 
 Each document is stored as `{"version": N, "data": ...}`; this build reads and writes
-version 1 of both. A document that cannot be decoded, or that has another version (written
+version 1 of both. The queue-only change kept version 1 of `scheduler_state`: the
+`loading` and `draining` mode phases the build before it wrote are still read (`loading`
+as serving since the same instant, `draining` as idle), and nothing this build writes is
+new to that build. A document that cannot be decoded, or that has another version (written
 by a newer build, say, before a rollback), is not reset and does not fail the invocation
 (Restate would retry it forever and block every exclusive handler, the lease handlers
 included). Instead:
@@ -125,14 +165,21 @@ included). Instead:
   is, they (and `leases`) answer `503` naming this section.
 
 To recover, either deploy the build that wrote the document, or discard it. Discarding
-`scheduler_state` restarts the sequencer from observation (a model with pods is seen again
-and no other model is allowed while it has them); discarding `lease_book` drops every lease.
-The handler returns what was stored, so keep a copy:
+`scheduler_state` restarts the sequencer from observation: no model is allowed until the
+planner picks one again (any running pod of a model it does not pick is scaled down by
+KEDA once the scaler publishes), dwell and idle clocks start over, and the memory of
+which sources have ever reported is dropped too, so a source that went silent before reads
+as never reported (no demand, for a source without an observer) instead of
+`demand_unknown`. Discarding `lease_book` drops every lease. The handler returns what was
+stored, so keep a copy. `discard_state` only discards a document that cannot be read; one
+that reads fine is refused with `409` unless the request also says `"force": true`:
 
 ```sh
 curl -X POST localhost:8080/Scheduler/main/discard_state \
   -H 'content-type: application/json' -d '{"key": "scheduler_state"}'
-# A document that reads fine is refused (409) unless "force": true.
+# A readable document needs "force": true:
+curl -X POST localhost:8080/Scheduler/main/discard_state \
+  -H 'content-type: application/json' -d '{"key": "scheduler_state", "force": true}'
 ```
 
 With the Restate CLI (1.8): `restate state get Scheduler main` shows every key;
@@ -145,9 +192,9 @@ When a later change alters a document's shape in a way this build cannot read, b
 version (`persist::STATE_VERSION`, `persist::LEASES_VERSION`).
 
 The observation cache is not persisted: it lives in the process. After a restart the
-scheduler continues from the persisted state (a model that was draining is still draining,
-a serving model keeps its dwell clock) and holds every safety-critical step (allowing a
-model, powering off) until the observers have reported fresh readings again. Which sources
+scheduler continues from the persisted state (a serving model stays allowed and keeps its
+dwell clock, a wind-down goes on) and holds every safety-critical step (allowing a model,
+powering off) until the observers have reported fresh reachability again. Which sources
 had reported before is seeded from `scheduler_state`, so a source that went silent before
 the restart still reads as `demand_unknown` (busy), not as never reported (no demand).
 
@@ -170,14 +217,16 @@ All are called as `POST {ingress}/Scheduler/main/{handler}`.
 `observe` is registered as private: the ingress answers
 `400 {"code":400,"message":"the invoked service is not public","source":"ingress"}`. The
 in-process observers do not use it (they write to the cache directly), so no pusher outside
-Restate can forge a reading such as `pods: 0` through the ingress any more.
+Restate can forge a reading (a host "up", or queue demand) through the ingress any more.
 
 ### Manual model leases
 
 A manual model lease hard-pins a model on its resource until it is released: the planner
-targets that model, batch work on the resource is cut short (intake paused at once,
-in-flight work given `drain_timeout`, or a class's own `kill_timeout`, then stopped), and
-the model stays loaded however much other work waits. Rules:
+targets that model, batch work on the resource is cut short (its classes leave the
+allowed set at once, in-flight work is given `drain_timeout`, or a class's own
+`kill_timeout`, then stopped, and the leased model is allowed in that same tick), and the
+model stays allowed however much other work waits. While it is pinned, ticks list the kind
+`pinned`, not `idle`. Rules:
 
 - The model must exist in the active config; the lease is on the model's resource.
 - At most one manual model lease per exclusive resource. Asking again for the leased model
@@ -220,11 +269,14 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
 - `sched_resource_phase_age_seconds{resource,axis,phase}`: how long each resource has been
   in its current phase at the last tick, one series per axis: `axis="power"` with `phase`
   `off`, `powering_on`, `on` or `shutting_down`, and `axis="mode"` with `phase` `idle`,
-  `loading`, `serving`, `winding_down` (a serving model whose intake is paused) or
-  `draining`. When the phase changes, the old phase's series is removed. Ages come from the
-  persisted state, so they survive restarts; `off` and `idle` have no recorded start and are
-  measured from when this process first saw them. Alert on stuck transitions, for example
-  `sched_resource_phase_age_seconds{phase=~"loading|draining|winding_down|powering_on|shutting_down"} > 900`.
+  `serving` (measured from the tick the model was allowed) or `winding_down` (a serving
+  model whose intake is paused). `loading` and `draining` no longer exist (no phase waits on
+  pods); update alerts that name them. When the phase changes, the old phase's series is
+  removed. Ages come from the persisted state, so they survive restarts; `off` and `idle`
+  have no recorded start and are measured from when this process first saw them. Alert on
+  stuck transitions, for example
+  `sched_resource_phase_age_seconds{phase=~"winding_down|powering_on|shutting_down"} > 900`.
+  A pod that stays pending is not seen here: that is Kubernetes' to report.
 - `sched_observation_age_seconds{source,capability}`: infinite if that capability never reported.
 - `sched_source_has_observer{source}`: 1 if an observer runs for the source, else 0.
 - `sched_source_errors_total{source}`: failed reads reported by a source.
@@ -245,7 +297,8 @@ Notes:
 - **Decision kinds**: `sched_tick_decisions_total{kind}` counts ticks (once per distinct
   kind in a tick), not actions; ticks run on every change and on the backstop. Kinds
   include the step kinds (`allow_model`, `drain_model`, `pause_intake`, `power_on`,
-  `power_off`, `kill_in_flight`, `run_recovery`, `wait`), `idle`, `error`, and
+  `power_off`, `kill_in_flight`, `run_recovery`, `wait`), `idle`, `error`, `pinned` (a
+  manual model lease pins a model; such a tick is never `idle`, even with no step), and
   `demand_unknown` (something should be reporting the demand, an observer runs or the source
   has reported before, and it is silent or stale), `demand_unsupported` (the source kind has
   no observer in this build, e.g. schedule and session sources, and nothing has ever pushed
@@ -279,21 +332,26 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
 
 - **Kill and recovery steps are not executed** (nor power steps, which only appear under
   `power.control: managed`). The sequencer records them as taken:
-  - `KillInFlight` marks the class as stopped and stops waiting for it; the model is drained
-    in the same tick. The in-flight work actually ends when KEDA scales the model's pods to
-    zero, which the sequencer waits for before allowing the next model.
-  - `RunRecovery` is emitted once, after the drained model reaches zero pods, and then
-    forgotten: failed jobs (speakr) stay failed until re-queued by hand.
+  - `KillInFlight` marks the class as stopped and stops waiting for it; the model is
+    withdrawn (and the next one allowed) in the same tick. The in-flight work actually ends
+    when KEDA scales the old model's pods down; the next model's pod starts once they are
+    gone (Kubernetes).
+  - `RunRecovery` is emitted once, in the tick the model is withdrawn, and then forgotten:
+    failed jobs (speakr) stay failed until re-queued by hand.
+  - `PauseIntake` stops no consumer (see above).
   - Under `managed` without an actuator (not a supported setup before M4): `PowerOn` moves
     the host to "powering on" until it is seen up; `PowerOff` moves it to "shutting down",
     and a host that stays up is never read back as on, so nothing is allowed on it until it
     is seen down. Under `manual` neither step is ever emitted.
-- **Removing a loaded model from the config stalls the GPU.** The removed model stays in
-  the allowed set until the planner releases it after `idle_grace`; it is then drained, and
-  the sequencer waits forever (`stale_observation`) on a pod count it no longer accepts, so
-  other work is not scheduled. Put the model back (it then drains normally), or, once its
-  pods are gone, discard `scheduler_state` (see Versions, and recovering the persisted
-  state). A later phase removes pod-count gating, since Kubernetes enforces GPU exclusivity.
+- **Removing a model from the config cuts its work off at once.** A model removed while
+  it is allowed leaves the allowed set at the next tick after the reload, with no dwell,
+  grace or wind-down (its classes are gone with it, so there is nothing left to wait for),
+  and the next model is allowed in the same tick. KEDA then scales the removed model's
+  pods down mid-job; remove a model while it is idle if that matters.
+- **The scheduler does not see GPU contention.** It relies on Kubernetes for exclusivity
+  (see the top of this section). If a GPU workload is deployed without
+  `nvidia.com/gpu: 1`, or the node exposes more than one GPU, two models can run at once
+  and nothing here notices.
 - **Demand that cannot be observed is treated as none.** A `schedule` or `session` source
   (backup, interactive LLM) that never reported counts as no demand, so the scheduler will
   not keep the LLM loaded for interactive use or NFS up for a backup it cannot see.

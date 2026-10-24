@@ -12,7 +12,7 @@ Goals:
 
 - **One decision authority.** Only the scheduler decides which model is loaded and which shared resources are held. Everything else either reports state or carries out a decision.
 - **Switch-cost-aware ordering.** Pick the next model by first-in-first-out across ready work, then drain that queue before switching, within configurable bounds.
-- **Safe transitions.** Never run two models at once, never power down a resource in use, never act on stale safety-critical data.
+- **Safe transitions.** Never publish two models of one GPU at once (Kubernetes enforces that two never run: see invariant 2), never power down a resource in use, never act on stale safety-critical data.
 - **Extensible by configuration.** Adding a service that speaks a supported protocol requires a config change, not a code change.
 - **Event-driven where reasonable.** React to events for latency and use slow periodic resyncs for correctness.
 - **Durable.** Decisions, leases, and in-progress transitions survive restarts of the scheduler.
@@ -59,6 +59,7 @@ The cluster has two nodes plus an NFS host, and the workload classes below compe
 | immich ML | immich machine-learning (GPU replica only; a CPU replica on blade-runner always serves) | GPU: immich ML, NFS | immich job queues (Valkey); API preferred |
 | backup | Postgres dump cronjob | NFS | Weekly schedule |
 | interactive LLM | Open WebUI, editor code assist | GPU: LLM | Session requests (not yet built) |
+| paperless-gpt (gate) | paperless-gpt itself | cuda-central up, NFS up (no model) | None: a gate class on host readiness |
 
 OCR must finish before LLM tagging for the same document, and transcription before summarization for the same recording. The backup does not interact with the GPU.
 
@@ -75,9 +76,10 @@ The scheduler reasons only about generic resources, models, and workload classes
 - **Workload class.** A unit of demand: its resource requirements, priority, preemptibility, whether it may change power state, and where its demand is observed.
 - **Lease.** A durable record that a holder is using a shared resource or has an interactive claim on a model. Interactive leases expire unless renewed, and while held they pin their model: batch work cannot evict it. The client renews the lease while the user is active, so a session never drops mid-use. An LLM loaded only for batch work has no such pin and can be evicted when higher-priority work arrives. A manual power-on of a host is a lease held by the user until they release it. Releasing it powers the host down only after every other hold ends: other leases on basestar, such as a running backup, and queued or in-flight GPU work on cuda-central. A manual lease on the LLM is the interactive counterpart of a reclaim: it cuts batch work short (intake stops; in-flight jobs finish or are stopped after a timeout) and keeps the LLM loaded until released.
 - **Reclaim.** The forceful alternative to releasing, for cuda-central only: the user takes the host back despite pending work. Intake stops at once, in-flight jobs finish or are stopped after a configured timeout, pending jobs stay queued, and the host is not woken or scheduled until the user returns it. A reclaim ends with a full shutdown of the host, since it is rebooted into another operating system; while reclaimed, the node's absence from the cluster is expected rather than an error.
+- **Gate class.** A workload class whose requirements are hosts only: on an exclusive resource it names no model, which means "that host is up". It has no demand source and never influences which model is chosen. It gates a consumer on host readiness, for example paperless-gpt, which may run only while cuda-central is up and paperless-ngx (its documents on basestar-nfs) is reachable. Consumers are not gated for GPU contention at all: that is Kubernetes' job (invariant 2).
 - **Precedence vs. priority.** Precedence (OCR before tagging for one document) is a property of jobs and is handled by readiness: a job is not counted until its upstream step is done. Priority decides which ready model to load next. The two are never mixed.
 - **Exhaustive service, bounded.** Once a model is loaded, it keeps serving while it has ready work, subject to a maximum dwell time or an age threshold on other queues to prevent starvation.
-- **Hysteresis.** A minimum dwell after loading and an idle grace period before unloading or releasing, to prevent flapping.
+- **Hysteresis.** A minimum dwell after a model is allowed (counted from the tick it is allowed, so it includes load time) and an idle grace period before unloading or releasing, to prevent flapping.
 - **Preemptibility.** Per workload class: whether intake can be paused, whether in-flight work can be killed and safely retried, or neither. A class may also declare a recovery action to run after a kill, such as re-queueing failed jobs through the service's API. The scheduler only switches early for classes that declare it safe.
 
 ## Architecture overview
@@ -130,10 +132,10 @@ Observers push into a cache on their own schedules, and a short decision step, t
 **Observation**
 
 - Observers run outside the decision step and push results into the scheduler. A slow source never holds up decisions or lease requests.
-- Kubernetes state (pods per model, node readiness) comes from watch streams, not polling.
+- Kubernetes state (node readiness, and pods per model for information only) comes from watch streams, not polling.
 - Other sources use webhooks where the service offers them, treated as notify-then-fetch: a webhook marks the source dirty, and the observer re-reads the source's current state.
 - Every source also has a slow periodic resync, so a missed event cannot leave the scheduler stuck.
-- Each observation carries its age. Safety-critical checks, such as "previous model has zero pods", require fresh data; scheduling inputs such as queue depth tolerate some staleness.
+- Each observation carries its age. Safety-critical checks, such as "the host is up" before a model is allowed or a host powered off, require fresh data; scheduling inputs such as queue depth tolerate some staleness. No decision reads pod state.
 
 **Decision**
 
@@ -143,11 +145,11 @@ Observers push into a cache on their own schedules, and a short decision step, t
 
 **Example: switching from OCR to transcription**
 
-1. The planner's intent changes to whisperX. The sequencer sees mineru serving with no in-flight work, sets the allowed set to empty, and marks mineru as draining. KEDA scales mineru to zero.
-2. A pod event shows mineru at zero pods. The sequencer allows whisperX and marks it as loading. KEDA scales it up.
-3. A readiness event shows whisperX ready. The sequencer marks it as serving.
+1. The planner's intent changes to whisperX (mineru has served its minimum dwell, counted from the tick it was allowed, and is idle past its grace, or another queue is starved). The sequencer withdraws mineru's classes from the allowed set (intake paused, as far as anything is gated on them) and waits for the in-flight OCR work its queue reports to finish; a forced switch gives that work its timeout instead.
+2. With no work in flight, in one tick and on a fresh "up" reading of cuda-central, the sequencer replaces mineru by whisperX in the allowed set: mineru leaves and whisperX enters together, and whisperX is serving from that tick. KEDA scales mineru to zero and whisperX to one.
+3. Kubernetes keeps the whisperX pod pending until mineru's pod has terminated and released the GPU (both request `nvidia.com/gpu: 1`, the node exposes one GPU, and the GPU node is tainted so nothing else lands there). The scheduler does not watch for this: pod counts are information only.
 
-No component performs the switch; it emerges from one decision source and two converging actuators. KEDA's polling and cooldown settings for these workloads must be short, with hysteresis owned by the sequencer instead.
+No component performs the switch; it emerges from one decision source, two converging actuators and Kubernetes' resource accounting. KEDA's polling and cooldown settings for these workloads must be short, with hysteresis owned by the sequencer instead.
 
 ## Configuration and extensibility
 
@@ -172,17 +174,17 @@ Kinds live in code and instances live in configuration, so adding a service that
 - Configuration starts as a watched ConfigMap; per-service custom resources are a later option if registering services through their own manifests becomes valuable.
 - The whole config is validated before it is applied: every reference resolves, and policy parameters are consistent. Invalid config is rejected and the last good config stays active.
 - Each tick is pinned to one config generation.
-- A workload class removed while its model is loaded is drained normally rather than stopped abruptly.
+- A workload class removed while its model is loaded is drained normally rather than stopped abruptly. A model removed while it is allowed leaves the allowed set at the next tick (its pods then scale down; nothing waits for them).
 
 ## Safety invariants
 
 These hold regardless of policy or configuration, and every milestone's tests should check them.
 
 1. At most one model is allowed on cuda-central at any time.
-2. A new model is allowed only after the previous model is observed at zero pods.
+2. GPU exclusivity is enforced by Kubernetes, not by the scheduler: every GPU workload requests `nvidia.com/gpu: 1`, the device plugin exposes exactly one GPU on cuda-central (no time-slicing or MIG), and the GPU node is tainted so that only those workloads run there. This is a deployment requirement. The scheduler decides from queues, leases and policy only, never from pod state: when it switches, the old model leaves the allowed set and the new one enters it in the same decision, and the new pod stays pending until the old one has released the GPU. A model is allowed only if it is configured, and only on a host that is up (never on a host observed off); a model removed from the configuration leaves the allowed set at the next tick.
 3. A host is never powered down while any lease on it is held, including a manual one, nor before its idle grace period ends. Releasing a manual lease never powers a host down by itself; the host powers down only once no hold remains. The one exception is a reclaim of cuda-central, which overrides pending GPU work but still stops in-flight jobs only through their declared preemptibility or after the reclaim timeout.
 4. In v1, power changes come only from manual requests or from workload classes that are explicitly allowed to change power.
-5. Safety-critical steps require observations newer than a configured bound; otherwise the sequencer holds.
+5. Safety-critical steps (allowing a model, powering a host off) require a reachability observation of the host newer than a configured bound (`safety_max_age`); otherwise the sequencer holds, and a switch waits as a whole (the old model stays) rather than leaving the GPU empty. Pod observations are not safety-critical: no decision reads them.
 6. The planner and sequencer are deterministic and have no side effects.
 7. Only the scheduler makes decisions; actuators carry them out and never decide.
 8. Work is switched away from early only for workload classes that declare it safe, or when the user forces it with a reclaim or a manual LLM lease; forced switches still give in-flight jobs a timeout to finish. An interactive lease pins its model against batch eviction.
@@ -195,6 +197,6 @@ These hold regardless of policy or configuration, and every milestone's tests sh
 - [x] immich ML: should the scheduler pause immich's ML-dependent queues whenever immich ML is not the loaded model, to avoid failed jobs? Answered: no. A CPU replica on blade-runner always serves immich ML, and the scheduler only scales the GPU-hosted replica on cuda-central, which Istio load-balances by least open requests. Because work proceeds without it, the GPU replica is an accelerator and should rank below workloads that would otherwise wait.
 - [x] paperless-ngx: does the deployed version support workflow webhooks on tag changes? Likely yes on 3.2.1: workflows offer a Document Updated trigger with tag filters and a Webhook action. A has-tag filter fires when a document enters a state but not when it leaves, so pair it with notify-then-fetch and the periodic resync. Decision: proceed on the assumption that paperless-gpt's API tag edits fire the trigger.
 - [x] speakr: does its API expose enough per-job status and timing, or is a narrow read-only database view needed? Answered: the API is enough. Pending recordings with their creation times give depth and oldest age, the PROCESSING and SUMMARIZING statuses separate the two stages, and webhooks for created, transcription and summary events make it event-driven. Risk (verified against speakr's current source): its worker is a thread inside the app that calls the transcription endpoint directly. A connection error is re-queued immediately, with no backoff, up to JOB\_MAX\_RETRIES (default 3); after that the recording is marked FAILED and kept, with its audio, for reprocessing. Nothing is deleted. Scaling whisperX to zero while speakr has queued work therefore turns those jobs into failures within seconds, which then need re-queueing. Decision: no gateway. Transcriptions that failed with a connection error count as pending demand for whisperX, so they pull the model in like any queued job. Re-queueing them through speakr's API once whisperX is serving comes later, in milestone M7. **Correction found during M2 (Oct 24, 2026):** the failure text is stored in the recording's `transcription` field as `ERROR_JSON:{...}`, not in `error_message`, and the v1 list API exposes only `has_transcription`, so these failures cannot be counted from the list. M2 leaves them unobserved; M7 must add detection (see milestones.md, Plan changes and follow-ups). **Superseded in M3 (Oct 24, 2026):** they are counted from the list after all: `status=failed` recordings with `has_summary: false` (a failed summary's error is stored in `summary`, every other failure's in `transcription`) updated within a 15m `updated_since` window count as whisperX demand, and automatic re-queueing, capped at 2 per recording, moved from M7 into M3 (see milestones.md, *Decided during M3*). Queued work is counted from `/api/v1/stats` (`queue.jobs_queued`, `recordings.pending`), because the list API has no filter for the `QUEUED` status.
-- [x] Model unload signal: is "zero pods" a sufficient signal that GPU memory is free, or is a node-level check also needed? Answered: zero pods is enough.
+- [x] Model unload signal: is "zero pods" a sufficient signal that GPU memory is free, or is a node-level check also needed? Answered: zero pods is enough. **Superseded in M3 (Oct 24, 2026):** the scheduler no longer waits for any unload signal. Kubernetes enforces GPU exclusivity (invariant 2): the next model's pod cannot start until the previous one has released the GPU.
 - [x] Power-off detection: what signal confirms a host is actually off, given that node status lags? Answered in part: power-off runs as a forced command on a dedicated SSH shutdown key, and the session connecting then closing confirms the host accepted the shutdown. That moves the sequencer to shutting down, not off. Off is confirmed when the host's Linux services (SSH, kubelet) stay unreachable for a few consecutive checks, with a timeout that raises an alert. Ping alone is not enough, since cuda-central may be running Windows after a reclaim.
 - [x] Configuration delivery: stay on a ConfigMap, or move to per-service custom resources later? Decision: ConfigMap, with no custom resources for now. flowmanager validates each new ConfigMap in full before applying it and keeps the last good config on failure.
