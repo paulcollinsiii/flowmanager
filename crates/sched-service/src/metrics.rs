@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use prometheus::{
-    Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use sched_model::Millis;
 
@@ -24,6 +24,8 @@ pub struct Metrics {
     last_tick_timestamp: Gauge,
     rejected: IntCounterVec,
     age_labels: Mutex<HashSet<(String, String)>>,
+    has_observer: IntGaugeVec,
+    observer_labels: Mutex<HashSet<String>>,
 }
 
 impl Metrics {
@@ -86,6 +88,15 @@ impl Metrics {
             &["reason"],
         )
         .unwrap();
+        let has_observer = IntGaugeVec::new(
+            Opts::new(
+                "sched_source_has_observer",
+                "1 if this build runs an observer for the source, 0 if it can only be fed by pushes (its demand then reads as not observable yet)",
+            ),
+            &["source"],
+        )
+        .unwrap();
+        registry.register(Box::new(has_observer.clone())).unwrap();
         registry.register(Box::new(rejected.clone())).unwrap();
         registry.register(Box::new(decisions.clone())).unwrap();
         registry
@@ -115,6 +126,8 @@ impl Metrics {
             last_tick_timestamp,
             rejected,
             age_labels: Mutex::new(HashSet::new()),
+            has_observer,
+            observer_labels: Mutex::new(HashSet::new()),
         }
     }
 
@@ -140,6 +153,21 @@ impl Metrics {
             let _ = self.observation_age.remove_label_values(&[source, cap]);
         }
         *labels = now_set;
+        let mut observers = self
+            .observer_labels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut sources = HashSet::new();
+        for a in ages {
+            self.has_observer
+                .with_label_values(&[a.source.as_str()])
+                .set(i64::from(a.observer));
+            sources.insert(a.source.to_string());
+        }
+        for gone in observers.difference(&sources) {
+            let _ = self.has_observer.remove_label_values(&[gone]);
+        }
+        *observers = sources;
     }
 
     /// Counts a dropped report (`unknown_source`) or value (`unknown_subject`).
@@ -204,12 +232,14 @@ mod tests {
             InputAge {
                 source: "s1".into(),
                 capability: Some(sched_model::Capability::Pods),
+                observer: true,
                 age: Some(Millis(1500)),
                 last_error: None,
             },
             InputAge {
                 source: "s2".into(),
                 capability: None,
+                observer: true,
                 age: None,
                 last_error: None,
             },
@@ -230,6 +260,7 @@ mod tests {
         m.set_input_ages(&[InputAge {
             source: "s1".into(),
             capability: Some(sched_model::Capability::Pods),
+            observer: true,
             age: Some(Millis(2000)),
             last_error: None,
         }]);
@@ -248,6 +279,7 @@ mod tests {
         let ages = vec![InputAge {
             source: "s1".into(),
             capability: Some(sched_model::Capability::Pods),
+            observer: true,
             age: Some(Millis(1000)),
             last_error: None,
         }];

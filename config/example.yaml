@@ -159,10 +159,18 @@ sources:
 
   # Jobs fail rather than queue while whisperX is unloaded, so recordings that failed with
   # a connection error count as pending demand, together with the pending ones. Recordings
-  # being processed are in-flight work. (Field names follow speakr's v1 API; check them
-  # against the deployed version: they are unverified.) `max_items` equals the page size
-  # in the URL: a response that fills a page may be truncated, so the poll then fails
-  # (shown as a source error) instead of silently under-counting.
+  # being processed are in-flight work.
+  # Field names come from speakr's v1 API reference (GET /api/v1/recordings: query `page`,
+  # `per_page` (max 100), `status` = all|pending|processing|completed|failed in lowercase;
+  # response `recordings[]` with uppercase `status` values, plus `pagination.total`).
+  # Pending and processing only need the total, so they ask for one item per page and read
+  # `/pagination/total`: no page cap, no pagination. The failed list is read in full (up to
+  # `max_items`, the page size: a truncated page fails the poll loudly instead of
+  # under-counting). `contains` is case-insensitive.
+  # UNVERIFIED: that list items carry `error_message` (the detail object does). If they do
+  # not, the poll fails with "field missing from every item" rather than counting zero.
+  # Cost: 3 requests per poll per minute, against speakr's read limit of 120/min per token.
+  # Auth: `Authorization: Bearer <token>`; a token with `read` scope is enough.
   - id: speakr-pending
     kind: http_json
     observe: [demand]
@@ -171,19 +179,22 @@ sources:
       timeout: 10s
       auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
       requests:
-        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=100
-          length: /recordings
-          max_items: 100
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=1
+          count: /pagination/total
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100
           length: /recordings
-          max_items: 100
           where: { field: /error_message, contains: connection }
-        - url: http://speakr.media.svc:8899/api/v1/recordings?status=processing&per_page=100
-          length: /recordings
           max_items: 100
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=processing&per_page=1
+          count: /pagination/total
           counts_as: in_flight
       webhook: { path: /hooks/speakr }
 
+  # Summarization: the status filter has no `summarizing` value, so this lists the
+  # `processing` recordings and keeps those whose `status` is SUMMARIZING.
+  # UNVERIFIED: that the `processing` filter returns SUMMARIZING recordings. If it does not
+  # the count is simply zero. (The in-flight count above then also includes recordings that
+  # are summarizing, which is the conservative direction.)
   - id: speakr-summaries
     kind: http_json
     observe: [demand]
@@ -192,8 +203,9 @@ sources:
       timeout: 10s
       auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
       requests:
-        - url: http://speakr.media.svc:8899/api/v1/recordings?status=summarizing&per_page=100
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=processing&per_page=100
           length: /recordings
+          where: { field: /status, equals: SUMMARIZING }
           max_items: 100
       webhook: { path: /hooks/speakr }
 

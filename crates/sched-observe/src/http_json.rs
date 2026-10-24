@@ -26,6 +26,9 @@ pub enum ExtractError {
     NotAnArray(String),
     /// The array is as long as the page can be, so items may be missing.
     AtLimit(u64),
+    /// The `where` field is in none of the (non-empty) array's items, so the filter would
+    /// silently match nothing.
+    FilterFieldMissing(String),
 }
 
 impl std::fmt::Display for ExtractError {
@@ -36,6 +39,10 @@ impl std::fmt::Display for ExtractError {
                 write!(f, "value at {p:?} is not a non-negative whole number")
             }
             ExtractError::NotAnArray(p) => write!(f, "value at {p:?} is not an array"),
+            ExtractError::FilterFieldMissing(field) => write!(
+                f,
+                "the where field {field:?} is missing from every item, so the filter would count nothing; check the field name against the API"
+            ),
             ExtractError::AtLimit(n) => write!(
                 f,
                 "the response holds {n} items, a full page; the count may be too low"
@@ -79,6 +86,12 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
         .ok_or_else(|| ExtractError::NotAnArray(ptr.to_string()))?;
     if req.max_items.is_some_and(|max| items.len() as u64 >= max) {
         return Err(ExtractError::AtLimit(items.len() as u64));
+    }
+    if let Some(f) = &req.filter
+        && !items.is_empty()
+        && items.iter().all(|e| e.pointer(&f.field).is_none())
+    {
+        return Err(ExtractError::FilterFieldMissing(f.field.clone()));
     }
     let n = match &req.filter {
         Some(f) => items.iter().filter(|e| matches(f, e)).count(),
@@ -378,9 +391,9 @@ mod tests {
         (spec, params, classes)
     }
 
-    const SPEAKR_PENDING: &str = "/api/v1/recordings?status=pending&per_page=100";
+    const SPEAKR_PENDING: &str = "/api/v1/recordings?status=pending&per_page=1";
     const SPEAKR_FAILED: &str = "/api/v1/recordings?status=failed&per_page=100";
-    const SPEAKR_PROCESSING: &str = "/api/v1/recordings?status=processing&per_page=100";
+    const SPEAKR_PROCESSING: &str = "/api/v1/recordings?status=processing&per_page=1";
 
     fn env(name: &str) -> Option<String> {
         (name == "SPEAKR_API_TOKEN").then(|| "s3cret\n".to_string())
@@ -407,7 +420,7 @@ mod tests {
         let server = TestServer::start().await;
         server.set(
             SPEAKR_PENDING,
-            Reply::json(r#"{"recordings": [{"id": 1}, {"id": 2}]}"#),
+            Reply::json(r#"{"recordings": [{"id": 1}], "pagination": {"total": 2}}"#),
         );
         server.set(
             SPEAKR_FAILED,
@@ -420,7 +433,7 @@ mod tests {
         );
         server.set(
             SPEAKR_PROCESSING,
-            Reply::json(r#"{"recordings": [{"id": 6}]}"#),
+            Reply::json(r#"{"recordings": [{"id": 6}], "pagination": {"total": 1}}"#),
         );
         let (spec, params, classes) = example_source("speakr-pending", &server);
         assert_eq!(classes.len(), 1);
@@ -467,9 +480,10 @@ mod tests {
     async fn every_kind_of_adapter_error_is_an_explicit_failure() {
         let server = TestServer::start().await;
         let (spec, mut params, _) = example_source("speakr-pending", &server);
-        server.set(SPEAKR_PENDING, Reply::json(r#"{"recordings": []}"#));
-        server.set(SPEAKR_FAILED, Reply::json(r#"{"recordings": []}"#));
-        server.set(SPEAKR_PROCESSING, Reply::json(r#"{"recordings": []}"#));
+        let empty = r#"{"recordings": [], "pagination": {"total": 0}}"#;
+        server.set(SPEAKR_PENDING, Reply::json(empty));
+        server.set(SPEAKR_FAILED, Reply::json(empty));
+        server.set(SPEAKR_PROCESSING, Reply::json(empty));
 
         // A server error on one request fails the whole poll, not just that request.
         server.set(SPEAKR_FAILED, Reply::status(503));
@@ -626,12 +640,18 @@ mod tests {
         r.max_items = Some(4);
         assert_eq!(extract(&d, &r), Ok(3));
 
-        // End to end with the example speakr source: 100 pending in one response.
+        // End to end with the example speakr source: a full page of failed recordings.
         let server = TestServer::start().await;
         let (spec, params, classes) = example_source("speakr-pending", &server);
-        let full: Vec<String> = (0..100).map(|i| format!("{{\"id\": {i}}}")).collect();
+        let full: Vec<String> = (0..100)
+            .map(|i| format!("{{\"id\": {i}, \"error_message\": null}}"))
+            .collect();
         server.set(
             SPEAKR_PENDING,
+            Reply::json(r#"{"recordings": [], "pagination": {"total": 0}}"#),
+        );
+        server.set(
+            SPEAKR_FAILED,
             Reply::json(&format!("{{\"recordings\": [{}]}}", full.join(","))),
         );
         match poll(
@@ -670,5 +690,82 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_filter_field_missing_from_every_item_fails_instead_of_counting_zero() {
+        let filter = ElementFilter {
+            field: "/error_message".into(),
+            contains: Some("connection".into()),
+            equals: None,
+        };
+        let r = req(None, Some("/recordings"), Some(filter));
+        // The list items do not carry the field at all: do not report "0 failed".
+        let d = doc(r#"{"recordings": [{"id": 1}, {"id": 2}]}"#);
+        assert_eq!(
+            extract(&d, &r),
+            Err(ExtractError::FilterFieldMissing("/error_message".into()))
+        );
+        // A null value means the field exists and the item did not fail that way.
+        let d = doc(r#"{"recordings": [{"id": 1, "error_message": null}, {"id": 2}]}"#);
+        assert_eq!(extract(&d, &r), Ok(0));
+        // An empty page is fine.
+        assert_eq!(extract(&doc(r#"{"recordings": []}"#), &r), Ok(0));
+        // `contains` ignores case.
+        let d = doc(r#"{"recordings": [{"error_message": "CONNECTION Refused"}]}"#);
+        assert_eq!(extract(&d, &r), Ok(1));
+    }
+
+    #[tokio::test]
+    async fn the_example_speakr_source_fails_explicitly_when_list_items_lack_error_message() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("speakr-pending", &server);
+        server.set(
+            SPEAKR_PENDING,
+            Reply::json(r#"{"recordings": [], "pagination": {"total": 3}}"#),
+        );
+        server.set(
+            SPEAKR_FAILED,
+            Reply::json(r#"{"recordings": [{"id": 9, "status": "FAILED"}]}"#),
+        );
+        server.set(
+            SPEAKR_PROCESSING,
+            Reply::json(r#"{"recordings": [], "pagination": {"total": 0}}"#),
+        );
+        match poll(
+            &build_client(&params).unwrap(),
+            &spec,
+            &params,
+            &classes,
+            &env,
+        )
+        .await
+        {
+            Report::Failed { error, .. } => {
+                assert!(error.contains("missing from every item"), "{error}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_example_summaries_source_counts_summarizing_recordings() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("speakr-summaries", &server);
+        server.set(
+            "/api/v1/recordings?status=processing&per_page=100",
+            Reply::json(
+                r#"{"recordings": [{"status": "PROCESSING"}, {"status": "SUMMARIZING"}, {"status": "SUMMARIZING"}]}"#,
+            ),
+        );
+        let report = poll(
+            &build_client(&params).unwrap(),
+            &spec,
+            &params,
+            &classes,
+            &env,
+        )
+        .await;
+        assert_eq!(demand(&report), (2, 0));
     }
 }

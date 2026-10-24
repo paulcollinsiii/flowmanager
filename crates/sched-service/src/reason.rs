@@ -29,13 +29,23 @@ pub const KIND_ERROR: &str = "error";
 /// tick with no step but unknown demand is this, never [`KIND_IDLE`]: unknown is not zero.
 pub const KIND_DEMAND_UNKNOWN: &str = "demand_unknown";
 
+/// Metric label for demand that is unknown only because this build has no observer for the
+/// source kind. Expected for now; kept apart from [`KIND_DEMAND_UNKNOWN`].
+pub const KIND_DEMAND_UNSUPPORTED: &str = "demand_unsupported";
+
 /// The distinct kinds in a decision, sorted; [`KIND_IDLE`] when there are no steps and all
-/// demand is known, [`KIND_DEMAND_UNKNOWN`] when any class's demand is unknown.
-pub fn kinds(steps: &[Step], unknown_demand: bool) -> Vec<&'static str> {
+/// demand is known, [`KIND_DEMAND_UNKNOWN`] when the demand of a class that has an observer
+/// is unknown, [`KIND_DEMAND_UNSUPPORTED`] when the only unknown demand is of a class whose
+/// source has no observer in this build.
+pub fn kinds(steps: &[Step], unknown_demand: bool, unsupported_demand: bool) -> Vec<&'static str> {
     let mut set: BTreeSet<&'static str> = steps.iter().map(step_kind).collect();
     if unknown_demand {
         set.insert(KIND_DEMAND_UNKNOWN);
-    } else if set.is_empty() {
+    }
+    if unsupported_demand {
+        set.insert(KIND_DEMAND_UNSUPPORTED);
+    }
+    if !unknown_demand && !unsupported_demand && set.is_empty() {
         set.insert(KIND_IDLE);
     }
     set.into_iter().collect()
@@ -105,7 +115,12 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
 }
 
 /// The whole reason of a decision: what the planner wants, then why each step.
-pub fn reason(intent: &Intent, steps: &[Step], unknown_demand: &[sched_model::ClassId]) -> String {
+pub fn reason(
+    intent: &Intent,
+    steps: &[Step],
+    unknown_demand: &[sched_model::ClassId],
+    unsupported_demand: &[sched_model::ClassId],
+) -> String {
     let wants: Vec<String> = intent
         .models
         .iter()
@@ -137,6 +152,13 @@ pub fn reason(intent: &Intent, steps: &[Step], unknown_demand: &[sched_model::Cl
             ids.join(", ")
         ));
     }
+    if !unsupported_demand.is_empty() {
+        let ids: Vec<_> = unsupported_demand.iter().map(|c| c.to_string()).collect();
+        out.push_str(&format!(
+            "; demand not observable yet for [{}] (no observer for the source kind): not idle either",
+            ids.join(", ")
+        ));
+    }
     out
 }
 
@@ -153,9 +175,10 @@ pub fn format_inputs(ages: &[InputAge]) -> String {
                 Some(Millis(ms)) => format!("{ms}ms"),
                 None => "none".to_string(),
             };
+            let note = if a.observer { "" } else { " (no observer)" };
             match &a.last_error {
-                Some(e) => format!("{name}={age} (error: {e})"),
-                None => format!("{name}={age}"),
+                Some(e) => format!("{name}={age}{note} (error: {e})"),
+                None => format!("{name}={age}{note}"),
             }
         })
         .collect::<Vec<_>>()
@@ -175,8 +198,13 @@ mod tests {
 
     #[test]
     fn kinds_are_distinct_sorted_and_idle_when_empty() {
-        assert_eq!(kinds(&[], false), vec![KIND_IDLE]);
-        assert_eq!(kinds(&[], true), vec![KIND_DEMAND_UNKNOWN]);
+        assert_eq!(kinds(&[], false, false), vec![KIND_IDLE]);
+        assert_eq!(kinds(&[], true, false), vec![KIND_DEMAND_UNKNOWN]);
+        assert_eq!(kinds(&[], false, true), vec![KIND_DEMAND_UNSUPPORTED]);
+        assert_eq!(
+            kinds(&[], true, true),
+            vec![KIND_DEMAND_UNKNOWN, KIND_DEMAND_UNSUPPORTED]
+        );
         let steps = vec![
             Step::Wait {
                 resource: "a".into(),
@@ -191,9 +219,9 @@ mod tests {
                 reason: WaitReason::MinDwell,
             },
         ];
-        assert_eq!(kinds(&steps, false), vec!["allow_model", "wait"]);
+        assert_eq!(kinds(&steps, false, false), vec!["allow_model", "wait"]);
         assert_eq!(
-            kinds(&steps, true),
+            kinds(&steps, true, false),
             vec!["allow_model", "demand_unknown", "wait"]
         );
     }
@@ -210,7 +238,7 @@ mod tests {
                 reason: WaitReason::HostNotUp,
             },
         ];
-        let r = reason(&intent(), &steps, &[]);
+        let r = reason(&intent(), &steps, &[], &[]);
         assert!(
             r.starts_with(SHADOW_PREFIX) && r.contains("intent [cuda-central=mineru]"),
             "{r}"
@@ -223,7 +251,7 @@ mod tests {
             r.contains("wait on basestar-nfs: the host is not up"),
             "{r}"
         );
-        assert!(reason(&Intent::default(), &[], &[]).contains("no step needed"));
+        assert!(reason(&Intent::default(), &[], &[], &[]).contains("no step needed"));
     }
 
     #[test]
@@ -232,12 +260,14 @@ mod tests {
             InputAge {
                 source: "a".into(),
                 capability: Some(sched_model::Capability::Pods),
+                observer: true,
                 age: Some(Millis(1200)),
                 last_error: None,
             },
             InputAge {
                 source: "b".into(),
                 capability: None,
+                observer: true,
                 age: None,
                 last_error: Some("HTTP 500".into()),
             },

@@ -60,6 +60,17 @@ restate deployments register http://localhost:9080
 - Metrics (`/metrics`, `--metrics-listen`): `sched_decisions_total{kind}`,
   `sched_observation_age_seconds{source}`, `sched_source_errors_total{source}`,
   `sched_tick_duration_seconds`, `sched_config_generation`, `sched_config_reloads_total{outcome}`.
+- **Trust boundary**: the Restate ingress (and the service port, which Restate calls) is
+  assumed to be reachable only from a trusted network. The handlers (`observe`, `tick`, ...)
+  have no authentication of their own; do not expose the ingress beyond the cluster.
+  `observe` is bounded all the same: unknown sources and values with no place in the
+  config are dropped and counted (`sched_rejected_reports_total`).
+- **Metric rename**: the decisions counter is now `sched_tick_decisions_total{kind}` (it was
+  `sched_decisions_total` in the first cut). It counts ticks, not actions; kinds include
+  `demand_unknown` (an observed source is silent or stale) and `demand_unsupported` (the
+  source kind has no observer in this build, e.g. schedule and session sources;
+  `sched_source_has_observer{source}` is 0 for these). Dashboards or alerts on the old name
+  need updating.
 - Handlers: `observe` (push observations; dated on receipt, never by the sender), `tick`,
   `last_decision`, e.g. `curl -X POST localhost:8080/Scheduler/main/last_decision`.
 
@@ -78,7 +89,7 @@ sequencer wait for effects that never happen. The consequences, stated plainly:
   scheduler would never do this".
 - **`allow_model` repeats on every tick** for as long as the demand lasts, since the model is
   never "loaded" in the sequencer's state.
-- `sched_tick_decisions_total{kind}` counts **ticks** by kind (once per distinct kind in a
+- `sched_tick_decisions_total{kind}` (renamed from `sched_decisions_total`) counts **ticks** by kind (once per distinct kind in a
   tick), not actions. Ticks also run on every change and on the backstop.
 - Leases are not modelled (the snapshot has none).
 - **Unknown is not idle**: if a class's demand source never reported or is stale, the tick is

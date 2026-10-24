@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use sched_model::test_support::{EXAMPLE_CONFIG, example_config};
 use sched_model::{Config, KubeWatchParams, Millis, ObservedValue, SourceSpec};
-use sched_observe::kube_watch::{Timing, run_with_client};
+use sched_observe::kube_watch::{ModelWorkloads, Timing, model_workloads, run_with_client};
 use sched_observe::testserver::{Reply, TestServer};
-use sched_observe::{Observers, Report, SpawnOptions, supervised};
+use sched_observe::{Observers, Report, RestartPolicy, SpawnOptions, supervised};
 use tokio::sync::mpsc;
 
 fn pod(name: &str, workload: &str, ready: bool) -> String {
@@ -26,6 +26,8 @@ struct Fake {
     pods: Arc<Mutex<Vec<String>>>,
     /// The next pod watch answers with a garbage line and ends.
     garbage_once: Arc<AtomicBool>,
+    /// The next node watch answers with a garbage line and ends.
+    garbage_once_nodes: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -34,6 +36,7 @@ impl Fake {
         let watches = Arc::new(AtomicUsize::new(0));
         let pods = Arc::new(Mutex::new(vec![pod("mineru-1", "mineru", true)]));
         let garbage_once = Arc::new(AtomicBool::new(false));
+        let garbage_once_nodes = Arc::new(AtomicBool::new(false));
         let (w, p, g) = (watches.clone(), pods.clone(), garbage_once.clone());
         server.set_dynamic("/api/v1/namespaces/ai/pods", move |query| {
             if query.contains("watch=true") {
@@ -47,9 +50,12 @@ impl Fake {
                 r#"{{"apiVersion":"v1","kind":"PodList","metadata":{{"resourceVersion":"10"}},"items":[{items}]}}"#
             ))
         });
-        let w = watches.clone();
+        let (w, gn) = (watches.clone(), garbage_once_nodes.clone());
         server.set_dynamic("/api/v1/nodes", move |query| {
             if query.contains("watch=true") {
+                if gn.swap(false, Ordering::SeqCst) {
+                    return Reply::json("this is not json\n");
+                }
                 return Reply::hanging("").tracked(&w);
             }
             let status = "True";
@@ -62,6 +68,7 @@ impl Fake {
             watches,
             pods,
             garbage_once,
+            garbage_once_nodes,
         }
     }
 
@@ -79,14 +86,14 @@ const FAST: Timing = Timing {
     client_retry: Duration::from_millis(20),
 };
 
-fn source() -> (SourceSpec, KubeWatchParams, Vec<sched_model::ModelSpec>) {
+fn source() -> (SourceSpec, KubeWatchParams, Vec<ModelWorkloads>) {
     let cfg = example_config();
     let mut spec = cfg.source(&"cluster-pods".into()).unwrap().clone();
     spec.resync = Millis(50);
     let mut params = spec.kube_watch_params().unwrap().unwrap();
     params.namespaces = vec!["ai".to_string()];
     params.reachability_confirmations = 1;
-    (spec, params, cfg.models().to_vec())
+    (spec, params, model_workloads(cfg.models()))
 }
 
 fn config_with_one_namespace(label: &str) -> Config {
@@ -227,7 +234,11 @@ async fn a_panicking_or_ending_observer_is_reported_and_restarted() {
     let task = tokio::spawn(supervised(
         "s".into(),
         tx.clone(),
-        Duration::from_millis(10),
+        RestartPolicy {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(10),
+            healthy_after: Duration::from_secs(60),
+        },
         move || {
             let n = r.fetch_add(1, Ordering::SeqCst);
             async move {
@@ -268,7 +279,11 @@ async fn reloads_do_not_leak_watches_and_unrelated_reloads_keep_observers() {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let opts = SpawnOptions {
         kube_client: Some(fake.client()),
-        restart_delay: Duration::from_millis(50),
+        restart: RestartPolicy {
+            initial: Duration::from_millis(50),
+            max: Duration::from_millis(200),
+            healthy_after: Duration::from_secs(60),
+        },
         kube_timing: FAST,
     };
     let mut observers = Observers::default();
@@ -325,4 +340,162 @@ async fn reloads_do_not_leak_watches_and_unrelated_reloads_keep_observers() {
         fake.watches.load(Ordering::SeqCst) == 0
     })
     .await;
+}
+
+const SLOW_RETRY: Timing = Timing {
+    backoff_initial: Duration::from_millis(700),
+    backoff_max: Duration::from_millis(700),
+    client_retry: Duration::from_millis(20),
+};
+
+/// Everything received over `window`.
+async fn collect(rx: &mut mpsc::Receiver<Report>, window: Duration) -> Vec<Report> {
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(window, async {
+        while let Some(r) = rx.recv().await {
+            out.push(r);
+        }
+    })
+    .await;
+    out
+}
+
+#[tokio::test]
+async fn nothing_is_reported_from_a_store_after_its_watch_failed_until_it_has_relisted() {
+    let (spec, params, models) = source();
+    // Pods.
+    let fake = Fake::start().await;
+    fake.garbage_once.store(true, Ordering::SeqCst);
+    let (tx, mut rx) = mpsc::channel(512);
+    let task = tokio::spawn(run_with_client(
+        spec.clone(),
+        params.clone(),
+        models.clone(),
+        fake.client(),
+        tx,
+        SLOW_RETRY,
+    ));
+    until(&mut rx, |r| pods_of(r, "mineru")).await;
+    until(&mut rx, |r| {
+        matches!(r, Report::Failed { error, .. } if error.contains("pod")).then_some(())
+    })
+    .await;
+    // During the backoff the resync ticks (every 50ms) must not report the stale store.
+    let during = collect(&mut rx, Duration::from_millis(450)).await;
+    assert!(
+        during.iter().all(|r| pods_of(r, "mineru").is_none()),
+        "pod counts were reported from a store whose watch had failed: {during:?}"
+    );
+    // After the relist they resume.
+    until(&mut rx, |r| pods_of(r, "mineru")).await;
+    task.abort();
+
+    // Nodes.
+    let fake = Fake::start().await;
+    fake.garbage_once_nodes.store(true, Ordering::SeqCst);
+    let (tx, mut rx) = mpsc::channel(512);
+    let task = tokio::spawn(run_with_client(
+        spec,
+        params,
+        models,
+        fake.client(),
+        tx,
+        SLOW_RETRY,
+    ));
+    until(&mut rx, |r| pods_of(r, "mineru")).await;
+    until(&mut rx, |r| {
+        matches!(r, Report::Failed { error, .. } if error.contains("node")).then_some(())
+    })
+    .await;
+    let during = collect(&mut rx, Duration::from_millis(450)).await;
+    assert!(
+        during.iter().all(|r| up_of(r).is_none()),
+        "reachability was reported from a node store whose watch had failed: {during:?}"
+    );
+    assert!(until(&mut rx, up_of).await);
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_kube_observer_restarts_only_for_changes_that_affect_it() {
+    let fake = Fake::start().await;
+    let (tx, mut rx) = mpsc::channel(4096);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let opts = SpawnOptions {
+        kube_client: Some(fake.client()),
+        kube_timing: FAST,
+        ..SpawnOptions::default()
+    };
+    let base = EXAMPLE_CONFIG.replace("namespaces: [ai, media, docs]", "namespaces: [ai]");
+    let mut observers = Observers::default();
+    observers.update(&Config::from_yaml(&base).unwrap(), &tx, &opts);
+
+    // Not used by the observer: a model's load time, a class's priority, policy.
+    let unrelated = base
+        .replace(
+            "load_time: 120s, workloads: [mineru]",
+            "load_time: 130s, workloads: [mineru]",
+        )
+        .replace("priority: 50", "priority: 51");
+    let started = observers.update(&Config::from_yaml(&unrelated).unwrap(), &tx, &opts);
+    assert!(
+        !started.iter().any(|s| s.as_str() == "cluster-pods"),
+        "{started:?}"
+    );
+
+    // Used: which workloads make up a model; the namespaces watched; the confirmations.
+    for changed in [
+        base.replace("workloads: [mineru]", "workloads: [mineru, mineru-b]"),
+        base.replace("namespaces: [ai]", "namespaces: [ai, docs]"),
+        base.replace(
+            "reachability_confirmations: 3",
+            "reachability_confirmations: 5",
+        ),
+    ] {
+        let started = observers.update(&Config::from_yaml(&changed).unwrap(), &tx, &opts);
+        assert!(
+            started.iter().any(|s| s.as_str() == "cluster-pods"),
+            "{changed}"
+        );
+        // Back to the base, which is also a change for the observer.
+        observers.update(&Config::from_yaml(&base).unwrap(), &tx, &opts);
+    }
+}
+
+#[tokio::test]
+async fn restarts_wait_the_configured_delay_and_the_delay_grows() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let s = starts.clone();
+    let task = tokio::spawn(supervised(
+        "s".into(),
+        tx,
+        RestartPolicy {
+            initial: Duration::from_millis(150),
+            max: Duration::from_secs(5),
+            healthy_after: Duration::from_secs(60),
+        },
+        move || {
+            s.lock().unwrap().push(std::time::Instant::now());
+            async move { panic!("always") }
+        },
+    ));
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let t = starts.lock().unwrap().clone();
+    assert!(t.len() >= 3);
+    let (g1, g2) = (t[1] - t[0], t[2] - t[1]);
+    assert!(
+        g1 >= Duration::from_millis(140),
+        "first restart came after {g1:?}"
+    );
+    assert!(
+        g2 >= Duration::from_millis(290),
+        "second restart came after {g2:?}, expected about double"
+    );
+    task.abort();
 }

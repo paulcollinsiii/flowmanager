@@ -397,7 +397,7 @@ mod tests {
             &EXAMPLE_CONFIG.replace(auth, "auth: { header: Authorization, token: abc, env: X }"),
         );
         assert!(has(&ps, "unknown field `token`"), "{ps:?}");
-        let ps = problems_of(&EXAMPLE_CONFIG.replace("timeout: 10s\n      auth: { header: Authorization, prefix: \"Bearer \", env: SPEAKR_API_TOKEN }\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=100", "timeout: 0\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=100"));
+        let ps = problems_of(&EXAMPLE_CONFIG.replace("timeout: 10s\n      auth: { header: Authorization, prefix: \"Bearer \", env: SPEAKR_API_TOKEN }\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=1", "timeout: 0\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=1"));
         assert!(has(&ps, "timeout"), "{ps:?}");
     }
 

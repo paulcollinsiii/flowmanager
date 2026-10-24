@@ -97,6 +97,23 @@ impl Scheduler {
         Ok(Millis(ms))
     }
 
+    /// Takes in a push, dated `now`: the receipt time read by the handler from the
+    /// scheduler's clock, never anything the sender says.
+    pub fn handle_observe(&self, now: Millis, req: ObserveRequest) -> ObserveAck {
+        match self.shared.ingest(req.into_report(), now) {
+            crate::cache::Ingest::Taken { changed, dropped } => ObserveAck {
+                accepted: true,
+                changed,
+                dropped,
+            },
+            crate::cache::Ingest::UnknownSource => ObserveAck {
+                accepted: false,
+                changed: false,
+                dropped: 0,
+            },
+        }
+    }
+
     async fn run_tick(&self, ctx: &ObjectContext<'_>) -> Result<TickReport, HandlerError> {
         let now = self.now(ctx).await?;
         let report = self.shared.tick(now);
@@ -115,18 +132,7 @@ impl Scheduler {
         Json(req): Json<ObserveRequest>,
     ) -> Result<Json<ObserveAck>, HandlerError> {
         let now = self.now(&ctx).await?;
-        let ack = match self.shared.ingest(req.into_report(), now) {
-            crate::cache::Ingest::Taken { changed, dropped } => ObserveAck {
-                accepted: true,
-                changed,
-                dropped,
-            },
-            crate::cache::Ingest::UnknownSource => ObserveAck {
-                accepted: false,
-                changed: false,
-                dropped: 0,
-            },
-        };
+        let ack = self.handle_observe(now, req);
         Ok(Json(ack))
     }
 
@@ -182,5 +188,75 @@ impl Scheduler {
                 .await?
                 .map(|j| j.into_inner()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::ManualClock;
+    use crate::config_source::ConfigHolder;
+    use crate::metrics::Metrics;
+    use sched_model::test_support::EXAMPLE_CONFIG;
+
+    fn scheduler(clock_at: u64) -> Scheduler {
+        let holder = Arc::new(ConfigHolder::new(EXAMPLE_CONFIG).unwrap());
+        let clock = Arc::new(ManualClock::new(Millis(clock_at)));
+        let shared = Arc::new(Shared::new(holder, Arc::new(Metrics::new()), clock));
+        Scheduler::new(shared, Duration::from_secs(30))
+    }
+
+    fn request(json: &str) -> ObserveRequest {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_push_is_dated_with_the_receipt_time_not_with_anything_the_sender_says() {
+        // The clock reads 9_999 but the handler was given 5_000 (the journaled receipt time).
+        let s = scheduler(9_999);
+        let ack = s.handle_observe(
+            Millis(5_000),
+            request(
+                r#"{"source": "paperless-ocr-pending", "values": [
+                    {"type": "demand", "class": "paperless-ocr", "ready": 2,
+                     "oldest_ready_at": 18446744073709551615}]}"#,
+            ),
+        );
+        assert!(ack.accepted && ack.changed && ack.dropped == 0);
+        let config = s.shared.config.current();
+        let snap = s
+            .shared
+            .cache
+            .lock()
+            .unwrap()
+            .snapshot(&config, Millis(5_100));
+        let o = &snap.observations[0];
+        assert_eq!(o.observed_at, Millis(5_000));
+        assert!(matches!(
+            o.value,
+            ObservedValue::Demand {
+                oldest_ready_at: Some(Millis(5_000)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_push_cannot_carry_its_own_timestamp_and_unknown_sources_are_refused() {
+        assert!(
+            serde_json::from_str::<ObserveRequest>(
+                r#"{"source": "s", "observed_at": 1, "values": []}"#
+            )
+            .is_err()
+        );
+        let s = scheduler(1);
+        let ack = s.handle_observe(Millis(1), request(r#"{"source": "nowhere"}"#));
+        assert!(!ack.accepted);
+        // An error push is recorded as a failure of the source, not as values.
+        let ack = s.handle_observe(
+            Millis(2),
+            request(r#"{"source": "paperless-ocr-pending", "error": "boom"}"#),
+        );
+        assert!(ack.accepted && ack.changed);
     }
 }

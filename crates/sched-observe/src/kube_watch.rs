@@ -16,7 +16,7 @@ use kube::Api;
 use kube::ResourceExt;
 use kube::runtime::watcher::{self, Event};
 use sched_model::{
-    Fidelity, KubeWatchParams, ModelSpec, ObservedValue, ResourceId, SourceId, SourceSpec,
+    Fidelity, KubeWatchParams, ModelId, ModelSpec, ObservedValue, ResourceId, SourceId, SourceSpec,
 };
 use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
@@ -115,22 +115,32 @@ impl PodStore {
     }
 }
 
+/// A model and the workloads (pod label values) that implement it.
+pub type ModelWorkloads = (ModelId, Vec<String>);
+
+/// The part of the models the pod observer uses.
+pub fn model_workloads(models: &[ModelSpec]) -> Vec<ModelWorkloads> {
+    models
+        .iter()
+        .map(|m| (m.id.clone(), m.workloads.clone()))
+        .collect()
+}
+
 /// One `ModelPods` value per configured model, summing its workloads over `stores`. A
 /// workload with no pods counts as zero: the lists are complete, so absence is a fact.
 pub fn model_values(
-    models: &[ModelSpec],
+    models: &[ModelWorkloads],
     stores: &[BTreeMap<String, (u32, u32)>],
 ) -> Vec<ObservedValue> {
     models
         .iter()
-        .map(|m| {
-            let (pods, ready_pods) = m
-                .workloads
+        .map(|(model, workloads)| {
+            let (pods, ready_pods) = workloads
                 .iter()
                 .flat_map(|w| stores.iter().filter_map(move |s| s.get(w)))
                 .fold((0, 0), |a, c| (a.0 + c.0, a.1 + c.1));
             ObservedValue::ModelPods {
-                model: m.id.clone(),
+                model: model.clone(),
                 pods,
                 ready_pods,
             }
@@ -204,6 +214,11 @@ impl Default for Timing {
     }
 }
 
+/// The next backoff after `current`: doubled, up to `max`.
+pub fn grow_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
+}
+
 /// Shared by the watch tasks and the resync loop.
 #[derive(Default)]
 struct Shared {
@@ -221,7 +236,7 @@ fn lock(s: &SharedState) -> std::sync::MutexGuard<'_, Shared> {
 /// The pod report, or `None` while any namespace is still unsynced.
 pub fn pod_report_from(
     source: &SourceId,
-    models: &[ModelSpec],
+    models: &[ModelWorkloads],
     stores: &BTreeMap<String, PodStore>,
     fidelity: Fidelity,
 ) -> Option<Report> {
@@ -238,7 +253,7 @@ pub fn pod_report_from(
 
 fn pod_report(
     spec: &SourceSpec,
-    models: &[ModelSpec],
+    models: &[ModelWorkloads],
     shared: &SharedState,
     fidelity: Fidelity,
 ) -> Option<Report> {
@@ -290,7 +305,7 @@ async fn watch_restarting<K>(
         }
         drop(stream);
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(timing.backoff_max);
+        backoff = grow_backoff(backoff, timing.backoff_max);
     }
 }
 
@@ -316,7 +331,7 @@ fn reachability_readings(
 pub async fn run(
     spec: SourceSpec,
     params: KubeWatchParams,
-    models: Vec<ModelSpec>,
+    models: Vec<ModelWorkloads>,
     tx: ReportTx,
     timing: Timing,
 ) {
@@ -344,7 +359,7 @@ pub async fn run(
 pub async fn run_with_client(
     spec: SourceSpec,
     params: KubeWatchParams,
-    models: Vec<ModelSpec>,
+    models: Vec<ModelWorkloads>,
     client: kube::Client,
     tx: ReportTx,
     timing: Timing,
@@ -595,7 +610,7 @@ mod tests {
             ("mineru".to_string(), (1, 0)),
             ("ollama".to_string(), (2, 2)),
         ]);
-        let values = model_values(config.models(), &[a, b]);
+        let values = model_values(&model_workloads(config.models()), &[a, b]);
         let get = |m: &str| {
             values
                 .iter()
@@ -667,15 +682,43 @@ mod tests {
             ("b".to_string(), PodStore::default()),
         ]);
         // One namespace has not listed yet: a count from the other alone would be a lie.
-        assert!(pod_report_from(&source, config.models(), &stores, Fidelity::Polled).is_none());
+        assert!(
+            pod_report_from(
+                &source,
+                &model_workloads(config.models()),
+                &stores,
+                Fidelity::Polled
+            )
+            .is_none()
+        );
         stores.insert("b".to_string(), synced(&["m2"]));
-        let Some(Report::Observed { values, .. }) =
-            pod_report_from(&source, config.models(), &stores, Fidelity::Polled)
-        else {
+        let Some(Report::Observed { values, .. }) = pod_report_from(
+            &source,
+            &model_workloads(config.models()),
+            &stores,
+            Fidelity::Polled,
+        ) else {
             panic!("expected a report once both are synced");
         };
         assert!(values.iter().any(|v| matches!(v, ObservedValue::ModelPods { model, pods: 2, .. } if model.as_str() == "mineru")));
         stores.get_mut("a").unwrap().invalidate();
-        assert!(pod_report_from(&source, config.models(), &stores, Fidelity::Polled).is_none());
+        assert!(
+            pod_report_from(
+                &source,
+                &model_workloads(config.models()),
+                &stores,
+                Fidelity::Polled
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn watch_backoff_doubles_up_to_the_cap() {
+        let (a, max) = (Duration::from_millis(100), Duration::from_millis(350));
+        let b = grow_backoff(a, max);
+        assert_eq!(b, Duration::from_millis(200));
+        assert_eq!(grow_backoff(b, max), max);
+        assert_eq!(grow_backoff(max, max), max);
     }
 }

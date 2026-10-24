@@ -15,4 +15,7 @@ mod supervisor;
 pub mod testserver;
 
 pub use report::{Report, ReportTx};
-pub use supervisor::{Observers, SpawnOptions, spawn_observers, supervised};
+pub use supervisor::{
+    Observers, RestartBackoff, RestartPolicy, SpawnOptions, observer_available, spawn_observers,
+    supervised,
+};

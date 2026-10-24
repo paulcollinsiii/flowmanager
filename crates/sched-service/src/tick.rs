@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{ClassId, Millis, ModelId, SchedState, Step, class_work};
-use sched_observe::Report;
+use sched_observe::{Report, observer_available};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{Ingest, InputAge, ObservationCache};
@@ -47,9 +47,14 @@ pub struct TickReport {
     /// Always true: each tick starts from a fresh sequencer state, so hysteresis (dwell,
     /// idle grace) and the steps that follow it (drain, pause, power off) cannot appear.
     pub shadow_stateless: bool,
-    /// Classes whose demand is unknown (the source never reported or is stale). Unknown is
-    /// not zero: such a tick is never `idle`.
+    /// Classes whose demand is unknown although an observer exists for their source (it
+    /// never reported or is stale): a real problem. Unknown is not zero: such a tick is
+    /// never `idle`.
     pub unknown_demand: Vec<ClassId>,
+    /// Classes whose demand is unknown because this build has no observer for their source
+    /// kind (for example schedule or session sources), unless something pushed a value.
+    /// Expected for now, and kept apart so it cannot drown `unknown_demand`.
+    pub unsupported_demand: Vec<ClassId>,
     /// Distinct decision kinds (see `reason::step_kind`), `idle` for none, `error` on failure.
     pub kinds: Vec<String>,
     pub reason: String,
@@ -156,24 +161,37 @@ impl Shared {
                 now,
             )
         };
-        let unknown_demand: Vec<ClassId> = config
-            .classes()
-            .iter()
-            .filter(|c| c.demand.is_some() && !class_work(&config, &snapshot, c).known)
-            .map(|c| c.id.clone())
-            .collect();
+        let (mut unknown_demand, mut unsupported_demand) = (Vec::new(), Vec::new());
+        for c in config.classes() {
+            let Some(d) = &c.demand else { continue };
+            if class_work(&config, &snapshot, c).known {
+                continue;
+            }
+            let observed = config.source(&d.source).is_some_and(observer_available);
+            if observed {
+                &mut unknown_demand
+            } else {
+                &mut unsupported_demand
+            }
+            .push(c.id.clone());
+        }
         // Shadow mode: the sequencer's state is not carried between ticks, because no step
         // is ever executed and carrying it would only let the scheduler wait for effects
         // that cannot happen. Each tick answers "what would I do given what I see now".
         let result = decide(&config, &snapshot, &SchedState::default());
-        let unknown = !unknown_demand.is_empty();
+        let (unknown, unsupported) = (!unknown_demand.is_empty(), !unsupported_demand.is_empty());
         let (kinds, reason, steps, allowed, error) = match result {
             Ok((intent, decision)) => (
-                reason::kinds(&decision.steps, unknown)
+                reason::kinds(&decision.steps, unknown, unsupported)
                     .into_iter()
                     .map(String::from)
                     .collect(),
-                reason::reason(&intent, &decision.steps, &unknown_demand),
+                reason::reason(
+                    &intent,
+                    &decision.steps,
+                    &unknown_demand,
+                    &unsupported_demand,
+                ),
                 decision.steps,
                 decision.allowed,
                 None,
@@ -191,6 +209,7 @@ impl Shared {
             at: now,
             shadow_stateless: true,
             unknown_demand,
+            unsupported_demand,
             kinds,
             reason,
             steps,
@@ -238,6 +257,8 @@ fn log_tick(r: &TickReport, ages: &[InputAge]) {
             reason = %r.reason,
             inputs = %inputs,
             input_changed = r.input_changed,
+            unknown_demand = ?r.unknown_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            unsupported_demand = ?r.unsupported_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             "shadow tick (nothing executed)"
         );
     }
@@ -437,7 +458,7 @@ mod tests {
             );
         }
         let r = s.tick(Millis(T0 + 2_000));
-        assert!(r.unknown_demand.is_empty(), "{:?}", r.unknown_demand);
+        assert!(r.unknown_demand.is_empty() && r.unsupported_demand.is_empty());
         assert_eq!(r.kinds, vec!["idle".to_string()], "{r:?}");
         // And stale demand is unknown again.
         let r = s.tick(Millis(T0 + 2_000 + 600_001));
@@ -545,6 +566,44 @@ mod tests {
                 changed: false,
                 dropped: 20
             }
+        );
+    }
+
+    #[test]
+    fn demand_of_sources_without_an_observer_is_reported_apart_and_is_still_not_idle() {
+        let (s, _) = shared();
+        cluster(&s);
+        for (src, class) in [
+            ("paperless-ocr-pending", "paperless-ocr"),
+            ("paperless-post-ocr", "paperless-tagging"),
+            ("speakr-pending", "speakr-transcription"),
+            ("speakr-summaries", "speakr-summarization"),
+            ("immich-queues", "immich-ml"),
+        ] {
+            push(
+                &s,
+                src,
+                vec![ObservedValue::Demand {
+                    class: class.into(),
+                    ready: 0,
+                    in_flight: 0,
+                    oldest_ready_at: None,
+                }],
+            );
+        }
+        // Everything that has an observer reports; only schedule and session sources are
+        // silent, and nothing is built to observe them.
+        let r = s.tick(Millis(T0 + 1_000));
+        assert!(r.unknown_demand.is_empty(), "{:?}", r.unknown_demand);
+        assert_eq!(r.kinds, vec!["demand_unsupported".to_string()], "{r:?}");
+        let text = s.metrics.render();
+        assert!(
+            text.contains("sched_source_has_observer{source=\"backup-schedule\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sched_source_has_observer{source=\"paperless-ocr-pending\"} 1"),
+            "{text}"
         );
     }
 }

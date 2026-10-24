@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use sched_model::{ClassId, Config, ModelSpec, SourceId, SourceKind, SourceSpec};
+use sched_model::{ClassId, Config, ModelId, SourceId, SourceKind, SourceSpec};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::kube_watch::{self, Timing};
@@ -19,8 +19,9 @@ struct Fingerprint {
     spec: SourceSpec,
     /// Classes taking demand from the source (HTTP/JSON).
     classes: Vec<ClassId>,
-    /// Models whose pods are counted (Kubernetes).
-    models: Vec<ModelSpec>,
+    /// Which workloads make up each model (Kubernetes): the only thing about a model the
+    /// pod observer uses, so other model changes (load time and the like) do not restart it.
+    models: Vec<(ModelId, Vec<String>)>,
 }
 
 struct Running {
@@ -33,8 +34,8 @@ struct Running {
 pub struct SpawnOptions {
     /// A cluster client to use instead of creating one from the environment.
     pub kube_client: Option<kube::Client>,
-    /// Wait before an observer that died is started again.
-    pub restart_delay: Duration,
+    /// How an observer that died is started again.
+    pub restart: RestartPolicy,
     pub kube_timing: Timing,
 }
 
@@ -42,7 +43,7 @@ impl Default for SpawnOptions {
     fn default() -> Self {
         SpawnOptions {
             kube_client: None,
-            restart_delay: Duration::from_secs(5),
+            restart: RestartPolicy::default(),
             kube_timing: Timing::default(),
         }
     }
@@ -128,7 +129,7 @@ fn fingerprint(config: &Config, spec: &SourceSpec) -> Fingerprint {
                 .collect()
         },
         models: if is_kube {
-            config.models().to_vec()
+            kube_watch::model_workloads(config.models())
         } else {
             Vec::new()
         },
@@ -144,7 +145,7 @@ fn start(fp: &Fingerprint, tx: &ReportTx, opts: &SpawnOptions) -> Option<JoinHan
                 Some(tokio::spawn(supervised(
                     spec.id.clone(),
                     tx.clone(),
-                    opts.restart_delay,
+                    opts.restart,
                     move || {
                         http_json::run(spec.clone(), params.clone(), classes.clone(), tx2.clone())
                     },
@@ -166,7 +167,7 @@ fn start(fp: &Fingerprint, tx: &ReportTx, opts: &SpawnOptions) -> Option<JoinHan
                 Some(tokio::spawn(supervised(
                     spec.id.clone(),
                     tx.clone(),
-                    opts.restart_delay,
+                    opts.restart,
                     move || {
                         let (spec, params, models, tx) =
                             (spec.clone(), params.clone(), models.clone(), tx2.clone());
@@ -196,6 +197,52 @@ fn start(fp: &Fingerprint, tx: &ReportTx, opts: &SpawnOptions) -> Option<JoinHan
     }
 }
 
+/// Restart delays for an observer that keeps dying: exponential up to a cap, starting over
+/// once it has run healthily for a while.
+#[derive(Debug, Clone, Copy)]
+pub struct RestartPolicy {
+    pub initial: Duration,
+    pub max: Duration,
+    /// An observer that ran at least this long before dying is not "flapping".
+    pub healthy_after: Duration,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        RestartPolicy {
+            initial: Duration::from_secs(5),
+            max: Duration::from_secs(300),
+            healthy_after: Duration::from_secs(120),
+        }
+    }
+}
+
+/// The delay state of one observer's restarts.
+#[derive(Debug, Clone)]
+pub struct RestartBackoff {
+    policy: RestartPolicy,
+    next: Duration,
+}
+
+impl RestartBackoff {
+    pub fn new(policy: RestartPolicy) -> Self {
+        RestartBackoff {
+            policy,
+            next: policy.initial,
+        }
+    }
+
+    /// The wait before restarting an observer that ran for `ran_for` and then died.
+    pub fn after_exit(&mut self, ran_for: Duration) -> Duration {
+        if ran_for >= self.policy.healthy_after {
+            self.next = self.policy.initial;
+        }
+        let wait = self.next;
+        self.next = self.next.saturating_mul(2).min(self.policy.max);
+        wait
+    }
+}
+
 /// Aborts a task when dropped, so the task cannot outlive whoever was waiting for it.
 struct AbortOnDrop(AbortHandle);
 
@@ -216,14 +263,16 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Runs the observer made by `make`, and when it panics or returns, says so with a
 /// `Report::Failed` (so it shows up as a source error and the source goes stale) and
-/// starts it again after `restart_delay`. Ends when the receiver is gone or this future
+/// starts it again after a delay that grows while it keeps dying (see [`RestartPolicy`]). Ends when the receiver is gone or this future
 /// is dropped, which also stops the observer.
-pub async fn supervised<F, Fut>(source: SourceId, tx: ReportTx, restart_delay: Duration, make: F)
+pub async fn supervised<F, Fut>(source: SourceId, tx: ReportTx, policy: RestartPolicy, make: F)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let mut backoff = RestartBackoff::new(policy);
     loop {
+        let started = Instant::now();
         let handle = tokio::spawn(make());
         let _abort = AbortOnDrop(handle.abort_handle());
         let error = match handle.await {
@@ -247,7 +296,18 @@ where
         {
             return;
         }
-        tokio::time::sleep(restart_delay).await;
+        tokio::time::sleep(backoff.after_exit(started.elapsed())).await;
+    }
+}
+
+/// Whether this build has an observer that would run for `spec`: a supported kind with
+/// params. Other sources are configured but not (yet) observed; they can still be fed by
+/// pushes.
+pub fn observer_available(spec: &SourceSpec) -> bool {
+    match spec.kind {
+        SourceKind::HttpJson => matches!(spec.http_json_params(), Ok(Some(_))),
+        SourceKind::KubernetesWatch => matches!(spec.kube_watch_params(), Ok(Some(_))),
+        _ => false,
     }
 }
 
@@ -256,4 +316,30 @@ pub fn spawn_observers(config: &Arc<Config>, tx: &ReportTx) -> Observers {
     let mut o = Observers::default();
     o.update(config, tx, &SpawnOptions::default());
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn restart_delays_double_to_a_cap_and_start_over_after_a_healthy_run() {
+        let mut b = RestartBackoff::new(RestartPolicy {
+            initial: ms(100),
+            max: ms(350),
+            healthy_after: ms(1000),
+        });
+        let quick = ms(10);
+        assert_eq!(b.after_exit(quick), ms(100));
+        assert_eq!(b.after_exit(quick), ms(200));
+        assert_eq!(b.after_exit(quick), ms(350));
+        assert_eq!(b.after_exit(quick), ms(350));
+        // It ran healthily for a while before dying this time: start over.
+        assert_eq!(b.after_exit(ms(1000)), ms(100));
+        assert_eq!(b.after_exit(quick), ms(200));
+    }
 }

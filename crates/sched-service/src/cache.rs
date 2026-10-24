@@ -11,7 +11,7 @@ use sched_model::{
     Capability, ClassId, Config, Fidelity, Millis, ModelId, Observation, ObservedValue, ResourceId,
     Snapshot, SourceId,
 };
-use sched_observe::Report;
+use sched_observe::{Report, observer_available};
 
 /// What an observation is about; one observation per source and subject is kept.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,6 +87,9 @@ pub struct InputAge {
     /// The capability this age is for. A source is only as healthy as its least healthy
     /// capability, so each one it declares is listed. `None` for a source that declares none.
     pub capability: Option<Capability>,
+    /// Whether this build runs an observer for the source. If not (a schedule or session
+    /// source, say) the source reports only when something pushes to it.
+    pub observer: bool,
     /// Age of the newest observation of that capability held from the source; `None` if there is none.
     pub age: Option<Millis>,
     pub last_error: Option<String>,
@@ -229,6 +232,7 @@ impl ObservationCache {
                 out.push(InputAge {
                     source: s.id.clone(),
                     capability: cap,
+                    observer: observer_available(s),
                     age: self
                         .entries
                         .values()
@@ -597,5 +601,27 @@ mod tests {
             Millis(3_000),
         );
         assert_eq!(c.latest_receipt(), Millis(5_000));
+    }
+
+    #[test]
+    fn stored_error_text_is_truncated_on_a_char_boundary() {
+        let cfg = example_config();
+        let mut c = ObservationCache::new();
+        let long = "é".repeat(5_000);
+        c.ingest(
+            &cfg,
+            Report::Failed {
+                source: "paperless-ocr-pending".into(),
+                error: long,
+            },
+            Millis(1),
+        );
+        let ages = c.input_ages(&cfg, Millis(2));
+        let e = ages
+            .iter()
+            .find_map(|a| a.last_error.as_ref())
+            .expect("an error is kept");
+        assert!(e.len() <= 512 && !e.is_empty(), "{}", e.len());
+        assert!(e.chars().all(|ch| ch == 'é'));
     }
 }
