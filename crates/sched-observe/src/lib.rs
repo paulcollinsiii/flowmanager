@@ -7,6 +7,7 @@
 
 pub mod http_json;
 pub mod kube_watch;
+pub mod prometheus;
 mod report;
 mod supervisor;
 

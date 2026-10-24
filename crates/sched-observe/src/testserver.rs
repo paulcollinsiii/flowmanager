@@ -145,6 +145,8 @@ struct Inner {
     /// By path alone; the function gets the query string.
     dynamic: HashMap<String, Dynamic>,
     requests: Vec<(String, Option<String>)>,
+    /// Every header of each request in `requests`, names lower-cased.
+    headers: Vec<Vec<(String, String)>>,
     times: Vec<std::time::Instant>,
 }
 
@@ -193,9 +195,20 @@ impl TestServer {
                                 .get("authorization")
                                 .and_then(|v| v.to_str().ok())
                                 .map(str::to_string);
+                            let headers = req
+                                .headers()
+                                .iter()
+                                .map(|(n, v)| {
+                                    (
+                                        n.as_str().to_string(),
+                                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                                    )
+                                })
+                                .collect();
                             let reply = {
                                 let mut g = shared.lock().unwrap();
                                 g.requests.push((key.clone(), auth));
+                                g.headers.push(headers);
                                 g.times.push(std::time::Instant::now());
                                 let (path, query) = key.split_once('?').unwrap_or((&key, ""));
                                 match g.dynamic.get(path) {
@@ -278,6 +291,24 @@ impl TestServer {
     /// When each request in `requests()` arrived.
     pub fn request_times(&self) -> Vec<std::time::Instant> {
         self.inner.lock().unwrap().times.clone()
+    }
+
+    /// Every request seen so far: path and query, and the value of header `name` (any
+    /// case) if it was sent.
+    pub fn requests_with_header(&self, name: &str) -> Vec<(String, Option<String>)> {
+        let g = self.inner.lock().unwrap();
+        let name = name.to_ascii_lowercase();
+        g.requests
+            .iter()
+            .zip(&g.headers)
+            .map(|((key, _), headers)| {
+                let value = headers
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.clone());
+                (key.clone(), value)
+            })
+            .collect()
     }
 
     /// Every request seen so far: path and query, and the Authorization header if any.

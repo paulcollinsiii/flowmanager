@@ -741,12 +741,11 @@ async fn backoff_state_of_a_source_removed_from_the_config_is_dropped() {
     assert!(observers.backoff_for(&immich).is_some());
 
     // Remove the source (and the class that took its demand from it).
-    let without = base
-        .replace("    demand: { source: immich-queues }\n", "")
-        .replace(
-            "  - id: immich-queues\n    kind: http_json\n    observe: [demand]\n    resync: 120s\n    params:\n      requests:\n        - url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting\n\n",
-            "",
-        );
+    let start = base.find("  - id: immich-queues\n").unwrap();
+    let end = start + base[start..].find("\n\n").unwrap() + 2;
+    let without = format!("{}{}", &base[..start], &base[end..])
+        .replace("    demand: { source: immich-queues }\n", "");
+    assert!(!without.contains("id: immich-queues"));
     assert_ne!(without, base);
     observers.update(&Config::from_yaml(&without).unwrap(), &tx, &opts);
     assert!(observers.backoff_for(&immich).is_none());

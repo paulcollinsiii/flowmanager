@@ -315,7 +315,7 @@ fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
     );
     // The prometheus-shaped params would not be valid http_json params.
     let text = text.replace(
-        "    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n",
+        "    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n      resource: basestar-nfs\n      timeout: 5s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
         "",
     );
     assert_ne!(text, EXAMPLE_CONFIG);

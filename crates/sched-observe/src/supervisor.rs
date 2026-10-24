@@ -10,14 +10,14 @@ use sched_model::{ClassId, Config, ModelId, SourceId, SourceKind, SourceSpec};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::kube_watch::{self, Timing};
-use crate::{ReportTx, http_json};
+use crate::{ReportTx, http_json, prometheus};
 
 /// What a running observer was built from. If it is unchanged by a reload, the observer
 /// keeps running (and keeps its state, such as reachability debounce counts).
 #[derive(Debug, Clone, PartialEq)]
 struct Fingerprint {
     spec: SourceSpec,
-    /// Classes taking demand from the source (HTTP/JSON).
+    /// Classes taking demand from the source (used by HTTP/JSON only).
     classes: Vec<ClassId>,
     /// Which workloads make up each model (Kubernetes): the only thing about a model the
     /// pod observer uses, so other model changes (load time and the like) do not restart it.
@@ -79,7 +79,7 @@ impl Observers {
         for spec in config.sources() {
             if matches!(
                 spec.kind,
-                SourceKind::HttpJson | SourceKind::KubernetesWatch
+                SourceKind::HttpJson | SourceKind::KubernetesWatch | SourceKind::Prometheus
             ) {
                 wanted.insert(spec.id.clone(), fingerprint(config, spec));
             } else {
@@ -218,6 +218,25 @@ fn start(
                 None
             }
         },
+        SourceKind::Prometheus => match spec.prometheus_params() {
+            Ok(Some(params)) => {
+                let (spec, tx2) = (spec.clone(), tx.clone());
+                Some(tokio::spawn(supervised(
+                    spec.id.clone(),
+                    tx.clone(),
+                    backoff,
+                    move || prometheus::run(spec.clone(), params.clone(), tx2.clone()),
+                )))
+            }
+            Ok(None) => {
+                tracing::info!(source = %spec.id, "no params: source is not polled");
+                None
+            }
+            Err(e) => {
+                tracing::error!(source = %spec.id, "{e}");
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -344,6 +363,7 @@ pub fn observer_state(spec: &SourceSpec) -> ObserverState {
     let has_params = match spec.kind {
         SourceKind::HttpJson => matches!(spec.http_json_params(), Ok(Some(_))),
         SourceKind::KubernetesWatch => matches!(spec.kube_watch_params(), Ok(Some(_))),
+        SourceKind::Prometheus => matches!(spec.prometheus_params(), Ok(Some(_))),
         _ => return ObserverState::NoImplementation,
     };
     if has_params {
