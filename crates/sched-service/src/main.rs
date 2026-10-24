@@ -22,6 +22,15 @@ fn duration(text: &str) -> Result<Duration, String> {
     Millis::parse(text).map(|m| Duration::from_millis(m.as_u64()))
 }
 
+/// A duration that must be greater than zero: a zero interval would spin or panic.
+fn positive_duration(text: &str) -> Result<Duration, String> {
+    let d = duration(text)?;
+    if d.is_zero() {
+        return Err(format!("{text:?} must be greater than zero"));
+    }
+    Ok(d)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -45,10 +54,10 @@ struct Args {
     )]
     restate_ingress: String,
     /// Interval of the periodic backstop tick.
-    #[arg(long, env = "SCHED_BACKSTOP", default_value = "30s", value_parser = duration)]
+    #[arg(long, env = "SCHED_BACKSTOP", default_value = "30s", value_parser = positive_duration)]
     backstop: Duration,
     /// How often the config file is checked for changes.
-    #[arg(long, env = "SCHED_RELOAD_INTERVAL", default_value = "5s", value_parser = duration)]
+    #[arg(long, env = "SCHED_RELOAD_INTERVAL", default_value = "5s", value_parser = positive_duration)]
     reload_interval: Duration,
     /// Delay that merges bursts of changes into one requested tick.
     #[arg(long, env = "SCHED_TRIGGER_DEBOUNCE", default_value = "250ms", value_parser = duration)]
@@ -92,6 +101,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.restate_ingress.clone(),
         args.trigger_debounce,
     ));
+    tokio::spawn(runtime::watch_backstop(
+        Arc::clone(&shared),
+        args.restate_ingress.clone(),
+        args.backstop,
+        args.backstop,
+    ));
     tokio::spawn(runtime::arm_backstop(
         args.restate_ingress.clone(),
         Duration::from_secs(5),
@@ -109,4 +124,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .listen_and_serve(args.listen)
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec!["sched-service", "--config", "c.yaml"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn zero_intervals_are_refused_at_startup_with_a_clear_error() {
+        for flag in ["--backstop", "--reload-interval"] {
+            for zero in ["0", "0s", "0ms"] {
+                let e = parse(&[flag, zero]).unwrap_err().to_string();
+                assert!(
+                    e.contains("must be greater than zero"),
+                    "{flag} {zero}: {e}"
+                );
+            }
+            assert!(parse(&[flag, "1s"]).is_ok());
+        }
+        assert_eq!(parse(&[]).unwrap().backstop, Duration::from_secs(30));
+    }
 }

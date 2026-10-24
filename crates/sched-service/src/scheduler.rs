@@ -69,6 +69,8 @@ pub struct ObserveAck {
     pub accepted: bool,
     /// Whether the push changed what the scheduler knows.
     pub changed: bool,
+    /// Values dropped because the config has no place for them.
+    pub dropped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,13 +116,15 @@ impl Scheduler {
     ) -> Result<Json<ObserveAck>, HandlerError> {
         let now = self.now(&ctx).await?;
         let ack = match self.shared.ingest(req.into_report(), now) {
-            crate::cache::Ingest::Taken { changed } => ObserveAck {
+            crate::cache::Ingest::Taken { changed, dropped } => ObserveAck {
                 accepted: true,
                 changed,
+                dropped,
             },
             crate::cache::Ingest::UnknownSource => ObserveAck {
                 accepted: false,
                 changed: false,
+                dropped: 0,
             },
         };
         Ok(Json(ack))
@@ -140,6 +144,8 @@ impl Scheduler {
     ) -> Result<Json<BackstopArgs>, HandlerError> {
         let epoch = ctx.get::<u64>(EPOCH).await?.unwrap_or(0) + 1;
         ctx.set(EPOCH, epoch);
+        let now = self.now(&ctx).await?;
+        self.shared.note_backstop(now);
         ctx.object_client::<SchedulerClient>(ctx.key())
             .backstop(Json(BackstopArgs { epoch }))
             .send();
@@ -157,7 +163,8 @@ impl Scheduler {
             tracing::info!(epoch = args.epoch, "backstop chain superseded; ending");
             return Ok(());
         }
-        self.run_tick(&ctx).await?;
+        let report = self.run_tick(&ctx).await?;
+        self.shared.note_backstop(report.at);
         ctx.object_client::<SchedulerClient>(ctx.key())
             .backstop(Json(args))
             .send_after(self.backstop_every);

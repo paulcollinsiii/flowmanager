@@ -24,6 +24,8 @@ pub enum ExtractError {
     Missing(String),
     NotANumber(String),
     NotAnArray(String),
+    /// The array is as long as the page can be, so items may be missing.
+    AtLimit(u64),
 }
 
 impl std::fmt::Display for ExtractError {
@@ -34,6 +36,10 @@ impl std::fmt::Display for ExtractError {
                 write!(f, "value at {p:?} is not a non-negative whole number")
             }
             ExtractError::NotAnArray(p) => write!(f, "value at {p:?} is not an array"),
+            ExtractError::AtLimit(n) => write!(
+                f,
+                "the response holds {n} items, a full page; the count may be too low"
+            ),
         }
     }
 }
@@ -71,6 +77,9 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
         .ok_or_else(|| ExtractError::Missing(ptr.to_string()))?
         .as_array()
         .ok_or_else(|| ExtractError::NotAnArray(ptr.to_string()))?;
+    if req.max_items.is_some_and(|max| items.len() as u64 >= max) {
+        return Err(ExtractError::AtLimit(items.len() as u64));
+    }
     let n = match &req.filter {
         Some(f) => items.iter().filter(|e| matches(f, e)).count(),
         None => items.len(),
@@ -99,6 +108,38 @@ pub fn demand_values(classes: &[ClassId], ready: u64, in_flight: u64) -> Vec<Obs
         .collect()
 }
 
+/// `url` without credentials or query values, safe for logs and error text: userinfo is
+/// dropped and each `key=value` of the query becomes `key=<redacted>`.
+pub fn redact_url(url: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (url, None),
+    };
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            if path.is_empty() && !rest.contains('/') {
+                format!("{scheme}://{host}")
+            } else {
+                format!("{scheme}://{host}/{path}")
+            }
+        }
+        None => base.to_string(),
+    };
+    match query {
+        None => base,
+        Some(q) => {
+            let pairs: Vec<String> = q
+                .split('&')
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("{}=<redacted>", p.split('=').next().unwrap_or("")))
+                .collect();
+            format!("{base}?{}", pairs.join("&"))
+        }
+    }
+}
+
 /// Reads the secret an `auth` entry points at and builds the header. Errors never contain
 /// the secret.
 pub async fn resolve_auth(auth: &AuthSpec, env: &EnvFn) -> Result<(String, String), String> {
@@ -122,6 +163,7 @@ async fn fetch(
     client: &reqwest::Client,
     req: &RequestSpec,
     auth: Option<&(String, String)>,
+    max_body: usize,
 ) -> Result<Value, String> {
     let mut builder = client.get(&req.url);
     if let Some((name, value)) = auth {
@@ -130,7 +172,7 @@ async fn fetch(
         v.set_sensitive(true);
         builder = builder.header(name, v);
     }
-    let resp = builder
+    let mut resp = builder
         .send()
         .await
         .map_err(|e| e.without_url().to_string())?;
@@ -138,12 +180,17 @@ async fn fetch(
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
     }
-    let body = resp
-        .bytes()
+    // Read chunk by chunk and stop at the limit, so a huge or endless body is never held.
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| e.without_url().to_string())?;
-    if body.len() > MAX_BODY {
-        return Err(format!("response is larger than {MAX_BODY} bytes"));
+        .map_err(|e| e.without_url().to_string())?
+    {
+        if body.len() + chunk.len() > max_body {
+            return Err(format!("response is larger than {max_body} bytes"));
+        }
+        body.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&body).map_err(|e| format!("response is not JSON: {e}"))
 }
@@ -156,6 +203,18 @@ pub async fn poll(
     params: &HttpJsonParams,
     classes: &[ClassId],
     env: &EnvFn,
+) -> Report {
+    poll_with_limit(client, spec, params, classes, env, MAX_BODY).await
+}
+
+/// As [`poll`], with an explicit cap on the size of each response body.
+pub async fn poll_with_limit(
+    client: &reqwest::Client,
+    spec: &SourceSpec,
+    params: &HttpJsonParams,
+    classes: &[ClassId],
+    env: &EnvFn,
+    max_body: usize,
 ) -> Report {
     let fail = |error: String| Report::Failed {
         source: spec.id.clone(),
@@ -170,13 +229,13 @@ pub async fn poll(
     };
     let mut parts = Vec::with_capacity(params.requests.len());
     for (i, req) in params.requests.iter().enumerate() {
-        let doc = match fetch(client, req, auth.as_ref()).await {
+        let doc = match fetch(client, req, auth.as_ref(), max_body).await {
             Ok(d) => d,
-            Err(e) => return fail(format!("request {i} ({}): {e}", req.url)),
+            Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         };
         match extract(&doc, req) {
             Ok(n) => parts.push((req.counts_as, n)),
-            Err(e) => return fail(format!("request {i} ({}): {e}", req.url)),
+            Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         }
     }
     let (ready, in_flight) = totals(&parts);
@@ -187,12 +246,18 @@ pub async fn poll(
     }
 }
 
+/// The HTTP client for a source. It follows no redirects: a custom auth header must never
+/// be forwarded to another origin, and a redirect from an API endpoint is an error anyway.
+pub fn build_client(params: &HttpJsonParams) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(params.timeout.as_u64()))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// Polls forever, every `resync`, until the receiver is gone.
 pub async fn run(spec: SourceSpec, params: HttpJsonParams, classes: Vec<ClassId>, tx: ReportTx) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(params.timeout.as_u64()))
-        .build()
-    {
+    let client = match build_client(&params) {
         Ok(c) => c,
         Err(e) => {
             let _ = tx
@@ -234,6 +299,7 @@ mod tests {
             length: length.map(Into::into),
             filter,
             counts_as: CountsAs::Ready,
+            max_items: None,
         }
     }
 
@@ -386,10 +452,7 @@ mod tests {
     }
 
     async fn failure(server: &TestServer, params: &HttpJsonParams, spec: &SourceSpec) -> String {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(params.timeout.as_u64()))
-            .build()
-            .unwrap();
+        let client = build_client(params).unwrap();
         match poll(&client, spec, params, &[], &env).await {
             Report::Failed { source, error } => {
                 assert_eq!(source, spec.id);
@@ -495,5 +558,117 @@ mod tests {
             }
         }
         task.abort();
+    }
+
+    #[test]
+    fn redaction_drops_credentials_and_query_values() {
+        assert_eq!(
+            redact_url("https://user:pw@host:8000/api/x?token=abc&status=failed"),
+            "https://host:8000/api/x?token=<redacted>&status=<redacted>"
+        );
+        assert_eq!(redact_url("http://host/p"), "http://host/p");
+        assert_eq!(redact_url("http://u@host"), "http://host");
+    }
+
+    #[tokio::test]
+    async fn errors_do_not_leak_credentials_from_the_url() {
+        let server = TestServer::start().await;
+        let (spec, mut params, _) = example_source("paperless-ocr-pending", &server);
+        params.auth = None;
+        params.requests[0].url = format!(
+            "{}?api_key=SECRETVALUE",
+            server
+                .url("/api/documents/")
+                .replace("http://", "http://bob:hunter2@")
+        );
+        server.set("/api/documents/?api_key=SECRETVALUE", Reply::status(500));
+        let e = failure(&server, &params, &spec).await;
+        assert!(
+            e.contains("HTTP 500") && e.contains("api_key=<redacted>"),
+            "{e}"
+        );
+        assert!(!e.contains("SECRETVALUE") && !e.contains("hunter2"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed_and_credentials_do_not_cross_origins() {
+        let other = TestServer::start().await;
+        other.set(
+            "/api/documents/?tags__name__iexact=ocr-pending&page_size=1",
+            Reply::json(r#"{"count": 99}"#),
+        );
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("paperless-ocr-pending", &server);
+        server.set(
+            "/api/documents/?tags__name__iexact=ocr-pending&page_size=1",
+            Reply::redirect(
+                &other.url("/api/documents/?tags__name__iexact=ocr-pending&page_size=1"),
+            ),
+        );
+        let env = |_: &str| Some("tok".to_string());
+        let client = build_client(&params).unwrap();
+        match poll(&client, &spec, &params, &classes, &env).await {
+            Report::Failed { error, .. } => assert!(error.contains("HTTP 302"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            other.requests().is_empty(),
+            "the redirect target was contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_page_fails_instead_of_under_counting() {
+        let d = doc(r#"{"r": [1,2,3]}"#);
+        let mut r = req(None, Some("/r"), None);
+        r.max_items = Some(3);
+        assert_eq!(extract(&d, &r), Err(ExtractError::AtLimit(3)));
+        r.max_items = Some(4);
+        assert_eq!(extract(&d, &r), Ok(3));
+
+        // End to end with the example speakr source: 100 pending in one response.
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("speakr-pending", &server);
+        let full: Vec<String> = (0..100).map(|i| format!("{{\"id\": {i}}}")).collect();
+        server.set(
+            SPEAKR_PENDING,
+            Reply::json(&format!("{{\"recordings\": [{}]}}", full.join(","))),
+        );
+        match poll(
+            &build_client(&params).unwrap(),
+            &spec,
+            &params,
+            &classes,
+            &env,
+        )
+        .await
+        {
+            Report::Failed { error, .. } => assert!(error.contains("full page"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endless_body_is_cut_off_while_streaming() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("paperless-ocr-pending", &server);
+        server.set(
+            "/api/documents/?tags__name__iexact=ocr-pending&page_size=1",
+            Reply::endless(),
+        );
+        let env = |_: &str| Some("tok".to_string());
+        let client = build_client(&params).unwrap();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            poll_with_limit(&client, &spec, &params, &classes, &env, 100_000),
+        )
+        .await
+        .expect("an endless body must not hang the poll");
+        match report {
+            Report::Failed { error, .. } => {
+                assert!(error.contains("larger than 100000"), "{error}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

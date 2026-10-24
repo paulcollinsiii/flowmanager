@@ -160,7 +160,9 @@ sources:
   # Jobs fail rather than queue while whisperX is unloaded, so recordings that failed with
   # a connection error count as pending demand, together with the pending ones. Recordings
   # being processed are in-flight work. (Field names follow speakr's v1 API; check them
-  # against the deployed version.)
+  # against the deployed version: they are unverified.) `max_items` equals the page size
+  # in the URL: a response that fills a page may be truncated, so the poll then fails
+  # (shown as a source error) instead of silently under-counting.
   - id: speakr-pending
     kind: http_json
     observe: [demand]
@@ -171,11 +173,14 @@ sources:
       requests:
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=100
           length: /recordings
+          max_items: 100
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100
           length: /recordings
+          max_items: 100
           where: { field: /error_message, contains: connection }
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=processing&per_page=100
           length: /recordings
+          max_items: 100
           counts_as: in_flight
       webhook: { path: /hooks/speakr }
 
@@ -189,6 +194,7 @@ sources:
       requests:
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=summarizing&per_page=100
           length: /recordings
+          max_items: 100
       webhook: { path: /hooks/speakr }
 
   - id: immich-queues

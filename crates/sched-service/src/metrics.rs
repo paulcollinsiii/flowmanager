@@ -1,6 +1,9 @@
 //! Prometheus metrics. Every label comes from a fixed set (decision kinds, reload
 //! outcomes) or from configuration (source ids), so cardinality is bounded.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts,
     Registry, TextEncoder,
@@ -19,22 +22,24 @@ pub struct Metrics {
     config_reloads: IntCounterVec,
     trigger_failures: IntCounter,
     last_tick_timestamp: Gauge,
+    rejected: IntCounterVec,
+    age_labels: Mutex<HashSet<(String, String)>>,
 }
 
 impl Metrics {
     pub fn new() -> Metrics {
         let registry = Registry::new();
         let decisions = IntCounterVec::new(
-            Opts::new("sched_decisions_total", "Ticks by decision kind, once per distinct kind in a tick (shadow mode: logged, never executed)"),
+            Opts::new("sched_tick_decisions_total", "Ticks by decision kind, counted once per distinct kind in each tick (per tick, not per executed action: shadow mode executes nothing and each tick starts from a fresh sequencer state)"),
             &["kind"],
         )
         .unwrap();
         let observation_age = GaugeVec::new(
             Opts::new(
                 "sched_observation_age_seconds",
-                "Age of the newest observation per source at the last tick; infinite if it never reported",
+                "Age of the newest observation per source and declared capability at the last tick; infinite if that capability never reported",
             ),
-            &["source"],
+            &["source", "capability"],
         )
         .unwrap();
         let source_errors = IntCounterVec::new(
@@ -73,6 +78,15 @@ impl Metrics {
             "Unix time of the last tick",
         )
         .unwrap();
+        let rejected = IntCounterVec::new(
+            Opts::new(
+                "sched_rejected_reports_total",
+                "Reports and values dropped because the config has no place for them, by reason",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        registry.register(Box::new(rejected.clone())).unwrap();
         registry.register(Box::new(decisions.clone())).unwrap();
         registry
             .register(Box::new(observation_age.clone()))
@@ -99,6 +113,8 @@ impl Metrics {
             config_reloads,
             trigger_failures,
             last_tick_timestamp,
+            rejected,
+            age_labels: Mutex::new(HashSet::new()),
         }
     }
 
@@ -106,15 +122,29 @@ impl Metrics {
         self.decisions.with_label_values(&[kind]).inc();
     }
 
-    /// Replaces the per-source ages, so a source removed from the config disappears.
+    /// Sets the per-source, per-capability ages and removes series that are no longer
+    /// configured. Series are only ever set or removed, never reset first, so a scrape
+    /// in between never sees them missing.
     pub fn set_input_ages(&self, ages: &[InputAge]) {
-        self.observation_age.reset();
+        let mut labels = self.age_labels.lock().unwrap_or_else(|e| e.into_inner());
+        let mut now_set = HashSet::new();
         for a in ages {
+            let cap = a.capability.map_or("none".to_string(), |c| c.to_string());
             let secs = a.age.map_or(f64::INFINITY, |Millis(ms)| ms as f64 / 1000.0);
             self.observation_age
-                .with_label_values(&[a.source.as_str()])
+                .with_label_values(&[a.source.as_str(), &cap])
                 .set(secs);
+            now_set.insert((a.source.to_string(), cap));
         }
+        for (source, cap) in labels.difference(&now_set) {
+            let _ = self.observation_age.remove_label_values(&[source, cap]);
+        }
+        *labels = now_set;
+    }
+
+    /// Counts a dropped report (`unknown_source`) or value (`unknown_subject`).
+    pub fn rejected(&self, reason: &str, n: u64) {
+        self.rejected.with_label_values(&[reason]).inc_by(n);
     }
 
     pub fn source_error(&self, source: &str) {
@@ -173,28 +203,70 @@ mod tests {
         m.set_input_ages(&[
             InputAge {
                 source: "s1".into(),
+                capability: Some(sched_model::Capability::Pods),
                 age: Some(Millis(1500)),
                 last_error: None,
             },
             InputAge {
                 source: "s2".into(),
+                capability: None,
                 age: None,
                 last_error: None,
             },
         ]);
         let text = m.render();
         for needle in [
-            "sched_decisions_total{kind=\"wait\"} 1",
+            "sched_tick_decisions_total{kind=\"wait\"} 1",
             "sched_source_errors_total{source=\"s1\"} 1",
             "sched_config_generation 4",
             "sched_config_reloads_total{outcome=\"rejected\"} 1",
-            "sched_observation_age_seconds{source=\"s1\"} 1.5",
-            "sched_observation_age_seconds{source=\"s2\"} inf",
+            "sched_observation_age_seconds{capability=\"pods\",source=\"s1\"} 1.5",
+            "sched_observation_age_seconds{capability=\"none\",source=\"s2\"} inf",
             "sched_tick_duration_seconds_count 1",
         ] {
             assert!(text.contains(needle), "missing {needle}:\n{text}");
         }
+        // A series that is still configured is never absent between updates.
+        m.set_input_ages(&[InputAge {
+            source: "s1".into(),
+            capability: Some(sched_model::Capability::Pods),
+            age: Some(Millis(2000)),
+            last_error: None,
+        }]);
+        let text = m.render();
+        assert!(
+            text.contains("source=\"s1\"} 2") && !text.contains("source=\"s2\""),
+            "{text}"
+        );
         m.set_input_ages(&[]);
-        assert!(!m.render().contains("source=\"s1\"} 1.5"));
+        assert!(!m.render().contains("sched_observation_age_seconds{"));
+    }
+
+    #[test]
+    fn a_scrape_never_sees_the_age_series_missing_while_they_are_updated() {
+        let m = std::sync::Arc::new(Metrics::new());
+        let ages = vec![InputAge {
+            source: "s1".into(),
+            capability: Some(sched_model::Capability::Pods),
+            age: Some(Millis(1000)),
+            last_error: None,
+        }];
+        m.set_input_ages(&ages);
+        let writer = {
+            let (m, ages) = (m.clone(), ages.clone());
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    m.set_input_ages(&ages);
+                }
+            })
+        };
+        for _ in 0..5_000 {
+            assert!(
+                m.render()
+                    .contains("sched_observation_age_seconds{capability=\"pods\",source=\"s1\"}"),
+                "series missing during an update"
+            );
+        }
+        writer.join().unwrap();
     }
 }

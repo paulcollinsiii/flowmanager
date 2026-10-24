@@ -91,6 +91,11 @@ pub struct RequestSpec {
     pub filter: Option<ElementFilter>,
     #[serde(default)]
     pub counts_as: CountsAs,
+    /// With `length`: the most elements one response can hold (the page size in the URL).
+    /// A response that reaches it may be truncated, so the poll fails instead of
+    /// under-counting.
+    #[serde(default)]
+    pub max_items: Option<u64>,
 }
 
 /// Where the value of an authentication header comes from. Never the config itself.
@@ -185,6 +190,17 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
         }
         for ptr in [&r.count, &r.length].into_iter().flatten() {
             out.extend(pointer_problem(ptr).map(|m| format!("{at}: {m}")));
+        }
+        if r.max_items.is_some() && r.length.is_none() {
+            out.push(format!("{at}: max_items is only valid with length"));
+        }
+        if r.max_items == Some(0) {
+            out.push(format!("{at}: max_items must be greater than zero"));
+        }
+        if let Some(j) = p.requests[..i].iter().position(|earlier| earlier == r) {
+            out.push(format!(
+                "{at} is identical to requests[{j}]; it would be counted twice"
+            ));
         }
         if let Some(f) = &r.filter {
             if r.length.is_none() {
@@ -349,6 +365,27 @@ mod tests {
             let ps = problems_of(&EXAMPLE_CONFIG.replace(url, replacement));
             assert!(has(&ps, needle), "{needle}: {ps:?}");
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_identical_requests_and_bad_max_items() {
+        let url = "url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting";
+        let dup = format!("{url}\n        - {url}");
+        let ps = problems_of(&EXAMPLE_CONFIG.replace(url, &dup));
+        assert!(
+            has(&ps, "requests[1] is identical to requests[0]"),
+            "{ps:?}"
+        );
+        let ps = problems_of(&EXAMPLE_CONFIG.replace(
+            url,
+            "url: http://x\n          count: /a\n          max_items: 5",
+        ));
+        assert!(has(&ps, "max_items is only valid with length"), "{ps:?}");
+        let ps = problems_of(&EXAMPLE_CONFIG.replace(
+            url,
+            "url: http://x\n          length: /a\n          max_items: 0",
+        ));
+        assert!(has(&ps, "max_items must be greater than zero"), "{ps:?}");
     }
 
     #[test]

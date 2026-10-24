@@ -6,6 +6,7 @@
 //! as "zero pods". Node readiness is checked once per resync and debounced.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,9 +14,12 @@ use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::Api;
 use kube::ResourceExt;
-use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
-use sched_model::{Config, Fidelity, KubeWatchParams, ObservedValue, ResourceId, SourceSpec};
+use sched_model::{
+    Fidelity, KubeWatchParams, ModelSpec, ObservedValue, ResourceId, SourceId, SourceSpec,
+};
+use serde::de::DeserializeOwned;
+use tokio::task::JoinSet;
 
 use crate::{Report, ReportTx};
 
@@ -114,11 +118,10 @@ impl PodStore {
 /// One `ModelPods` value per configured model, summing its workloads over `stores`. A
 /// workload with no pods counts as zero: the lists are complete, so absence is a fact.
 pub fn model_values(
-    config: &Config,
+    models: &[ModelSpec],
     stores: &[BTreeMap<String, (u32, u32)>],
 ) -> Vec<ObservedValue> {
-    config
-        .models()
+    models
         .iter()
         .map(|m| {
             let (pods, ready_pods) = m
@@ -180,6 +183,27 @@ impl Debouncer {
     }
 }
 
+/// Delays of the restart loops.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// First wait before re-listing after a watch failure; doubles up to `backoff_max`
+    /// and starts over after a list completes.
+    pub backoff_initial: Duration,
+    pub backoff_max: Duration,
+    /// Wait between attempts to create the cluster client.
+    pub client_retry: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            backoff_initial: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+            client_retry: Duration::from_secs(5),
+        }
+    }
+}
+
 /// Shared by the watch tasks and the resync loop.
 #[derive(Default)]
 struct Shared {
@@ -195,103 +219,78 @@ fn lock(s: &SharedState) -> std::sync::MutexGuard<'_, Shared> {
 }
 
 /// The pod report, or `None` while any namespace is still unsynced.
-fn pod_report(
-    spec: &SourceSpec,
-    config: &Config,
-    shared: &SharedState,
+pub fn pod_report_from(
+    source: &SourceId,
+    models: &[ModelSpec],
+    stores: &BTreeMap<String, PodStore>,
     fidelity: Fidelity,
 ) -> Option<Report> {
-    let g = lock(shared);
-    if g.pods.values().any(|s| !s.synced()) {
+    if stores.values().any(|s| !s.synced()) {
         return None;
     }
-    let counts: Vec<_> = g.pods.values().map(PodStore::counts).collect();
+    let counts: Vec<_> = stores.values().map(PodStore::counts).collect();
     Some(Report::Observed {
-        source: spec.id.clone(),
+        source: source.clone(),
         fidelity,
-        values: model_values(config, &counts),
+        values: model_values(models, &counts),
     })
 }
 
-async fn watch_pods(
-    namespace: String,
-    spec: SourceSpec,
-    params: KubeWatchParams,
-    config: Arc<Config>,
-    shared: SharedState,
-    client: kube::Client,
-    tx: ReportTx,
-) {
-    let api: Api<Pod> = Api::namespaced(client, &namespace);
-    let mut stream = Box::pin(watcher::watcher(api, watcher::Config::default()).default_backoff());
-    while let Some(ev) = stream.next().await {
-        match ev {
-            Ok(ev) => {
-                lock(&shared)
-                    .pods
-                    .entry(namespace.clone())
-                    .or_default()
-                    .apply(ev, &params.workload_label);
-                if let Some(r) = pod_report(&spec, &config, &shared, Fidelity::Event)
-                    && tx.send(r).await.is_err()
-                {
-                    return;
-                }
-            }
-            Err(e) => {
-                lock(&shared)
-                    .pods
-                    .entry(namespace.clone())
-                    .or_default()
-                    .invalidate();
-                let failed = Report::Failed {
-                    source: spec.id.clone(),
-                    error: format!("pod watch in namespace {namespace}: {e}"),
-                };
-                if tx.send(failed).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
+fn pod_report(
+    spec: &SourceSpec,
+    models: &[ModelSpec],
+    shared: &SharedState,
+    fidelity: Fidelity,
+) -> Option<Report> {
+    pod_report_from(&spec.id, models, &lock(shared).pods, fidelity)
 }
 
-async fn watch_nodes(spec: SourceSpec, shared: SharedState, client: kube::Client, tx: ReportTx) {
-    let api: Api<Node> = Api::all(client);
-    let mut stream = Box::pin(watcher::watcher(api, watcher::Config::default()).default_backoff());
-    let mut relist: Option<HashMap<String, bool>> = None;
-    while let Some(ev) = stream.next().await {
-        match ev {
-            Ok(Event::Init) => relist = Some(HashMap::new()),
-            Ok(Event::InitApply(n)) => {
-                if let Some(r) = &mut relist {
-                    r.insert(n.name_any(), node_ready(&n));
+/// Watches `K` until the receiver is gone. After any watch error the watcher is thrown
+/// away and, after a backoff, started afresh: the new one lists again, so the store is
+/// replaced and resumes reporting. (kube-runtime alone would keep watching without a new
+/// list and the stores would stay unsynced for good.)
+async fn watch_restarting<K>(
+    make_api: impl Fn() -> Api<K>,
+    timing: Timing,
+    source: SourceId,
+    what: String,
+    tx: ReportTx,
+    mut on_event: impl FnMut(Event<K>) -> Option<Report>,
+    mut on_error: impl FnMut(),
+) where
+    K: kube::Resource<DynamicType = ()> + Clone + DeserializeOwned + Debug + Send + 'static,
+{
+    let mut backoff = timing.backoff_initial;
+    loop {
+        let mut stream = Box::pin(watcher::watcher(make_api(), watcher::Config::default()));
+        while let Some(ev) = stream.next().await {
+            match ev {
+                Ok(ev) => {
+                    if matches!(ev, Event::InitDone) {
+                        backoff = timing.backoff_initial;
+                    }
+                    if let Some(r) = on_event(ev)
+                        && tx.send(r).await.is_err()
+                    {
+                        return;
+                    }
                 }
-            }
-            Ok(Event::InitDone) => {
-                if let Some(r) = relist.take() {
-                    let mut g = lock(&shared);
-                    g.nodes = r;
-                    g.nodes_synced = true;
-                }
-            }
-            Ok(Event::Apply(n)) => {
-                lock(&shared).nodes.insert(n.name_any(), node_ready(&n));
-            }
-            Ok(Event::Delete(n)) => {
-                lock(&shared).nodes.remove(&n.name_any());
-            }
-            Err(e) => {
-                lock(&shared).nodes_synced = false;
-                let failed = Report::Failed {
-                    source: spec.id.clone(),
-                    error: format!("node watch: {e}"),
-                };
-                if tx.send(failed).await.is_err() {
-                    return;
+                Err(e) => {
+                    on_error();
+                    let failed = Report::Failed {
+                        source: source.clone(),
+                        error: format!("{what} watch: {e}"),
+                    };
+                    if tx.send(failed).await.is_err() {
+                        return;
+                    }
+                    break;
                 }
             }
         }
+        drop(stream);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(timing.backoff_max);
     }
 }
 
@@ -311,11 +310,16 @@ fn reachability_readings(
     })
 }
 
-/// Watches until the receiver is gone. A cluster client that cannot be built is reported
-/// as a source failure and retried, so the source goes stale rather than looking healthy.
-pub async fn run(spec: SourceSpec, params: KubeWatchParams, config: Arc<Config>, tx: ReportTx) {
-    use sched_model::Capability;
-    let resync = Duration::from_millis(spec.resync.as_u64().max(1));
+/// Creates the cluster client from the environment and watches until the receiver is gone.
+/// A client that cannot be created is reported as a source failure and retried, so the
+/// source goes stale rather than looking healthy.
+pub async fn run(
+    spec: SourceSpec,
+    params: KubeWatchParams,
+    models: Vec<ModelSpec>,
+    tx: ReportTx,
+    timing: Timing,
+) {
     let client = loop {
         match kube::Client::try_default().await {
             Ok(c) => break c,
@@ -327,46 +331,116 @@ pub async fn run(spec: SourceSpec, params: KubeWatchParams, config: Arc<Config>,
                 if tx.send(failed).await.is_err() {
                     return;
                 }
-                tokio::time::sleep(resync.max(Duration::from_secs(5))).await;
+                tokio::time::sleep(timing.client_retry).await;
             }
         }
     };
+    run_with_client(spec, params, models, client, tx, timing).await
+}
+
+/// Watches with `client` until the receiver is gone or a watch task dies. All child tasks
+/// belong to a `JoinSet`, so they end with this future however it ends (including when it
+/// is aborted).
+pub async fn run_with_client(
+    spec: SourceSpec,
+    params: KubeWatchParams,
+    models: Vec<ModelSpec>,
+    client: kube::Client,
+    tx: ReportTx,
+    timing: Timing,
+) {
+    use sched_model::Capability;
+    let resync = Duration::from_millis(spec.resync.as_u64().max(1));
     let shared: SharedState = Arc::default();
-    let mut tasks = Vec::new();
+    let mut tasks: JoinSet<()> = JoinSet::new();
     let observes_pods = spec.observe.contains(&Capability::Pods);
     let observes_up = spec.observe.contains(&Capability::Reachability);
     if observes_pods {
-        for ns in &params.namespaces {
+        for ns in params.namespaces.clone() {
             lock(&shared).pods.entry(ns.clone()).or_default();
-            tasks.push(tokio::spawn(watch_pods(
-                ns.clone(),
-                spec.clone(),
-                params.clone(),
-                Arc::clone(&config),
-                Arc::clone(&shared),
-                client.clone(),
+            let (on_event_state, on_error_state) = (Arc::clone(&shared), Arc::clone(&shared));
+            let (ev_ns, err_ns, api_ns) = (ns.clone(), ns.clone(), ns.clone());
+            let label = params.workload_label.clone();
+            let (source, event_models) = (spec.id.clone(), models.clone());
+            let c = client.clone();
+            tasks.spawn(watch_restarting(
+                move || Api::<Pod>::namespaced(c.clone(), &api_ns),
+                timing,
+                spec.id.clone(),
+                format!("pod (namespace {ns})"),
                 tx.clone(),
-            )));
+                move |ev| {
+                    let mut g = lock(&on_event_state);
+                    g.pods.entry(ev_ns.clone()).or_default().apply(ev, &label);
+                    pod_report_from(&source, &event_models, &g.pods, Fidelity::Event)
+                },
+                move || {
+                    lock(&on_error_state)
+                        .pods
+                        .entry(err_ns.clone())
+                        .or_default()
+                        .invalidate();
+                },
+            ));
         }
     }
     if observes_up {
-        tasks.push(tokio::spawn(watch_nodes(
-            spec.clone(),
-            Arc::clone(&shared),
-            client.clone(),
+        let (state, state2) = (Arc::clone(&shared), Arc::clone(&shared));
+        let c = client.clone();
+        let mut relist: Option<HashMap<String, bool>> = None;
+        tasks.spawn(watch_restarting(
+            move || Api::<Node>::all(c.clone()),
+            timing,
+            spec.id.clone(),
+            "node".to_string(),
             tx.clone(),
-        )));
+            move |ev| {
+                let mut g = lock(&state);
+                match ev {
+                    Event::Init => relist = Some(HashMap::new()),
+                    Event::InitApply(n) => {
+                        if let Some(r) = &mut relist {
+                            r.insert(n.name_any(), node_ready(&n));
+                        }
+                    }
+                    Event::InitDone => {
+                        if let Some(r) = relist.take() {
+                            g.nodes = r;
+                            g.nodes_synced = true;
+                        }
+                    }
+                    Event::Apply(n) => {
+                        g.nodes.insert(n.name_any(), node_ready(&n));
+                    }
+                    Event::Delete(n) => {
+                        g.nodes.remove(&n.name_any());
+                    }
+                }
+                None
+            },
+            move || lock(&state2).nodes_synced = false,
+        ));
     }
     let mut debouncers: BTreeMap<ResourceId, Debouncer> = BTreeMap::new();
     let mut ticker = tokio::time::interval(resync);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            ended = tasks.join_next(), if !tasks.is_empty() => {
+                let why = match ended {
+                    Some(Err(e)) if e.is_panic() => "a watch task panicked",
+                    _ => "a watch task ended",
+                };
+                let _ = tx.send(Report::Failed { source: spec.id.clone(), error: why.to_string() }).await;
+                return;
+            }
+        }
         if observes_pods
-            && let Some(r) = pod_report(&spec, &config, &shared, Fidelity::Polled)
+            && let Some(r) = pod_report(&spec, &models, &shared, Fidelity::Polled)
             && tx.send(r).await.is_err()
         {
-            break;
+            return;
         }
         if observes_up && let Some(readings) = reachability_readings(&params, &shared) {
             let values = readings
@@ -385,12 +459,9 @@ pub async fn run(spec: SourceSpec, params: KubeWatchParams, config: Arc<Config>,
                 values,
             };
             if tx.send(report).await.is_err() {
-                break;
+                return;
             }
         }
-    }
-    for t in tasks {
-        t.abort();
     }
 }
 
@@ -398,6 +469,7 @@ pub async fn run(spec: SourceSpec, params: KubeWatchParams, config: Arc<Config>,
 mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::{NodeCondition, NodeStatus, PodCondition, PodStatus};
+    use sched_model::SourceId;
     use sched_model::test_support::example_config;
 
     fn pod(name: &str, workload: Option<&str>, phase: &str, ready: bool) -> Pod {
@@ -523,7 +595,7 @@ mod tests {
             ("mineru".to_string(), (1, 0)),
             ("ollama".to_string(), (2, 2)),
         ]);
-        let values = model_values(&config, &[a, b]);
+        let values = model_values(config.models(), &[a, b]);
         let get = |m: &str| {
             values
                 .iter()
@@ -572,5 +644,38 @@ mod tests {
         let mut zero = Debouncer::new(0);
         assert!(zero.check(true));
         assert!(!zero.check(false));
+    }
+
+    #[test]
+    fn nothing_is_reported_while_any_namespace_is_unsynced() {
+        let config = example_config();
+        let source = SourceId::new("cluster-pods");
+        let synced = |names: &[&str]| {
+            let mut s = PodStore::default();
+            s.apply(Event::Init, LABEL);
+            for n in names {
+                s.apply(
+                    Event::InitApply(pod(n, Some("mineru"), "Running", true)),
+                    LABEL,
+                );
+            }
+            s.apply(Event::InitDone, LABEL);
+            s
+        };
+        let mut stores = BTreeMap::from([
+            ("a".to_string(), synced(&["m1"])),
+            ("b".to_string(), PodStore::default()),
+        ]);
+        // One namespace has not listed yet: a count from the other alone would be a lie.
+        assert!(pod_report_from(&source, config.models(), &stores, Fidelity::Polled).is_none());
+        stores.insert("b".to_string(), synced(&["m2"]));
+        let Some(Report::Observed { values, .. }) =
+            pod_report_from(&source, config.models(), &stores, Fidelity::Polled)
+        else {
+            panic!("expected a report once both are synced");
+        };
+        assert!(values.iter().any(|v| matches!(v, ObservedValue::ModelPods { model, pods: 2, .. } if model.as_str() == "mineru")));
+        stores.get_mut("a").unwrap().invalidate();
+        assert!(pod_report_from(&source, config.models(), &stores, Fidelity::Polled).is_none());
     }
 }

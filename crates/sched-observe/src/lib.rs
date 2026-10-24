@@ -15,4 +15,4 @@ mod supervisor;
 pub mod testserver;
 
 pub use report::{Report, ReportTx};
-pub use supervisor::{Observers, spawn_observers};
+pub use supervisor::{Observers, SpawnOptions, spawn_observers, supervised};

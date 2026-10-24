@@ -25,15 +25,25 @@ pub const KIND_IDLE: &str = "idle";
 /// Metric label for a tick that failed to produce a decision.
 pub const KIND_ERROR: &str = "error";
 
-/// The distinct kinds in a decision, sorted; [`KIND_IDLE`] when there are no steps.
-pub fn kinds(steps: &[Step]) -> Vec<&'static str> {
-    let set: BTreeSet<&'static str> = steps.iter().map(step_kind).collect();
-    if set.is_empty() {
-        vec![KIND_IDLE]
-    } else {
-        set.into_iter().collect()
+/// Metric label for demand that is not known (its source never reported or is stale). A
+/// tick with no step but unknown demand is this, never [`KIND_IDLE`]: unknown is not zero.
+pub const KIND_DEMAND_UNKNOWN: &str = "demand_unknown";
+
+/// The distinct kinds in a decision, sorted; [`KIND_IDLE`] when there are no steps and all
+/// demand is known, [`KIND_DEMAND_UNKNOWN`] when any class's demand is unknown.
+pub fn kinds(steps: &[Step], unknown_demand: bool) -> Vec<&'static str> {
+    let mut set: BTreeSet<&'static str> = steps.iter().map(step_kind).collect();
+    if unknown_demand {
+        set.insert(KIND_DEMAND_UNKNOWN);
+    } else if set.is_empty() {
+        set.insert(KIND_IDLE);
     }
+    set.into_iter().collect()
 }
+
+/// What every shadow reason starts with, so a log line cannot be mistaken for the state of
+/// a live scheduler: the sequencer starts each tick from nothing.
+pub const SHADOW_PREFIX: &str = "[shadow: next step from a fresh sequencer state] ";
 
 fn wait_text(reason: WaitReason) -> &'static str {
     match reason {
@@ -95,7 +105,7 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
 }
 
 /// The whole reason of a decision: what the planner wants, then why each step.
-pub fn reason(intent: &Intent, steps: &[Step]) -> String {
+pub fn reason(intent: &Intent, steps: &[Step], unknown_demand: &[sched_model::ClassId]) -> String {
     let wants: Vec<String> = intent
         .models
         .iter()
@@ -104,7 +114,7 @@ pub fn reason(intent: &Intent, steps: &[Step]) -> String {
             None => format!("{r}=none"),
         })
         .collect();
-    let mut out = format!("intent [{}]", wants.join(", "));
+    let mut out = format!("{SHADOW_PREFIX}intent [{}]", wants.join(", "));
     if !intent.power_up.is_empty() {
         let up: Vec<_> = intent.power_up.keys().map(|r| r.to_string()).collect();
         out.push_str(&format!(", power up [{}]", up.join(", ")));
@@ -120,6 +130,13 @@ pub fn reason(intent: &Intent, steps: &[Step]) -> String {
         out.push_str("; ");
         out.push_str(&step_reason(s, intent));
     }
+    if !unknown_demand.is_empty() {
+        let ids: Vec<_> = unknown_demand.iter().map(|c| c.to_string()).collect();
+        out.push_str(&format!(
+            "; demand UNKNOWN for [{}] (source never reported or stale): this is not idle",
+            ids.join(", ")
+        ));
+    }
     out
 }
 
@@ -128,13 +145,17 @@ pub fn reason(intent: &Intent, steps: &[Step]) -> String {
 pub fn format_inputs(ages: &[InputAge]) -> String {
     ages.iter()
         .map(|a| {
+            let name = match a.capability {
+                Some(c) => format!("{}/{c}", a.source),
+                None => a.source.to_string(),
+            };
             let age = match a.age {
                 Some(Millis(ms)) => format!("{ms}ms"),
                 None => "none".to_string(),
             };
             match &a.last_error {
-                Some(e) => format!("{}={age} (error: {e})", a.source),
-                None => format!("{}={age}", a.source),
+                Some(e) => format!("{name}={age} (error: {e})"),
+                None => format!("{name}={age}"),
             }
         })
         .collect::<Vec<_>>()
@@ -154,7 +175,8 @@ mod tests {
 
     #[test]
     fn kinds_are_distinct_sorted_and_idle_when_empty() {
-        assert_eq!(kinds(&[]), vec![KIND_IDLE]);
+        assert_eq!(kinds(&[], false), vec![KIND_IDLE]);
+        assert_eq!(kinds(&[], true), vec![KIND_DEMAND_UNKNOWN]);
         let steps = vec![
             Step::Wait {
                 resource: "a".into(),
@@ -169,7 +191,11 @@ mod tests {
                 reason: WaitReason::MinDwell,
             },
         ];
-        assert_eq!(kinds(&steps), vec!["allow_model", "wait"]);
+        assert_eq!(kinds(&steps, false), vec!["allow_model", "wait"]);
+        assert_eq!(
+            kinds(&steps, true),
+            vec!["allow_model", "demand_unknown", "wait"]
+        );
     }
 
     #[test]
@@ -184,8 +210,11 @@ mod tests {
                 reason: WaitReason::HostNotUp,
             },
         ];
-        let r = reason(&intent(), &steps);
-        assert!(r.starts_with("intent [cuda-central=mineru]"), "{r}");
+        let r = reason(&intent(), &steps, &[]);
+        assert!(
+            r.starts_with(SHADOW_PREFIX) && r.contains("intent [cuda-central=mineru]"),
+            "{r}"
+        );
         assert!(
             r.contains("allow mineru on cuda-central: the planner wants mineru on cuda-central"),
             "{r}"
@@ -194,7 +223,7 @@ mod tests {
             r.contains("wait on basestar-nfs: the host is not up"),
             "{r}"
         );
-        assert!(reason(&Intent::default(), &[]).contains("no step needed"));
+        assert!(reason(&Intent::default(), &[], &[]).contains("no step needed"));
     }
 
     #[test]
@@ -202,15 +231,20 @@ mod tests {
         let ages = vec![
             InputAge {
                 source: "a".into(),
+                capability: Some(sched_model::Capability::Pods),
                 age: Some(Millis(1200)),
                 last_error: None,
             },
             InputAge {
                 source: "b".into(),
+                capability: None,
                 age: None,
                 last_error: Some("HTTP 500".into()),
             },
         ];
-        assert_eq!(format_inputs(&ages), "a=1200ms, b=none (error: HTTP 500)");
+        assert_eq!(
+            format_inputs(&ages),
+            "a/pods=1200ms, b=none (error: HTTP 500)"
+        );
     }
 }

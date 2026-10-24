@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use sched_model::{
-    ClassId, Config, Fidelity, Millis, ModelId, Observation, ObservedValue, ResourceId, Snapshot,
-    SourceId,
+    Capability, ClassId, Config, Fidelity, Millis, ModelId, Observation, ObservedValue, ResourceId,
+    Snapshot, SourceId,
 };
 use sched_observe::Report;
 
@@ -29,6 +29,36 @@ fn subject(v: &ObservedValue) -> Subject {
     }
 }
 
+/// The capability a value belongs to.
+fn capability(v: &ObservedValue) -> Capability {
+    match v {
+        ObservedValue::Demand { .. } => Capability::Demand,
+        ObservedValue::ModelPods { .. } => Capability::Pods,
+        ObservedValue::ResourceUp { .. } => Capability::Reachability,
+    }
+}
+
+/// Whether `config` has a place for `value` from `source`: the source declares the value's
+/// capability, and the subject (class, model, resource) exists, with a class taking its
+/// demand from this very source. Anything else is dropped, so the cache is bounded by the
+/// config however a source (or a pusher) behaves.
+fn accepts(config: &Config, source: &SourceId, value: &ObservedValue) -> bool {
+    if !config.source_observes(source, capability(value)) {
+        return false;
+    }
+    match value {
+        ObservedValue::Demand { class, .. } => config
+            .class(class)
+            .and_then(|c| c.demand.as_ref())
+            .is_some_and(|d| &d.source == source),
+        ObservedValue::ModelPods { model, .. } => config.model(model).is_some(),
+        ObservedValue::ResourceUp { resource, .. } => config.resource(resource).is_some(),
+    }
+}
+
+/// Longest error text kept per source.
+const MAX_ERROR_LEN: usize = 512;
+
 /// How a source has been doing, as the scheduler saw it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceStatus {
@@ -43,8 +73,9 @@ pub struct SourceStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ingest {
     /// Taken in; `changed` says whether any value (or the source's health) differs from
-    /// before, i.e. whether a decision could now differ.
-    Taken { changed: bool },
+    /// before, i.e. whether a decision could now differ. `dropped` counts values with no
+    /// place in the config (see `accepts`).
+    Taken { changed: bool, dropped: usize },
     /// The source is not in the active config; the report was dropped.
     UnknownSource,
 }
@@ -53,7 +84,10 @@ pub enum Ingest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputAge {
     pub source: SourceId,
-    /// Age of the newest observation held from it; `None` if there is none.
+    /// The capability this age is for. A source is only as healthy as its least healthy
+    /// capability, so each one it declares is listed. `None` for a source that declares none.
+    pub capability: Option<Capability>,
+    /// Age of the newest observation of that capability held from the source; `None` if there is none.
     pub age: Option<Millis>,
     pub last_error: Option<String>,
 }
@@ -66,6 +100,8 @@ pub struct ObservationCache {
     ready_since: BTreeMap<(SourceId, ClassId), Millis>,
     sources: BTreeMap<SourceId, SourceStatus>,
     dirty: bool,
+    /// The latest receipt time seen, so a tick never runs "before" something it can read.
+    latest_receipt: Millis,
 }
 
 impl ObservationCache {
@@ -79,8 +115,11 @@ impl ObservationCache {
             return Ingest::UnknownSource;
         }
         let mut changed = false;
+        let mut dropped = 0;
+        self.latest_receipt = self.latest_receipt.max(now);
         match report {
-            Report::Failed { source, error } => {
+            Report::Failed { source, mut error } => {
+                error.truncate(error.floor_char_boundary(MAX_ERROR_LEN));
                 let st = self.sources.entry(source).or_default();
                 changed |= st.last_error.as_ref().map(|e| &e.1) != Some(&error);
                 st.last_error = Some((now, error));
@@ -95,6 +134,10 @@ impl ObservationCache {
                 st.last_report_at = Some(now);
                 changed |= st.last_error.take().is_some();
                 for mut value in values {
+                    if !accepts(config, &source, &value) {
+                        dropped += 1;
+                        continue;
+                    }
                     if let ObservedValue::Demand {
                         class,
                         ready,
@@ -125,7 +168,12 @@ impl ObservationCache {
             }
         }
         self.dirty |= changed;
-        Ingest::Taken { changed }
+        Ingest::Taken { changed, dropped }
+    }
+
+    /// The latest time at which anything was received.
+    pub fn latest_receipt(&self) -> Millis {
+        self.latest_receipt
     }
 
     /// Returns whether anything changed since the last call, and clears the flag.
@@ -161,28 +209,40 @@ impl ObservationCache {
         self.sources.get(source)
     }
 
-    /// Age of the newest observation from each configured source, with its last error.
-    /// A source that never reported has no age; it is not reported as healthy.
+    /// Age of the newest observation of each capability each configured source declares,
+    /// with the source's last error. A capability that never reported has no age; it is
+    /// not reported as healthy, even if the source's other capabilities are fresh.
     pub fn input_ages(&self, config: &Config, now: Millis) -> Vec<InputAge> {
-        config
-            .sources()
-            .iter()
-            .map(|s| InputAge {
-                source: s.id.clone(),
-                age: self
-                    .entries
-                    .values()
-                    .filter(|o| o.source == s.id)
-                    .map(|o| o.observed_at)
-                    .max()
-                    .map(|t| now.saturating_sub(t)),
-                last_error: self
-                    .sources
-                    .get(&s.id)
-                    .and_then(|st| st.last_error.as_ref())
-                    .map(|e| e.1.clone()),
-            })
-            .collect()
+        let mut out = Vec::new();
+        for s in config.sources() {
+            let caps: Vec<Option<Capability>> = if s.observe.is_empty() {
+                vec![None]
+            } else {
+                s.observe.iter().copied().map(Some).collect()
+            };
+            let last_error = self
+                .sources
+                .get(&s.id)
+                .and_then(|st| st.last_error.as_ref())
+                .map(|e| e.1.clone());
+            for cap in caps {
+                out.push(InputAge {
+                    source: s.id.clone(),
+                    capability: cap,
+                    age: self
+                        .entries
+                        .values()
+                        .filter(|o| {
+                            o.source == s.id && cap.is_none_or(|c| capability(&o.value) == c)
+                        })
+                        .map(|o| o.observed_at)
+                        .max()
+                        .map(|t| now.saturating_sub(t)),
+                    last_error: last_error.clone(),
+                });
+            }
+        }
+        out
     }
 }
 
@@ -334,14 +394,20 @@ mod tests {
         };
         assert_eq!(
             c.ingest(&cfg, r(), Millis(1)),
-            Ingest::Taken { changed: true }
+            Ingest::Taken {
+                changed: true,
+                dropped: 0
+            }
         );
         assert!(c.take_dirty());
         assert!(!c.take_dirty());
         // The same reading again refreshes the timestamp but is not a change.
         assert_eq!(
             c.ingest(&cfg, r(), Millis(2)),
-            Ingest::Taken { changed: false }
+            Ingest::Taken {
+                changed: false,
+                dropped: 0
+            }
         );
         assert!(!c.take_dirty());
         assert_eq!(held(&c, &cfg, 3)[0].observed_at, Millis(2));
@@ -352,15 +418,24 @@ mod tests {
         };
         assert_eq!(
             c.ingest(&cfg, err(), Millis(3)),
-            Ingest::Taken { changed: true }
+            Ingest::Taken {
+                changed: true,
+                dropped: 0
+            }
         );
         assert_eq!(
             c.ingest(&cfg, err(), Millis(4)),
-            Ingest::Taken { changed: false }
+            Ingest::Taken {
+                changed: false,
+                dropped: 0
+            }
         );
         assert_eq!(
             c.ingest(&cfg, r(), Millis(5)),
-            Ingest::Taken { changed: true }
+            Ingest::Taken {
+                changed: true,
+                dropped: 0
+            }
         );
     }
 
@@ -404,5 +479,123 @@ mod tests {
         let snap = ObservationCache::new().snapshot(&cfg, Millis(7));
         assert_eq!(snap.config_generation, cfg.generation());
         assert!(snap.leases.is_empty());
+    }
+
+    #[test]
+    fn values_without_a_place_in_the_config_are_dropped_and_the_cache_stays_bounded() {
+        let cfg = example_config();
+        let mut c = ObservationCache::new();
+        let stray = |n: usize| {
+            (0..n)
+                .map(|i| demand(&format!("class-{i}"), 1, None))
+                .collect::<Vec<_>>()
+        };
+        // Unknown classes; a real class from the wrong source; a capability the source
+        // does not declare (a demand source reporting pods); unknown model and resource.
+        let mut values = stray(1000);
+        values.push(demand("speakr-transcription", 1, None));
+        let r = c.ingest(&cfg, report("paperless-ocr-pending", values), Millis(1));
+        assert_eq!(
+            r,
+            Ingest::Taken {
+                changed: false,
+                dropped: 1001
+            }
+        );
+        let r = c.ingest(
+            &cfg,
+            report(
+                "paperless-ocr-pending",
+                vec![ObservedValue::ModelPods {
+                    model: "mineru".into(),
+                    pods: 1,
+                    ready_pods: 1,
+                }],
+            ),
+            Millis(2),
+        );
+        assert_eq!(
+            r,
+            Ingest::Taken {
+                changed: false,
+                dropped: 1
+            }
+        );
+        let r = c.ingest(
+            &cfg,
+            report(
+                "cluster-pods",
+                vec![
+                    ObservedValue::ModelPods {
+                        model: "nope".into(),
+                        pods: 1,
+                        ready_pods: 1,
+                    },
+                    ObservedValue::ResourceUp {
+                        resource: "nope".into(),
+                        up: true,
+                    },
+                ],
+            ),
+            Millis(3),
+        );
+        assert_eq!(
+            r,
+            Ingest::Taken {
+                changed: false,
+                dropped: 2
+            }
+        );
+        assert!(held(&c, &cfg, 4).is_empty());
+    }
+
+    #[test]
+    fn a_capability_that_never_reported_is_visible_even_if_the_source_is_otherwise_fresh() {
+        let cfg = example_config();
+        let mut c = ObservationCache::new();
+        // cluster-pods declares pods and reachability; only reachability reports.
+        c.ingest(
+            &cfg,
+            report(
+                "cluster-pods",
+                vec![ObservedValue::ResourceUp {
+                    resource: "cuda-central".into(),
+                    up: true,
+                }],
+            ),
+            Millis(1_000),
+        );
+        let ages = c.input_ages(&cfg, Millis(1_500));
+        let of = |cap| {
+            ages.iter()
+                .find(|a| a.source.as_str() == "cluster-pods" && a.capability == Some(cap))
+                .unwrap()
+                .age
+        };
+        assert_eq!(of(Capability::Reachability), Some(Millis(500)));
+        assert_eq!(of(Capability::Pods), None);
+    }
+
+    #[test]
+    fn the_latest_receipt_is_tracked_for_clamping_ticks() {
+        let cfg = example_config();
+        let mut c = ObservationCache::new();
+        c.ingest(
+            &cfg,
+            report(
+                "paperless-ocr-pending",
+                vec![demand("paperless-ocr", 1, None)],
+            ),
+            Millis(5_000),
+        );
+        c.ingest(
+            &cfg,
+            report(
+                "paperless-ocr-pending",
+                vec![demand("paperless-ocr", 1, None)],
+            ),
+            Millis(3_000),
+        );
+        assert_eq!(c.latest_receipt(), Millis(5_000));
     }
 }
