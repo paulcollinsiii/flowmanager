@@ -34,6 +34,24 @@ pub fn example_config() -> Config {
     Config::from_yaml(EXAMPLE_CONFIG).expect("bundled example config is valid")
 }
 
+/// `yaml` with every `control: manual` power section switched to `control: managed`: the
+/// scheduler powers hosts on and off (M4). Tests of the power machine use it.
+pub fn managed_power(yaml: &str) -> String {
+    let out = yaml.replace("      control: manual\n", "      control: managed\n");
+    assert_ne!(out, yaml, "no `control: manual` line to switch");
+    out
+}
+
+/// The example configuration with managed power (see [`managed_power`]).
+pub fn example_yaml_managed() -> String {
+    managed_power(EXAMPLE_CONFIG)
+}
+
+/// The example config with managed power.
+pub fn example_config_managed() -> Config {
+    Config::from_yaml(&example_yaml_managed()).expect("managed example config is valid")
+}
+
 /// A bundled fixture by name, checked against the example config.
 pub fn fixture(name: &str) -> Fixture {
     let (_, yaml) = FIXTURES
@@ -279,7 +297,7 @@ mod tests {
     #[test]
     fn resource_up_needs_a_power_section() {
         let yaml = EXAMPLE_CONFIG.replace(
-            "    power:\n      actuator: ssh_power\n      params: { host: basestar }\n",
+            "    power:\n      actuator: ssh_power\n      params: { host: basestar }\n      control: manual\n",
             "",
         );
         let yaml = yaml.replace("    may_change_power: true\n", "");

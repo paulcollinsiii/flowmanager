@@ -67,6 +67,9 @@ pub struct SourceStatus {
     /// Its latest failure, cleared by the next good report: when it arrived and what it said.
     pub last_error: Option<(Millis, String)>,
     pub errors_total: u64,
+    /// Whether the source reported values before this process started, as remembered in
+    /// the scheduler's durable state (see `seed_reported`).
+    pub reported_before: bool,
 }
 
 /// The result of taking in one report.
@@ -205,14 +208,31 @@ impl ObservationCache {
                 .cloned()
                 .collect(),
             leases: Vec::new(),
+            unobservable: Default::default(),
         }
     }
 
-    /// Whether `source` has ever reported values (a push or an observer).
+    /// Whether `source` has ever reported values (a push or an observer), in this process
+    /// or, as seeded from durable state, before it.
     pub fn has_reported(&self, source: &SourceId) -> bool {
         self.sources
             .get(source)
-            .is_some_and(|s| s.last_report_at.is_some())
+            .is_some_and(|s| s.last_report_at.is_some() || s.reported_before)
+    }
+
+    /// Remembers that the configured sources among `sources` reported before (in an earlier
+    /// process). This holds no observation and makes nothing fresh: it only keeps a silent
+    /// source reading as silent (`demand_unknown`) rather than as never reported.
+    pub fn seed_reported<'a>(
+        &mut self,
+        config: &Config,
+        sources: impl IntoIterator<Item = &'a SourceId>,
+    ) {
+        for s in sources {
+            if config.source(s).is_some() {
+                self.sources.entry(s.clone()).or_default().reported_before = true;
+            }
+        }
     }
 
     pub fn status(&self, source: &SourceId) -> Option<&SourceStatus> {

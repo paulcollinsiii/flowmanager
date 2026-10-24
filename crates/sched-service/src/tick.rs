@@ -1,20 +1,35 @@
-//! The shared scheduler context and one tick. A tick takes the cached snapshot, runs the
-//! core (planner, then sequencer), and logs the decision and why. Nothing is executed: the
-//! service has no actuator, and the observers only read.
+//! The shared scheduler context and one tick.
+//!
+//! A tick reads the cached snapshot and the scheduler's durable state ([`Durable`]: the
+//! sequencer state, the leases, and which sources have ever reported), runs the core
+//! (planner, then sequencer) and returns a [`TickOutcome`]: the decision and the state to
+//! persist. The `Scheduler` object computes it inside a journaled step, stores the new
+//! state, and only then calls [`Shared::publish`], which makes the decision visible: the
+//! allowed set on the channel the KEDA scaler reads, logs and metrics.
+//!
+//! What is carried out: the allowed set is published, so allowing a model, draining it and
+//! pausing a class's intake take effect once the scaler converges on it. Powering a host on
+//! or off, stopping in-flight work and recovery actions have no actuator in this build;
+//! those steps are listed in `not_executed` and logged as such.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use sched_model::{ClassId, Millis, ModelId, SchedState, Step, class_work};
+use sched_model::{
+    AllowedSet, Capability, ClassId, Lease, LeaseId, Millis, ModelId, PublishedAllowed, ResourceId,
+    SchedState, SourceId, Step, class_work,
+};
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::cache::{Ingest, InputAge, ObservationCache};
 use crate::clock::Clock;
 use crate::config_source::ConfigHolder;
 use crate::core::decide;
+use crate::leases;
 use crate::metrics::Metrics;
 use crate::reason::{self, DemandGaps};
 
@@ -27,6 +42,18 @@ pub struct InputReport {
     /// Milliseconds since the newest observation arrived; absent if none ever did.
     pub age_ms: Option<u64>,
     pub last_error: Option<String>,
+    /// Whether something observes the source: `running`, `no_params` (an observable kind
+    /// configured without params) or `no_observer` (no observer for the kind).
+    #[serde(default)]
+    pub observer: String,
+}
+
+fn observer_label(o: ObserverState) -> &'static str {
+    match o {
+        ObserverState::Running => "running",
+        ObserverState::NoParams => "no_params",
+        ObserverState::NoImplementation => "no_observer",
+    }
 }
 
 impl From<&InputAge> for InputReport {
@@ -36,6 +63,29 @@ impl From<&InputAge> for InputReport {
             capability: a.capability.map(|c| c.to_string()),
             age_ms: a.age.map(Millis::as_u64),
             last_error: a.last_error.clone(),
+            observer: observer_label(a.observer).to_string(),
+        }
+    }
+}
+
+impl InputReport {
+    /// Back to the form metrics and log lines are made from.
+    pub fn to_input_age(&self) -> InputAge {
+        InputAge {
+            source: self.source.as_str().into(),
+            capability: match self.capability.as_deref() {
+                Some("pods") => Some(Capability::Pods),
+                Some("reachability") => Some(Capability::Reachability),
+                Some("demand") => Some(Capability::Demand),
+                _ => None,
+            },
+            observer: match self.observer.as_str() {
+                "no_params" => ObserverState::NoParams,
+                "no_observer" => ObserverState::NoImplementation,
+                _ => ObserverState::Running,
+            },
+            age: self.age_ms.map(Millis),
+            last_error: self.last_error.clone(),
         }
     }
 }
@@ -45,30 +95,100 @@ impl From<&InputAge> for InputReport {
 pub struct TickReport {
     pub config_generation: u64,
     pub at: Millis,
-    /// Always true: each tick starts from a fresh sequencer state, so hysteresis (dwell,
-    /// idle grace) and the steps that follow it (drain, pause, power off) cannot appear.
-    pub shadow_stateless: bool,
     /// Classes whose demand is unknown although something should be reporting it: an
-    /// observer runs for the source, or the source has reported before, and it is silent or
-    /// stale. A real problem. Unknown is not zero: such a tick is never `idle`.
+    /// observer runs for the source, or the source has reported before (in this process or
+    /// an earlier one), and it is silent or stale. A real problem. Unknown is not zero:
+    /// such a tick is never `idle`.
     pub unknown_demand: Vec<ClassId>,
-    /// Classes whose demand is unknown because this build has no observer for their source
-    /// kind (schedule, session, ...) and nothing has ever pushed to it. Expected for now,
-    /// and kept apart so it cannot drown `unknown_demand`.
+    /// Classes whose demand cannot be observed because this build has no observer for their
+    /// source kind (schedule, session, ...) and the source has never reported. Nothing can
+    /// push to it either (`observe` is ingress-private), so such a class counts as having
+    /// no demand: idle, not busy.
     pub unsupported_demand: Vec<ClassId>,
     /// Classes whose source is of an observable kind but configured without `params`, and
-    /// has never been pushed to: nothing polls it. A config gap, still not idle.
+    /// has never reported: nothing polls it. A config gap; counted as no demand, like
+    /// `unsupported_demand`.
     pub unpolled_demand: Vec<ClassId>,
+    /// Exclusive resources where the intent is forced: a manual model lease (or a reclaim)
+    /// cuts batch work short, so intake is paused and in-flight work gets a timeout instead
+    /// of being waited for.
+    #[serde(default)]
+    pub forced: Vec<ResourceId>,
     /// Distinct decision kinds (see `reason::step_kind`), `idle` for none, `error` on failure.
     pub kinds: Vec<String>,
     pub reason: String,
     pub steps: Vec<Step>,
+    /// The steps nothing in this build carries out (power on/off, stopping in-flight work,
+    /// recovery actions). The sequencer has recorded them as taken all the same.
+    #[serde(default)]
+    pub not_executed: Vec<Step>,
     pub allowed_models: Vec<ModelId>,
     pub allowed_classes: Vec<ClassId>,
+    /// The leases the core was given.
+    #[serde(default)]
+    pub leases: Vec<Lease>,
+    /// Leases held but not given to the core, because the active config no longer has
+    /// their resource or model.
+    #[serde(default)]
+    pub ignored_leases: Vec<LeaseId>,
+    /// The sequencer state after this tick (unchanged from before if the tick failed).
+    #[serde(default)]
+    pub state: SchedState,
     pub inputs: Vec<InputReport>,
-    /// Whether observations changed since the previous tick.
+    /// Whether observations changed since the previous tick of this process.
     pub input_changed: bool,
     pub error: Option<String>,
+}
+
+/// What a tick reads from the scheduler's durable state, kept by the `Scheduler` object in
+/// Restate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Durable {
+    /// The sequencer state the previous tick left.
+    #[serde(default)]
+    pub state: SchedState,
+    #[serde(default)]
+    pub leases: Vec<Lease>,
+    /// Configured sources that have reported values at some point, in this process or an
+    /// earlier one.
+    #[serde(default)]
+    pub reported: BTreeSet<SourceId>,
+}
+
+impl Durable {
+    /// Takes in what a tick says to persist.
+    pub fn apply(&mut self, outcome: &TickOutcome) {
+        self.state = outcome.report.state.clone();
+        self.reported = outcome.reported.clone();
+    }
+}
+
+/// One tick's outcome: the decision and what to persist. The `Scheduler` object journals
+/// it whole, so a retried invocation reuses it instead of deciding again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickOutcome {
+    pub report: TickReport,
+    /// Sources that have ever reported, to persist (configured sources only).
+    pub reported: BTreeSet<SourceId>,
+    /// How long deciding took, in microseconds.
+    pub duration_us: u64,
+}
+
+impl TickOutcome {
+    /// The allowed set to publish, or `None` if the tick failed (the previous publication
+    /// then stays).
+    pub fn published(&self) -> Option<PublishedAllowed> {
+        let r = &self.report;
+        r.error.is_none().then(|| PublishedAllowed {
+            config_generation: r.config_generation,
+            at: r.at,
+            allowed: AllowedSet {
+                models: r.allowed_models.iter().cloned().collect(),
+                classes: r.allowed_classes.iter().cloned().collect(),
+            },
+        })
+    }
 }
 
 /// Everything ticks and observer plumbing share.
@@ -83,6 +203,11 @@ pub struct Shared {
     pub started_at: Millis,
     /// Woken when a report changed what the scheduler knows, so a tick follows promptly.
     pub changed: tokio::sync::Notify,
+    /// The allowed set of the latest tick this process published; `None` until then.
+    allowed: watch::Sender<Option<PublishedAllowed>>,
+    /// The latest tick report this process published (decided or failed); what
+    /// `last_decision` returns. Kept in memory so the report is journaled once per tick.
+    last_report: Mutex<Option<TickReport>>,
 }
 
 impl Shared {
@@ -96,11 +221,82 @@ impl Shared {
             clock,
             last_backstop: AtomicU64::new(0),
             changed: tokio::sync::Notify::new(),
+            allowed: watch::channel(None).0,
+            last_report: Mutex::new(None),
         }
+    }
+
+    /// The latest tick report this process published, if any.
+    pub fn last_report(&self) -> Option<TickReport> {
+        self.last_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Remembers in the cache which sources reported before, as the durable state says.
+    /// Idempotent; done before the journaled decision so a replay does it too.
+    pub fn seed_reported(&self, reported: &BTreeSet<SourceId>) {
+        let config = self.config.current();
+        self.cache().seed_reported(&config, reported);
+    }
+
+    /// A tick that cannot decide because the persisted state could not be read: reported,
+    /// logged at error level and counted per key, and nothing is published, so the scaler
+    /// keeps what it had. `problems` are `(key, problem)`.
+    pub fn state_error(&self, now: Millis, problems: &[(String, String)]) -> TickReport {
+        let text = problems
+            .iter()
+            .map(|(k, p)| format!("{k}: {p}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        for (key, _) in problems {
+            self.metrics.persisted_state_error(key);
+        }
+        let report = TickReport {
+            config_generation: self.config.current().generation(),
+            at: now,
+            unknown_demand: vec![],
+            unsupported_demand: vec![],
+            unpolled_demand: vec![],
+            forced: vec![],
+            kinds: vec![reason::KIND_ERROR.to_string()],
+            reason: format!(
+                "no decision: the persisted state cannot be read ({text}); nothing is published and the stored state is left as it is (see the README section 'Versions, and recovering the persisted state')"
+            ),
+            steps: vec![],
+            not_executed: vec![],
+            allowed_models: vec![],
+            allowed_classes: vec![],
+            leases: vec![],
+            ignored_leases: vec![],
+            state: SchedState::default(),
+            inputs: vec![],
+            input_changed: false,
+            error: Some(format!("persisted state cannot be read: {text}")),
+        };
+        tracing::error!(
+            at_ms = now.as_u64(),
+            problems = %text,
+            "tick failed: the persisted state cannot be read; nothing published, stored state left untouched"
+        );
+        *self.last_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(report.clone());
+        report
     }
 
     fn cache(&self) -> std::sync::MutexGuard<'_, ObservationCache> {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A receiver of the published allowed set, for the KEDA scaler. It holds `None` until
+    /// the first tick of this process has been published, then the latest tick's set.
+    pub fn subscribe_allowed(&self) -> watch::Receiver<Option<PublishedAllowed>> {
+        self.allowed.subscribe()
+    }
+
+    /// The allowed set currently published.
+    pub fn published_allowed(&self) -> Option<PublishedAllowed> {
+        self.allowed.borrow().clone()
     }
 
     /// Takes in a report, dating it `now` (the scheduler's receipt time). Returns whether it
@@ -141,26 +337,37 @@ impl Shared {
         self.cache().retain_sources(&config);
     }
 
-    /// Runs one tick at `now`. The config handle is taken once, so the whole tick sees one
+    /// Decides one tick at `now` from the cache and `durable`. Publishes nothing: see
+    /// [`Shared::publish`]. The config handle is taken once, so the whole tick sees one
     /// generation.
-    pub fn tick(&self, now: Millis) -> TickReport {
-        self.tick_pinned(now, || {})
+    pub fn decide(&self, now: Millis, durable: &Durable) -> TickOutcome {
+        self.decide_pinned(now, durable, || {})
     }
 
-    /// As [`Shared::tick`]; `after_pin` runs right after the config is pinned, a seam for
+    /// As [`Shared::decide`]; `after_pin` runs right after the config is pinned, a seam for
     /// tests to change the config mid-tick.
-    pub fn tick_pinned(&self, now: Millis, after_pin: impl FnOnce()) -> TickReport {
+    pub fn decide_pinned(
+        &self,
+        now: Millis,
+        durable: &Durable,
+        after_pin: impl FnOnce(),
+    ) -> TickOutcome {
         let started = Instant::now();
         let config = self.config.current();
         after_pin();
-        let (snapshot, ages, changed, now, reported) = {
+        let (leases, ignored_leases) = leases::effective(&config, &durable.leases);
+        let (mut snapshot, ages, changed, now, reported) = {
             let mut cache = self.cache();
+            // Which sources reported before is durable and was seeded into the cache before
+            // this step (`seed_reported`); the cache itself only knows this process.
             // Never run before something already received: that observation would be
             // dated after `now` and read as not fresh.
             let now = now.max(cache.latest_receipt());
             (
                 cache.snapshot(&config, now),
                 cache.input_ages(&config, now),
+                // The dirty flag is taken inside the journaled step: on a replay it stays
+                // set, so the next tick reports `input_changed`, which is harmless.
                 cache.take_dirty(),
                 now,
                 config
@@ -171,70 +378,127 @@ impl Shared {
                     .collect::<BTreeSet<_>>(),
             )
         };
+        snapshot.leases = leases.clone();
+        // Sources that can never report: nothing observes them in this build and, `observe`
+        // being ingress-private, nothing outside Restate can push to them. If they have
+        // never reported, their classes have no demand (see `Snapshot::unobservable`). One
+        // that has reported before (in any process) is merely silent: unknown, as before.
+        snapshot.unobservable = config
+            .sources()
+            .iter()
+            .filter(|s| observer_state(s) != ObserverState::Running)
+            .filter(|s| !reported.contains(&s.id))
+            .map(|s| s.id.clone())
+            .collect();
         let mut gaps = DemandGaps::default();
         for c in config.classes() {
             let Some(d) = &c.demand else { continue };
-            if class_work(&config, &snapshot, c).known {
-                continue;
+            if snapshot.unobservable.contains(&d.source) {
+                match config.source(&d.source).map(observer_state) {
+                    Some(ObserverState::NoParams) => gaps.unpolled.push(c.id.clone()),
+                    _ => gaps.unsupported.push(c.id.clone()),
+                }
+            } else if !class_work(&config, &snapshot, c).known {
+                gaps.unknown.push(c.id.clone());
             }
-            let state = config.source(&d.source).map(observer_state);
-            let silent_before = reported.contains(&d.source);
-            // Something that has ever reported is merely silent now, whatever feeds it.
-            let list = match state {
-                _ if silent_before => &mut gaps.unknown,
-                Some(ObserverState::NoParams) => &mut gaps.unpolled,
-                Some(ObserverState::NoImplementation) => &mut gaps.unsupported,
-                _ => &mut gaps.unknown,
-            };
-            list.push(c.id.clone());
         }
-        // Shadow mode: the sequencer's state is not carried between ticks, because no step
-        // is ever executed and carrying it would only let the scheduler wait for effects
-        // that cannot happen. Each tick answers "what would I do given what I see now".
-        let result = decide(&config, &snapshot, &SchedState::default());
-        let (kinds, reason, steps, allowed, error) = match result {
-            Ok((intent, decision)) => (
-                reason::kinds(&decision.steps, &gaps)
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                reason::reason(&intent, &decision.steps, &gaps),
-                decision.steps,
-                decision.allowed,
-                None,
-            ),
-            Err(e) => (
-                vec![reason::KIND_ERROR.to_string()],
-                format!("{}no decision: {e}", reason::SHADOW_PREFIX),
-                Vec::new(),
-                Default::default(),
-                Some(e.to_string()),
-            ),
-        };
+        let (kinds, reason, steps, allowed, state, forced, error) =
+            match decide(&config, &snapshot, &durable.state) {
+                Ok((intent, decision)) => {
+                    // Power wishes of hosts under manual control are never acted on; the
+                    // reason does not list them.
+                    let mut shown = intent.clone();
+                    shown.power_up.retain(|r, _| config.power_managed(r));
+                    (
+                        reason::kinds(&decision.steps, &gaps)
+                            .into_iter()
+                            .map(String::from)
+                            .collect(),
+                        reason::reason(&shown, &decision.steps, &gaps),
+                        decision.steps,
+                        decision.allowed,
+                        decision.state,
+                        intent.forced.iter().cloned().collect(),
+                        None,
+                    )
+                }
+                // The previous state stays, and so does the previous publication.
+                Err(e) => (
+                    vec![reason::KIND_ERROR.to_string()],
+                    format!("no decision: {e}"),
+                    Vec::new(),
+                    AllowedSet::default(),
+                    durable.state.clone(),
+                    Vec::new(),
+                    Some(e.to_string()),
+                ),
+            };
         let report = TickReport {
             config_generation: config.generation(),
             at: now,
-            shadow_stateless: true,
             unknown_demand: gaps.unknown,
             unsupported_demand: gaps.unsupported,
             unpolled_demand: gaps.unpolled,
+            forced,
             kinds,
             reason,
+            not_executed: steps
+                .iter()
+                .filter(|s| reason::not_executed(s))
+                .cloned()
+                .collect(),
             steps,
             allowed_models: allowed.models.into_iter().collect(),
             allowed_classes: allowed.classes.into_iter().collect(),
+            leases,
+            ignored_leases,
+            state,
             inputs: ages.iter().map(InputReport::from).collect(),
             input_changed: changed,
             error,
         };
-        for kind in &report.kinds {
-            self.metrics.decision(kind);
+        TickOutcome {
+            report,
+            reported,
+            duration_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         }
+    }
+
+    /// Makes a decided tick visible: publishes its allowed set (unless the tick failed),
+    /// counts it, and logs it, with a warning per step that nothing carries out.
+    ///
+    /// `replayed` says the decision came back from the journal (the step did not run in
+    /// this attempt): it is published and logged again, since this process may be a new
+    /// one, but not counted again in `sched_tick_decisions_total` or the tick duration.
+    pub fn publish(&self, outcome: &TickOutcome, replayed: bool) {
+        let r = &outcome.report;
+        if let Some(p) = outcome.published() {
+            self.allowed.send_replace(Some(p));
+        }
+        if !replayed {
+            for kind in &r.kinds {
+                self.metrics.decision(kind);
+            }
+            self.metrics
+                .tick_duration(outcome.duration_us as f64 / 1_000_000.0);
+        }
+        let ages: Vec<InputAge> = r.inputs.iter().map(InputReport::to_input_age).collect();
         self.metrics.set_input_ages(&ages);
-        self.metrics.tick_finished_at(now);
-        self.metrics.tick_duration(started.elapsed().as_secs_f64());
-        log_tick(&report, &ages);
-        report
+        self.metrics.set_phases(r.at, &r.state);
+        self.metrics.tick_finished_at(r.at);
+        log_tick(r, &reason::format_inputs(&ages), replayed);
+        *self.last_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
+    }
+
+    /// Decides and publishes one tick against `durable`, then updates it as the
+    /// `Scheduler` object updates its Restate state. For tests and tools; the object
+    /// journals the decision in between.
+    pub fn tick(&self, now: Millis, durable: &mut Durable) -> TickReport {
+        self.seed_reported(&durable.reported);
+        let outcome = self.decide(now, durable);
+        self.publish(&outcome, false);
+        durable.apply(&outcome);
+        outcome.report
     }
 
     /// Records that the backstop ran at `now`.
@@ -243,32 +507,53 @@ impl Shared {
     }
 }
 
-fn log_tick(r: &TickReport, ages: &[InputAge]) {
+fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
     let kinds = r.kinds.join(",");
-    let inputs = reason::format_inputs(ages);
     if r.error.is_some() {
         tracing::error!(
             generation = r.config_generation,
             at_ms = r.at.as_u64(),
-            shadow_stateless = true,
             decision = %kinds,
             reason = %r.reason,
             inputs = %inputs,
-            "shadow tick failed (nothing executed)"
+            replayed,
+            "tick failed; the previous state and allowed set stay"
         );
-    } else {
-        tracing::info!(
+        return;
+    }
+    fn ids(v: &[ClassId]) -> Vec<&str> {
+        v.iter().map(|c| c.as_str()).collect()
+    }
+    tracing::info!(
+        generation = r.config_generation,
+        at_ms = r.at.as_u64(),
+        decision = %kinds,
+        reason = %r.reason,
+        allowed_models = ?r.allowed_models.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
+        allowed_classes = ?ids(&r.allowed_classes),
+        leases = ?r.leases.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+        forced = ?r.forced.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+        inputs = %inputs,
+        replayed,
+        input_changed = r.input_changed,
+        unknown_demand = ?ids(&r.unknown_demand),
+        unsupported_demand = ?ids(&r.unsupported_demand),
+        unpolled_demand = ?ids(&r.unpolled_demand),
+        "tick"
+    );
+    for step in &r.not_executed {
+        tracing::warn!(
             generation = r.config_generation,
             at_ms = r.at.as_u64(),
-            shadow_stateless = true,
-            decision = %kinds,
-            reason = %r.reason,
-            inputs = %inputs,
-            input_changed = r.input_changed,
-            unknown_demand = ?r.unknown_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            unsupported_demand = ?r.unsupported_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            unpolled_demand = ?r.unpolled_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            "shadow tick (nothing executed)"
+            kind = reason::step_kind(step),
+            step = ?step,
+            "step NOT EXECUTED: no actuator for it in this build"
+        );
+    }
+    if !r.ignored_leases.is_empty() {
+        tracing::warn!(
+            leases = ?r.ignored_leases.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+            "leases ignored: the active config has no such resource or model"
         );
     }
 }
@@ -283,8 +568,12 @@ mod tests {
     const T0: u64 = 10_000_000;
 
     fn shared() -> (Arc<Shared>, Arc<ManualClock>) {
+        shared_with(EXAMPLE_CONFIG)
+    }
+
+    fn shared_with(yaml: &str) -> (Arc<Shared>, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(Millis(T0)));
-        let holder = Arc::new(ConfigHolder::new(EXAMPLE_CONFIG).unwrap());
+        let holder = Arc::new(ConfigHolder::new(yaml).unwrap());
         let s = Shared::new(holder, Arc::new(Metrics::new()), clock.clone());
         (Arc::new(s), clock)
     }
@@ -337,9 +626,10 @@ mod tests {
     #[test]
     fn demand_with_fresh_cluster_state_is_logged_as_a_decision_to_allow_a_model() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         cluster(&s);
         ocr_demand(&s, 3);
-        let r = s.tick(Millis(T0 + 1_000));
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
         assert_eq!(r.error, None);
         assert!(r.kinds.contains(&"allow_model".to_string()), "{r:?}");
         assert!(
@@ -349,22 +639,28 @@ mod tests {
         );
         assert_eq!(r.config_generation, 1);
         assert!(r.input_changed);
-        let again = s.tick(Millis(T0 + 2_000));
+        // The state is carried: the next tick sees the model loading, not idle.
+        let again = s.tick(Millis(T0 + 2_000), &mut d);
         assert!(!again.input_changed);
+        assert!(again.kinds.contains(&"wait".to_string()), "{again:?}");
         assert!(
-            s.metrics
-                .render()
-                .contains("sched_tick_decisions_total{kind=\"allow_model\"} 2")
+            !again.kinds.contains(&"allow_model".to_string()),
+            "{again:?}"
         );
+        assert!(again.reason.contains("still loading"), "{}", again.reason);
+        let text = s.metrics.render();
+        assert!(text.contains("sched_tick_decisions_total{kind=\"allow_model\"} 1"));
+        assert!(text.contains("sched_tick_decisions_total{kind=\"wait\"} 1"));
     }
 
     #[test]
     fn a_source_that_stops_reporting_makes_decisions_wait_instead_of_looking_healthy() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         cluster(&s);
         ocr_demand(&s, 3);
         // 31s later nothing was refreshed: pod counts are older than safety_max_age (30s).
-        let r = s.tick(Millis(T0 + 31_000));
+        let r = s.tick(Millis(T0 + 31_000), &mut d);
         assert!(!r.kinds.contains(&"allow_model".to_string()), "{r:?}");
         let pods_age = r
             .inputs
@@ -383,6 +679,7 @@ mod tests {
     #[test]
     fn adapter_errors_are_visible_in_the_tick_and_the_metrics_and_do_not_refresh_data() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         cluster(&s);
         ocr_demand(&s, 3);
         s.ingest(
@@ -392,7 +689,7 @@ mod tests {
             },
             Millis(T0 + 5_000),
         );
-        let r = s.tick(Millis(T0 + 6_000));
+        let r = s.tick(Millis(T0 + 6_000), &mut d);
         let i = r
             .inputs
             .iter()
@@ -411,17 +708,19 @@ mod tests {
     #[test]
     fn each_tick_is_pinned_to_one_generation_and_follows_reloads() {
         let (s, _) = shared();
-        assert_eq!(s.tick(Millis(T0)).config_generation, 1);
+        let mut d = Durable::default();
+        assert_eq!(s.tick(Millis(T0), &mut d).config_generation, 1);
         s.config
             .apply_text(&EXAMPLE_CONFIG.replace("idle_grace: 10m", "idle_grace: 20m"));
-        let r = s.tick(Millis(T0 + 1));
+        let r = s.tick(Millis(T0 + 1), &mut d);
         assert_eq!((r.config_generation, r.error), (2, None));
     }
 
     #[test]
     fn an_empty_world_decides_without_error() {
         let (s, _) = shared();
-        let r = s.tick(Millis(T0));
+        let mut d = Durable::default();
+        let r = s.tick(Millis(T0), &mut d);
         assert_eq!(r.error, None);
         assert!(!r.kinds.is_empty());
         println!("{r:#?}");
@@ -430,9 +729,10 @@ mod tests {
     #[test]
     fn a_demand_source_that_never_reported_is_unknown_not_idle() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         cluster(&s);
         // Pods and reachability are fresh; no demand source has ever reported.
-        let r = s.tick(Millis(T0 + 1_000));
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
         assert!(!r.kinds.contains(&"idle".to_string()), "{r:?}");
         assert!(r.kinds.contains(&"demand_unknown".to_string()), "{r:?}");
         assert!(
@@ -466,29 +766,262 @@ mod tests {
                 }],
             );
         }
-        let r = s.tick(Millis(T0 + 2_000));
+        let r = s.tick(Millis(T0 + 2_000), &mut d);
         assert!(r.unknown_demand.is_empty() && r.unsupported_demand.is_empty());
         assert_eq!(r.kinds, vec!["idle".to_string()], "{r:?}");
         // And stale demand is unknown again.
-        let r = s.tick(Millis(T0 + 2_000 + 600_001));
+        let r = s.tick(Millis(T0 + 2_000 + 600_001), &mut d);
         assert!(r.kinds.contains(&"demand_unknown".to_string()), "{r:?}");
     }
 
-    #[test]
-    fn every_tick_says_it_is_stateless_shadow_output() {
+    /// The durable state as Restate keeps it: written as JSON, read back in a new process.
+    fn restart(d: &Durable) -> (Arc<Shared>, Durable) {
+        let text = serde_json::to_string(d).unwrap();
         let (s, _) = shared();
-        let r = s.tick(Millis(T0));
-        assert!(r.shadow_stateless);
-        assert!(
-            r.reason.starts_with(crate::reason::SHADOW_PREFIX),
-            "{}",
-            r.reason
+        (s, serde_json::from_str(&text).unwrap())
+    }
+
+    fn llm_lease() -> Lease {
+        Lease {
+            id: "manual-model-1".into(),
+            resource: "cuda-central".into(),
+            kind: sched_model::LeaseKind::ManualModel {
+                model: "llm".into(),
+            },
+            granted_at: Millis(T0),
+        }
+    }
+
+    #[test]
+    fn the_sequencer_state_is_carried_and_survives_a_restart_with_an_empty_cache() {
+        let (s, clock) = shared();
+        let mut d = Durable::default();
+        cluster(&s);
+        ocr_demand(&s, 3);
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        assert!(r.kinds.contains(&"allow_model".to_string()), "{r:?}");
+        assert!(!r.reason.contains("shadow"), "{}", r.reason);
+        assert!(matches!(
+            d.state.resource(&"cuda-central".into()).unwrap().mode,
+            sched_model::ModePhase::Loading { .. }
+        ));
+        clock.set(Millis(T0 + 2_000));
+        push(
+            &s,
+            "cluster-pods",
+            vec![ObservedValue::ModelPods {
+                model: "mineru".into(),
+                pods: 1,
+                ready_pods: 1,
+            }],
+        );
+        let r = s.tick(Millis(T0 + 2_000), &mut d);
+        assert_eq!(r.allowed_models, vec![ModelId::from("mineru")]);
+        let serving_since = match &d.state.resource(&"cuda-central".into()).unwrap().mode {
+            sched_model::ModePhase::Serving { since, .. } => *since,
+            m => panic!("{m:?}"),
+        };
+        // A new process: nothing observed yet, the state comes back from Restate.
+        let (s2, mut d2) = restart(&d);
+        assert_eq!(d2, d);
+        assert_eq!(s2.published_allowed(), None);
+        let r = s2.tick(Millis(T0 + 3_000), &mut d2);
+        assert_eq!(r.error, None);
+        // It goes on serving mineru (since the same instant) instead of starting over.
+        assert_eq!(r.allowed_models, vec![ModelId::from("mineru")], "{r:?}");
+        assert!(!r.kinds.contains(&"allow_model".to_string()), "{r:?}");
+        match &d2.state.resource(&"cuda-central".into()).unwrap().mode {
+            sched_model::ModePhase::Serving { since, .. } => assert_eq!(*since, serving_since),
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(
+            s2.published_allowed().unwrap().allowed.models,
+            [ModelId::from("mineru")].into_iter().collect()
         );
     }
 
     #[test]
+    fn the_allowed_set_is_published_only_after_a_tick_and_follows_each_one() {
+        let (s, _) = shared();
+        let mut d = Durable::default();
+        let mut rx = s.subscribe_allowed();
+        assert_eq!(*rx.borrow_and_update(), None);
+        cluster(&s);
+        ocr_demand(&s, 3);
+        // Deciding alone publishes nothing: the object journals the decision first.
+        let outcome = s.decide(Millis(T0 + 1_000), &d);
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(s.published_allowed(), None);
+        s.publish(&outcome, false);
+        d.apply(&outcome);
+        assert!(rx.has_changed().unwrap());
+        let p = rx.borrow_and_update().clone().unwrap();
+        assert_eq!((p.config_generation, p.at), (1, Millis(T0 + 1_000)));
+        assert_eq!(
+            p.allowed.models,
+            [ModelId::from("mineru")].into_iter().collect()
+        );
+        // NFS is up, so the NFS-only classes are allowed; OCR is not until mineru serves.
+        assert!(p.allowed.classes.contains(&ClassId::from("paperless-ngx")));
+        assert!(!p.allowed.classes.contains(&ClassId::from("paperless-ocr")));
+        let r = s.tick(Millis(T0 + 2_000), &mut d);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().as_ref().unwrap().at, r.at);
+    }
+
+    #[test]
+    fn a_failed_tick_keeps_the_previous_state_and_publication() {
+        let (s, _) = shared();
+        let mut d = Durable::default();
+        cluster(&s);
+        ocr_demand(&s, 3);
+        s.tick(Millis(T0 + 1_000), &mut d);
+        let (state, published) = (d.state.clone(), s.published_allowed());
+        assert!(published.is_some());
+        s.config
+            .apply_text(&EXAMPLE_CONFIG.replace("fifo-exhaustive", "no-such-strategy"));
+        let r = s.tick(Millis(T0 + 2_000), &mut d);
+        assert!(r.error.is_some(), "{r:?}");
+        assert_eq!(r.kinds, vec!["error".to_string()]);
+        assert_eq!(d.state, state);
+        assert_eq!(s.published_allowed(), published);
+    }
+
+    #[test]
+    fn sources_that_reported_before_a_restart_stay_unknown_rather_than_unsupported() {
+        let (s, _) = shared();
+        let mut d = Durable::default();
+        cluster(&s);
+        // backup-schedule has no observer in this build, but something pushed to it.
+        push(
+            &s,
+            "backup-schedule",
+            vec![ObservedValue::Demand {
+                class: "backup".into(),
+                ready: 0,
+                in_flight: 0,
+                oldest_ready_at: None,
+            }],
+        );
+        s.tick(Millis(T0 + 1_000), &mut d);
+        assert!(d.reported.contains(&SourceId::from("backup-schedule")));
+        assert!(d.reported.contains(&SourceId::from("cluster-pods")));
+        assert!(!d.reported.contains(&SourceId::from("llm-sessions")));
+        // After a restart the pusher is dead: nothing arrives.
+        let (s2, mut d2) = restart(&d);
+        let r = s2.tick(Millis(T0 + 2_000), &mut d2);
+        assert!(
+            r.unknown_demand.iter().any(|c| c.as_str() == "backup"),
+            "{r:?}"
+        );
+        assert!(
+            !r.unsupported_demand.iter().any(|c| c.as_str() == "backup"),
+            "{r:?}"
+        );
+        // The memory is kept across further ticks and restarts.
+        assert!(d2.reported.contains(&SourceId::from("backup-schedule")));
+        // Without the durable memory it would read as never reported.
+        let (s3, _) = shared();
+        let r = s3.tick(Millis(T0 + 2_000), &mut Durable::default());
+        assert!(r.unsupported_demand.iter().any(|c| c.as_str() == "backup"));
+    }
+
+    #[test]
+    fn durable_leases_reach_the_core_and_leases_the_config_lost_are_ignored() {
+        let (s, _) = shared();
+        let mut d = Durable {
+            leases: vec![
+                llm_lease(),
+                Lease {
+                    id: "manual-model-9".into(),
+                    resource: "cuda-central".into(),
+                    kind: sched_model::LeaseKind::ManualModel {
+                        model: "gone".into(),
+                    },
+                    granted_at: Millis(T0),
+                },
+            ],
+            ..Durable::default()
+        };
+        cluster(&s);
+        ocr_demand(&s, 3);
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        // OCR has work, but the manual lease pins the LLM.
+        assert_eq!(r.allowed_models, vec![ModelId::from("llm")], "{r:?}");
+        assert_eq!(r.leases, vec![llm_lease()]);
+        assert_eq!(r.ignored_leases, vec![LeaseId::from("manual-model-9")]);
+    }
+
+    #[test]
+    fn steps_without_an_actuator_are_reported_as_not_executed() {
+        // Managed power control (M4), the only way a power step can appear.
+        let (s, _) = shared_with(&sched_model::test_support::example_yaml_managed());
+        let mut d = Durable {
+            leases: vec![llm_lease()],
+            ..Durable::default()
+        };
+        // cuda-central is down; a manual model lease asks for it to be powered up.
+        push(
+            &s,
+            "cluster-pods",
+            vec![ObservedValue::ResourceUp {
+                resource: "cuda-central".into(),
+                up: false,
+            }],
+        );
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        let on = Step::PowerOn {
+            resource: "cuda-central".into(),
+        };
+        assert!(r.steps.contains(&on), "{r:?}");
+        assert_eq!(r.not_executed, vec![on]);
+        assert!(r.reason.contains(reason::NOT_EXECUTED), "{}", r.reason);
+        // The sequencer took the step all the same: the host now reads as powering on.
+        assert!(matches!(
+            d.state.resource(&"cuda-central".into()).unwrap().power,
+            sched_model::PowerPhase::PoweringOn { .. }
+        ));
+        let text = s.metrics.render();
+        assert!(
+            text.contains(
+                "sched_resource_phase_age_seconds{axis=\"power\",phase=\"powering_on\",resource=\"cuda-central\"} 0"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn under_manual_power_control_a_lease_on_a_host_that_is_off_waits_for_a_person() {
+        let (s, _) = shared();
+        let mut d = Durable {
+            leases: vec![llm_lease()],
+            ..Durable::default()
+        };
+        push(
+            &s,
+            "cluster-pods",
+            vec![ObservedValue::ResourceUp {
+                resource: "cuda-central".into(),
+                up: false,
+            }],
+        );
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        assert!(r.not_executed.is_empty(), "{r:?}");
+        assert!(
+            r.steps.contains(&Step::Wait {
+                resource: "cuda-central".into(),
+                reason: sched_model::WaitReason::HostNotUp
+            }),
+            "{r:?}"
+        );
+        let gpu = d.state.resource(&"cuda-central".into()).unwrap();
+        assert_eq!(gpu.power, sched_model::PowerPhase::Off);
+        assert!(!gpu.managed);
+    }
+    #[test]
     fn a_tick_never_runs_before_an_observation_it_can_read() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         cluster(&s);
         // Received at T0 + 5s, after the time the tick was told: without the clamp the
         // observation would be dated in the future and read as not fresh.
@@ -505,7 +1038,7 @@ mod tests {
             },
             Millis(T0 + 5_000),
         );
-        let r = s.tick(Millis(T0));
+        let r = s.tick(Millis(T0), &mut d);
         assert_eq!(r.at, Millis(T0 + 5_000));
         assert!(
             !r.unknown_demand
@@ -524,16 +1057,19 @@ mod tests {
     #[test]
     fn a_config_change_in_the_middle_of_a_tick_does_not_split_its_generation() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         let changed = EXAMPLE_CONFIG.replace("idle_grace: 10m", "idle_grace: 20m");
-        let r = s.tick_pinned(Millis(T0), || {
-            assert!(matches!(
-                s.config.apply_text(&changed),
-                crate::config_source::ReloadOutcome::Applied(2)
-            ));
-        });
+        let r = s
+            .decide_pinned(Millis(T0), &d, || {
+                assert!(matches!(
+                    s.config.apply_text(&changed),
+                    crate::config_source::ReloadOutcome::Applied(2)
+                ));
+            })
+            .report;
         // The whole tick ran on generation 1, snapshot and core alike: no mismatch error.
         assert_eq!((r.config_generation, r.error), (1, None));
-        assert_eq!(s.tick(Millis(T0 + 1)).config_generation, 2);
+        assert_eq!(s.tick(Millis(T0 + 1), &mut d).config_generation, 2);
     }
 
     #[test]
@@ -579,8 +1115,9 @@ mod tests {
     }
 
     #[test]
-    fn demand_of_sources_without_an_observer_is_reported_apart_and_is_still_not_idle() {
+    fn demand_of_sources_without_an_observer_is_reported_apart_and_counts_as_idle() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         cluster(&s);
         for (src, class) in [
             ("paperless-ocr-pending", "paperless-ocr"),
@@ -602,9 +1139,19 @@ mod tests {
         }
         // Everything that has an observer reports; only schedule and session sources are
         // silent, and nothing is built to observe them.
-        let r = s.tick(Millis(T0 + 1_000));
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
         assert!(r.unknown_demand.is_empty(), "{:?}", r.unknown_demand);
-        assert_eq!(r.kinds, vec!["demand_unsupported".to_string()], "{r:?}");
+        assert_eq!(
+            r.unsupported_demand,
+            vec![ClassId::from("backup"), ClassId::from("interactive-llm")]
+        );
+        // Nothing can ever report it, so it is no demand: the tick is idle.
+        assert_eq!(
+            r.kinds,
+            vec!["demand_unsupported".to_string(), "idle".to_string()],
+            "{r:?}"
+        );
+        assert!(r.reason.contains("counted as no demand"), "{}", r.reason);
         let text = s.metrics.render();
         assert!(
             text.contains("sched_source_has_observer{source=\"backup-schedule\"} 0"),
@@ -619,6 +1166,7 @@ mod tests {
     #[test]
     fn a_pushed_source_that_goes_silent_is_unknown_not_unsupported() {
         let (s, _) = shared();
+        let mut d = Durable::default();
         cluster(&s);
         // backup-schedule has no observer in this build, but something pushed to it.
         push(
@@ -631,7 +1179,7 @@ mod tests {
                 oldest_ready_at: None,
             }],
         );
-        let fresh = s.tick(Millis(T0 + 1_000));
+        let fresh = s.tick(Millis(T0 + 1_000), &mut d);
         assert!(
             !fresh
                 .unsupported_demand
@@ -641,7 +1189,7 @@ mod tests {
         assert!(!fresh.unknown_demand.iter().any(|c| c.as_str() == "backup"));
         // Ten minutes later it has gone stale: a source that reported before and has gone
         // quiet is a real problem, not the expected "nothing observes this".
-        let stale = s.tick(Millis(T0 + 1_000 + 600_001));
+        let stale = s.tick(Millis(T0 + 1_000 + 600_001), &mut d);
         assert!(
             stale.unknown_demand.iter().any(|c| c.as_str() == "backup"),
             "{stale:?}"
@@ -665,8 +1213,9 @@ mod tests {
         let clock = Arc::new(ManualClock::new(Millis(T0)));
         let holder = Arc::new(ConfigHolder::new(&y).unwrap());
         let s = Shared::new(holder, Arc::new(Metrics::new()), clock);
+        let mut d = Durable::default();
         cluster(&s);
-        let r = s.tick(Millis(T0 + 1_000));
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
         assert_eq!(r.unpolled_demand, vec![ClassId::from("immich-ml")], "{r:?}");
         assert!(!r.unknown_demand.iter().any(|c| c.as_str() == "immich-ml"));
         assert!(
@@ -691,6 +1240,10 @@ mod tests {
                 oldest_ready_at: None,
             }],
         );
-        assert!(s.tick(Millis(T0 + 2_000)).unpolled_demand.is_empty());
+        assert!(
+            s.tick(Millis(T0 + 2_000), &mut d)
+                .unpolled_demand
+                .is_empty()
+        );
     }
 }

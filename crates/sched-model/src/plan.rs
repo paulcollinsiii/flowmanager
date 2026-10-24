@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ClassId, ModelId, ResourceId};
+use crate::time::Millis;
 
 /// Why a host should be powered up. Only these two reasons may ever power a host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -127,4 +128,15 @@ pub struct AllowedSet {
     pub models: BTreeSet<ModelId>,
     #[serde(default)]
     pub classes: BTreeSet<ClassId>,
+}
+
+/// An allowed set as published for the KEDA scaler: the set one tick decided, with the
+/// config generation that tick was pinned to and the tick's time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedAllowed {
+    pub config_generation: u64,
+    /// The time of the tick that decided `allowed`.
+    pub at: Millis,
+    pub allowed: AllowedSet,
 }

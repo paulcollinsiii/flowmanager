@@ -33,11 +33,12 @@ pub const KIND_ERROR: &str = "error";
 pub const KIND_DEMAND_UNKNOWN: &str = "demand_unknown";
 
 /// Metric label for demand of a source whose kind has no observer in this build and that
-/// nothing has ever pushed to. Expected for now; kept apart from [`KIND_DEMAND_UNKNOWN`].
+/// has never reported. It counts as no demand; kept apart from [`KIND_DEMAND_UNKNOWN`].
 pub const KIND_DEMAND_UNSUPPORTED: &str = "demand_unsupported";
 
 /// Metric label for demand of a source of an observable kind that was configured without
-/// `params`, so nothing polls it, and nothing has pushed to it either. A config gap.
+/// `params`, so nothing polls it, and that has never reported. A config gap; it counts as
+/// no demand.
 pub const KIND_DEMAND_UNPOLLED: &str = "demand_unpolled";
 
 /// Classes whose demand is unknown, by why. None of them is "zero demand".
@@ -54,8 +55,9 @@ impl DemandGaps {
     }
 }
 
-/// The distinct kinds in a decision, sorted; [`KIND_IDLE`] only when there are no steps and
-/// every class's demand is known.
+/// The distinct kinds in a decision, sorted; [`KIND_IDLE`] when there are no steps and no
+/// class's demand is unknown (unobservable demand counts as none, so it does not prevent
+/// `idle`, but its kind is still listed).
 pub fn kinds(steps: &[Step], gaps: &DemandGaps) -> Vec<&'static str> {
     let mut set: BTreeSet<&'static str> = steps.iter().map(step_kind).collect();
     if !gaps.unknown.is_empty() {
@@ -67,15 +69,27 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps) -> Vec<&'static str> {
     if !gaps.unpolled.is_empty() {
         set.insert(KIND_DEMAND_UNPOLLED);
     }
-    if gaps.is_empty() && set.is_empty() {
+    if gaps.unknown.is_empty() && steps.is_empty() {
         set.insert(KIND_IDLE);
     }
     set.into_iter().collect()
 }
 
-/// What every shadow reason starts with, so a log line cannot be mistaken for the state of
-/// a live scheduler: the sequencer starts each tick from nothing.
-pub const SHADOW_PREFIX: &str = "[shadow: next step from a fresh sequencer state] ";
+/// Whether nothing in this build carries `step` out. Allowing, draining and pausing are
+/// carried out through the published allowed set (KEDA converges on it); powering a host on
+/// or off, stopping in-flight work and running a recovery action have no actuator yet.
+pub fn not_executed(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::PowerOn { .. }
+            | Step::PowerOff { .. }
+            | Step::KillInFlight { .. }
+            | Step::RunRecovery { .. }
+    )
+}
+
+/// Appended to the reason of every step for which [`not_executed`] holds.
+pub const NOT_EXECUTED: &str = " [NOT EXECUTED: no actuator for this step in this build]";
 
 fn wait_text(reason: WaitReason) -> &'static str {
     match reason {
@@ -146,10 +160,17 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
             None => format!("{r}=none"),
         })
         .collect();
-    let mut out = format!("{SHADOW_PREFIX}intent [{}]", wants.join(", "));
+    let mut out = format!("intent [{}]", wants.join(", "));
     if !intent.power_up.is_empty() {
         let up: Vec<_> = intent.power_up.keys().map(|r| r.to_string()).collect();
         out.push_str(&format!(", power up [{}]", up.join(", ")));
+    }
+    if !intent.forced.is_empty() {
+        let f: Vec<_> = intent.forced.iter().map(|r| r.to_string()).collect();
+        out.push_str(&format!(
+            ", forced [{}] (a manual model lease or a reclaim cuts batch work short: intake paused, in-flight work gets a timeout)",
+            f.join(", ")
+        ));
     }
     if !intent.reclaim.is_empty() {
         let rc: Vec<_> = intent.reclaim.iter().map(|r| r.to_string()).collect();
@@ -161,6 +182,9 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
     for s in steps {
         out.push_str("; ");
         out.push_str(&step_reason(s, intent));
+        if not_executed(s) {
+            out.push_str(NOT_EXECUTED);
+        }
     }
     let ids = |v: &[sched_model::ClassId]| {
         v.iter()
@@ -176,13 +200,13 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
     }
     if !gaps.unpolled.is_empty() {
         out.push_str(&format!(
-            "; demand not polled for [{}] (the source is configured without params: nothing polls it and nothing has pushed to it): not idle either",
+            "; demand not polled for [{}] (the source is configured without params and has never reported): counted as no demand",
             ids(&gaps.unpolled)
         ));
     }
     if !gaps.unsupported.is_empty() {
         out.push_str(&format!(
-            "; demand not observable yet for [{}] (no observer for the source kind and nothing has pushed to it): not idle either",
+            "; demand not observable for [{}] (no observer for the source kind in this build, and it has never reported): counted as no demand",
             ids(&gaps.unsupported)
         ));
     }
@@ -241,13 +265,14 @@ mod tests {
             kinds(&[], &gap(&["a"], &[], &[])),
             vec![KIND_DEMAND_UNKNOWN]
         );
+        // Unobservable demand counts as none: still idle, and still labelled.
         assert_eq!(
             kinds(&[], &gap(&[], &["a"], &[])),
-            vec![KIND_DEMAND_UNSUPPORTED]
+            vec![KIND_DEMAND_UNSUPPORTED, KIND_IDLE]
         );
         assert_eq!(
             kinds(&[], &gap(&[], &[], &["a"])),
-            vec![KIND_DEMAND_UNPOLLED]
+            vec![KIND_DEMAND_UNPOLLED, KIND_IDLE]
         );
         assert_eq!(
             kinds(&[], &gap(&["a"], &["b"], &["c"])),
@@ -300,10 +325,7 @@ mod tests {
             },
         ];
         let r = reason(&intent(), &steps, &DemandGaps::default());
-        assert!(
-            r.starts_with(SHADOW_PREFIX) && r.contains("intent [cuda-central=mineru]"),
-            "{r}"
-        );
+        assert!(r.starts_with("intent [cuda-central=mineru]"), "{r}");
         assert!(
             r.contains("allow mineru on cuda-central: the planner wants mineru on cuda-central"),
             "{r}"
@@ -313,6 +335,59 @@ mod tests {
             "{r}"
         );
         assert!(reason(&Intent::default(), &[], &DemandGaps::default()).contains("no step needed"));
+    }
+
+    #[test]
+    fn steps_without_an_actuator_are_marked_as_not_executed() {
+        let steps = vec![
+            Step::PowerOn {
+                resource: "cuda-central".into(),
+            },
+            Step::KillInFlight {
+                class: "paperless-ocr".into(),
+            },
+            Step::DrainModel {
+                resource: "cuda-central".into(),
+                model: "mineru".into(),
+            },
+        ];
+        let r = reason(&intent(), &steps, &DemandGaps::default());
+        assert_eq!(r.matches(NOT_EXECUTED).count(), 2, "{r}");
+        assert!(
+            r.contains(&format!(
+                "power on cuda-central: the sequencer needs it up{NOT_EXECUTED}"
+            )),
+            "{r}"
+        );
+        assert!(!r.contains(&format!(
+            "drain mineru on cuda-central: the planner wants mineru on cuda-central{NOT_EXECUTED}"
+        )));
+        for (step, want) in [
+            (
+                Step::PowerOff {
+                    resource: "r".into(),
+                },
+                true,
+            ),
+            (Step::RunRecovery { class: "c".into() }, true),
+            (Step::PauseIntake { class: "c".into() }, false),
+            (
+                Step::AllowModel {
+                    resource: "r".into(),
+                    model: "m".into(),
+                },
+                false,
+            ),
+            (
+                Step::Wait {
+                    resource: "r".into(),
+                    reason: WaitReason::Loading,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(not_executed(&step), want, "{step:?}");
+        }
     }
 
     #[test]

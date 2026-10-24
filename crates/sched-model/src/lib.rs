@@ -23,14 +23,15 @@ pub mod work;
 pub mod test_support;
 
 pub use config::{
-    Capability, ClassSpec, Config, ConfigError, DemandRef, ModelSpec, PolicyConfig, PowerSpec,
-    Preemptibility, RecoverySpec, Requirement, ResourceKind, ResourceSpec, SourceKind, SourceSpec,
+    Capability, ClassSpec, Config, ConfigError, DemandRef, ModelSpec, PolicyConfig, PowerControl,
+    PowerSpec, Preemptibility, RecoverySpec, Requirement, ResourceKind, ResourceSpec, SourceKind,
+    SourceSpec,
 };
 pub use fixture::{Fixture, FixtureError};
 pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};
 pub use lease::{Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};
-pub use plan::{AllowedSet, Intent, PowerWant, Step, WaitReason};
+pub use plan::{AllowedSet, Intent, PowerWant, PublishedAllowed, Step, WaitReason};
 pub use source_params::{
     AuthSpec, CountsAs, ElementFilter, ExtraCount, FilterValue, HttpJsonParams, KubeWatchParams,
     PrometheusParams, RequestSpec, ResponseCondition, SinceSpec,

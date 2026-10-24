@@ -1,6 +1,12 @@
 //! Table-driven tests for the sequencer's state machines and safety rules.
 
-use sched_model::test_support::{EXAMPLE_CONFIG, example_config};
+use sched_model::test_support::{example_config, example_config_managed, example_yaml_managed};
+
+/// Most tables here exercise the managed power machine (M4): the example config with
+/// `power.control: managed`. The manual-control tests at the end use the example as is.
+fn managed_yaml() -> String {
+    example_yaml_managed()
+}
 use sched_model::{
     AllowedSet, ClassId, Config, Fixture, Intent, ModePhase, ModelId, PowerPhase, PowerWant,
     ResourceId, SchedState, Step, WaitReason,
@@ -106,7 +112,7 @@ impl Case {
             gpu: format!("{{ power: {}, mode: {} }}", on(), mode_idle()),
             nfs: format!("{{ power: {}, mode: {} }}", on(), mode_idle()),
             intent: Intent::default(),
-            config: example_config(),
+            config: example_config_managed(),
         }
     }
 
@@ -605,11 +611,11 @@ fn forced_switches_give_in_flight_work_its_timeout() {
 #[test]
 fn reclaim_uses_reclaim_timeout_and_class_kill_timeout() {
     // A class-level kill_timeout shortens the wait for that class.
-    let yaml = EXAMPLE_CONFIG.replace(
+    let yaml = managed_yaml().replace(
         "    priority: 50\n    preemptibility: pause_intake\n    demand: { source: paperless-ocr-pending }",
         "    priority: 50\n    preemptibility: pause_intake\n    kill_timeout: 1m\n    demand: { source: paperless-ocr-pending }",
     );
-    assert_ne!(yaml, EXAMPLE_CONFIG);
+    assert_ne!(yaml, managed_yaml());
     let config = Config::from_yaml(&yaml).unwrap();
     let mut c = Case::new()
         .gpu(&serving("mineru", 10 * MIN))
@@ -635,7 +641,7 @@ fn reclaim_uses_reclaim_timeout_and_class_kill_timeout() {
     );
 
     // With a distinct reclaim_timeout the policy value applies.
-    let yaml = EXAMPLE_CONFIG.replace(
+    let yaml = managed_yaml().replace(
         "  drain_timeout: 10m",
         "  drain_timeout: 10m\n  reclaim_timeout: 2m",
     );
@@ -1037,7 +1043,7 @@ fn a_reclaim_on_a_shared_resource_is_ignored_and_never_overrides_holds() {
 
 #[test]
 fn only_a_forced_switch_ever_stops_in_flight_work() {
-    let yaml = EXAMPLE_CONFIG.replace(
+    let yaml = managed_yaml().replace(
         "    priority: 50\n    preemptibility: pause_intake\n    demand: { source: paperless-ocr-pending }",
         "    priority: 50\n    preemptibility: pause_intake\n    kill_timeout: 1m\n    demand: { source: paperless-ocr-pending }",
     );
@@ -1073,11 +1079,11 @@ fn wind_down(d: &Decision) -> Option<sched_model::WindDown> {
 
 #[test]
 fn each_class_is_stopped_when_its_own_timeout_expires() {
-    let yaml = EXAMPLE_CONFIG.replace(
+    let yaml = managed_yaml().replace(
         "    priority: 50\n    preemptibility: pause_intake\n    demand: { source: paperless-post-ocr }",
         "    priority: 50\n    preemptibility: pause_intake\n    kill_timeout: 1m\n    demand: { source: paperless-post-ocr }",
     );
-    assert_ne!(yaml, EXAMPLE_CONFIG);
+    assert_ne!(yaml, managed_yaml());
     let busy = || {
         let mut c = Case::new()
             .gpu(&serving("llm", 10 * MIN))
@@ -1225,7 +1231,7 @@ fn future_dated_observations_are_not_fresh() {
 
 #[test]
 fn a_different_forcing_cause_restarts_the_clock_and_losing_it_removes_the_timeout() {
-    let yaml = EXAMPLE_CONFIG.replace(
+    let yaml = managed_yaml().replace(
         "  drain_timeout: 10m",
         "  drain_timeout: 10m\n  reclaim_timeout: 2m",
     );
@@ -1287,4 +1293,141 @@ fn a_different_forcing_cause_restarts_the_clock_and_losing_it_removes_the_timeou
         vec![wait(G, WaitReason::InFlightWork)],
         "unforced again",
     );
+}
+
+// ---- power.control: manual (the example config as shipped) ----
+
+fn manual(mut c: Case) -> Case {
+    c.config = example_config();
+    c
+}
+
+fn host_state(power: &str, mode: &str, managed: bool) -> String {
+    format!("{{ power: {power}, mode: {mode}, managed: {managed} }}")
+}
+
+#[test]
+fn manual_control_never_powers_a_host_on_and_waits_for_a_person() {
+    let lease = lease_on("m", G, "{ type: manual_model, model: llm }");
+    let c = manual(
+        Case::new()
+            .gpu_state(&host_state("{ phase: \"off\" }", "{ phase: idle }", false))
+            .obs(up(G, false, 0))
+            .lease(lease)
+            .target(Some("llm"))
+            .want(G, PowerWant::Manual),
+    );
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::HostNotUp)],
+        "manual: no power on",
+    );
+    assert_eq!(power_of(&d, G), PowerPhase::Off);
+    assert!(!d.state.resource(&rid(G)).unwrap().managed);
+    // The same request under managed control powers it on.
+    let mut m = c;
+    m.config = example_config_managed();
+    assert!(m.run().steps.contains(&Step::PowerOn { resource: rid(G) }));
+    // A person powers it on: the phase follows the observation and the model is allowed.
+    let on = manual(
+        Case::new()
+            .gpu_state(&host_state("{ phase: \"off\" }", "{ phase: idle }", false))
+            .target(Some("llm"))
+            .want(G, PowerWant::Manual),
+    );
+    let d = on.run();
+    assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+    assert_steps(&d, vec![allow("llm")], "allowed once up");
+    assert!(
+        !d.state.resource(&rid(G)).unwrap().managed,
+        "never taken over"
+    );
+}
+
+#[test]
+fn manual_control_never_powers_a_host_off_however_long_it_is_idle() {
+    // Idle for hours, nothing holding it, every demand known and zero, and the state even
+    // says it is managed (left from a managed build): still no power off.
+    for nfs_mode in [managed_idle(99 * MIN), managed_idle(0)] {
+        let c = manual(
+            Case::new()
+                .gpu_state(&managed_idle(99 * MIN))
+                .nfs_state(&nfs_mode),
+        );
+        let mut st = c.state();
+        for i in 0..5 {
+            let d = c.run_fresh_at(&st, T + i * 30 * MIN);
+            assert!(
+                !d.steps
+                    .iter()
+                    .any(|s| matches!(s, Step::PowerOff { .. } | Step::PowerOn { .. })),
+                "{:?}",
+                d.steps
+            );
+            for r in [G, N] {
+                let rs = d.state.resource(&rid(r)).unwrap();
+                assert!(rs.is_on() && !rs.managed && rs.host_idle_since.is_none());
+            }
+            st = d.state;
+        }
+    }
+    // Under managed control the same state powers off.
+    let mut m = Case::new().gpu_state(&managed_idle(99 * MIN));
+    m.config = example_config_managed();
+    assert!(m.run().steps.contains(&Step::PowerOff { resource: rid(G) }));
+}
+
+#[test]
+fn manual_control_converges_transitional_phases_to_what_is_observed() {
+    let shutting = "{ phase: shutting_down, since: 5 }";
+    let powering = "{ phase: powering_on, since: 5 }";
+    // Shutting down but observed up: on again, and the model can be allowed.
+    let d = manual(
+        Case::new()
+            .gpu_state(&host_state(shutting, "{ phase: idle }", true))
+            .target(Some("mineru")),
+    )
+    .run();
+    assert!(matches!(power_of(&d, G), PowerPhase::On { .. }), "{d:?}");
+    assert!(!d.state.resource(&rid(G)).unwrap().managed);
+    assert_steps(&d, vec![allow("mineru")], "converged and allowed");
+    // Powering on but observed down: off.
+    let d = manual(
+        Case::new()
+            .gpu_state(&host_state(powering, "{ phase: idle }", true))
+            .obs(up(G, false, 0)),
+    )
+    .run();
+    assert_eq!(power_of(&d, G), PowerPhase::Off);
+    // Without a fresh reading the phase cannot be known yet: it holds, visibly.
+    let d = manual(
+        Case::new()
+            .gpu_state(&host_state(shutting, "{ phase: idle }", true))
+            .drop_obs("type: resource_up, resource: cuda-central")
+            .target(Some("mineru")),
+    )
+    .run();
+    assert_steps(&d, vec![wait(G, WaitReason::ShuttingDown)], "stale: hold");
+    assert!(d.allowed.models.is_empty());
+    // Under managed control a host observed up stays shutting down (the managed machine
+    // waits for it to go down).
+    let mut m = Case::new().gpu_state(&host_state(shutting, "{ phase: idle }", true));
+    m.config = example_config_managed();
+    assert!(matches!(
+        power_of(&m.run(), G),
+        PowerPhase::ShuttingDown { .. }
+    ));
+}
+
+#[test]
+fn manual_control_reclaim_clears_the_model_but_does_not_power_off() {
+    let d = manual(Case::new().reclaim()).run();
+    assert!(
+        !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+        "{:?}",
+        d.steps
+    );
+    assert!(d.allowed.models.is_empty());
+    assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
 }

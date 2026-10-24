@@ -1,35 +1,52 @@
 //! The scheduler as a Restate virtual object, invoked directly by Restate. There is one
-//! instance (key [`KEY`]).
+//! instance (key [`KEY`]). The handlers' logic lives in [`crate::object`], written against
+//! a small context trait that this module implements for Restate's context.
 //!
 //! Handlers:
-//! - `observe`: an external pusher hands in observations; they are dated on receipt.
-//! - `tick`: one decision from the cached snapshot. The decision is logged and kept as
-//!   `last_decision`; nothing is executed.
+//! - `observe` (ingress-private): pushed observations; they are dated on receipt. It can
+//!   only be called from other Restate handlers, not through the ingress: the in-process
+//!   observers write to the cache directly, and a forged push (`pods: 0`, say) could
+//!   otherwise let a second model load.
+//! - `tick`: one decision. It loads the durable state, decides inside a journaled step
+//!   (`ctx.run`), stores the new state, and only then publishes the allowed set in process.
+//!   A retried or replayed invocation gets the journaled decision back instead of deciding
+//!   again, so what is published and what is stored always agree. Answers a short
+//!   [`TickAck`]; the full report is `last_decision`.
 //! - `arm_backstop` / `backstop`: the periodic backstop. `backstop` runs a tick and
 //!   re-schedules itself with a delayed send to itself; `arm_backstop` starts a new chain
 //!   and bumps an epoch kept in the object's state, so a chain started earlier (before a
 //!   restart, say) sees a stale epoch and ends instead of doubling the ticks.
-//! - `last_decision`: the most recent tick, read without blocking behind a tick.
+//! - `acquire_model_lease` / `release_lease` / `leases`: manual model leases (see
+//!   [`crate::leases`]). A change asks for a tick.
+//! - `discard_state`: the recovery path for a persisted document that cannot be read.
+//! - `last_decision`: the latest tick report this process published (kept in memory, so
+//!   the report is journaled once per tick; `null` until the first tick of the process).
 //!
-//! The wall clock is read inside `ctx.run`, so a replayed handler sees the time it first
-//! saw. The observation cache lives in this process, not in Restate state: observations are
-//! cheap to re-read and must be fresh anyway.
+//! Durable state (the object's Restate state, see [`crate::persist`]): `scheduler_state`
+//! (the sequencer state and which sources have ever reported), `lease_book`, and
+//! `backstop_epoch`. The observation cache lives in this process, not in Restate:
+//! observations are cheap to re-read and must be fresh anyway, so after a restart the
+//! scheduler continues from its persisted state and waits for fresh observations before
+//! any safety-critical step.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use restate_sdk::prelude::*;
-use sched_model::{Fidelity, Millis, ObservedValue, SourceId};
+use sched_model::{Fidelity, Lease, Millis, ObservedValue, SourceId};
 use sched_observe::Report;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::leases::LeaseGrant;
+use crate::object::{
+    self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseLease, TickAck,
+};
+use crate::persist::{EPOCH_KEY, LEASES_KEY};
 use crate::tick::{Shared, TickReport};
 
 /// The key of the single scheduler instance.
 pub const KEY: &str = "main";
-
-const LAST_DECISION: &str = "last_decision";
-const EPOCH: &str = "backstop_epoch";
 
 /// A push of observations (or of a failure) from an external observer. It carries no
 /// timestamps: the scheduler dates it on receipt.
@@ -78,6 +95,45 @@ pub struct BackstopArgs {
     pub epoch: u64,
 }
 
+/// [`ObjectCtx`] over Restate's exclusive-handler context.
+struct Rctx<'a, 'b>(&'a ObjectContext<'b>);
+
+impl ObjectCtx for Rctx<'_, '_> {
+    fn get_raw<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Option<Vec<u8>>, HandlerError>> {
+        Box::pin(async move { Ok(self.0.get::<Vec<u8>>(key).await?) })
+    }
+
+    fn set_raw(&self, key: &str, value: Vec<u8>) {
+        self.0.set(key, value);
+    }
+
+    fn clear_key(&self, key: &str) {
+        self.0.clear(key);
+    }
+
+    fn run_journaled<T, F>(&self, name: &'static str, f: F) -> BoxFut<'_, Result<T, HandlerError>>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        Box::pin(async move {
+            let Json(v) = self
+                .0
+                .run(move || async move { Ok(Json(f())) })
+                .name(name)
+                .await?;
+            Ok(v)
+        })
+    }
+
+    fn request_tick(&self) {
+        self.0
+            .object_client::<SchedulerClient>(self.0.key())
+            .tick()
+            .send();
+    }
+}
+
 pub struct Scheduler {
     shared: Arc<Shared>,
     backstop_every: Duration,
@@ -93,7 +149,9 @@ impl Scheduler {
 
     async fn now(&self, ctx: &ObjectContext<'_>) -> Result<Millis, HandlerError> {
         let clock = Arc::clone(&self.shared.clock);
-        let ms = ctx.run(|| async move { Ok(clock.now().as_u64()) }).await?;
+        let ms = Rctx(ctx)
+            .run_journaled("clock", move || clock.now().as_u64())
+            .await?;
         Ok(Millis(ms))
     }
 
@@ -113,19 +171,12 @@ impl Scheduler {
             },
         }
     }
-
-    async fn run_tick(&self, ctx: &ObjectContext<'_>) -> Result<TickReport, HandlerError> {
-        let now = self.now(ctx).await?;
-        let report = self.shared.tick(now);
-        ctx.set(LAST_DECISION, Json(report.clone()));
-        Ok(report)
-    }
 }
 
 #[object]
 impl Scheduler {
-    /// Takes in pushed observations.
-    #[handler]
+    /// Takes in pushed observations. Ingress-private: only other Restate handlers may call it.
+    #[handler(ingress_private)]
     async fn observe(
         &self,
         ctx: ObjectContext<'_>,
@@ -136,10 +187,11 @@ impl Scheduler {
         Ok(Json(ack))
     }
 
-    /// One decision. Logged and remembered; never executed.
+    /// One decision from the cached observations and the persisted state.
     #[handler]
-    async fn tick(&self, ctx: ObjectContext<'_>) -> Result<Json<TickReport>, HandlerError> {
-        Ok(Json(self.run_tick(&ctx).await?))
+    async fn tick(&self, ctx: ObjectContext<'_>) -> Result<Json<TickAck>, HandlerError> {
+        let report = object::tick(&self.shared, &Rctx(&ctx)).await?;
+        Ok(Json(TickAck::from(&report)))
     }
 
     /// Starts a backstop chain, superseding any earlier one.
@@ -148,8 +200,8 @@ impl Scheduler {
         &self,
         ctx: ObjectContext<'_>,
     ) -> Result<Json<BackstopArgs>, HandlerError> {
-        let epoch = ctx.get::<u64>(EPOCH).await?.unwrap_or(0) + 1;
-        ctx.set(EPOCH, epoch);
+        let epoch = ctx.get::<u64>(EPOCH_KEY).await?.unwrap_or(0) + 1;
+        ctx.set(EPOCH_KEY, epoch);
         let now = self.now(&ctx).await?;
         self.shared.note_backstop(now);
         ctx.object_client::<SchedulerClient>(ctx.key())
@@ -165,11 +217,11 @@ impl Scheduler {
         ctx: ObjectContext<'_>,
         Json(args): Json<BackstopArgs>,
     ) -> Result<(), HandlerError> {
-        if ctx.get::<u64>(EPOCH).await?.unwrap_or(0) != args.epoch {
+        if ctx.get::<u64>(EPOCH_KEY).await?.unwrap_or(0) != args.epoch {
             tracing::info!(epoch = args.epoch, "backstop chain superseded; ending");
             return Ok(());
         }
-        let report = self.run_tick(&ctx).await?;
+        let report = object::tick(&self.shared, &Rctx(&ctx)).await?;
         self.shared.note_backstop(report.at);
         ctx.object_client::<SchedulerClient>(ctx.key())
             .backstop(Json(args))
@@ -177,17 +229,58 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The most recent tick, if any.
+    /// Acquires a manual lease on a model, which pins it on its resource until released and
+    /// cuts batch work short. Asking again for the leased model returns the same lease; a
+    /// different model of the same resource is refused (409); an unknown model too (400).
+    #[handler]
+    async fn acquire_model_lease(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<AcquireModelLease>,
+    ) -> Result<Json<LeaseGrant>, HandlerError> {
+        Ok(Json(
+            object::acquire_model_lease(&self.shared, &Rctx(&ctx), req).await?,
+        ))
+    }
+
+    /// Releases a lease by id and returns it; an unknown id is refused (404).
+    #[handler]
+    async fn release_lease(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<ReleaseLease>,
+    ) -> Result<Json<Lease>, HandlerError> {
+        Ok(Json(
+            object::release_lease(&self.shared, &Rctx(&ctx), req).await?,
+        ))
+    }
+
+    /// Every lease held.
+    #[handler]
+    async fn leases(&self, ctx: SharedObjectContext<'_>) -> Result<Json<Vec<Lease>>, HandlerError> {
+        let raw = ctx.get::<Vec<u8>>(LEASES_KEY).await?;
+        Ok(Json(object::list_leases(&self.shared, raw.as_deref())?))
+    }
+
+    /// Discards a persisted document (`scheduler_state` or `lease_book`) that cannot be
+    /// read, so the next tick starts it afresh; a readable one only with `force`. Returns
+    /// what was stored.
+    #[handler]
+    async fn discard_state(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<DiscardState>,
+    ) -> Result<Json<Discarded>, HandlerError> {
+        Ok(Json(object::discard_state(&Rctx(&ctx), req).await?))
+    }
+
+    /// The latest tick report this process published, if any.
     #[handler]
     async fn last_decision(
         &self,
-        ctx: SharedObjectContext<'_>,
+        _ctx: SharedObjectContext<'_>,
     ) -> Result<Json<Option<TickReport>>, HandlerError> {
-        Ok(Json(
-            ctx.get::<Json<TickReport>>(LAST_DECISION)
-                .await?
-                .map(|j| j.into_inner()),
-        ))
+        Ok(Json(self.shared.last_report()))
     }
 }
 
@@ -239,6 +332,33 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn only_observe_is_ingress_private_in_the_registered_metadata() {
+        use restate_sdk::service::Discoverable;
+        let d = <Scheduler as Discoverable>::discover();
+        let mut seen: Vec<(String, Option<bool>)> = d
+            .handlers
+            .iter()
+            .map(|h| (h.name.to_string(), h.ingress_private))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("acquire_model_lease".to_string(), None),
+                ("arm_backstop".to_string(), None),
+                ("backstop".to_string(), None),
+                ("discard_state".to_string(), None),
+                ("last_decision".to_string(), None),
+                ("leases".to_string(), None),
+                ("observe".to_string(), Some(true)),
+                ("release_lease".to_string(), None),
+                ("tick".to_string(), None),
+            ]
+        );
+        assert_eq!(d.ingress_private, None);
     }
 
     #[test]

@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use sched_model::test_support::example_config;
+use sched_model::test_support::example_config_managed as example_config;
+// The power machine is exercised as under managed control (M4).
 use sched_model::{
     AllowedSet, ClassId, Config, Fidelity, Millis, ModelId, Observation, ObservedValue, ResourceId,
     SchedState, Snapshot, Step,
@@ -147,6 +148,7 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
             now: Millis(now),
             observations,
             leases: vec![],
+            unobservable: Default::default(),
         };
         let (intent, decision) = decide(config, &snap, &state).unwrap();
         let bad = invariants::check(config, &snap, &state, &intent, &decision);

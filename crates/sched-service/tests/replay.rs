@@ -3,7 +3,8 @@
 
 use std::path::Path;
 
-use sched_model::test_support::example_config;
+use sched_model::PowerControl;
+use sched_model::test_support::{example_config, example_config_managed};
 use sched_service::replay::{Scenario, run_checked};
 
 fn replay(name: &str) {
@@ -12,7 +13,11 @@ fn replay(name: &str) {
         .join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let scenario = Scenario::from_yaml(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
-    if let Err(problems) = run_checked(&example_config(), &scenario) {
+    let config = match scenario.power_control {
+        Some(PowerControl::Managed) => example_config_managed(),
+        Some(PowerControl::Manual) | None => example_config(),
+    };
+    if let Err(problems) = run_checked(&config, &scenario) {
         panic!("{name}: {}\n{}", scenario.description, problems.join("\n"));
     }
 }

@@ -1,7 +1,8 @@
 //! The invariant checker must itself catch what it claims to: each test hands it a decision
 //! no correct sequencer would make and expects a violation.
 
-use sched_model::test_support::example_config;
+// Power-off invariants are about managed control (M4); manual control is checked apart.
+use sched_model::test_support::example_config_managed as example_config;
 use sched_model::{
     ClassId, Fixture, Intent, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, ResourceId,
     SchedState, Snapshot, Step, WindDown,
@@ -77,6 +78,7 @@ fn snap(observations: Vec<sched_model::Observation>, leases: Vec<Lease>) -> Snap
         now: Millis(NOW),
         observations,
         leases,
+        unobservable: Default::default(),
     }
 }
 

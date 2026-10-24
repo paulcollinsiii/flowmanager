@@ -1,4 +1,6 @@
 description: "A reclaim stops intake, gives in-flight work its timeout, stops it, runs the class's recovery action and shuts the host down; it is then not woken."
+# The power machine as under managed control (M4).
+power_control: managed
 initial_state:
   resources:
     cuda-central:
