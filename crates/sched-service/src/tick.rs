@@ -2,12 +2,13 @@
 //! core (planner, then sequencer), and logs the decision and why. Nothing is executed: the
 //! service has no actuator, and the observers only read.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{ClassId, Millis, ModelId, SchedState, Step, class_work};
-use sched_observe::{Report, observer_available};
+use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{Ingest, InputAge, ObservationCache};
@@ -15,7 +16,7 @@ use crate::clock::Clock;
 use crate::config_source::ConfigHolder;
 use crate::core::decide;
 use crate::metrics::Metrics;
-use crate::reason;
+use crate::reason::{self, DemandGaps};
 
 /// One source's input age in a [`TickReport`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,14 +48,17 @@ pub struct TickReport {
     /// Always true: each tick starts from a fresh sequencer state, so hysteresis (dwell,
     /// idle grace) and the steps that follow it (drain, pause, power off) cannot appear.
     pub shadow_stateless: bool,
-    /// Classes whose demand is unknown although an observer exists for their source (it
-    /// never reported or is stale): a real problem. Unknown is not zero: such a tick is
-    /// never `idle`.
+    /// Classes whose demand is unknown although something should be reporting it: an
+    /// observer runs for the source, or the source has reported before, and it is silent or
+    /// stale. A real problem. Unknown is not zero: such a tick is never `idle`.
     pub unknown_demand: Vec<ClassId>,
     /// Classes whose demand is unknown because this build has no observer for their source
-    /// kind (for example schedule or session sources), unless something pushed a value.
-    /// Expected for now, and kept apart so it cannot drown `unknown_demand`.
+    /// kind (schedule, session, ...) and nothing has ever pushed to it. Expected for now,
+    /// and kept apart so it cannot drown `unknown_demand`.
     pub unsupported_demand: Vec<ClassId>,
+    /// Classes whose source is of an observable kind but configured without `params`, and
+    /// has never been pushed to: nothing polls it. A config gap, still not idle.
+    pub unpolled_demand: Vec<ClassId>,
     /// Distinct decision kinds (see `reason::step_kind`), `idle` for none, `error` on failure.
     pub kinds: Vec<String>,
     pub reason: String,
@@ -149,7 +153,7 @@ impl Shared {
         let started = Instant::now();
         let config = self.config.current();
         after_pin();
-        let (snapshot, ages, changed, now) = {
+        let (snapshot, ages, changed, now, reported) = {
             let mut cache = self.cache();
             // Never run before something already received: that observation would be
             // dated after `now` and read as not fresh.
@@ -159,39 +163,42 @@ impl Shared {
                 cache.input_ages(&config, now),
                 cache.take_dirty(),
                 now,
+                config
+                    .sources()
+                    .iter()
+                    .filter(|s| cache.has_reported(&s.id))
+                    .map(|s| s.id.clone())
+                    .collect::<BTreeSet<_>>(),
             )
         };
-        let (mut unknown_demand, mut unsupported_demand) = (Vec::new(), Vec::new());
+        let mut gaps = DemandGaps::default();
         for c in config.classes() {
             let Some(d) = &c.demand else { continue };
             if class_work(&config, &snapshot, c).known {
                 continue;
             }
-            let observed = config.source(&d.source).is_some_and(observer_available);
-            if observed {
-                &mut unknown_demand
-            } else {
-                &mut unsupported_demand
-            }
-            .push(c.id.clone());
+            let state = config.source(&d.source).map(observer_state);
+            let silent_before = reported.contains(&d.source);
+            // Something that has ever reported is merely silent now, whatever feeds it.
+            let list = match state {
+                _ if silent_before => &mut gaps.unknown,
+                Some(ObserverState::NoParams) => &mut gaps.unpolled,
+                Some(ObserverState::NoImplementation) => &mut gaps.unsupported,
+                _ => &mut gaps.unknown,
+            };
+            list.push(c.id.clone());
         }
         // Shadow mode: the sequencer's state is not carried between ticks, because no step
         // is ever executed and carrying it would only let the scheduler wait for effects
         // that cannot happen. Each tick answers "what would I do given what I see now".
         let result = decide(&config, &snapshot, &SchedState::default());
-        let (unknown, unsupported) = (!unknown_demand.is_empty(), !unsupported_demand.is_empty());
         let (kinds, reason, steps, allowed, error) = match result {
             Ok((intent, decision)) => (
-                reason::kinds(&decision.steps, unknown, unsupported)
+                reason::kinds(&decision.steps, &gaps)
                     .into_iter()
                     .map(String::from)
                     .collect(),
-                reason::reason(
-                    &intent,
-                    &decision.steps,
-                    &unknown_demand,
-                    &unsupported_demand,
-                ),
+                reason::reason(&intent, &decision.steps, &gaps),
                 decision.steps,
                 decision.allowed,
                 None,
@@ -208,8 +215,9 @@ impl Shared {
             config_generation: config.generation(),
             at: now,
             shadow_stateless: true,
-            unknown_demand,
-            unsupported_demand,
+            unknown_demand: gaps.unknown,
+            unsupported_demand: gaps.unsupported,
+            unpolled_demand: gaps.unpolled,
             kinds,
             reason,
             steps,
@@ -259,6 +267,7 @@ fn log_tick(r: &TickReport, ages: &[InputAge]) {
             input_changed = r.input_changed,
             unknown_demand = ?r.unknown_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             unsupported_demand = ?r.unsupported_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            unpolled_demand = ?r.unpolled_demand.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             "shadow tick (nothing executed)"
         );
     }
@@ -605,5 +614,82 @@ mod tests {
             text.contains("sched_source_has_observer{source=\"paperless-ocr-pending\"} 1"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_pushed_source_that_goes_silent_is_unknown_not_unsupported() {
+        let (s, _) = shared();
+        cluster(&s);
+        // backup-schedule has no observer in this build, but something pushed to it.
+        push(
+            &s,
+            "backup-schedule",
+            vec![ObservedValue::Demand {
+                class: "backup".into(),
+                ready: 0,
+                in_flight: 0,
+                oldest_ready_at: None,
+            }],
+        );
+        let fresh = s.tick(Millis(T0 + 1_000));
+        assert!(
+            !fresh
+                .unsupported_demand
+                .iter()
+                .any(|c| c.as_str() == "backup")
+        );
+        assert!(!fresh.unknown_demand.iter().any(|c| c.as_str() == "backup"));
+        // Ten minutes later it has gone stale: a source that reported before and has gone
+        // quiet is a real problem, not the expected "nothing observes this".
+        let stale = s.tick(Millis(T0 + 1_000 + 600_001));
+        assert!(
+            stale.unknown_demand.iter().any(|c| c.as_str() == "backup"),
+            "{stale:?}"
+        );
+        assert!(
+            !stale
+                .unsupported_demand
+                .iter()
+                .any(|c| c.as_str() == "backup")
+        );
+    }
+
+    #[test]
+    fn an_observable_source_configured_without_params_is_labelled_as_such() {
+        let y = EXAMPLE_CONFIG.replace(
+            "    params:\n      requests:\n        - url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting\n",
+            "",
+        );
+        assert_ne!(y, EXAMPLE_CONFIG);
+        let clock = Arc::new(ManualClock::new(Millis(T0)));
+        let holder = Arc::new(ConfigHolder::new(&y).unwrap());
+        let s = Shared::new(holder, Arc::new(Metrics::new()), clock);
+        cluster(&s);
+        let r = s.tick(Millis(T0 + 1_000));
+        assert_eq!(r.unpolled_demand, vec![ClassId::from("immich-ml")], "{r:?}");
+        assert!(!r.unknown_demand.iter().any(|c| c.as_str() == "immich-ml"));
+        assert!(
+            !r.unsupported_demand
+                .iter()
+                .any(|c| c.as_str() == "immich-ml")
+        );
+        assert!(r.kinds.contains(&"demand_unpolled".to_string()), "{r:?}");
+        assert!(
+            r.reason.contains("configured without params"),
+            "{}",
+            r.reason
+        );
+        // Nothing polls it, but a push is accepted and makes it known.
+        push(
+            &s,
+            "immich-queues",
+            vec![ObservedValue::Demand {
+                class: "immich-ml".into(),
+                ready: 0,
+                in_flight: 0,
+                oldest_ready_at: None,
+            }],
+        );
+        assert!(s.tick(Millis(T0 + 2_000)).unpolled_demand.is_empty());
     }
 }

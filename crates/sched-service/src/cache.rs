@@ -11,7 +11,7 @@ use sched_model::{
     Capability, ClassId, Config, Fidelity, Millis, ModelId, Observation, ObservedValue, ResourceId,
     Snapshot, SourceId,
 };
-use sched_observe::{Report, observer_available};
+use sched_observe::{ObserverState, Report, observer_state};
 
 /// What an observation is about; one observation per source and subject is kept.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,9 +87,9 @@ pub struct InputAge {
     /// The capability this age is for. A source is only as healthy as its least healthy
     /// capability, so each one it declares is listed. `None` for a source that declares none.
     pub capability: Option<Capability>,
-    /// Whether this build runs an observer for the source. If not (a schedule or session
-    /// source, say) the source reports only when something pushes to it.
-    pub observer: bool,
+    /// Whether an observer runs for the source. If not, it reports only when something
+    /// pushes to it.
+    pub observer: ObserverState,
     /// Age of the newest observation of that capability held from the source; `None` if there is none.
     pub age: Option<Millis>,
     pub last_error: Option<String>,
@@ -208,6 +208,13 @@ impl ObservationCache {
         }
     }
 
+    /// Whether `source` has ever reported values (a push or an observer).
+    pub fn has_reported(&self, source: &SourceId) -> bool {
+        self.sources
+            .get(source)
+            .is_some_and(|s| s.last_report_at.is_some())
+    }
+
     pub fn status(&self, source: &SourceId) -> Option<&SourceStatus> {
         self.sources.get(source)
     }
@@ -232,7 +239,7 @@ impl ObservationCache {
                 out.push(InputAge {
                     source: s.id.clone(),
                     capability: cap,
-                    observer: observer_available(s),
+                    observer: observer_state(s),
                     age: self
                         .entries
                         .values()

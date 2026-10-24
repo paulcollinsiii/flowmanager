@@ -2,10 +2,11 @@
 //! the count, which failures count as demand) comes from the source's `params`; nothing
 //! here knows paperless, speakr or any other service. It only ever issues GET requests.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sched_model::{
-    AuthSpec, ClassId, CountsAs, ElementFilter, Fidelity, HttpJsonParams, ObservedValue,
+    AuthSpec, ClassId, CountsAs, ElementFilter, Fidelity, HttpJsonParams, Millis, ObservedValue,
     RequestSpec, SourceSpec,
 };
 use serde_json::Value;
@@ -14,6 +15,55 @@ use crate::{Report, ReportTx};
 
 /// Looks up an environment variable; injected so tests need not touch the process environment.
 pub type EnvFn = dyn Fn(&str) -> Option<String> + Sync;
+
+/// The scheduler's clock, as the adapter sees it: read once per poll to date `since` windows.
+pub type NowFn = Arc<dyn Fn() -> Millis + Send + Sync>;
+
+/// The system clock. This crate is the I/O layer; the service passes its own clock instead.
+pub fn system_now() -> NowFn {
+    Arc::new(|| {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        Millis(u64::try_from(ms).unwrap_or(u64::MAX))
+    })
+}
+
+/// `ms` since the unix epoch as `YYYY-MM-DDTHH:MM:SSZ` (UTC), with `:` percent-encoded so
+/// the text can go straight into a query string.
+pub fn iso8601_query(ms: Millis) -> String {
+    let secs = ms.as_u64() / 1000;
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}%3A{:02}%3A{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// The URL to request: `req.url`, plus the `since` window ending at `now` if set.
+pub fn request_url(req: &RequestSpec, now: Millis) -> String {
+    match &req.since {
+        None => req.url.clone(),
+        Some(s) => {
+            let from = now.saturating_sub(s.ago);
+            let sep = if req.url.contains('?') { '&' } else { '?' };
+            format!("{}{sep}{}={}", req.url, s.param, iso8601_query(from))
+        }
+    }
+}
 
 /// Largest response body read.
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -177,8 +227,9 @@ async fn fetch(
     req: &RequestSpec,
     auth: Option<&(String, String)>,
     max_body: usize,
+    now: Millis,
 ) -> Result<Value, String> {
-    let mut builder = client.get(&req.url);
+    let mut builder = client.get(request_url(req, now));
     if let Some((name, value)) = auth {
         let mut v = reqwest::header::HeaderValue::from_str(value)
             .map_err(|_| "the secret is not a valid header value".to_string())?;
@@ -191,7 +242,17 @@ async fn fetch(
         .map_err(|e| e.without_url().to_string())?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("HTTP {status}"));
+        // Say when the service asked us to come back; polling cadence is unchanged.
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.chars().take(64).collect::<String>());
+        return Err(match (status.as_u16(), retry_after) {
+            (429, Some(after)) => format!("HTTP {status} (rate limited; Retry-After: {after})"),
+            (429, None) => format!("HTTP {status} (rate limited)"),
+            _ => format!("HTTP {status}"),
+        });
     }
     // Read chunk by chunk and stop at the limit, so a huge or endless body is never held.
     let mut body = Vec::new();
@@ -229,6 +290,19 @@ pub async fn poll_with_limit(
     env: &EnvFn,
     max_body: usize,
 ) -> Report {
+    poll_at(client, spec, params, classes, env, max_body, system_now()()).await
+}
+
+/// As [`poll_with_limit`], at `now` (the clock reading `since` windows are dated from).
+pub async fn poll_at(
+    client: &reqwest::Client,
+    spec: &SourceSpec,
+    params: &HttpJsonParams,
+    classes: &[ClassId],
+    env: &EnvFn,
+    max_body: usize,
+    now: Millis,
+) -> Report {
     let fail = |error: String| Report::Failed {
         source: spec.id.clone(),
         error,
@@ -242,7 +316,7 @@ pub async fn poll_with_limit(
     };
     let mut parts = Vec::with_capacity(params.requests.len());
     for (i, req) in params.requests.iter().enumerate() {
-        let doc = match fetch(client, req, auth.as_ref(), max_body).await {
+        let doc = match fetch(client, req, auth.as_ref(), max_body, now).await {
             Ok(d) => d,
             Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         };
@@ -269,7 +343,13 @@ pub fn build_client(params: &HttpJsonParams) -> Result<reqwest::Client, reqwest:
 }
 
 /// Polls forever, every `resync`, until the receiver is gone.
-pub async fn run(spec: SourceSpec, params: HttpJsonParams, classes: Vec<ClassId>, tx: ReportTx) {
+pub async fn run(
+    spec: SourceSpec,
+    params: HttpJsonParams,
+    classes: Vec<ClassId>,
+    tx: ReportTx,
+    now: NowFn,
+) {
     let client = match build_client(&params) {
         Ok(c) => c,
         Err(e) => {
@@ -287,7 +367,7 @@ pub async fn run(spec: SourceSpec, params: HttpJsonParams, classes: Vec<ClassId>
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let report = poll(&client, &spec, &params, &classes, &env).await;
+        let report = poll_at(&client, &spec, &params, &classes, &env, MAX_BODY, now()).await;
         if tx.send(report).await.is_err() {
             return;
         }
@@ -313,6 +393,7 @@ mod tests {
             filter,
             counts_as: CountsAs::Ready,
             max_items: None,
+            since: None,
         }
     }
 
@@ -381,6 +462,8 @@ mod tests {
         for r in &mut params.requests {
             let at = r.url.find("/api/").unwrap();
             r.url = server.url(&r.url[at..]);
+            // Tests that do not care about the window ask for the plain URL.
+            r.since = None;
         }
         let classes = config
             .classes()
@@ -392,7 +475,8 @@ mod tests {
     }
 
     const SPEAKR_PENDING: &str = "/api/v1/recordings?status=pending&per_page=1";
-    const SPEAKR_FAILED: &str = "/api/v1/recordings?status=failed&per_page=100";
+    const SPEAKR_FAILED: &str =
+        "/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc";
     const SPEAKR_PROCESSING: &str = "/api/v1/recordings?status=processing&per_page=1";
 
     fn env(name: &str) -> Option<String> {
@@ -559,7 +643,7 @@ mod tests {
         let url = "/api/documents/?tags__name__iexact=ocr-pending&page_size=1";
         server.set(url, Reply::status(500));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let task = tokio::spawn(run(spec, params, classes, tx));
+        let task = tokio::spawn(run(spec, params, classes, tx, system_now()));
         assert!(matches!(rx.recv().await.unwrap(), Report::Failed { .. }));
         server.set(url, Reply::json(r#"{"count": 3}"#));
         loop {
@@ -767,5 +851,105 @@ mod tests {
         )
         .await;
         assert_eq!(demand(&report), (2, 0));
+    }
+
+    #[test]
+    fn dates_are_iso8601_utc_with_encoded_colons() {
+        assert_eq!(iso8601_query(Millis(0)), "1970-01-01T00%3A00%3A00Z");
+        assert_eq!(
+            iso8601_query(Millis(1_700_000_000_000)),
+            "2023-11-14T22%3A13%3A20Z"
+        );
+        // A leap day, and the last second of a year.
+        assert_eq!(
+            iso8601_query(Millis(951_782_400_000)),
+            "2000-02-29T00%3A00%3A00Z"
+        );
+        assert_eq!(
+            iso8601_query(Millis(1_704_067_199_999)),
+            "2023-12-31T23%3A59%3A59Z"
+        );
+    }
+
+    #[test]
+    fn the_since_window_is_appended_to_the_query_from_the_given_clock() {
+        let mut r = req(Some("/count"), None, None);
+        r.since = Some(sched_model::SinceSpec {
+            param: "updated_since".into(),
+            ago: Millis(86_400_000),
+        });
+        r.url = "http://x/a?b=1".into();
+        let now = Millis(1_700_000_000_000);
+        assert_eq!(
+            request_url(&r, now),
+            "http://x/a?b=1&updated_since=2023-11-13T22%3A13%3A20Z"
+        );
+        r.url = "http://x/a".into();
+        assert_eq!(
+            request_url(&r, now),
+            "http://x/a?updated_since=2023-11-13T22%3A13%3A20Z"
+        );
+        r.since = None;
+        assert_eq!(request_url(&r, now), "http://x/a");
+    }
+
+    #[tokio::test]
+    async fn the_example_failed_request_only_asks_for_the_last_day_using_the_clock_it_is_given() {
+        let server = TestServer::start().await;
+        let (spec, mut params, classes) = example_source("speakr-pending", &server);
+        // Put the example's window back (the helper strips it).
+        let original = example_config()
+            .source(&"speakr-pending".into())
+            .unwrap()
+            .http_json_params()
+            .unwrap()
+            .unwrap();
+        params.requests[1].since = original.requests[1].since.clone();
+        assert!(params.requests[1].since.is_some());
+        let totals = r#"{"recordings": [], "pagination": {"total": 0}}"#;
+        server.set(SPEAKR_PENDING, Reply::json(totals));
+        server.set(SPEAKR_PROCESSING, Reply::json(totals));
+        let windowed = format!("{SPEAKR_FAILED}&updated_since=2023-11-13T22%3A13%3A20Z");
+        server.set(
+            &windowed,
+            Reply::json(r#"{"recordings": [{"error_message": "Connection refused"}]}"#),
+        );
+        let now = Millis(1_700_000_000_000);
+        let report = poll_at(
+            &build_client(&params).unwrap(),
+            &spec,
+            &params,
+            &classes,
+            &env,
+            MAX_BODY,
+            now,
+        )
+        .await;
+        assert_eq!(demand(&report), (1, 0));
+        assert!(server.requests().iter().any(|(k, _)| *k == windowed));
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_reports_retry_after() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("paperless-ocr-pending", &server);
+        let path = "/api/documents/?tags__name__iexact=ocr-pending&page_size=1";
+        let env = |_: &str| Some("tok".to_string());
+        let client = build_client(&params).unwrap();
+        server.set(path, Reply::status(429).header("Retry-After", "37"));
+        match poll(&client, &spec, &params, &classes, &env).await {
+            Report::Failed { error, .. } => {
+                assert!(
+                    error.contains("429") && error.contains("Retry-After: 37"),
+                    "{error}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        server.set(path, Reply::status(429));
+        match poll(&client, &spec, &params, &classes, &env).await {
+            Report::Failed { error, .. } => assert!(error.contains("rate limited"), "{error}"),
+            other => panic!("{other:?}"),
+        }
     }
 }

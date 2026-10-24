@@ -10,6 +10,8 @@ use prometheus::{
 };
 use sched_model::Millis;
 
+use sched_observe::ObserverState;
+
 use crate::cache::InputAge;
 
 pub struct Metrics {
@@ -161,7 +163,7 @@ impl Metrics {
         for a in ages {
             self.has_observer
                 .with_label_values(&[a.source.as_str()])
-                .set(i64::from(a.observer));
+                .set(i64::from(a.observer == ObserverState::Running));
             sources.insert(a.source.to_string());
         }
         for gone in observers.difference(&sources) {
@@ -232,14 +234,14 @@ mod tests {
             InputAge {
                 source: "s1".into(),
                 capability: Some(sched_model::Capability::Pods),
-                observer: true,
+                observer: ObserverState::Running,
                 age: Some(Millis(1500)),
                 last_error: None,
             },
             InputAge {
                 source: "s2".into(),
                 capability: None,
-                observer: true,
+                observer: ObserverState::Running,
                 age: None,
                 last_error: None,
             },
@@ -260,7 +262,7 @@ mod tests {
         m.set_input_ages(&[InputAge {
             source: "s1".into(),
             capability: Some(sched_model::Capability::Pods),
-            observer: true,
+            observer: ObserverState::Running,
             age: Some(Millis(2000)),
             last_error: None,
         }]);
@@ -279,7 +281,7 @@ mod tests {
         let ages = vec![InputAge {
             source: "s1".into(),
             capability: Some(sched_model::Capability::Pods),
-            observer: true,
+            observer: ObserverState::Running,
             age: Some(Millis(1000)),
             last_error: None,
         }];

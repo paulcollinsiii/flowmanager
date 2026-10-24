@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sched_model::{ClassId, Config, ModelId, SourceId, SourceKind, SourceSpec};
@@ -37,12 +37,24 @@ pub struct SpawnOptions {
     /// How an observer that died is started again.
     pub restart: RestartPolicy,
     pub kube_timing: Timing,
+    /// The clock adapters date `since` windows from; defaults to the system clock.
+    pub now: Option<http_json::NowFn>,
 }
 
 /// The running observers. Dropping this stops them and everything they started.
 #[derive(Default)]
 pub struct Observers {
     running: BTreeMap<SourceId, Running>,
+    /// Restart delay state per source. It outlives a restart caused by a reload, so an
+    /// observer that crash-loops stays throttled however often the config is reapplied.
+    backoffs: BTreeMap<SourceId, SharedBackoff>,
+}
+
+/// A restart backoff shared between an observer's incarnations.
+pub type SharedBackoff = Arc<Mutex<RestartBackoff>>;
+
+pub fn shared_backoff(policy: RestartPolicy) -> SharedBackoff {
+    Arc::new(Mutex::new(RestartBackoff::new(policy)))
 }
 
 impl Observers {
@@ -52,6 +64,11 @@ impl Observers {
 
     pub fn is_empty(&self) -> bool {
         self.running.is_empty()
+    }
+
+    /// The restart backoff kept for `source`.
+    pub fn backoff_for(&self, source: &SourceId) -> Option<SharedBackoff> {
+        self.backoffs.get(source).cloned()
     }
 
     /// Brings the running set in line with `config`: starts observers for new sources,
@@ -76,12 +93,18 @@ impl Observers {
             }
             keep
         });
+        self.backoffs.retain(|id, _| wanted.contains_key(id));
         let mut started = Vec::new();
         for (id, fp) in wanted {
             if self.running.contains_key(&id) {
                 continue;
             }
-            if let Some(handle) = start(&fp, tx, opts) {
+            let backoff = Arc::clone(
+                self.backoffs
+                    .entry(id.clone())
+                    .or_insert_with(|| shared_backoff(opts.restart)),
+            );
+            if let Some(handle) = start(&fp, tx, opts, backoff) {
                 self.running.insert(
                     id.clone(),
                     Running {
@@ -126,18 +149,30 @@ fn fingerprint(config: &Config, spec: &SourceSpec) -> Fingerprint {
     }
 }
 
-fn start(fp: &Fingerprint, tx: &ReportTx, opts: &SpawnOptions) -> Option<JoinHandle<()>> {
+fn start(
+    fp: &Fingerprint,
+    tx: &ReportTx,
+    opts: &SpawnOptions,
+    backoff: SharedBackoff,
+) -> Option<JoinHandle<()>> {
     let spec = &fp.spec;
     match spec.kind {
         SourceKind::HttpJson => match spec.http_json_params() {
             Ok(Some(params)) => {
                 let (spec, classes, tx2) = (spec.clone(), fp.classes.clone(), tx.clone());
+                let now = opts.now.clone().unwrap_or_else(http_json::system_now);
                 Some(tokio::spawn(supervised(
                     spec.id.clone(),
                     tx.clone(),
-                    opts.restart,
+                    backoff,
                     move || {
-                        http_json::run(spec.clone(), params.clone(), classes.clone(), tx2.clone())
+                        http_json::run(
+                            spec.clone(),
+                            params.clone(),
+                            classes.clone(),
+                            tx2.clone(),
+                            now.clone(),
+                        )
                     },
                 )))
             }
@@ -157,7 +192,7 @@ fn start(fp: &Fingerprint, tx: &ReportTx, opts: &SpawnOptions) -> Option<JoinHan
                 Some(tokio::spawn(supervised(
                     spec.id.clone(),
                     tx.clone(),
-                    opts.restart,
+                    backoff,
                     move || {
                         let (spec, params, models, tx) =
                             (spec.clone(), params.clone(), models.clone(), tx2.clone());
@@ -255,12 +290,11 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 /// `Report::Failed` (so it shows up as a source error and the source goes stale) and
 /// starts it again after a delay that grows while it keeps dying (see [`RestartPolicy`]). Ends when the receiver is gone or this future
 /// is dropped, which also stops the observer.
-pub async fn supervised<F, Fut>(source: SourceId, tx: ReportTx, policy: RestartPolicy, make: F)
+pub async fn supervised<F, Fut>(source: SourceId, tx: ReportTx, backoff: SharedBackoff, make: F)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let mut backoff = RestartBackoff::new(policy);
     loop {
         let started = Instant::now();
         let handle = tokio::spawn(make());
@@ -286,19 +320,42 @@ where
         {
             return;
         }
-        tokio::time::sleep(backoff.after_exit(started.elapsed())).await;
+        let wait = backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .after_exit(started.elapsed());
+        tokio::time::sleep(wait).await;
     }
 }
 
-/// Whether this build has an observer that would run for `spec`: a supported kind with
-/// params. Other sources are configured but not (yet) observed; they can still be fed by
-/// pushes.
-pub fn observer_available(spec: &SourceSpec) -> bool {
-    match spec.kind {
+/// Whether something in this build polls or watches a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserverState {
+    /// An observer runs for it.
+    Running,
+    /// The kind has an observer, but the source was configured without `params`, so
+    /// nothing polls it. It can still be fed by pushes.
+    NoParams,
+    /// This build has no observer for the kind at all (schedule, session, ...).
+    NoImplementation,
+}
+
+pub fn observer_state(spec: &SourceSpec) -> ObserverState {
+    let has_params = match spec.kind {
         SourceKind::HttpJson => matches!(spec.http_json_params(), Ok(Some(_))),
         SourceKind::KubernetesWatch => matches!(spec.kube_watch_params(), Ok(Some(_))),
-        _ => false,
+        _ => return ObserverState::NoImplementation,
+    };
+    if has_params {
+        ObserverState::Running
+    } else {
+        ObserverState::NoParams
     }
+}
+
+/// Whether an observer runs for `spec`.
+pub fn observer_available(spec: &SourceSpec) -> bool {
+    observer_state(spec) == ObserverState::Running
 }
 
 /// Starts the observers `config` asks for, with default options. See [`Observers::update`].

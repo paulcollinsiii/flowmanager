@@ -75,6 +75,20 @@ pub struct ElementFilter {
     pub equals: Option<String>,
 }
 
+/// Bounds a request by age: adds `param=<now - ago>` (ISO 8601, UTC) to its query, so
+/// only items changed since then come back. `now` is the scheduler's clock at the poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinceSpec {
+    /// Name of the query parameter, for example `updated_since`.
+    pub param: String,
+    /// How far back from now.
+    pub ago: Millis,
+}
+
+/// Longest accepted `since.ago`.
+pub const MAX_SINCE_AGO: Millis = Millis(365 * 86_400_000);
+
 /// One request and how its response becomes a number. Exactly one of `count` and `length`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +110,9 @@ pub struct RequestSpec {
     /// under-counting.
     #[serde(default)]
     pub max_items: Option<u64>,
+    /// Only items changed within a window ending now (see [`SinceSpec`]).
+    #[serde(default)]
+    pub since: Option<SinceSpec>,
 }
 
 /// Where the value of an authentication header comes from. Never the config itself.
@@ -190,6 +207,25 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
         }
         for ptr in [&r.count, &r.length].into_iter().flatten() {
             out.extend(pointer_problem(ptr).map(|m| format!("{at}: {m}")));
+        }
+        if let Some(sc) = &r.since {
+            let plain = !sc.param.is_empty()
+                && sc
+                    .param
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+            if !plain {
+                out.push(format!(
+                    "{at}.since.param {:?} must be a plain query parameter name",
+                    sc.param
+                ));
+            }
+            if sc.ago == Millis::ZERO || sc.ago > MAX_SINCE_AGO {
+                out.push(format!(
+                    "{at}.since.ago ({}) must be greater than zero and at most {}",
+                    sc.ago, MAX_SINCE_AGO
+                ));
+            }
         }
         if r.max_items.is_some() && r.length.is_none() {
             out.push(format!("{at}: max_items is only valid with length"));
@@ -386,6 +422,25 @@ mod tests {
             "url: http://x\n          length: /a\n          max_items: 0",
         ));
         assert!(has(&ps, "max_items must be greater than zero"), "{ps:?}");
+    }
+
+    #[test]
+    fn rejects_bad_since_options() {
+        let url = "url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting";
+        let with =
+            |since: &str| EXAMPLE_CONFIG.replace(url, &format!("{url}\n          since: {since}"));
+        assert!(Config::from_yaml(&with("{ param: updated_since, ago: 24h }")).is_ok());
+        let ps = problems_of(&with("{ param: updated_since, ago: 0 }"));
+        assert!(
+            has(&ps, "since.ago (0ms) must be greater than zero"),
+            "{ps:?}"
+        );
+        let ps = problems_of(&with("{ param: updated_since, ago: 400d }"));
+        assert!(has(&ps, "since.ago"), "{ps:?}");
+        let ps = problems_of(&with("{ param: \"a=b&c\", ago: 1h }"));
+        assert!(has(&ps, "plain query parameter name"), "{ps:?}");
+        let ps = problems_of(&with("{ param: \"\", ago: 1h }"));
+        assert!(has(&ps, "plain query parameter name"), "{ps:?}");
     }
 
     #[test]

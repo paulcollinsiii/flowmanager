@@ -197,7 +197,7 @@ impl Debouncer {
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     /// First wait before re-listing after a watch failure; doubles up to `backoff_max`
-    /// and starts over after a list completes.
+    /// and starts over once a watcher has lived `backoff_max` without failing.
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
     /// Wait between attempts to create the cluster client.
@@ -277,13 +277,11 @@ async fn watch_restarting<K>(
 {
     let mut backoff = timing.backoff_initial;
     loop {
+        let started = std::time::Instant::now();
         let mut stream = Box::pin(watcher::watcher(make_api(), watcher::Config::default()));
         while let Some(ev) = stream.next().await {
             match ev {
                 Ok(ev) => {
-                    if matches!(ev, Event::InitDone) {
-                        backoff = timing.backoff_initial;
-                    }
                     if let Some(r) = on_event(ev)
                         && tx.send(r).await.is_err()
                     {
@@ -304,6 +302,11 @@ async fn watch_restarting<K>(
             }
         }
         drop(stream);
+        // A watcher that lived a good while was healthy: its next failure starts the waits
+        // over. One that fails right after listing (a bad watch endpoint) keeps backing off.
+        if started.elapsed() >= timing.backoff_max {
+            backoff = timing.backoff_initial;
+        }
         tokio::time::sleep(backoff).await;
         backoff = grow_backoff(backoff, timing.backoff_max);
     }
@@ -335,8 +338,29 @@ pub async fn run(
     tx: ReportTx,
     timing: Timing,
 ) {
+    run_with_factory(spec, params, models, tx, timing, || async {
+        kube::Client::try_default().await.map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// As [`run`], with the client made by `make_client`. A failure is reported and retried
+/// after a wait that doubles (from `timing.client_retry` up to `timing.backoff_max`), so a
+/// cluster that stays unreachable is not hammered.
+pub async fn run_with_factory<F, Fut>(
+    spec: SourceSpec,
+    params: KubeWatchParams,
+    models: Vec<ModelWorkloads>,
+    tx: ReportTx,
+    timing: Timing,
+    mut make_client: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<kube::Client, String>>,
+{
+    let mut wait = timing.client_retry;
     let client = loop {
-        match kube::Client::try_default().await {
+        match make_client().await {
             Ok(c) => break c,
             Err(e) => {
                 let failed = Report::Failed {
@@ -346,7 +370,8 @@ pub async fn run(
                 if tx.send(failed).await.is_err() {
                     return;
                 }
-                tokio::time::sleep(timing.client_retry).await;
+                tokio::time::sleep(wait).await;
+                wait = grow_backoff(wait, timing.backoff_max);
             }
         }
     };

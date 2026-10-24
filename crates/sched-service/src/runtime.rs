@@ -34,7 +34,12 @@ pub async fn pump(shared: Arc<Shared>, mut rx: mpsc::Receiver<Report>) {
 /// own inputs changed (the rest keep running, with their state).
 pub async fn supervise_observers(shared: Arc<Shared>, tx: ReportTx) {
     let mut rx = shared.config.subscribe();
-    let opts = SpawnOptions::default();
+    let clock = Arc::clone(&shared.clock);
+    let opts = SpawnOptions {
+        // Adapters date their `since` windows from the scheduler's clock.
+        now: Some(Arc::new(move || clock.now())),
+        ..SpawnOptions::default()
+    };
     let mut observers = Observers::default();
     let config = Arc::clone(&rx.borrow_and_update());
     observers.update(&config, &tx, &opts);

@@ -169,7 +169,9 @@ sources:
   # under-counting). `contains` is case-insensitive.
   # UNVERIFIED: that list items carry `error_message` (the detail object does). If they do
   # not, the poll fails with "field missing from every item" rather than counting zero.
-  # Cost: 3 requests per poll per minute, against speakr's read limit of 120/min per token.
+  # Cost: 3 requests per poll here plus 1 for speakr-summaries below, at one poll a minute
+  # each: 4 requests per minute in total on the one token, against speakr's read limit of
+  # 120/min (add up all speakr sources before raising `resync` rates).
   # Auth: `Authorization: Bearer <token>`; a token with `read` scope is enough.
   - id: speakr-pending
     kind: http_json
@@ -181,15 +183,24 @@ sources:
       requests:
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=1
           count: /pagination/total
-        - url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100
+        # Failed recordings are never deleted by speakr, so without a bound the oldest
+        # connection failures would count as demand for ever and 100+ failures would trip
+        # `max_items` for good. `since` keeps only those updated within the last 24h (a
+        # failed job older than that stops counting; recovery by requeueing, milestone M7,
+        # clears the rest), and sorting newest first means a truncated page keeps the
+        # newest failures.
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc
           length: /recordings
           where: { field: /error_message, contains: connection }
           max_items: 100
+          since: { param: updated_since, ago: 24h }
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=processing&per_page=1
           count: /pagination/total
           counts_as: in_flight
       webhook: { path: /hooks/speakr }
 
+  # *** UNVERIFIED AND POSSIBLY ALWAYS ZERO until checked against a live speakr: the API
+  # doc does not say that the `processing` filter returns SUMMARIZING recordings. ***
   # Summarization: the status filter has no `summarizing` value, so this lists the
   # `processing` recordings and keeps those whose `status` is SUMMARIZING.
   # UNVERIFIED: that the `processing` filter returns SUMMARIZING recordings. If it does not

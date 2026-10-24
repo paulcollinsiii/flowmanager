@@ -16,6 +16,6 @@ pub mod testserver;
 
 pub use report::{Report, ReportTx};
 pub use supervisor::{
-    Observers, RestartBackoff, RestartPolicy, SpawnOptions, observer_available, spawn_observers,
-    supervised,
+    ObserverState, Observers, RestartBackoff, RestartPolicy, SharedBackoff, SpawnOptions, observer_available, observer_state,
+    shared_backoff, spawn_observers, supervised,
 };

@@ -64,6 +64,8 @@ pub struct Reply {
     pub delay: Duration,
     pub mode: Mode,
     pub location: Option<String>,
+    /// Further response headers.
+    pub headers: Vec<(String, String)>,
     /// Counts this response while its body is alive (until it ends or the client goes).
     pub track: Option<Arc<AtomicUsize>>,
 }
@@ -76,8 +78,15 @@ impl Reply {
             delay: Duration::ZERO,
             mode: Mode::Normal,
             location: None,
+            headers: Vec::new(),
             track: None,
         }
+    }
+
+    /// Adds a response header.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 
     /// Counts this response in `counter` while it is open.
@@ -117,6 +126,7 @@ impl Reply {
             delay: Duration::ZERO,
             mode: Mode::Normal,
             location: None,
+            headers: Vec::new(),
             track: None,
         }
     }
@@ -135,6 +145,7 @@ struct Inner {
     /// By path alone; the function gets the query string.
     dynamic: HashMap<String, Dynamic>,
     requests: Vec<(String, Option<String>)>,
+    times: Vec<std::time::Instant>,
 }
 
 pub struct TestServer {
@@ -185,6 +196,7 @@ impl TestServer {
                             let reply = {
                                 let mut g = shared.lock().unwrap();
                                 g.requests.push((key.clone(), auth));
+                                g.times.push(std::time::Instant::now());
                                 let (path, query) = key.split_once('?').unwrap_or((&key, ""));
                                 match g.dynamic.get(path) {
                                     Some(f) => Some(f(query)),
@@ -198,6 +210,9 @@ impl TestServer {
                             let mut b = Response::builder()
                                 .status(reply.status)
                                 .header("content-type", "application/json");
+                            for (n, v) in &reply.headers {
+                                b = b.header(n, v);
+                            }
                             if let Some(l) = &reply.location {
                                 b = b.header("location", l);
                             }
@@ -258,6 +273,11 @@ impl TestServer {
             .iter()
             .filter(|(k, _)| k.split('?').next() == Some(path))
             .count()
+    }
+
+    /// When each request in `requests()` arrived.
+    pub fn request_times(&self) -> Vec<std::time::Instant> {
+        self.inner.lock().unwrap().times.clone()
     }
 
     /// Every request seen so far: path and query, and the Authorization header if any.

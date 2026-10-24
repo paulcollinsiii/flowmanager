@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use sched_model::test_support::{EXAMPLE_CONFIG, example_config};
 use sched_model::{Config, KubeWatchParams, Millis, ObservedValue, SourceSpec};
-use sched_observe::kube_watch::{ModelWorkloads, Timing, model_workloads, run_with_client};
+use sched_observe::kube_watch::{
+    ModelWorkloads, Timing, model_workloads, run_with_client, run_with_factory,
+};
 use sched_observe::testserver::{Reply, TestServer};
-use sched_observe::{Observers, Report, RestartPolicy, SpawnOptions, supervised};
+use sched_observe::{Observers, Report, RestartPolicy, SpawnOptions, shared_backoff, supervised};
 use tokio::sync::mpsc;
 
 fn pod(name: &str, workload: &str, ready: bool) -> String {
@@ -28,6 +30,8 @@ struct Fake {
     garbage_once: Arc<AtomicBool>,
     /// The next node watch answers with a garbage line and ends.
     garbage_once_nodes: Arc<AtomicBool>,
+    /// Every pod watch answers with a garbage line and ends.
+    garbage_always: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -37,10 +41,16 @@ impl Fake {
         let pods = Arc::new(Mutex::new(vec![pod("mineru-1", "mineru", true)]));
         let garbage_once = Arc::new(AtomicBool::new(false));
         let garbage_once_nodes = Arc::new(AtomicBool::new(false));
-        let (w, p, g) = (watches.clone(), pods.clone(), garbage_once.clone());
+        let garbage_always = Arc::new(AtomicBool::new(false));
+        let (w, p, g, ga) = (
+            watches.clone(),
+            pods.clone(),
+            garbage_once.clone(),
+            garbage_always.clone(),
+        );
         server.set_dynamic("/api/v1/namespaces/ai/pods", move |query| {
             if query.contains("watch=true") {
-                if g.swap(false, Ordering::SeqCst) {
+                if g.swap(false, Ordering::SeqCst) || ga.load(Ordering::SeqCst) {
                     return Reply::json("this is not json\n");
                 }
                 return Reply::hanging("").tracked(&w);
@@ -69,6 +79,7 @@ impl Fake {
             pods,
             garbage_once,
             garbage_once_nodes,
+            garbage_always,
         }
     }
 
@@ -234,11 +245,11 @@ async fn a_panicking_or_ending_observer_is_reported_and_restarted() {
     let task = tokio::spawn(supervised(
         "s".into(),
         tx.clone(),
-        RestartPolicy {
+        shared_backoff(RestartPolicy {
             initial: Duration::from_millis(10),
             max: Duration::from_millis(10),
             healthy_after: Duration::from_secs(60),
-        },
+        }),
         move || {
             let n = r.fetch_add(1, Ordering::SeqCst);
             async move {
@@ -285,6 +296,7 @@ async fn reloads_do_not_leak_watches_and_unrelated_reloads_keep_observers() {
             healthy_after: Duration::from_secs(60),
         },
         kube_timing: FAST,
+        now: None,
     };
     let mut observers = Observers::default();
     let first = observers.update(
@@ -470,11 +482,11 @@ async fn restarts_wait_the_configured_delay_and_the_delay_grows() {
     let task = tokio::spawn(supervised(
         "s".into(),
         tx,
-        RestartPolicy {
+        shared_backoff(RestartPolicy {
             initial: Duration::from_millis(150),
             max: Duration::from_secs(5),
             healthy_after: Duration::from_secs(60),
-        },
+        }),
         move || {
             s.lock().unwrap().push(std::time::Instant::now());
             async move { panic!("always") }
@@ -498,4 +510,155 @@ async fn restarts_wait_the_configured_delay_and_the_delay_grows() {
         "second restart came after {g2:?}, expected about double"
     );
     task.abort();
+}
+
+fn gaps(times: &[std::time::Instant]) -> Vec<Duration> {
+    times.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+#[tokio::test]
+async fn a_watch_that_keeps_failing_is_retried_with_a_growing_wait() {
+    let fake = Fake::start().await;
+    fake.garbage_always.store(true, Ordering::SeqCst);
+    let (spec, params, models) = source();
+    let (tx, mut rx) = mpsc::channel(4096);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let timing = Timing {
+        backoff_initial: Duration::from_millis(100),
+        backoff_max: Duration::from_secs(2),
+        client_retry: Duration::from_millis(20),
+    };
+    let task = tokio::spawn(run_with_client(
+        spec,
+        params,
+        models,
+        fake.client(),
+        tx,
+        timing,
+    ));
+    // One list per incarnation of the watcher.
+    wait_for("four relists", || {
+        fake.server
+            .requests()
+            .iter()
+            .filter(|(k, _)| {
+                k.starts_with("/api/v1/namespaces/ai/pods?") && !k.contains("watch=true")
+            })
+            .count()
+            >= 4
+    })
+    .await;
+    let times: Vec<_> = fake
+        .server
+        .requests()
+        .iter()
+        .zip(fake.server.request_times())
+        .filter(|((k, _), _)| {
+            k.starts_with("/api/v1/namespaces/ai/pods?") && !k.contains("watch=true")
+        })
+        .map(|(_, t)| t)
+        .collect();
+    let g = gaps(&times);
+    // Waits of about 100, 200, 400 ms between lists: the third gap is well past the first.
+    assert!(g[0] >= Duration::from_millis(90), "{g:?}");
+    assert!(
+        g[2] >= Duration::from_millis(350),
+        "waits did not grow: {g:?}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn client_creation_is_retried_with_a_growing_wait_and_then_proceeds() {
+    let fake = Fake::start().await;
+    let (spec, params, models) = source();
+    let (tx, mut rx) = mpsc::channel(4096);
+    let timing = Timing {
+        backoff_initial: Duration::from_millis(20),
+        backoff_max: Duration::from_secs(2),
+        client_retry: Duration::from_millis(60),
+    };
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let (a, client) = (attempts.clone(), fake.client());
+    let task = tokio::spawn(run_with_factory(
+        spec,
+        params,
+        models,
+        tx,
+        timing,
+        move || {
+            let n = {
+                let mut g = a.lock().unwrap();
+                g.push(std::time::Instant::now());
+                g.len()
+            };
+            let client = client.clone();
+            async move {
+                if n < 4 {
+                    Err("no cluster".to_string())
+                } else {
+                    Ok(client)
+                }
+            }
+        },
+    ));
+    // Each failure is reported, then pods flow once a client exists.
+    for _ in 0..3 {
+        until(&mut rx, |r| {
+            matches!(r, Report::Failed { error, .. } if error.contains("cannot create"))
+                .then_some(())
+        })
+        .await;
+    }
+    assert_eq!(until(&mut rx, |r| pods_of(r, "mineru")).await, (1, 1));
+    let g = gaps(&attempts.lock().unwrap());
+    assert!(g[0] >= Duration::from_millis(55), "{g:?}");
+    assert!(
+        g[2] >= Duration::from_millis(220),
+        "waits did not grow: {g:?}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn restart_throttling_survives_a_restart_caused_by_a_reload() {
+    let fake = Fake::start().await;
+    let (tx, mut rx) = mpsc::channel(4096);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let opts = SpawnOptions {
+        kube_client: Some(fake.client()),
+        restart: RestartPolicy {
+            initial: Duration::from_millis(50),
+            max: Duration::from_secs(10),
+            healthy_after: Duration::from_secs(60),
+        },
+        kube_timing: FAST,
+        now: None,
+    };
+    let id = sched_model::SourceId::new("cluster-pods");
+    let mut observers = Observers::default();
+    observers.update(&config_with_one_namespace("l0"), &tx, &opts);
+    let before = observers
+        .backoff_for(&id)
+        .expect("a backoff is kept per source");
+    // The observer crash-loops: two quick deaths so far.
+    let quick = Duration::from_millis(1);
+    assert_eq!(
+        before.lock().unwrap().after_exit(quick),
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        before.lock().unwrap().after_exit(quick),
+        Duration::from_millis(100)
+    );
+
+    // A reload that restarts the observer must not hand it a fresh, unthrottled backoff.
+    let started = observers.update(&config_with_one_namespace("l1"), &tx, &opts);
+    assert!(started.iter().any(|s| s == &id));
+    let after = observers.backoff_for(&id).unwrap();
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(
+        after.lock().unwrap().after_exit(quick),
+        Duration::from_millis(200)
+    );
 }
