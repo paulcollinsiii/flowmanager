@@ -57,9 +57,17 @@ restate deployments register http://localhost:9080
 - Backstop: `arm_backstop` starts a self-scheduling `backstop` chain (delayed send to itself,
   every `--backstop`); the binary calls it through `--restate-ingress` until Restate accepts.
   Changed observations ask for an extra `tick` the same way.
-- Metrics (`/metrics`, `--metrics-listen`): `sched_decisions_total{kind}`,
-  `sched_observation_age_seconds{source}`, `sched_source_errors_total{source}`,
-  `sched_tick_duration_seconds`, `sched_config_generation`, `sched_config_reloads_total{outcome}`.
+- Metrics (`/metrics`, `--metrics-listen`), the complete set (checked against a scrape and
+  the registrations in `metrics.rs`; labelled counters appear after their first event):
+  - `sched_tick_decisions_total{kind}`: ticks by decision kind.
+  - `sched_observation_age_seconds{source,capability}`: infinite if that capability never reported.
+  - `sched_source_has_observer{source}`: 1 if an observer runs for the source, else 0.
+  - `sched_source_errors_total{source}`: failed reads reported by a source.
+  - `sched_rejected_reports_total{reason}`: reports (`unknown_source`) or values
+    (`unknown_subject`) dropped because the config has no place for them.
+  - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
+    `sched_tick_trigger_failures_total`.
+  - `sched_config_generation`, `sched_config_reloads_total{outcome}`.
 - **Trust boundary**: the Restate ingress (and the service port, which Restate calls) is
   assumed to be reachable only from a trusted network. The handlers (`observe`, `tick`, ...)
   have no authentication of their own; do not expose the ingress beyond the cluster.
@@ -67,10 +75,18 @@ restate deployments register http://localhost:9080
   config are dropped and counted (`sched_rejected_reports_total`).
 - **Metric rename**: the decisions counter is now `sched_tick_decisions_total{kind}` (it was
   `sched_decisions_total` in the first cut). It counts ticks, not actions; kinds include
-  `demand_unknown` (an observed source is silent or stale) and `demand_unsupported` (the
-  source kind has no observer in this build, e.g. schedule and session sources;
-  `sched_source_has_observer{source}` is 0 for these). Dashboards or alerts on the old name
-  need updating.
+  `demand_unknown` (something should be reporting the demand, an observer runs or the source
+  has reported before, and it is silent or stale), `demand_unsupported` (the source kind has
+  no observer in this build, e.g. schedule and session sources, and nothing has ever pushed
+  to it) and `demand_unpolled` (an observable kind configured without `params`: nothing polls
+  it and nothing has pushed to it). `sched_source_has_observer{source}` is 0 for the last two.
+  All three still mean "not idle". A source that has reported once and then goes quiet is
+  always `demand_unknown`. Dashboards or alerts on the old name need updating.
+- **Bounding `http_json` by age**: a request may carry `since: { param, ago }`; each poll
+  appends `param=<now - ago>` (ISO 8601 UTC, from the scheduler's clock). The example uses it so
+  speakr's never-deleted failed recordings stop counting as demand after 24h.
+- A `429` response is recorded in the source error text with its `Retry-After`; the polling
+  cadence is not changed.
 - Handlers: `observe` (push observations; dated on receipt, never by the sender), `tick`,
   `last_decision`, e.g. `curl -X POST localhost:8080/Scheduler/main/last_decision`.
 
