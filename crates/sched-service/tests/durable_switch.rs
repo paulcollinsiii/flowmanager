@@ -1,13 +1,15 @@
 //! Multi-tick runs of the stateful scheduler: the sequencer state is persisted between
 //! ticks the way the `Scheduler` object keeps it in Restate (as JSON), and the process is
 //! restarted (new `Shared`, empty observation cache, state read back) in the middle of a
-//! switch. A small world plays KEDA: it scales models from the published allowed set only,
-//! and takes a few ticks to bring pods up or down.
+//! switch. A small world plays KEDA and Kubernetes: it scales models from the published
+//! allowed set only, takes a few ticks to bring pods down, and keeps a newly allowed model's
+//! pod pending until no other model's pod holds the GPU (one `nvidia.com/gpu`).
 //!
-//! Checked at every tick, from the world and from what the test pushed, not from the
-//! scheduler's own state: at most one model of the exclusive resource is allowed, and the
-//! second model is never allowed while the first still has pods or while the newest zero
-//! reading of the first model the running process received is older than `safety_max_age`.
+//! Checked at every tick, from the world and from what was published, not from the
+//! scheduler's own state: at most one model of the exclusive resource is allowed, a model
+//! that was replaced never comes back while its successor is wanted, and the GPU never runs
+//! two models (the world's exclusivity is what Kubernetes provides, and the scheduler must
+//! not need anything more).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -85,11 +87,14 @@ struct Queue {
     in_flight: u64,
 }
 
-/// The cluster and the services, as KEDA and the workloads would make them behave.
+/// The cluster and the services, as KEDA, Kubernetes and the workloads would make them
+/// behave.
 struct World {
-    /// (pods, ready pods) per model.
+    /// (pods, ready pods) per model. A pending pod is (1, 0); a terminating one keeps its
+    /// count with no ready pod until it is gone.
     pods: BTreeMap<&'static str, (u32, u32)>,
-    /// Ticks left until a model that lost its allowance has no pods.
+    /// Ticks left until a model that lost its allowance has no pods. Such a pod still
+    /// holds the GPU.
     terminating: BTreeMap<&'static str, u32>,
     queues: BTreeMap<&'static str, Queue>,
     /// What KEDA last saw: kept while the scaler has nothing published (just restarted).
@@ -121,33 +126,56 @@ impl World {
             .is_some_and(|a| a.allowed.classes.contains(&ClassId::from(c)))
     }
 
-    /// One tick of the world: KEDA converges on the allowed set it has, work proceeds.
+    /// Whether a pod of a model other than `m` holds the GPU (running or terminating).
+    fn gpu_held_by_other(&self, m: &str) -> bool {
+        MODELS
+            .iter()
+            .any(|o| *o != m && (self.pods[o].1 > 0 || self.terminating.contains_key(o)))
+    }
+
+    /// Models whose pods run on the GPU right now (ready).
+    fn running(&self) -> Vec<&'static str> {
+        MODELS
+            .iter()
+            .copied()
+            .filter(|m| self.pods[m].1 > 0)
+            .collect()
+    }
+
+    /// One tick of the world: KEDA converges on the allowed set it has, Kubernetes
+    /// schedules a pending pod once the GPU is free, work proceeds.
     fn step(&mut self, published: Option<PublishedAllowed>) {
         if published.is_some() {
             self.allowed = published;
         }
+        // Withdrawn models first: their pods start terminating and still hold the GPU.
         for m in MODELS {
-            let (p, r) = self.pods[m];
-            let next = if self.model_allowed(m) {
+            let (p, _) = self.pods[m];
+            if self.model_allowed(m) || p == 0 {
+                continue;
+            }
+            let left = self.terminating.entry(m).or_insert(3);
+            *left -= 1;
+            if *left == 0 {
                 self.terminating.remove(m);
-                match (p, r) {
-                    (0, _) => (1, 0),
-                    _ => (1, 1),
-                }
-            } else if p > 0 {
-                let left = self.terminating.entry(m).or_insert(3);
-                *left -= 1;
-                if *left == 0 {
-                    self.terminating.remove(m);
-                    (0, 0)
-                } else {
-                    (p, 0)
-                }
+                self.pods.insert(m, (0, 0));
             } else {
-                (0, 0)
+                self.pods.insert(m, (p, 0));
+            }
+        }
+        for m in MODELS {
+            if !self.model_allowed(m) {
+                continue;
+            }
+            self.terminating.remove(m);
+            let next = if self.gpu_held_by_other(m) {
+                (1, 0)
+            } else {
+                (1, 1)
             };
             self.pods.insert(m, next);
         }
+        assert!(self.running().len() <= 1, "two models on one GPU: {:?}", self.pods);
         for (c, _) in CLASSES {
             let runs = self.class_allowed(c);
             let q = self.queues.get_mut(c).unwrap();
@@ -239,58 +267,47 @@ fn tick(p: &Process, store: &mut Store, now: u64) -> TickReport {
     outcome.report
 }
 
+fn allowed_has(a: &PublishedAllowed, m: &str) -> bool {
+    a.allowed.models.contains(&ModelId::from(m))
+}
+
 #[test]
-fn a_switch_resumes_safely_after_a_restart_in_the_middle_of_draining() {
+fn a_switch_is_one_tick_and_resumes_safely_after_a_restart_in_the_middle_of_it() {
     let mut store = Store::default();
     let mut world = World::new();
     world.queues.get_mut("paperless-ocr").unwrap().ready = 3;
     let mut p = start(T0);
     let mut log: Vec<String> = Vec::new();
-    // When the running process last received a zero pod count for mineru.
-    let mut mineru_zero_seen: Option<u64> = None;
-    let mut restarted_at: Option<usize> = None;
-    // The tick of the first zero reading of mineru after the restart. After it the
-    // cluster watch stalls for longer than safety_max_age, and the demand sources (silent
-    // since the restart) come back while that zero reading is already stale.
-    let mut zero_at: Option<usize> = None;
-    let mut saw_draining_after_restart = false;
-    let mut whisperx_allowed_at: Option<usize> = None;
-    let mut mineru_served = false;
+    // The cluster watch stalls for longer than safety_max_age when the switch comes due.
+    let stall = 60..75usize;
     let mut stale_holds = 0;
+    let mut switched_at: Option<usize> = None;
+    let mut restarted_at: Option<usize> = None;
+    let mut whisperx_ready_at: Option<usize> = None;
+    let mut mineru_served = false;
 
-    for t in 0..80usize {
+    for t in 0..120usize {
         let now = T0 + t as u64 * TICK;
         if t == 8 {
             // Transcription work arrives while OCR is being served.
             world.queues.get_mut("speakr-transcription").unwrap().ready = 2;
         }
-        // Restart in the middle of draining mineru, while it still has pods.
-        if restarted_at.is_none()
-            && matches!(mode(&store.load()), ModePhase::Draining { .. })
-            && world.pods["mineru"].0 > 0
-        {
+        // Restart right after the switch: mineru's pod is still terminating and holds the
+        // GPU, whisperx's is pending behind it.
+        if restarted_at.is_none() && switched_at.is_some_and(|s| t == s + 1) {
+            assert!(world.terminating.contains_key("mineru"), "{}", log.join("\n"));
+            assert_eq!(world.pods["whisperx"], (1, 0), "{}", log.join("\n"));
             restarted_at = Some(t);
             p = start(now);
-            mineru_zero_seen = None;
-            assert_eq!(
-                *p.allowed.borrow(),
-                None,
-                "nothing published by a new process"
-            );
+            assert_eq!(*p.allowed.borrow(), None, "nothing published by a new process");
             log.push(format!("t={t}: RESTART"));
         }
         p.clock.set(Millis(now));
         let first_after_restart = restarted_at == Some(t);
-        let stalled = zero_at.is_some_and(|z| t > z && t < z + 6);
-        let demand_silent = restarted_at.is_some() && zero_at.is_none_or(|z| t < z + 4);
-        if !first_after_restart && !stalled {
+        // After the restart the demand sources are silent for a few ticks.
+        let demand_silent = restarted_at.is_some_and(|r| t < r + 4);
+        if !stall.contains(&t) && !first_after_restart {
             push_pods(&p, &world);
-            if world.pods["mineru"].0 == 0 {
-                mineru_zero_seen = Some(now);
-                if restarted_at.is_some() && zero_at.is_none() {
-                    zero_at = Some(t);
-                }
-            }
         }
         if !demand_silent {
             push_rest(&p, &world);
@@ -300,11 +317,11 @@ fn a_switch_resumes_safely_after_a_restart_in_the_middle_of_draining() {
         assert_eq!(r.error, None, "t={t}: {r:?}");
         let published = p.allowed.borrow().clone().expect("published after a tick");
         assert_eq!(published.at, r.at);
-        let d = store.load();
         log.push(format!(
-            "t={t} pods={:?} mode={:?} allowed={:?} steps={:?}",
+            "t={t} pods={:?} terminating={:?} mode={:?} allowed={:?} steps={:?}",
             world.pods,
-            mode(&d),
+            world.terminating,
+            mode(&store.load()),
             gpu_models(&published),
             r.steps
         ));
@@ -312,62 +329,65 @@ fn a_switch_resumes_safely_after_a_restart_in_the_middle_of_draining() {
 
         // 1. At most one model of the exclusive resource.
         assert!(gpu_models(&published).len() <= 1, "t={t}\n{}", dump());
-        // 2. whisperx only once mineru has no pods and that reading is fresh.
-        if published
-            .allowed
-            .models
-            .contains(&ModelId::from("whisperx"))
-        {
-            assert_eq!(world.pods["mineru"].0, 0, "t={t}\n{}", dump());
-            let fresh = mineru_zero_seen.is_some_and(|at| now - at <= SAFETY_MAX_AGE);
-            assert!(fresh, "t={t}: zero reading stale or missing\n{}", dump());
-            whisperx_allowed_at.get_or_insert(t);
+        // 2. The switch is one tick: mineru out and whisperx in together, never both.
+        let drained = r.steps.contains(&Step::DrainModel {
+            resource: GPU.into(),
+            model: "mineru".into(),
+        });
+        let allowed = r.steps.contains(&Step::AllowModel {
+            resource: GPU.into(),
+            model: "whisperx".into(),
+        });
+        assert_eq!(drained, allowed, "t={t}: half a switch\n{}", dump());
+        if drained {
+            assert!(switched_at.is_none(), "switched twice\n{}", dump());
+            assert!(!stall.contains(&t), "switched on stale reachability\n{}", dump());
+            // mineru's pod is still there: nothing waited for it.
+            assert!(world.pods["mineru"].1 > 0, "t={t}\n{}", dump());
+            switched_at = Some(t);
         }
-        if published.allowed.models.contains(&ModelId::from("mineru")) && world.pods["mineru"].1 > 0
-        {
-            mineru_served = true;
+        if switched_at.is_some() {
+            assert!(!allowed_has(&published, "mineru"), "t={t}: mineru is back\n{}", dump());
+            assert!(allowed_has(&published, "whisperx"), "t={t}\n{}", dump());
         }
-        if restarted_at.is_some_and(|at| t >= at) && matches!(mode(&d), ModePhase::Draining { .. })
-        {
-            saw_draining_after_restart = true;
+        // The switch was due during the stall but the host's reading was stale: it waited
+        // as a whole, mineru staying allowed.
+        let stale = t > stall.start + (SAFETY_MAX_AGE / TICK) as usize;
+        if stall.contains(&t) && stale && switched_at.is_none() {
+            if r.steps.contains(&Step::Wait {
+                resource: GPU.into(),
+                reason: sched_model::WaitReason::StaleObservation,
+            }) {
+                assert!(allowed_has(&published, "mineru"), "t={t}\n{}", dump());
+                stale_holds += 1;
+            }
         }
         if first_after_restart {
-            // Nothing observed yet in this process: the persisted drain holds and nothing
-            // new is allowed.
-            assert!(published.allowed.models.is_empty(), "{}", dump());
-            assert!(
-                matches!(mode(&d), ModePhase::Draining { ref model, .. } if model.as_str() == "mineru"),
-                "{}",
-                dump()
-            );
+            // Nothing observed yet in this process: the persisted state carries the switch.
+            assert_eq!(gpu_models(&published), vec![&ModelId::from("whisperx")], "{}", dump());
+            assert!(r.steps.iter().all(|s| matches!(s, Step::Wait { .. })), "{}", dump());
         }
-        // Demand is back and wants whisperx, but the zero reading is stale: hold.
-        if stalled && !demand_silent {
-            assert!(mineru_zero_seen.is_some_and(|at| now - at > SAFETY_MAX_AGE));
-            assert!(
-                r.steps.contains(&Step::Wait {
-                    resource: GPU.into(),
-                    reason: sched_model::WaitReason::StaleObservation
-                }),
-                "t={t}\n{}",
-                dump()
-            );
-            stale_holds += 1;
+        if allowed_has(&published, "mineru") && world.pods["mineru"].1 > 0 {
+            mineru_served = true;
         }
 
         world.step(p.allowed.borrow().clone());
+        if world.pods["whisperx"].1 > 0 {
+            whisperx_ready_at.get_or_insert(t);
+        }
     }
     let dump = log.join("\n");
+    if std::env::var_os("DURABLE_SWITCH_LOG").is_some() {
+        println!("{dump}\nstale_holds={stale_holds}");
+    }
     assert!(mineru_served, "{dump}");
-    let restarted_at = restarted_at.unwrap_or_else(|| panic!("never drained\n{dump}"));
-    assert!(saw_draining_after_restart, "{dump}");
-    let zero_at = zero_at.unwrap_or_else(|| panic!("no zero reading after the restart\n{dump}"));
-    assert_eq!(stale_holds, 2, "{dump}");
-    let allowed_at =
-        whisperx_allowed_at.unwrap_or_else(|| panic!("whisperx never allowed\n{dump}"));
-    assert!(allowed_at > restarted_at, "{dump}");
-    // whisperx waited for the stalled watch to report again.
-    assert_eq!(allowed_at, zero_at + 6, "{dump}");
+    let switched_at = switched_at.unwrap_or_else(|| panic!("never switched\n{dump}"));
+    assert!(switched_at >= stall.end, "{dump}");
+    assert!(stale_holds >= 1, "the stale reading never held the switch\n{dump}");
+    let restarted_at = restarted_at.unwrap_or_else(|| panic!("never restarted\n{dump}"));
+    // whisperx ran only once mineru's pod had gone (Kubernetes), after the restart.
+    let ready = whisperx_ready_at.unwrap_or_else(|| panic!("whisperx never ran\n{dump}"));
+    assert!(ready >= restarted_at, "{dump}");
     assert!(
         matches!(mode(&store.load()), ModePhase::Serving { ref model, .. } if model.as_str() == "whisperx"),
         "{dump}"
@@ -441,15 +461,18 @@ fn a_manual_lease_forces_a_switch_and_an_unexecuted_kill_does_not_stall_it() {
                 r.steps.contains(&Step::DrainModel {
                     resource: GPU.into(),
                     model: "mineru".into()
+                }) && r.steps.contains(&Step::AllowModel {
+                    resource: GPU.into(),
+                    model: "llm".into()
                 }),
-                "the drain follows the kill in the same tick\n{}",
+                "the switch follows the kill in the same tick\n{}",
                 dump()
             );
             assert!(killed_at.is_none(), "killed twice\n{}", dump());
             killed_at = Some(now);
         }
         if published.allowed.models.contains(&ModelId::from("llm")) {
-            assert_eq!(world.pods["mineru"].0, 0, "{}", dump());
+            assert!(!allowed_has(&published, "mineru"), "{}", dump());
             llm_allowed_at.get_or_insert(now);
         }
         let mut next = p.allowed.borrow().clone();
@@ -466,7 +489,10 @@ fn a_manual_lease_forces_a_switch_and_an_unexecuted_kill_does_not_stall_it() {
     let killed = killed_at.unwrap_or_else(|| panic!("never killed\n{dump}"));
     assert_eq!(killed - paused, drain_timeout, "{dump}");
     let llm = llm_allowed_at.unwrap_or_else(|| panic!("llm never allowed\n{dump}"));
-    assert!(llm > killed, "{dump}");
+    // Allowed in the tick of the kill: nothing waits for mineru's pods to go; Kubernetes
+    // keeps llm pending until they have.
+    assert_eq!(llm, killed, "{dump}");
+    assert!(world.pods["llm"].1 > 0, "llm never ran\n{dump}");
     assert!(
         matches!(mode(&store.load()), ModePhase::Serving { ref model, .. } if model.as_str() == "llm"),
         "{dump}"
