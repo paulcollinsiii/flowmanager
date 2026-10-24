@@ -5,8 +5,8 @@
 //! Handlers:
 //! - `observe` (ingress-private): pushed observations; they are dated on receipt. It can
 //!   only be called from other Restate handlers, not through the ingress: the in-process
-//!   observers write to the cache directly, and a forged push (`pods: 0`, say) could
-//!   otherwise let a second model load.
+//!   observers write to the cache directly, and a forged push (a host reading `up`, or
+//!   queue demand, say) could otherwise steer decisions.
 //! - `tick`: one decision. It loads the durable state, decides inside a journaled step
 //!   (`ctx.run`), stores the new state, and only then publishes the allowed set in process.
 //!   A retried or replayed invocation gets the journaled decision back instead of deciding
