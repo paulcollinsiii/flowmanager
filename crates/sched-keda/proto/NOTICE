@@ -1,0 +1,13 @@
+externalscaler.proto is copied unmodified from KEDA:
+
+  repository: https://github.com/kedacore/keda
+  tag:        v2.21.0
+  commit:     626ded5d783108bedf647e20bbc83f8e458e02e4
+  path:       pkg/scalers/externalscaler/externalscaler.proto
+  sha256:     0e1c84a7ee1d4745eefe1fd7d16e2cbbd02763dc0cfc4c4c37d92d026deb9253
+
+KEDA is licensed under the Apache License, Version 2.0; a copy of the licence, taken from
+the same commit, is in LICENSE-KEDA next to this file. Copyright The KEDA Authors.
+
+To update it, copy the file from a newer KEDA tag, update the fields above, and rebuild
+(crates/sched-keda/build.rs generates the Rust code from it).
