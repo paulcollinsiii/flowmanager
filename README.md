@@ -96,6 +96,16 @@ restate deployments register http://localhost:9080
   number after `equals:` was compared as text.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
+- **Reachability sources for hosts outside the cluster**: `tcp_probe` (params `host`,
+  `port`, `resource`, `timeout` default 2s within 100ms..60s and not above `resync`,
+  `reachability_confirmations` default 3) connects to `host:port` each resync; connected is
+  up, refused or timed out is down, anything else is a source error. `basestar-probe` uses
+  it. `prometheus` (params `url`, `query`, `resource`, `timeout`, optional `auth`,
+  `reachability_confirmations`) stays available for hosts a Prometheus probe covers: one
+  instant query per resync that must return exactly one series, `1` up and `0` down, every
+  other answer a source error. No source in the example config uses it (no blackbox exporter
+  probes basestar); the example shows it as a commented source. Both may declare only
+  `reachability`.
 - Handlers: `observe` (push observations; dated on receipt, never by the sender), `tick`,
   `last_decision`, e.g. `curl -X POST localhost:8080/Scheduler/main/last_decision`.
 
@@ -144,14 +154,37 @@ What shadow output (and the M2 sources) cannot see or get wrong. Read these befo
 - **Queued speakr summary, merge and stitch jobs count as transcription demand.** The speakr
   `/stats` queue counts jobs of every type, so this is a deliberate, conservative overcount.
 - **speakr `/stats` is scoped to the token's user.** Recordings of other users are not seen.
-- **basestar's reachability is one Prometheus query, and the probe is not set up yet.**
-  `basestar-probe` reads `probe_success{instance="basestar"}`: 1 is up, 0 is down. Until a
-  blackbox probe of basestar exists the source fails every read. If Prometheus is unreachable,
-  the series is missing or there are several (one per blackbox module or job: pin the module/job
-  label in the query), or the value is anything else (including `-0`), the read fails and the
-  reading goes stale (decisions needing NFS wait) rather than reading "down". It shows what the
-  blackbox probe checks (the host answering), not that the NFS export works. Up/down flips
-  only after 3 agreeing readings.
+- **basestar's reachability is one TCP connect, the check power.py makes.**
+  `basestar-probe` (kind `tcp_probe`) connects to `basestar:2049` (NFS) once per resync,
+  with a 2s timeout, and closes the connection at once without sending anything. Connected
+  is up; refused, or no answer within the timeout, is down. A name that does not resolve (or
+  whose lookup outlasts the timeout), no address, or any other connect error ("no route to
+  host", "network unreachable", an address that cannot be connected to) fails the read and
+  the reading goes stale (decisions needing NFS wait) rather than reading "down". Up/down
+  flips only after 3 agreeing readings; a failed read is not a reading. What it misses:
+  - It shows that something accepts connections on port 2049, not that the NFS export
+    works: a hung `nfsd` that still completes the TCP handshake, or a stale or full export,
+    reads as up.
+  - Another host taking basestar's address, or anything else listening on that port there,
+    reads as up.
+  - A firewall in the way that drops the connection, or rejects it with a TCP reset or an
+    ICMP port-unreachable, reads as down even with basestar running; one that rejects it
+    with ICMP host- or admin-prohibited is a failed read ("no route to host").
+  - The name is resolved where the scheduler runs (its pod, through cluster DNS), not where
+    power.py runs. If cluster DNS does not resolve the bare name `basestar`, every read
+    fails and basestar's reachability stays stale; set `host` to an IP address or a name
+    the pod can resolve. Not checked against the cluster.
+  - If the name `basestar` stops resolving while the host is off (a name served only by the
+    host itself or by DHCP leases, for example), the probe fails instead of reading down,
+    and basestar's reachability goes stale rather than "down".
+  - With default kernel settings (3 ARP requests 1s apart), a host on the local network that
+    does not answer ARP, such as a powered-off basestar, is reported as "no route to host"
+    after about 3s. The 2s timeout fires first, so it reads as down; a `timeout` of 3s or
+    more would turn it into a failed read. This ordering is reasoned from the kernel
+    defaults, not observed against basestar.
+  - Several addresses for the name are tried in order within the one timeout: any connection
+    is up, any refusal (or the timeout) is down; only when every address fails another way is
+    the read failed.
 - **immich demand is the three ML queues only, through an alpha API.** `immich-queues` reads
   `GET /api/queues/{smartSearch,faceDetection,ocr}` (added in v2.4.0 and marked alpha there,
   `.alpha('v2.4.0')`; this deployment runs v4.0 or later) with an admin API key (`queue.read`,
