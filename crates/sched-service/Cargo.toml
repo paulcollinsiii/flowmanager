@@ -30,3 +30,4 @@ tracing-subscriber = { workspace = true }
 sched-observe = { workspace = true, features = ["test-support"] }
 sched-model = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
+tonic = { workspace = true }

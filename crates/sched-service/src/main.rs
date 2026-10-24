@@ -1,6 +1,6 @@
 //! The flowmanager scheduler binary: it hosts the scheduler as a Restate virtual object,
-//! runs the observers, serves metrics, and publishes each tick's allowed set in process for
-//! the KEDA scaler. It has no actuator for power, kill or recovery steps: those are logged
+//! runs the observers, serves metrics, and serves each tick's allowed set to KEDA as an
+//! external scaler (gRPC). It has no actuator for power, kill or recovery steps: those are logged
 //! as not executed. The observers only read.
 
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use sched_service::config_source::{ConfigHolder, watch_file};
 use sched_service::metrics::Metrics;
 use sched_service::scheduler::Scheduler;
 use sched_service::tick::Shared;
-use sched_service::{metrics_server, runtime};
+use sched_service::{keda_scaler, metrics_server, runtime};
 
 fn duration(text: &str) -> Result<Duration, String> {
     Millis::parse(text).map(|m| Duration::from_millis(m.as_u64()))
@@ -47,6 +47,9 @@ struct Args {
     /// Address of the Prometheus /metrics listener.
     #[arg(long, env = "SCHED_METRICS_LISTEN", default_value = "0.0.0.0:9090")]
     metrics_listen: SocketAddr,
+    /// Address of the KEDA external scaler (plaintext gRPC; in the cluster Istio adds mTLS).
+    #[arg(long, env = "SCHED_KEDA_LISTEN", default_value = "0.0.0.0:9095")]
+    keda_listen: SocketAddr,
     /// Restate ingress, used to ask for a tick when observations change and to arm the backstop.
     #[arg(
         long,
@@ -115,6 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = metrics_server::bind(args.metrics_listen).await?;
     tracing::info!(addr = %args.metrics_listen, "serving /metrics");
     tokio::spawn(metrics_server::serve(listener, metrics));
+    let keda = keda_scaler::spawn(&shared, args.keda_listen).await?;
+    tracing::info!(addr = %keda, "serving the KEDA external scaler (gRPC)");
 
     tracing::info!(addr = %args.listen, "serving the Restate endpoint");
     HttpServer::new(
@@ -150,5 +155,19 @@ mod tests {
             assert!(parse(&[flag, "1s"]).is_ok());
         }
         assert_eq!(parse(&[]).unwrap().backstop, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_keda_scaler_listens_on_its_own_address() {
+        assert_eq!(
+            parse(&[]).unwrap().keda_listen,
+            "0.0.0.0:9095".parse::<SocketAddr>().unwrap()
+        );
+        let a = parse(&["--keda-listen", "127.0.0.1:50195"]).unwrap();
+        assert_eq!(
+            a.keda_listen,
+            "127.0.0.1:50195".parse::<SocketAddr>().unwrap()
+        );
+        assert!(parse(&["--keda-listen", "nope"]).is_err());
     }
 }
