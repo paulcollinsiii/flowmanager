@@ -1,6 +1,7 @@
-//! The flowmanager scheduler binary, in shadow mode: it hosts the scheduler as a Restate
-//! virtual object, runs the observers, serves metrics, and logs what it would do. It has no
-//! actuator and changes nothing in the cluster, on any host or in any service.
+//! The flowmanager scheduler binary: it hosts the scheduler as a Restate virtual object,
+//! runs the observers, serves metrics, and publishes each tick's allowed set in process for
+//! the KEDA scaler. It has no actuator for power, kill or recovery steps: those are logged
+//! as not executed. The observers only read.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -34,7 +35,7 @@ fn positive_duration(text: &str) -> Result<Duration, String> {
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "GPU scheduler (shadow mode: observes and logs, never acts)"
+    about = "GPU scheduler: decides which model runs and publishes the allowed set"
 )]
 struct Args {
     /// Path of the scheduler configuration; re-read on change (a mounted ConfigMap).
@@ -84,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         generation = holder.current().generation(),
         path = %args.config.display(),
-        "shadow mode: observing and logging decisions; nothing will be executed"
+        "scheduler starting; state is kept in Restate; power, kill and recovery steps are not executed (no actuator)"
     );
 
     let (tx, rx) = runtime::report_channel();

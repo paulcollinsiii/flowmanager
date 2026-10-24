@@ -30,7 +30,7 @@ pub use fixture::{Fixture, FixtureError};
 pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};
 pub use lease::{Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};
-pub use plan::{AllowedSet, Intent, PowerWant, Step, WaitReason};
+pub use plan::{AllowedSet, Intent, PowerWant, PublishedAllowed, Step, WaitReason};
 pub use source_params::{
     AuthSpec, CountsAs, ElementFilter, ExtraCount, HttpJsonParams, KubeWatchParams, RequestSpec,
     SinceSpec,

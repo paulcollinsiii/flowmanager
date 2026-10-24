@@ -73,9 +73,21 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps) -> Vec<&'static str> {
     set.into_iter().collect()
 }
 
-/// What every shadow reason starts with, so a log line cannot be mistaken for the state of
-/// a live scheduler: the sequencer starts each tick from nothing.
-pub const SHADOW_PREFIX: &str = "[shadow: next step from a fresh sequencer state] ";
+/// Whether nothing in this build carries `step` out. Allowing, draining and pausing are
+/// carried out through the published allowed set (KEDA converges on it); powering a host on
+/// or off, stopping in-flight work and running a recovery action have no actuator yet.
+pub fn not_executed(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::PowerOn { .. }
+            | Step::PowerOff { .. }
+            | Step::KillInFlight { .. }
+            | Step::RunRecovery { .. }
+    )
+}
+
+/// Appended to the reason of every step for which [`not_executed`] holds.
+pub const NOT_EXECUTED: &str = " [NOT EXECUTED: no actuator for this step in this build]";
 
 fn wait_text(reason: WaitReason) -> &'static str {
     match reason {
@@ -146,7 +158,7 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
             None => format!("{r}=none"),
         })
         .collect();
-    let mut out = format!("{SHADOW_PREFIX}intent [{}]", wants.join(", "));
+    let mut out = format!("intent [{}]", wants.join(", "));
     if !intent.power_up.is_empty() {
         let up: Vec<_> = intent.power_up.keys().map(|r| r.to_string()).collect();
         out.push_str(&format!(", power up [{}]", up.join(", ")));
@@ -161,6 +173,9 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
     for s in steps {
         out.push_str("; ");
         out.push_str(&step_reason(s, intent));
+        if not_executed(s) {
+            out.push_str(NOT_EXECUTED);
+        }
     }
     let ids = |v: &[sched_model::ClassId]| {
         v.iter()
@@ -300,10 +315,7 @@ mod tests {
             },
         ];
         let r = reason(&intent(), &steps, &DemandGaps::default());
-        assert!(
-            r.starts_with(SHADOW_PREFIX) && r.contains("intent [cuda-central=mineru]"),
-            "{r}"
-        );
+        assert!(r.starts_with("intent [cuda-central=mineru]"), "{r}");
         assert!(
             r.contains("allow mineru on cuda-central: the planner wants mineru on cuda-central"),
             "{r}"
@@ -313,6 +325,59 @@ mod tests {
             "{r}"
         );
         assert!(reason(&Intent::default(), &[], &DemandGaps::default()).contains("no step needed"));
+    }
+
+    #[test]
+    fn steps_without_an_actuator_are_marked_as_not_executed() {
+        let steps = vec![
+            Step::PowerOn {
+                resource: "cuda-central".into(),
+            },
+            Step::KillInFlight {
+                class: "paperless-ocr".into(),
+            },
+            Step::DrainModel {
+                resource: "cuda-central".into(),
+                model: "mineru".into(),
+            },
+        ];
+        let r = reason(&intent(), &steps, &DemandGaps::default());
+        assert_eq!(r.matches(NOT_EXECUTED).count(), 2, "{r}");
+        assert!(
+            r.contains(&format!(
+                "power on cuda-central: the sequencer needs it up{NOT_EXECUTED}"
+            )),
+            "{r}"
+        );
+        assert!(!r.contains(&format!(
+            "drain mineru on cuda-central: the planner wants mineru on cuda-central{NOT_EXECUTED}"
+        )));
+        for (step, want) in [
+            (
+                Step::PowerOff {
+                    resource: "r".into(),
+                },
+                true,
+            ),
+            (Step::RunRecovery { class: "c".into() }, true),
+            (Step::PauseIntake { class: "c".into() }, false),
+            (
+                Step::AllowModel {
+                    resource: "r".into(),
+                    model: "m".into(),
+                },
+                false,
+            ),
+            (
+                Step::Wait {
+                    resource: "r".into(),
+                    reason: WaitReason::Loading,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(not_executed(&step), want, "{step:?}");
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The sequencer's own state: plain serializable data, carried from one tick to the next
-//! (and persisted by a later phase). The planner reads it but never changes it.
+//! (the service persists it between ticks). The planner reads it but never changes it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
