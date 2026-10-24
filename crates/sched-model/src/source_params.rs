@@ -290,6 +290,42 @@ pub struct PrometheusParams {
     pub reachability_confirmations: u32,
 }
 
+/// Default `timeout` of a TCP connect probe.
+pub const DEFAULT_TCP_PROBE_TIMEOUT: Millis = Millis(2_000);
+
+/// Shortest accepted `timeout` of a TCP connect probe. Durations without a unit are
+/// milliseconds, so this also refuses `timeout: 2` written to mean two seconds.
+pub const MIN_TCP_PROBE_TIMEOUT: Millis = Millis(100);
+
+/// Longest accepted `timeout` of a TCP connect probe.
+pub const MAX_TCP_PROBE_TIMEOUT: Millis = Millis(60_000);
+
+/// Params of a `tcp_probe` source: one TCP connect to `host:port` per resync says whether
+/// one resource's host is up. A connection is up; a refused connection, no answer within
+/// `timeout`, or "no route to host" (the host does not answer) is down. Anything else (the
+/// name does not resolve, "network unreachable", an unusable address, any other error) is a
+/// failed read, never "down".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpProbeParams {
+    /// Host name or IP address (an IPv6 address without brackets).
+    pub host: String,
+    pub port: u16,
+    /// The resource whose reachability the connect result is.
+    pub resource: ResourceId,
+    /// How long one probe may take, name lookup and connect together.
+    #[serde(default = "default_tcp_probe_timeout")]
+    pub timeout: Millis,
+    /// Consecutive agreeing readings (one per resync) before a reported up/down flips, as
+    /// for `kubernetes_watch`. Failed reads are not readings.
+    #[serde(default = "default_confirmations")]
+    pub reachability_confirmations: u32,
+}
+
+fn default_tcp_probe_timeout() -> Millis {
+    DEFAULT_TCP_PROBE_TIMEOUT
+}
+
 impl SourceSpec {
     /// The typed params of a `kubernetes_watch` source; `None` when it has no params.
     pub fn kube_watch_params(&self) -> Result<Option<KubeWatchParams>, String> {
@@ -304,6 +340,11 @@ impl SourceSpec {
     /// The typed params of a `prometheus` source; `None` when it has no params.
     pub fn prometheus_params(&self) -> Result<Option<PrometheusParams>, String> {
         typed(self, SourceKind::Prometheus)
+    }
+
+    /// The typed params of a `tcp_probe` source; `None` when it has no params.
+    pub fn tcp_probe_params(&self) -> Result<Option<TcpProbeParams>, String> {
+        typed(self, SourceKind::TcpProbe)
     }
 }
 
@@ -460,7 +501,6 @@ fn auth_problems(a: &AuthSpec) -> Vec<String> {
 }
 
 fn prometheus_problems(p: &PrometheusParams, spec: &SourceSpec) -> Vec<String> {
-    use crate::config::Capability;
     let mut out = Vec::new();
     if !(p.url.starts_with("http://") || p.url.starts_with("https://")) {
         out.push("url must start with http:// or https://".to_string());
@@ -481,12 +521,19 @@ fn prometheus_problems(p: &PrometheusParams, spec: &SourceSpec) -> Vec<String> {
     if let Some(a) = &p.auth {
         out.extend(auth_problems(a));
     }
-    // The observer reads one up/down value; it supplies nothing else.
+    out.extend(reachability_only_problems("prometheus", spec));
+    out
+}
+
+/// A source whose observer reads one up/down value supplies nothing else: with params, it
+/// must declare reachability and only that.
+fn reachability_only_problems(kind: &str, spec: &SourceSpec) -> Vec<String> {
+    use crate::config::Capability;
+    let mut out = Vec::new();
     if !spec.observe.contains(&Capability::Reachability) {
-        out.push(
-            "a prometheus source with params reports reachability; observe must include reachability"
-                .to_string(),
-        );
+        out.push(format!(
+            "a {kind} source with params reports reachability; observe must include reachability"
+        ));
     }
     for cap in spec
         .observe
@@ -494,9 +541,55 @@ fn prometheus_problems(p: &PrometheusParams, spec: &SourceSpec) -> Vec<String> {
         .filter(|c| **c != Capability::Reachability)
     {
         out.push(format!(
-            "a prometheus source with params reports reachability only, not {cap}"
+            "a {kind} source with params reports reachability only, not {cap}"
         ));
     }
+    out
+}
+
+/// Problems with a `tcp_probe` host: it must be a bare host name or IP address, since the
+/// port is its own field and nothing else is looked up.
+fn tcp_host_problem(host: &str) -> Option<String> {
+    if host.is_empty() {
+        return Some("host must not be empty".to_string());
+    }
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '@' | '[' | ']'))
+    {
+        return Some(format!(
+            "host {host:?} must be a bare host name or IP address (no scheme, path, brackets or spaces)"
+        ));
+    }
+    if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+        return Some(format!(
+            "host {host:?} contains ':' but is not an IPv6 address; put the port in port"
+        ));
+    }
+    None
+}
+
+fn tcp_probe_problems(p: &TcpProbeParams, spec: &SourceSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    out.extend(tcp_host_problem(&p.host));
+    if p.port == 0 {
+        out.push("port must be between 1 and 65535".to_string());
+    }
+    if p.timeout < MIN_TCP_PROBE_TIMEOUT || p.timeout > MAX_TCP_PROBE_TIMEOUT {
+        out.push(format!(
+            "timeout ({}) must be between {MIN_TCP_PROBE_TIMEOUT} and {MAX_TCP_PROBE_TIMEOUT}",
+            p.timeout
+        ));
+    }
+    // One probe per resync: a connect that may outlast the interval would overlap the next.
+    if p.timeout > spec.resync {
+        out.push(format!(
+            "timeout ({}) must not exceed the source's resync ({})",
+            p.timeout, spec.resync
+        ));
+    }
+    out.extend(confirmations_problem(p.reachability_confirmations));
+    out.extend(reachability_only_problems("tcp_probe", spec));
     out
 }
 
@@ -544,6 +637,11 @@ pub(crate) fn problems(spec: &SourceSpec) -> Vec<String> {
             Ok(None) => Vec::new(),
             Err(e) => vec![e],
         },
+        SourceKind::TcpProbe => match spec.tcp_probe_params() {
+            Ok(Some(p)) => tcp_probe_problems(&p, spec),
+            Ok(None) => Vec::new(),
+            Err(e) => vec![e],
+        },
         _ => Vec::new(),
     }
 }
@@ -551,7 +649,7 @@ pub(crate) fn problems(spec: &SourceSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::config::{Config, ConfigError};
-    use crate::test_support::{EXAMPLE_CONFIG, example_config};
+    use crate::test_support::{EXAMPLE_CONFIG, example_config, example_with_prometheus_probe};
 
     fn problems_of(yaml: &str) -> Vec<String> {
         match Config::from_yaml(yaml) {
@@ -640,15 +738,26 @@ mod tests {
         let probe = c
             .source(&"basestar-probe".into())
             .unwrap()
-            .prometheus_params()
+            .tcp_probe_params()
             .unwrap()
             .unwrap();
         assert_eq!(probe.resource.as_str(), "basestar-nfs");
-        assert_eq!(probe.url, "http://prometheus.monitoring.svc:9090");
-        assert_eq!(probe.query, "probe_success{instance=\"basestar\"}");
-        assert_eq!(probe.timeout, crate::Millis(5_000));
+        assert_eq!((probe.host.as_str(), probe.port), ("basestar", 2049));
+        assert_eq!(probe.timeout, crate::Millis(2_000));
         assert_eq!(probe.reachability_confirmations, 3);
-        assert!(probe.auth.is_none());
+        let prom = Config::from_yaml(&example_with_prometheus_probe())
+            .unwrap()
+            .source(&"basestar-probe".into())
+            .unwrap()
+            .prometheus_params()
+            .unwrap()
+            .unwrap();
+        assert_eq!(prom.resource.as_str(), "basestar-nfs");
+        assert_eq!(prom.url, "http://prometheus.monitoring.svc:9090");
+        assert_eq!(prom.query, "probe_success{instance=\"basestar\"}");
+        assert_eq!(prom.timeout, crate::Millis(5_000));
+        assert_eq!(prom.reachability_confirmations, 3);
+        assert!(prom.auth.is_none());
         assert_eq!(
             p.auth.as_ref().unwrap().env.as_deref(),
             Some("SPEAKR_API_TOKEN")
@@ -877,8 +986,9 @@ mod tests {
     const PROBE: &str = "      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n      resource: basestar-nfs\n      timeout: 5s\n";
 
     fn probe_with(from: &str, to: &str) -> String {
-        assert!(EXAMPLE_CONFIG.contains(PROBE));
-        EXAMPLE_CONFIG.replace(PROBE, &PROBE.replace(from, to))
+        let example = example_with_prometheus_probe();
+        assert!(example.contains(PROBE));
+        example.replace(PROBE, &PROBE.replace(from, to))
     }
 
     #[test]
@@ -957,19 +1067,184 @@ mod tests {
         assert_eq!(p.timeout, crate::Millis(10_000));
         assert_eq!(p.auth.unwrap().env.as_deref(), Some("PROM_TOKEN"));
         // With params, the source must declare reachability and nothing else.
+        let example = example_with_prometheus_probe();
         let probe_head =
             "  - id: basestar-probe\n    kind: prometheus\n    observe: [reachability]\n";
-        assert!(EXAMPLE_CONFIG.contains(probe_head));
-        let ps = problems_of(&EXAMPLE_CONFIG.replace(
+        assert!(example.contains(probe_head));
+        let ps = problems_of(&example.replace(
             probe_head,
             "  - id: basestar-probe\n    kind: prometheus\n    observe: [reachability, demand]\n",
         ));
         assert!(has(&ps, "reachability only, not demand"), "{ps:?}");
-        let ps = problems_of(&EXAMPLE_CONFIG.replace(
+        let ps = problems_of(&example.replace(
             probe_head,
             "  - id: basestar-probe\n    kind: prometheus\n    observe: [demand]\n",
         ));
         assert!(has(&ps, "observe must include reachability"), "{ps:?}");
+    }
+
+    /// The example's basestar-probe params (a TCP probe), as one line each.
+    const TCP: &str =
+        "      host: basestar\n      port: 2049\n      resource: basestar-nfs\n      timeout: 2s\n";
+
+    fn tcp_with(from: &str, to: &str) -> String {
+        assert!(EXAMPLE_CONFIG.contains(TCP));
+        let replaced = TCP.replace(from, to);
+        assert_ne!(replaced, TCP, "{from:?} is not in the probe params");
+        EXAMPLE_CONFIG.replace(TCP, &replaced)
+    }
+
+    fn tcp_params(yaml: &str) -> super::TcpProbeParams {
+        Config::from_yaml(yaml)
+            .unwrap()
+            .source(&"basestar-probe".into())
+            .unwrap()
+            .tcp_probe_params()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn rejects_bad_tcp_probe_params() {
+        for (from, to, needle) in [
+            ("host: basestar", "host: \"\"", "host must not be empty"),
+            (
+                "host: basestar",
+                "host: basestar:2049",
+                "is not an IPv6 address; put the port in port",
+            ),
+            (
+                "host: basestar",
+                "host: nfs://basestar",
+                "must be a bare host name or IP address",
+            ),
+            (
+                "host: basestar",
+                "host: \"base star\"",
+                "must be a bare host name or IP address",
+            ),
+            (
+                "host: basestar",
+                "host: \"[::1]\"",
+                "must be a bare host name or IP address",
+            ),
+            ("port: 2049", "port: 0", "port must be between 1 and 65535"),
+            ("port: 2049", "port: 70000", "invalid value"),
+            ("port: 2049", "port: -1", "invalid value"),
+            ("port: 2049", "port: nfs", "invalid type"),
+            ("      port: 2049\n", "", "missing field `port`"),
+            ("      host: basestar\n", "", "missing field `host`"),
+            (
+                "      resource: basestar-nfs\n",
+                "",
+                "missing field `resource`",
+            ),
+            (
+                "resource: basestar-nfs",
+                "resource: ghost",
+                "params.resource: unknown resource \"ghost\"",
+            ),
+            ("timeout: 2s", "timeout: 0", "timeout (0ms) must be between"),
+            // A plain number is milliseconds: `2` is 2ms, not 2s.
+            ("timeout: 2s", "timeout: 2", "timeout (2ms) must be between"),
+            ("timeout: 2s", "timeout: 99ms", "must be between 100ms and"),
+            ("timeout: 2s", "timeout: 2m", "and 60000ms"),
+            (
+                "timeout: 2s",
+                "timeout: 11s",
+                "timeout (11000ms) must not exceed the source's resync (10000ms)",
+            ),
+            (
+                "timeout: 2s",
+                "timeout: 2s\n      url: http://basestar",
+                "unknown field `url`",
+            ),
+        ] {
+            let ps = problems_of(&tcp_with(from, to));
+            assert!(has(&ps, needle), "{needle}: {ps:?}");
+        }
+        for (n, ok) in [("0", false), ("1", true), ("100", true), ("101", false)] {
+            let y = EXAMPLE_CONFIG.replace(
+                &format!("{TCP}      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n"),
+                &format!("{TCP}      reachability_confirmations: {n}\n"),
+            );
+            assert_ne!(y, EXAMPLE_CONFIG);
+            match Config::from_yaml(&y) {
+                Ok(_) => assert!(ok, "{n} accepted"),
+                Err(_) => {
+                    assert!(!ok, "{n} refused");
+                    let ps = problems_of(&y);
+                    assert!(
+                        has(&ps, &format!("reachability_confirmations ({n})")),
+                        "{ps:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_probe_params_take_ip_addresses_and_defaults() {
+        for host in ["192.168.1.20", "fd00::20", "::1", "basestar.lan", "nas-01"] {
+            let p = tcp_params(&tcp_with("host: basestar", &format!("host: \"{host}\"")));
+            assert_eq!(p.host, host);
+        }
+        let p = tcp_params(&tcp_with("      timeout: 2s\n", ""));
+        assert_eq!(p.timeout, super::DEFAULT_TCP_PROBE_TIMEOUT);
+        assert_eq!(p.timeout, crate::Millis(2_000));
+        let p = tcp_params(&tcp_with("timeout: 2s", "timeout: 100ms"));
+        assert_eq!(p.timeout, crate::Millis(100));
+        // The longest timeout is accepted once resync allows it.
+        let y = tcp_with("timeout: 2s", "timeout: 60s").replace(
+            "    kind: tcp_probe\n    observe: [reachability]\n    resync: 10s\n",
+            "    kind: tcp_probe\n    observe: [reachability]\n    resync: 60s\n",
+        );
+        // resync 60s exceeds the example's safety_max_age (30s), so raise that as well.
+        let y = y.replace("safety_max_age: 30s", "safety_max_age: 60s");
+        assert_eq!(tcp_params(&y).timeout, crate::Millis(60_000));
+        let p = tcp_params(&EXAMPLE_CONFIG.replace(
+            "      timeout: 2s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
+            "",
+        ));
+        assert_eq!(p.reachability_confirmations, 3);
+        assert_eq!(p.timeout, crate::Millis(2_000));
+    }
+
+    #[test]
+    fn a_tcp_probe_reports_only_reachability() {
+        let head = "  - id: basestar-probe\n    kind: tcp_probe\n    observe: [reachability]\n";
+        assert!(EXAMPLE_CONFIG.contains(head));
+        let with = |observe: &str| {
+            EXAMPLE_CONFIG.replace(
+                head,
+                &format!("  - id: basestar-probe\n    kind: tcp_probe\n    observe: {observe}\n"),
+            )
+        };
+        let ps = problems_of(&with("[reachability, demand]"));
+        assert!(has(&ps, "reachability only, not demand"), "{ps:?}");
+        assert!(
+            has(&ps, "kind TcpProbe cannot supply the demand capability"),
+            "{ps:?}"
+        );
+        let ps = problems_of(&with("[reachability, pods]"));
+        assert!(
+            has(&ps, "kind TcpProbe cannot supply the pods capability"),
+            "{ps:?}"
+        );
+        let ps = problems_of(&with("[]"));
+        assert!(
+            has(
+                &ps,
+                "a tcp_probe source with params reports reachability; observe must include reachability"
+            ),
+            "{ps:?}"
+        );
+        // The params belong to this kind only.
+        let ps = problems_of(&EXAMPLE_CONFIG.replace(
+            head,
+            "  - id: basestar-probe\n    kind: prometheus\n    observe: [reachability]\n",
+        ));
+        assert!(has(&ps, "unknown field `host`"), "{ps:?}");
     }
 
     #[test]

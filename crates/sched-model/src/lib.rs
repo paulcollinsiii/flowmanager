@@ -34,7 +34,7 @@ pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};
 pub use plan::{AllowedSet, Intent, PowerWant, PublishedAllowed, Step, WaitReason};
 pub use source_params::{
     AuthSpec, CountsAs, ElementFilter, ExtraCount, FilterValue, HttpJsonParams, KubeWatchParams,
-    PrometheusParams, RequestSpec, ResponseCondition, SinceSpec,
+    PrometheusParams, RequestSpec, ResponseCondition, SinceSpec, TcpProbeParams,
 };
 pub use state::{ModePhase, PowerPhase, ResourceState, SchedState, WindDown};
 pub use store::ConfigStore;

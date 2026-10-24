@@ -10,6 +10,7 @@ pub mod kube_watch;
 pub mod prometheus;
 mod report;
 mod supervisor;
+pub mod tcp_probe;
 
 /// A local HTTP server for tests (here and in dependent crates).
 #[cfg(any(test, feature = "test-support"))]

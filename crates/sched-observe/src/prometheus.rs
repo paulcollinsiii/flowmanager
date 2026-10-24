@@ -231,8 +231,13 @@ mod tests {
     use super::*;
     use crate::testserver::{Reply, TestServer};
     use crate::{ObserverState, Observers, SpawnOptions, observer_state};
-    use sched_model::test_support::{EXAMPLE_CONFIG, example_config};
+    use sched_model::test_support::example_with_prometheus_probe;
     use sched_model::{Config, Millis, ResourceId};
+
+    /// The example configuration with `basestar-probe` read through Prometheus.
+    fn example_config() -> Config {
+        Config::from_yaml(&example_with_prometheus_probe()).unwrap()
+    }
 
     /// The example's instant query, as the adapter sends it.
     const QUERY: &str = "/api/v1/query?query=probe_success%7Binstance%3D%22basestar%22%7D";
@@ -548,11 +553,12 @@ mod tests {
         no_params.params = Default::default();
         assert_eq!(observer_state(&no_params), ObserverState::NoParams);
 
-        let text = EXAMPLE_CONFIG.replace(
+        let example = example_with_prometheus_probe();
+        let text = example.replace(
             "url: http://prometheus.monitoring.svc:9090\n",
             &format!("url: {}\n", server.url("")),
         );
-        assert_ne!(text, EXAMPLE_CONFIG);
+        assert_ne!(text, example);
         let config = Config::from_yaml(&text).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let mut observers = Observers::default();

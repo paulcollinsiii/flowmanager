@@ -140,6 +140,8 @@ pub enum SourceKind {
     HttpJson,
     Sql,
     Prometheus,
+    /// A TCP connect to one host and port, for the reachability of one resource.
+    TcpProbe,
     Webhook,
     Schedule,
     Session,
@@ -156,6 +158,7 @@ impl SourceKind {
             SourceKind::HttpJson | SourceKind::Prometheus => {
                 matches!(capability, Reachability | Demand)
             }
+            SourceKind::TcpProbe => matches!(capability, Reachability),
             SourceKind::Sql | SourceKind::Schedule | SourceKind::Session => {
                 matches!(capability, Demand)
             }
@@ -172,7 +175,8 @@ pub enum Capability {
     /// Pod counts of models (`model_pods`).
     Pods,
     /// Whether a powered host is reachable and up (`resource_up`): kubelet/node readiness
-    /// for cluster nodes, an SSH or ping probe for hosts outside the cluster.
+    /// for cluster nodes, a TCP connect probe (or a probe read through Prometheus) for hosts
+    /// outside the cluster.
     Reachability,
     /// Queue demand of workload classes (`demand`).
     Demand,
