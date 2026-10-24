@@ -30,23 +30,13 @@ struct Running {
 }
 
 /// Knobs for starting observers; the defaults suit production.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SpawnOptions {
     /// A cluster client to use instead of creating one from the environment.
     pub kube_client: Option<kube::Client>,
     /// How an observer that died is started again.
     pub restart: RestartPolicy,
     pub kube_timing: Timing,
-}
-
-impl Default for SpawnOptions {
-    fn default() -> Self {
-        SpawnOptions {
-            kube_client: None,
-            restart: RestartPolicy::default(),
-            kube_timing: Timing::default(),
-        }
-    }
 }
 
 /// The running observers. Dropping this stops them and everything they started.
