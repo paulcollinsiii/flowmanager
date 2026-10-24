@@ -4,6 +4,7 @@
 
 policy:
   strategy: fifo-exhaustive
+  # Counted from the tick a model is allowed, so it includes its load time.
   min_dwell: 5m
   max_dwell: 2h
   idle_grace: 10m
@@ -106,6 +107,20 @@ classes:
 
   - id: immich-server
     requires:
+      - { resource: basestar-nfs }
+    priority: 0
+    preemptibility: none
+
+  # Gate classes: a requirement on an exclusive resource WITHOUT a model means only "that
+  # host is up". A gate class has no demand source and never influences which model is
+  # chosen. GPU contention is not gated by flowmanager at all: Kubernetes enforces it (every
+  # GPU workload requests nvidia.com/gpu: 1 and the node exposes one GPU), so consumers are
+  # gated on host readiness only. paperless-gpt's deployment scales on this class: it runs
+  # only while cuda-central is up and paperless-ngx (its documents on basestar-nfs) is
+  # reachable. Its OCR and tagging work are still the demand classes above.
+  - id: paperless-gpt
+    requires:
+      - { resource: cuda-central }
       - { resource: basestar-nfs }
     priority: 0
     preemptibility: none

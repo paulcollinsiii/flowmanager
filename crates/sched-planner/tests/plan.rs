@@ -625,3 +625,76 @@ fn a_reclaim_removes_the_power_wants_of_the_reclaimed_host_only() {
     // Other resources keep theirs.
     assert_eq!(i.power_up.get(&nfs), Some(&PowerWant::Manual));
 }
+
+/// The example config without the whisperx model and the class that needs it.
+fn without_whisperx() -> Config {
+    let line =
+        "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx] }\n";
+    let start = EXAMPLE_CONFIG
+        .find("  - id: speakr-transcription\n")
+        .unwrap();
+    let end = start + EXAMPLE_CONFIG[start..].find("\n\n").unwrap() + 2;
+    let y = format!("{}{}", &EXAMPLE_CONFIG[..start], &EXAMPLE_CONFIG[end..]).replace(line, "");
+    assert!(!y.contains("model: whisperx") && !y.contains("id: whisperx"));
+    Config::from_yaml(&y).unwrap()
+}
+
+#[test]
+fn a_model_removed_from_the_config_gets_no_dwell_and_no_grace() {
+    let config = without_whisperx();
+    // whisperx was allowed a minute ago (well inside min_dwell) and has just been removed.
+    let unchecked = |obs: &[String]| {
+        let y = fixture_yaml(obs, &[], Some(("whisperx", T - MIN, None)));
+        Fixture::from_yaml(&y).unwrap()
+    };
+    let f = unchecked(&[ocr(2, T - MIN)]);
+    let i = plan(&config, &f.snapshot, &f.state).unwrap();
+    assert_eq!(
+        i.models[&ResourceId::new(G)],
+        Some(ModelId::new("mineru")),
+        "the best candidate at once"
+    );
+    let f = unchecked(&[ocr(0, T)]);
+    let i = plan(&config, &f.snapshot, &f.state).unwrap();
+    assert_eq!(i.models[&ResourceId::new(G)], None, "no grace either");
+    // The same state with the model still configured keeps it (min_dwell).
+    let f = fixture(&[ocr(2, T - MIN)], &[], Some(("whisperx", T - MIN, None)));
+    assert_eq!(target(&f).as_deref(), Some("whisperx"));
+}
+
+#[test]
+fn gate_classes_never_influence_model_choice() {
+    // The example has a gate class (requires the GPU host and NFS, no model, no demand).
+    let config = example_config();
+    let gate = config.class(&"paperless-gpt".into()).unwrap();
+    assert!(gate.demand.is_none() && gate.requires.iter().all(|r| r.model.is_none()));
+    let start = EXAMPLE_CONFIG.find("  - id: paperless-gpt\n").unwrap();
+    let end = start + EXAMPLE_CONFIG[start..].find("\n\n").unwrap() + 2;
+    let without = Config::from_yaml(&format!(
+        "{}{}",
+        &EXAMPLE_CONFIG[..start],
+        &EXAMPLE_CONFIG[end..]
+    ))
+    .unwrap();
+    assert!(without.class(&"paperless-gpt".into()).is_none());
+    let worlds: Vec<(Vec<String>, Option<(&str, u64, Option<u64>)>)> = vec![
+        (vec![ocr(0, T)], None),
+        (vec![ocr(2, T - 9 * MIN), tagging(1, T - 5 * MIN)], None),
+        (
+            vec![transcription(1, T - 40 * MIN)],
+            Some(("mineru", T - 3 * 60 * MIN, None)),
+        ),
+        (
+            vec![ocr(0, T)],
+            Some(("llm", T - 60 * MIN, Some(T - 20 * MIN))),
+        ),
+    ];
+    for (obs, serving) in worlds {
+        let f = fixture(&obs, &[], serving);
+        assert_eq!(
+            plan(&config, &f.snapshot, &f.state).unwrap(),
+            plan(&without, &f.snapshot, &f.state).unwrap(),
+            "{obs:?} {serving:?}"
+        );
+    }
+}

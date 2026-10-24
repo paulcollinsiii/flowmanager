@@ -528,7 +528,7 @@ sources:
     #[test]
     fn a_gate_class_requires_hosts_without_a_model_and_has_no_demand() {
         let gate = "  - id: gate\n    requires: [ { resource: gpu }, { resource: nfs } ]\n    priority: 0\n    preemptibility: none\n";
-        let y = VALID.replace("sources:\n", &format!("{gate}sources:\n"));
+        let y = VALID.replace("\nsources:\n", &format!("\n{gate}sources:\n"));
         assert_ne!(y, VALID);
         let c = Config::from_yaml(&y).unwrap_or_else(|e| panic!("{e}"));
         let g = c.class(&"gate".into()).unwrap();

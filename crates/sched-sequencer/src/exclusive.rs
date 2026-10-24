@@ -60,11 +60,10 @@ fn waiting(cx: &Cx, steps: &mut Vec<Step>, reason: WaitReason) -> bool {
 /// otherwise only on a fresh "up" reading (safety-critical, held to `safety_max_age`).
 fn fresh_up(cx: &Cx) -> bool {
     cx.res.power.is_none()
-        || cx.snapshot.fresh_resource_up(
-            cx.config,
-            &cx.res.id,
-            cx.config.policy().safety_max_age,
-        ) == Some(true)
+        || cx
+            .snapshot
+            .fresh_resource_up(cx.config, &cx.res.id, cx.config.policy().safety_max_age)
+            == Some(true)
 }
 
 /// Runs the recovery actions of classes whose work was stopped, once their model is gone.

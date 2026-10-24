@@ -29,6 +29,7 @@ fn cid(s: &str) -> ClassId {
 }
 
 /// Builder for one tick's inputs.
+#[derive(Clone)]
 struct Case {
     obs: Vec<String>,
     leases: Vec<String>,
@@ -313,7 +314,7 @@ fn uses_gpu(d: &Decision) -> bool {
 }
 
 #[test]
-fn allowing_a_model_needs_fresh_zero_pods_of_every_other_model() {
+fn allowing_a_model_never_waits_on_pods_but_needs_the_host_freshly_up() {
     let table: Vec<(&str, Case, Vec<Step>)> = vec![
         (
             "all zero and fresh",
@@ -321,37 +322,41 @@ fn allowing_a_model_needs_fresh_zero_pods_of_every_other_model() {
             vec![allow("mineru")],
         ),
         (
-            "another model has pods",
+            "another model has pods: Kubernetes keeps the new pod pending, not the scheduler",
             Case::new().target(Some("mineru")).obs(pods("llm", 1, 1, 0)),
-            vec![wait(G, WaitReason::OtherModelPresent)],
+            vec![allow("mineru")],
         ),
         (
             "a pod observation is missing",
             Case::new()
                 .target(Some("mineru"))
                 .drop_obs("model: whisperx"),
-            vec![wait(G, WaitReason::StaleObservation)],
-        ),
-        (
-            "a pod observation is 1ms too old",
-            Case::new()
-                .target(Some("mineru"))
-                .obs(pods("llm", 0, 0, 30_001)),
-            vec![wait(G, WaitReason::StaleObservation)],
-        ),
-        (
-            "a pod observation exactly at the bound",
-            Case::new()
-                .target(Some("mineru"))
-                .obs(pods("llm", 0, 0, 30_000)),
             vec![allow("mineru")],
         ),
         (
-            "the target's own residual pods do not block",
+            "every pod observation is stale",
             Case::new()
                 .target(Some("mineru"))
-                .obs(pods("mineru", 1, 0, 0)),
+                .drop_obs("type: model_pods")
+                .obs(pods("llm", 3, 3, 99 * MIN)),
             vec![allow("mineru")],
+        ),
+        (
+            "the host's reachability is 1ms too old",
+            Case::new().target(Some("mineru")).obs(up(G, true, 30_001)),
+            vec![wait(G, WaitReason::StaleObservation)],
+        ),
+        (
+            "the host's reachability exactly at the bound",
+            Case::new().target(Some("mineru")).obs(up(G, true, 30_000)),
+            vec![allow("mineru")],
+        ),
+        (
+            "the host's reachability is missing",
+            Case::new()
+                .target(Some("mineru"))
+                .drop_obs("type: resource_up, resource: cuda-central"),
+            vec![wait(G, WaitReason::StaleObservation)],
         ),
         ("no target, nothing to do", Case::new().target(None), vec![]),
     ];
@@ -363,88 +368,279 @@ fn allowing_a_model_needs_fresh_zero_pods_of_every_other_model() {
 }
 
 #[test]
-fn loading_transitions() {
-    let loading = || {
-        Case::new().gpu(&format!(
-            "{{ phase: loading, model: mineru, since: {} }}",
-            T - 1000
-        ))
-    };
-    let d = loading()
+fn pod_observations_never_change_a_decision() {
+    // Cases that reach every branch of the mode machine: allow, stay, wind down, switch,
+    // forced switch with a kill, reclaim, and an idle host that may power off.
+    let cases: Vec<(&str, Case)> = vec![
+        ("allow", Case::new().target(Some("mineru"))),
+        (
+            "stay",
+            Case::new()
+                .gpu(&serving("mineru", 10 * MIN))
+                .target(Some("mineru")),
+        ),
+        (
+            "wind down",
+            Case::new()
+                .gpu(&serving("mineru", 10 * MIN))
+                .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+                .target(Some("llm")),
+        ),
+        (
+            "switch",
+            Case::new()
+                .gpu(&serving("mineru", 10 * MIN))
+                .target(Some("llm")),
+        ),
+        (
+            "min dwell",
+            Case::new().gpu(&serving("mineru", MIN)).target(Some("llm")),
+        ),
+        (
+            "reclaim",
+            Case::new().gpu(&serving("mineru", 10 * MIN)).reclaim(),
+        ),
+        ("power off", Case::new().gpu_state(&managed_idle(99 * MIN))),
+    ];
+    let variants: Vec<(&str, Vec<String>)> = vec![
+        ("no pod readings", vec![]),
+        (
+            "every model running",
+            ["mineru", "llm", "whisperx", "immich-ml"]
+                .iter()
+                .map(|m| pods(m, 2, 1, 0))
+                .collect(),
+        ),
+        (
+            "stale readings",
+            ["mineru", "llm"]
+                .iter()
+                .map(|m| pods(m, 1, 1, 99 * MIN))
+                .collect(),
+        ),
+        (
+            "a future-dated reading",
+            vec![future(&pods("llm", 1, 0, 0))],
+        ),
+    ];
+    for (name, case) in cases {
+        let base = case.run();
+        let st = case.state();
+        for (label, extra) in &variants {
+            let mut c = case.clone().drop_obs("type: model_pods");
+            c.obs.extend(extra.iter().cloned());
+            assert_eq!(c.run_at(&st, T), base, "{name} / {label}");
+        }
+    }
+}
+
+#[test]
+fn an_allowed_model_serves_from_the_tick_it_is_allowed() {
+    let d = Case::new()
         .target(Some("mineru"))
-        .obs(pods("mineru", 1, 0, 0))
+        .obs(pods("llm", 1, 1, 0))
         .run();
-    assert_steps(&d, vec![wait(G, WaitReason::Loading)], "not ready");
+    assert_steps(&d, vec![allow("mineru")], "allowed");
+    assert_eq!(
+        mode_of(&d, G),
+        ModePhase::Serving {
+            model: mid("mineru"),
+            since: sched_model::Millis(T),
+            idle_since: None,
+            wind_down: None
+        }
+    );
+    // Its classes are allowed in the same tick: its pods are still pending, but a consumer
+    // that sends work only waits for them.
     assert!(d.allowed.models.contains(&mid("mineru")));
-    assert!(d.allowed.classes.is_empty() || !d.allowed.classes.contains(&cid("paperless-ocr")));
-
-    let d = loading()
-        .target(Some("mineru"))
-        .obs(pods("mineru", 1, 1, 0))
-        .run();
-    assert_steps(&d, vec![], "ready");
-    assert!(matches!(mode_of(&d, G), ModePhase::Serving { .. }));
     assert!(d.allowed.classes.contains(&cid("paperless-ocr")));
+    // min_dwell counts from that tick: load time is part of it.
+    let c = Case::new().target(Some("llm"));
+    let early = c.run_fresh_at(&d.state, T + 5 * MIN - 1);
+    assert_steps(
+        &early,
+        vec![wait(G, WaitReason::MinDwell)],
+        "within min_dwell",
+    );
+    let at = c.run_fresh_at(&d.state, T + 5 * MIN);
+    assert_steps(
+        &at,
+        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
+        "min_dwell after the allow",
+    );
+}
 
-    let d = loading()
-        .target(Some("mineru"))
-        .obs(pods("mineru", 1, 1, 31_000))
+#[test]
+fn modes_persisted_by_the_build_with_pod_gating_converge_without_blocking() {
+    // `loading` reads as serving since the same instant: it keeps its dwell clock.
+    let loading = Case::new().gpu(&format!(
+        "{{ phase: loading, model: mineru, since: {} }}",
+        T - 1000
+    ));
+    assert_eq!(
+        mode_of(&loading.clone().target(Some("mineru")).run(), G),
+        ModePhase::Serving {
+            model: mid("mineru"),
+            since: sched_model::Millis(T - 1000),
+            idle_since: Some(sched_model::Millis(T)),
+            wind_down: None
+        }
+    );
+    let d = loading.clone().target(Some("mineru")).run();
+    assert_steps(&d, vec![], "no wait for readiness");
+    assert!(d.allowed.classes.contains(&cid("paperless-ocr")));
+    let d = loading.clone().target(Some("llm")).run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::MinDwell)],
+        "dwell from the allow",
+    );
+    // `draining` reads as idle: the next model is allowed at once, whatever the pods say.
+    let draining = || {
+        Case::new()
+            .gpu(&format!(
+                "{{ phase: draining, model: mineru, since: {} }}",
+                T - 1000
+            ))
+            .obs(pods("mineru", 1, 1, 0))
+    };
+    let d = draining().target(Some("llm")).run();
+    assert_steps(&d, vec![allow("llm")], "next model at once");
+    assert_eq!(d.allowed.models, [mid("llm")].into());
+    let d = draining().target(None).run();
+    assert_steps(&d, vec![], "nothing wanted");
+    assert!(matches!(mode_of(&d, G), ModePhase::Idle));
+    // A recovery that was waiting for the drain runs now.
+    let d = Case::new()
+        .gpu_state(&format!(
+            "{{ power: {}, mode: {{ phase: draining, model: whisperx, since: 1 }}, pending_recovery: [speakr-transcription] }}",
+            on()
+        ))
+        .target(None)
         .run();
     assert_steps(
         &d,
-        vec![wait(G, WaitReason::StaleObservation)],
-        "stale readiness",
+        vec![Step::RunRecovery {
+            class: cid("speakr-transcription"),
+        }],
+        "pending recovery",
     );
+    assert!(
+        d.state
+            .resource(&rid(G))
+            .unwrap()
+            .pending_recovery
+            .is_empty()
+    );
+}
 
-    let d = loading()
-        .target(Some("llm"))
-        .obs(pods("mineru", 1, 0, 0))
-        .run();
-    assert_steps(&d, vec![drain("mineru")], "target changed while loading");
+#[test]
+fn a_switch_withdraws_the_old_model_and_allows_the_new_one_in_the_same_tick() {
+    let serve = || {
+        Case::new()
+            .gpu(&serving("mineru", 10 * MIN))
+            .obs(pods("mineru", 1, 1, 0))
+    };
+    let d = serve().target(Some("llm")).run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
+        "switch",
+    );
+    assert_eq!(d.allowed.models, [mid("llm")].into(), "never both");
+    assert!(d.allowed.classes.contains(&cid("paperless-tagging")));
+    assert!(!d.allowed.classes.contains(&cid("paperless-ocr")));
+    assert!(matches!(
+        mode_of(&d, G),
+        ModePhase::Serving { ref model, since, .. } if *model == mid("llm") && since == sched_model::Millis(T)
+    ));
+    // Without a fresh reading of the host the switch waits as a whole: the old model stays.
+    let d = serve().target(Some("llm")).obs(up(G, true, 31_000)).run();
+    assert_steps(
+        &d,
+        vec![
+            pause("paperless-ocr"),
+            wait(G, WaitReason::StaleObservation),
+        ],
+        "stale reachability",
+    );
+    assert_eq!(d.allowed.models, [mid("mineru")].into());
+    // Releasing (no target) withdraws alone, and needs no reading.
+    let d = serve().target(None).obs(up(G, true, 31_000)).run();
+    assert_steps(&d, vec![pause("paperless-ocr"), drain("mineru")], "release");
+    assert!(d.allowed.models.is_empty());
+    assert!(matches!(mode_of(&d, G), ModePhase::Idle));
+}
+
+/// The example config without the whisperx model and the class that needs it.
+fn without_whisperx() -> Config {
+    let yaml = managed_yaml();
+    let line =
+        "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx] }\n";
+    let start = yaml.find("  - id: speakr-transcription\n").unwrap();
+    let end = start + yaml[start..].find("\n\n").unwrap() + 2;
+    let y = format!("{}{}", &yaml[..start], &yaml[end..]).replace(line, "");
+    assert!(!y.contains("id: whisperx"));
+    Config::from_yaml(&y).unwrap()
+}
+
+#[test]
+fn a_model_removed_from_the_config_leaves_the_allowed_set_at_the_next_tick() {
+    let removed = |target: Option<&str>| {
+        let mut c = Case::new()
+            .gpu(&serving("whisperx", MIN))
+            .obs(pods("whisperx", 1, 1, 0))
+            .target(target);
+        c.config = without_whisperx();
+        c
+    };
+    // Inside min_dwell, its pods still up: it goes now, and the next model comes in.
+    let d = removed(Some("mineru")).run();
+    assert_steps(&d, vec![drain("whisperx"), allow("mineru")], "replaced");
+    assert_eq!(d.allowed.models, [mid("mineru")].into());
+    let d = removed(None).run();
+    assert_steps(&d, vec![drain("whisperx")], "withdrawn");
+    assert!(d.allowed.models.is_empty() && matches!(mode_of(&d, G), ModePhase::Idle));
+    // Nothing is left to wait for afterwards.
+    let next = removed(None).run_at(&d.state, T + 1000);
+    assert_steps(&next, vec![], "settled");
+    // An intent (or a stale lease) naming an unconfigured model allows nothing.
+    let d = Case {
+        config: without_whisperx(),
+        ..Case::new()
+    }
+    .target(Some("whisperx"))
+    .run();
+    assert_steps(&d, vec![], "never allowed");
     assert!(d.allowed.models.is_empty());
 }
 
 #[test]
-fn draining_transitions() {
-    let draining = || {
-        Case::new().gpu(&format!(
-            "{{ phase: draining, model: mineru, since: {} }}",
-            T - 1000
-        ))
-    };
-    let d = draining()
+fn gate_classes_follow_their_hosts_and_nothing_else() {
+    let gate = cid("paperless-gpt");
+    // Both hosts up, no model: the gate is open.
+    let d = Case::new().run();
+    assert!(d.allowed.classes.contains(&gate), "{:?}", d.allowed);
+    // Whatever model serves, or is wound down, it stays open.
+    let d = Case::new()
+        .gpu(&serving("mineru", 10 * MIN))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
         .target(Some("llm"))
-        .obs(pods("mineru", 1, 1, 0))
         .run();
-    assert_steps(&d, vec![wait(G, WaitReason::Draining)], "still has pods");
-    assert!(d.allowed.models.is_empty());
-
-    let d = draining()
-        .target(Some("llm"))
-        .obs(pods("mineru", 1, 1, 31_000))
+    assert!(d.allowed.classes.contains(&gate), "{:?}", d.steps);
+    // The GPU host or NFS down closes it.
+    let d = Case::new()
+        .gpu_state("{ power: { phase: \"off\" }, mode: { phase: idle } }")
+        .obs(up(G, false, 0))
         .run();
-    assert_steps(&d, vec![wait(G, WaitReason::StaleObservation)], "stale");
-
-    let d = draining().target(Some("llm")).run();
-    assert_steps(
-        &d,
-        vec![allow("llm")],
-        "zero pods: next model in the same tick",
-    );
-
-    let d = draining().target(None).run();
-    assert_steps(&d, vec![], "zero pods, nothing wanted");
-    assert!(matches!(mode_of(&d, G), ModePhase::Idle));
-
-    let d = draining()
-        .target(Some("llm"))
-        .obs(pods("whisperx", 1, 0, 0))
+    assert!(!d.allowed.classes.contains(&gate));
+    let d = Case::new()
+        .nfs_state("{ power: { phase: \"off\" }, mode: { phase: idle } }")
+        .obs(up(N, false, 0))
         .run();
-    assert_steps(
-        &d,
-        vec![wait(G, WaitReason::OtherModelPresent)],
-        "another model still present blocks the next",
-    );
+    assert!(!d.allowed.classes.contains(&gate));
+    // A reclaimed GPU host closes it too.
+    assert!(!Case::new().reclaim().run().allowed.classes.contains(&gate));
 }
 
 #[test]
@@ -460,7 +656,7 @@ fn switching_away_from_a_serving_model() {
     let d = serve(5 * MIN).target(Some("llm")).run();
     assert_steps(
         &d,
-        vec![pause("paperless-ocr"), drain("mineru")],
+        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
         "at min_dwell with nothing in flight",
     );
 
@@ -515,7 +711,7 @@ fn switching_away_from_a_serving_model() {
         .run();
     assert_steps(
         &d,
-        vec![pause("paperless-ocr"), drain("mineru")],
+        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
         "ready but not in flight does not block",
     );
 
@@ -591,10 +787,10 @@ fn forced_switches_give_in_flight_work_its_timeout() {
         vec![wait(G, WaitReason::InFlightWork)],
         "one ms before the timeout",
     );
-    let after = c.run_at(&d.state, T + 10 * MIN);
+    let after = c.run_fresh_at(&d.state, T + 10 * MIN);
     assert_steps(
         &after,
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
         "at the timeout",
     );
     assert!(
@@ -683,13 +879,21 @@ fn reclaim_shuts_the_host_down_overriding_holds_and_grace() {
     assert!(matches!(power_of(&d, G), PowerPhase::ShuttingDown { .. }));
     assert!(d.allowed.models.is_empty());
 
-    let d = Case::new().obs(pods("llm", 0, 0, 31_000)).reclaim().run();
+    let d = Case::new().obs(pods("llm", 2, 2, 31_000)).reclaim().run();
+    assert_steps(
+        &d,
+        vec![Step::PowerOff { resource: rid(G) }],
+        "pod readings, stale or not, are not consulted",
+    );
+    let d = Case::new().obs(up(G, true, 31_000)).reclaim().run();
     assert_steps(
         &d,
         vec![wait(G, WaitReason::StaleObservation)],
-        "stale pods hold the shutdown",
+        "stale reachability holds the shutdown",
     );
 
+    // A model allowed a second ago, with nothing in flight, is wound down and withdrawn
+    // at once (a reclaim ignores min_dwell); the power-off follows on the next tick.
     let c = Case::new()
         .gpu(&format!(
             "{{ phase: loading, model: mineru, since: {} }}",
@@ -699,8 +903,8 @@ fn reclaim_shuts_the_host_down_overriding_holds_and_grace() {
     let d = c.obs(pods("mineru", 1, 0, 0)).run();
     assert_steps(
         &d,
-        vec![drain("mineru")],
-        "a loading model is withdrawn at once",
+        vec![pause("paperless-ocr"), drain("mineru")],
+        "a just-allowed model is withdrawn at once",
     );
 
     let off = Case::new()
@@ -853,24 +1057,19 @@ fn power_down_rules() {
     let d = Case::new().nfs_state(unmanaged).run();
     assert_steps(&d, vec![], "a host found running is never powered down");
 
-    let d = Case::new()
-        .gpu_state(&format!("{managed}{} }}", T - 99 * MIN))
-        .obs(pods("llm", 0, 0, 31_000))
-        .run();
-    assert_steps(
-        &d,
-        vec![wait(G, WaitReason::StaleObservation)],
-        "stale pods stop the power down",
-    );
-    let d = Case::new()
-        .gpu_state(&format!("{managed}{} }}", T - 99 * MIN))
-        .obs(pods("llm", 1, 1, 0))
-        .run();
-    assert_steps(
-        &d,
-        vec![wait(G, WaitReason::OtherModelPresent)],
-        "pods present stop the power down",
-    );
+    // No model is allowed (mode idle): pod readings, stale or showing pods, are not
+    // consulted. Kubernetes and KEDA have scaled the withdrawn model down.
+    for p in [pods("llm", 0, 0, 31_000), pods("llm", 1, 1, 0)] {
+        let d = Case::new()
+            .gpu_state(&format!("{managed}{} }}", T - 99 * MIN))
+            .obs(p)
+            .run();
+        assert_steps(
+            &d,
+            vec![Step::PowerOff { resource: rid(G) }],
+            "pods do not stop the power down",
+        );
+    }
     let d = Case::new()
         .gpu_state(&format!("{managed}{} }}", T - 99 * MIN))
         .obs(up(G, true, 31_000))
@@ -925,7 +1124,8 @@ fn unseen_resources_are_initialised_from_observation() {
 
 #[test]
 fn allowed_set_requires_every_requirement() {
-    let all_nfs: Vec<ClassId> = ["backup", "paperless-ngx", "immich-server"]
+    // The NFS-only classes, and the gate class that needs the GPU host and NFS up.
+    let all_nfs: Vec<ClassId> = ["backup", "paperless-ngx", "immich-server", "paperless-gpt"]
         .iter()
         .map(|c| cid(c))
         .collect();
@@ -1174,28 +1374,26 @@ fn future(model_line: &str) -> String {
 
 #[test]
 fn future_dated_observations_are_not_fresh() {
-    let line = pods("llm", 0, 0, 0);
+    let line = up(G, true, 0);
     assert!(line.contains(&format!("observed_at: {T}")));
     let d = Case::new().target(Some("mineru")).obs(future(&line)).run();
     assert_steps(
         &d,
         vec![wait(G, WaitReason::StaleObservation)],
-        "future pods block allowing",
+        "a future-dated up reading blocks allowing",
     );
 
     // A fresh older observation does not rescue a future-dated newest one.
     let d = Case::new()
         .target(Some("mineru"))
-        .obs(pods("llm", 0, 0, 1000))
+        .obs(up(G, true, 1000))
         .run();
     assert_steps(
         &d,
         vec![allow("mineru")],
         "baseline: an older fresh observation is fine alone",
     );
-    let mut c = Case::new()
-        .target(Some("mineru"))
-        .obs(pods("llm", 0, 0, 1000));
+    let mut c = Case::new().target(Some("mineru")).obs(up(G, true, 1000));
     c.obs.push(future(&line));
     assert_steps(
         &c.run(),

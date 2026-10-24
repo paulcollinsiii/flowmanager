@@ -78,7 +78,10 @@ pub enum ModePhase {
 enum ModePhaseRepr {
     Idle,
     /// Legacy: becomes `Serving` since the same instant (the model was allowed then).
-    Loading { model: ModelId, since: Millis },
+    Loading {
+        model: ModelId,
+        since: Millis,
+    },
     Serving {
         model: ModelId,
         since: Millis,
@@ -208,7 +211,12 @@ mod tests {
             r#"{"phase":"serving","model":"llm","since":1,"idle_since":5,"wind_down":{"since":3,"timeout":600000,"reclaim":false,"killed":["c"]}}"#,
         )
         .unwrap();
-        let ModePhase::Serving { wind_down, idle_since, .. } = &wd else {
+        let ModePhase::Serving {
+            wind_down,
+            idle_since,
+            ..
+        } = &wd
+        else {
             panic!("{wd:?}");
         };
         assert_eq!(*idle_since, Some(Millis(5)));
@@ -236,7 +244,10 @@ mod tests {
             },
         ] {
             let text = serde_yaml_ng::to_string(&m).unwrap();
-            assert!(!text.contains("loading") && !text.contains("draining"), "{text}");
+            assert!(
+                !text.contains("loading") && !text.contains("draining"),
+                "{text}"
+            );
             assert_eq!(mode(&text).unwrap(), m);
         }
     }
