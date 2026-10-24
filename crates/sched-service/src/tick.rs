@@ -647,18 +647,19 @@ mod tests {
         );
         assert_eq!(r.config_generation, 1);
         assert!(r.input_changed);
-        // The state is carried: the next tick sees the model loading, not idle.
+        // The state is carried: the next tick sees the model serving (from the tick it was
+        // allowed, whatever its pods do) and has nothing to do.
         let again = s.tick(Millis(T0 + 2_000), &mut d);
         assert!(!again.input_changed);
-        assert!(again.kinds.contains(&"wait".to_string()), "{again:?}");
+        assert!(again.steps.is_empty(), "{again:?}");
         assert!(
             !again.kinds.contains(&"allow_model".to_string()),
             "{again:?}"
         );
-        assert!(again.reason.contains("still loading"), "{}", again.reason);
+        assert!(!again.reason.contains("pods"), "{}", again.reason);
         let text = s.metrics.render();
         assert!(text.contains("sched_tick_decisions_total{kind=\"allow_model\"} 1"));
-        assert!(text.contains("sched_tick_decisions_total{kind=\"wait\"} 1"));
+        assert!(!text.contains("sched_tick_decisions_total{kind=\"wait\"}"));
     }
 
     #[test]
@@ -667,9 +668,22 @@ mod tests {
         let mut d = Durable::default();
         cluster(&s);
         ocr_demand(&s, 3);
-        // 31s later nothing was refreshed: pod counts are older than safety_max_age (30s).
+        // 31s later nothing was refreshed: the host's reachability is older than
+        // safety_max_age (30s), so no model is allowed on it.
         let r = s.tick(Millis(T0 + 31_000), &mut d);
         assert!(!r.kinds.contains(&"allow_model".to_string()), "{r:?}");
+        assert!(
+            r.steps.contains(&Step::Wait {
+                resource: "cuda-central".into(),
+                reason: sched_model::WaitReason::StaleObservation
+            }),
+            "{r:?}"
+        );
+        assert!(
+            r.reason.contains("reachability observation of the host is missing or stale"),
+            "{}",
+            r.reason
+        );
         let pods_age = r
             .inputs
             .iter()
@@ -811,18 +825,9 @@ mod tests {
         assert!(!r.reason.contains("shadow"), "{}", r.reason);
         assert!(matches!(
             d.state.resource(&"cuda-central".into()).unwrap().mode,
-            sched_model::ModePhase::Loading { .. }
+            sched_model::ModePhase::Serving { .. }
         ));
         clock.set(Millis(T0 + 2_000));
-        push(
-            &s,
-            "cluster-pods",
-            vec![ObservedValue::ModelPods {
-                model: "mineru".into(),
-                pods: 1,
-                ready_pods: 1,
-            }],
-        );
         let r = s.tick(Millis(T0 + 2_000), &mut d);
         assert_eq!(r.allowed_models, vec![ModelId::from("mineru")]);
         let serving_since = match &d.state.resource(&"cuda-central".into()).unwrap().mode {
@@ -869,9 +874,11 @@ mod tests {
             p.allowed.models,
             [ModelId::from("mineru")].into_iter().collect()
         );
-        // NFS is up, so the NFS-only classes are allowed; OCR is not until mineru serves.
+        // NFS is up, so the NFS-only classes are allowed, and so is the gate class (the GPU
+        // host is up too); OCR is allowed with mineru, which serves from this tick.
         assert!(p.allowed.classes.contains(&ClassId::from("paperless-ngx")));
-        assert!(!p.allowed.classes.contains(&ClassId::from("paperless-ocr")));
+        assert!(p.allowed.classes.contains(&ClassId::from("paperless-gpt")));
+        assert!(p.allowed.classes.contains(&ClassId::from("paperless-ocr")));
         let r = s.tick(Millis(T0 + 2_000), &mut d);
         assert!(rx.has_changed().unwrap());
         assert_eq!(rx.borrow_and_update().as_ref().unwrap().at, r.at);
@@ -1169,6 +1176,59 @@ mod tests {
             text.contains("sched_source_has_observer{source=\"paperless-ocr-pending\"} 1"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_model_pinned_by_a_manual_lease_does_not_read_as_idle() {
+        let (s, _) = shared();
+        let mut d = Durable {
+            leases: vec![llm_lease()],
+            ..Durable::default()
+        };
+        cluster(&s);
+        for (src, class) in [
+            ("paperless-ocr-pending", "paperless-ocr"),
+            ("paperless-post-ocr", "paperless-tagging"),
+            ("speakr-pending", "speakr-transcription"),
+            ("speakr-summaries", "speakr-summarization"),
+            ("immich-queues", "immich-ml"),
+        ] {
+            push(
+                &s,
+                src,
+                vec![ObservedValue::Demand {
+                    class: class.into(),
+                    ready: 0,
+                    in_flight: 0,
+                    oldest_ready_at: None,
+                }],
+            );
+        }
+        let first = s.tick(Millis(T0 + 1_000), &mut d);
+        assert!(first.kinds.contains(&"allow_model".to_string()), "{first:?}");
+        // Pinned and settled: no step, but the LLM is held on purpose, not idle.
+        let r = s.tick(Millis(T0 + 2_000), &mut d);
+        assert!(r.steps.is_empty(), "{r:?}");
+        assert_eq!(
+            r.kinds,
+            vec!["demand_unsupported".to_string(), "pinned".to_string()],
+            "{r:?}"
+        );
+        assert!(
+            r.reason
+                .contains("pinned by a manual model lease [cuda-central=llm]"),
+            "{}",
+            r.reason
+        );
+        assert!(
+            s.metrics
+                .render()
+                .contains("sched_tick_decisions_total{kind=\"pinned\"} 2")
+        );
+        // Released: idle again.
+        d.leases.clear();
+        let r = s.tick(Millis(T0 + 3_000), &mut d);
+        assert!(!r.kinds.contains(&"pinned".to_string()), "{r:?}");
     }
 
     #[test]
