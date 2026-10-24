@@ -1,4 +1,5 @@
 [tools]
+protoc = "latest"
 restate = { version = "latest", matching = "restate-cli" }
 restate-server = { version = "latest", matching = "restate-server" }
 rust = "latest"
