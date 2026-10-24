@@ -241,12 +241,18 @@ async fn a_panicking_or_ending_observer_is_reported_and_restarted() {
             }
         },
     ));
-    let first = rx.recv().await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the panic must be reported")
+        .unwrap();
     assert!(
         matches!(&first, Report::Failed { source, error } if source.as_str() == "s" && error.contains("panicked") && error.contains("CryptoProvider")),
         "{first:?}"
     );
-    let second = rx.recv().await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the early exit must be reported")
+        .unwrap();
     assert!(
         matches!(&second, Report::Failed { error, .. } if error.contains("stopped")),
         "{second:?}"

@@ -3627,6 +3627,7 @@ dependencies = [
  "reqwest",
  "sched-model",
  "sched-observe",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

@@ -40,8 +40,7 @@ Depending on the service needed, will need to power on the GPU machine and have 
 It has no actuator: every observer is read-only and nothing is scaled, powered or called.
 It runs as the `Scheduler` Restate virtual object (key `main`); a tick is
 snapshot, then planner, then sequencer, then a log line with the decision, its reason, the
-config generation and each input's age. Sequencer state is not carried between ticks (nothing is
-executed, so each tick answers "what would I do given what I see now").
+config generation and each input's age (per source and capability).
 
 Run it locally against a Restate server:
 
@@ -63,3 +62,28 @@ restate deployments register http://localhost:9080
   `sched_tick_duration_seconds`, `sched_config_generation`, `sched_config_reloads_total{outcome}`.
 - Handlers: `observe` (push observations; dated on receipt, never by the sender), `tick`,
   `last_decision`, e.g. `curl -X POST localhost:8080/Scheduler/main/last_decision`.
+
+## What shadow output can and cannot show
+
+Every tick starts the sequencer from a **fresh state**; nothing is carried from one tick to
+the next (log field `shadow_stateless=true`, reasons begin `[shadow: next step from a fresh
+sequencer state]`). Nothing is executed, so carrying a simulated state would only make the
+sequencer wait for effects that never happen. The consequences, stated plainly:
+
+- **Dwell and idle grace never elapse**, because they are measured from state the sequencer
+  does not have. Decisions that wait on them (minimum dwell, idle grace before unloading or
+  powering off) are not reproduced.
+- **Drain, pause intake, kill and power-off steps essentially cannot appear**: they follow a
+  model being loaded or a host being held, which is state. Do not read their absence as "the
+  scheduler would never do this".
+- **`allow_model` repeats on every tick** for as long as the demand lasts, since the model is
+  never "loaded" in the sequencer's state.
+- `sched_tick_decisions_total{kind}` counts **ticks** by kind (once per distinct kind in a
+  tick), not actions. Ticks also run on every change and on the backstop.
+- Leases are not modelled (the snapshot has none).
+- **Unknown is not idle**: if a class's demand source never reported or is stale, the tick is
+  `demand_unknown` (listed in `unknown_demand`), never `idle`.
+
+What shadow output does show well: which model the planner wants given current demand, whether
+inputs are fresh (`inputs` with an age per source and capability, `inf` for a capability that
+never reported), and whether a source is failing (`sched_source_errors_total`).
