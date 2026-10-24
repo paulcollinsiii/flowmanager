@@ -656,10 +656,11 @@ mod tests {
 
     #[test]
     fn an_observable_source_configured_without_params_is_labelled_as_such() {
-        let y = EXAMPLE_CONFIG.replace(
-            "    params:\n      requests:\n        - url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting\n",
-            "",
-        );
+        // Drop the params block of immich-queues (it ends at the blank line after it).
+        let start = EXAMPLE_CONFIG.find("  - id: immich-queues\n").unwrap();
+        let params = start + EXAMPLE_CONFIG[start..].find("    params:\n").unwrap();
+        let end = params + EXAMPLE_CONFIG[params..].find("\n\n").unwrap() + 1;
+        let y = format!("{}{}", &EXAMPLE_CONFIG[..params], &EXAMPLE_CONFIG[end..]);
         assert_ne!(y, EXAMPLE_CONFIG);
         let clock = Arc::new(ManualClock::new(Millis(T0)));
         let holder = Arc::new(ConfigHolder::new(&y).unwrap());

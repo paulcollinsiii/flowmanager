@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sched_model::{
-    AuthSpec, ClassId, CountsAs, ElementFilter, Fidelity, HttpJsonParams, Millis, ObservedValue,
-    RequestSpec, SourceSpec,
+    AuthSpec, ClassId, CountsAs, ElementFilter, Fidelity, FilterValue, HttpJsonParams, Millis,
+    ObservedValue, RequestSpec, SourceSpec,
 };
 use serde_json::Value;
 
@@ -66,7 +66,7 @@ pub fn request_url(req: &RequestSpec, now: Millis) -> String {
 }
 
 /// Largest response body read.
-const MAX_BODY: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Why a response could not be turned into a number.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +79,14 @@ pub enum ExtractError {
     /// The `where` field is in none of the (non-empty) array's items, so the filter would
     /// silently match nothing.
     FilterFieldMissing(String),
+    /// An item's `where` field (or the response's `when` field) holds a value of another
+    /// JSON type than the condition compares (for example a number where a boolean is
+    /// expected), so it would silently match nothing. For `where`, `null` is not a
+    /// mismatch: it is an item that does not match.
+    FilterTypeMismatch {
+        field: String,
+        expected: &'static str,
+    },
 }
 
 impl std::fmt::Display for ExtractError {
@@ -93,6 +101,10 @@ impl std::fmt::Display for ExtractError {
                 f,
                 "the where field {field:?} is missing from every item, so the filter would count nothing; check the field name against the API"
             ),
+            ExtractError::FilterTypeMismatch { field, expected } => write!(
+                f,
+                "the field {field:?} holds a value that is not a {expected}, so the condition on it cannot be checked; check the field against the API"
+            ),
             ExtractError::AtLimit(n) => write!(
                 f,
                 "the response holds {n} items, a full page; the count may be too low"
@@ -101,15 +113,83 @@ impl std::fmt::Display for ExtractError {
     }
 }
 
+/// The JSON type the filter compares, by name: `contains` compares text, `equals` its
+/// value's type.
+fn filter_type(filter: &ElementFilter) -> &'static str {
+    match (&filter.contains, &filter.equals) {
+        (None, Some(v)) => v.json_type(),
+        _ => "string",
+    }
+}
+
+/// Whether `value` is `expected`, by JSON type and value (numbers compared numerically).
+fn value_equals(value: &Value, expected: &FilterValue) -> bool {
+    match expected {
+        FilterValue::Text(t) => value.as_str() == Some(t.as_str()),
+        FilterValue::Bool(b) => value.as_bool() == Some(*b),
+        FilterValue::Number(n) => value.as_f64() == Some(*n),
+    }
+}
+
+/// Whether `value` has the JSON type named by `json_type`.
+fn has_type(value: &Value, json_type: &str) -> bool {
+    match json_type {
+        "boolean" => value.is_boolean(),
+        "number" => value.is_number(),
+        _ => value.is_string(),
+    }
+}
+
 fn matches(filter: &ElementFilter, element: &Value) -> bool {
-    let Some(text) = element.pointer(&filter.field).and_then(Value::as_str) else {
+    let Some(value) = element.pointer(&filter.field) else {
         return false;
     };
     match (&filter.contains, &filter.equals) {
-        (Some(needle), _) => text.to_lowercase().contains(&needle.to_lowercase()),
-        (None, Some(exact)) => text == exact,
+        (Some(needle), _) => value
+            .as_str()
+            .is_some_and(|text| text.to_lowercase().contains(&needle.to_lowercase())),
+        (None, Some(expected)) => value_equals(value, expected),
         (None, None) => false,
     }
+}
+
+/// Whether `value` (present at the filter's field) has the type the filter compares.
+fn comparable(filter: &ElementFilter, value: &Value) -> bool {
+    has_type(value, filter_type(filter))
+}
+
+/// Whether the response is to be counted: `true` without a `when`, else whether its field
+/// equals the value. A missing field or one of another JSON type is an error.
+pub fn condition_holds(doc: &Value, req: &RequestSpec) -> Result<bool, ExtractError> {
+    let Some(w) = &req.when else {
+        return Ok(true);
+    };
+    let value = doc
+        .pointer(&w.field)
+        .ok_or_else(|| ExtractError::Missing(w.field.clone()))?;
+    if !has_type(value, w.equals.json_type()) {
+        return Err(ExtractError::FilterTypeMismatch {
+            field: w.field.clone(),
+            expected: w.equals.json_type(),
+        });
+    }
+    Ok(value_equals(value, &w.equals))
+}
+
+/// Every number one response contributes: the request's own and its `also` numbers, or
+/// none when its `when` condition does not hold.
+pub fn request_numbers(
+    doc: &Value,
+    req: &RequestSpec,
+) -> Result<Vec<(CountsAs, u64)>, ExtractError> {
+    if !condition_holds(doc, req)? {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![(req.counts_as, extract(doc, req)?)];
+    for e in &req.also {
+        out.push((e.counts_as, extract_number(doc, &e.count)?));
+    }
+    Ok(out)
 }
 
 /// The number one request contributes: the value at `count`, or the number of elements of
@@ -132,6 +212,17 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
         && items.iter().all(|e| e.pointer(&f.field).is_none())
     {
         return Err(ExtractError::FilterFieldMissing(f.field.clone()));
+    }
+    if let Some(f) = &req.filter
+        && items
+            .iter()
+            .filter_map(|e| e.pointer(&f.field))
+            .any(|v| !v.is_null() && !comparable(f, v))
+    {
+        return Err(ExtractError::FilterTypeMismatch {
+            field: f.field.clone(),
+            expected: filter_type(f),
+        });
     }
     let n = match &req.filter {
         Some(f) => items.iter().filter(|e| matches(f, e)).count(),
@@ -226,39 +317,47 @@ pub async fn resolve_auth(auth: &AuthSpec, env: &EnvFn) -> Result<(String, Strin
     Ok((auth.header.clone(), format!("{}{secret}", auth.prefix)))
 }
 
-async fn fetch(
+/// A GET of `url`, with the auth header (marked sensitive) if any, sent.
+pub(crate) async fn send_get(
     client: &reqwest::Client,
-    req: &RequestSpec,
+    url: &str,
     auth: Option<&(String, String)>,
-    max_body: usize,
-    now: Millis,
-) -> Result<Value, String> {
-    let mut builder = client.get(request_url(req, now));
+) -> Result<reqwest::Response, String> {
+    let mut builder = client.get(url);
     if let Some((name, value)) = auth {
         let mut v = reqwest::header::HeaderValue::from_str(value)
             .map_err(|_| "the secret is not a valid header value".to_string())?;
         v.set_sensitive(true);
         builder = builder.header(name, v);
     }
-    let mut resp = builder
+    builder
         .send()
         .await
-        .map_err(|e| e.without_url().to_string())?;
+        .map_err(|e| e.without_url().to_string())
+}
+
+/// The error text for a non-success response: the status, and for a 429 when the service
+/// asked us to come back (polling cadence is unchanged).
+pub(crate) fn status_error(resp: &reqwest::Response) -> String {
     let status = resp.status();
-    if !status.is_success() {
-        // Say when the service asked us to come back; polling cadence is unchanged.
-        let retry_after = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.chars().take(64).collect::<String>());
-        return Err(match (status.as_u16(), retry_after) {
-            (429, Some(after)) => format!("HTTP {status} (rate limited; Retry-After: {after})"),
-            (429, None) => format!("HTTP {status} (rate limited)"),
-            _ => format!("HTTP {status}"),
-        });
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(64).collect::<String>());
+    match (status.as_u16(), retry_after) {
+        (429, Some(after)) => format!("HTTP {status} (rate limited; Retry-After: {after})"),
+        (429, None) => format!("HTTP {status} (rate limited)"),
+        _ => format!("HTTP {status}"),
     }
-    // Read chunk by chunk and stop at the limit, so a huge or endless body is never held.
+}
+
+/// The body, read chunk by chunk and abandoned at the limit, so a huge or endless body is
+/// never held.
+pub(crate) async fn read_body(
+    resp: &mut reqwest::Response,
+    max_body: usize,
+) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = resp
         .chunk()
@@ -270,6 +369,21 @@ async fn fetch(
         }
         body.extend_from_slice(&chunk);
     }
+    Ok(body)
+}
+
+async fn fetch(
+    client: &reqwest::Client,
+    req: &RequestSpec,
+    auth: Option<&(String, String)>,
+    max_body: usize,
+    now: Millis,
+) -> Result<Value, String> {
+    let mut resp = send_get(client, &request_url(req, now), auth).await?;
+    if !resp.status().is_success() {
+        return Err(status_error(&resp));
+    }
+    let body = read_body(&mut resp, max_body).await?;
     serde_json::from_slice(&body).map_err(|e| format!("response is not JSON: {e}"))
 }
 
@@ -324,16 +438,9 @@ pub async fn poll_at(
             Ok(d) => d,
             Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         };
-        let numbers = std::iter::once(extract(&doc, req).map(|n| (req.counts_as, n))).chain(
-            req.also
-                .iter()
-                .map(|e| extract_number(&doc, &e.count).map(|n| (e.counts_as, n))),
-        );
-        for n in numbers {
-            match n {
-                Ok(part) => parts.push(part),
-                Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
-            }
+        match request_numbers(&doc, req) {
+            Ok(numbers) => parts.extend(numbers),
+            Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         }
     }
     let (ready, in_flight) = totals(&parts);
@@ -347,8 +454,13 @@ pub async fn poll_at(
 /// The HTTP client for a source. It follows no redirects: a custom auth header must never
 /// be forwarded to another origin, and a redirect from an API endpoint is an error anyway.
 pub fn build_client(params: &HttpJsonParams) -> Result<reqwest::Client, reqwest::Error> {
+    client_with_timeout(params.timeout)
+}
+
+/// As [`build_client`], for any adapter's timeout.
+pub(crate) fn client_with_timeout(timeout: Millis) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
-        .timeout(Duration::from_millis(params.timeout.as_u64()))
+        .timeout(Duration::from_millis(timeout.as_u64()))
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
@@ -406,6 +518,7 @@ mod tests {
             max_items: None,
             also: Vec::new(),
             since: None,
+            when: None,
         }
     }
 
@@ -475,12 +588,6 @@ mod tests {
             let at = r.url.find("/api/").unwrap();
             r.url = server.url(&r.url[at..]);
         }
-        if id == "speakr-pending" {
-            // The example no longer reads failed recordings (they are not observable through
-            // speakr's list API); the adapter features it exercised are kept under test with
-            // this fixture request.
-            params.requests.push(failed_fixture(server));
-        }
         let classes = config
             .classes()
             .iter()
@@ -490,26 +597,6 @@ mod tests {
         (spec, params, classes)
     }
 
-    /// A request listing failed recordings whose `error_message` mentions a connection: the
-    /// shape of the request the example used before M2 dropped it. Exercises `where`,
-    /// `max_items` and the missing-field safeguard.
-    fn failed_fixture(server: &TestServer) -> RequestSpec {
-        RequestSpec {
-            url: server.url(SPEAKR_FAILED),
-            count: None,
-            length: Some("/recordings".into()),
-            filter: Some(ElementFilter {
-                field: "/error_message".into(),
-                contains: Some("connection".into()),
-                equals: None,
-            }),
-            counts_as: CountsAs::Ready,
-            max_items: Some(100),
-            also: Vec::new(),
-            since: None,
-        }
-    }
-
     const SPEAKR_STATS: &str = "/api/v1/stats";
 
     fn stats(pending: u64, queued: u64, processing: u64) -> Reply {
@@ -517,8 +604,43 @@ mod tests {
             r#"{{"recordings": {{"total": 9, "pending": {pending}}}, "queue": {{"jobs_queued": {queued}, "jobs_processing": {processing}}}}}"#
         ))
     }
-    const SPEAKR_FAILED: &str =
-        "/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc";
+    /// The clock reading speakr's failed-recordings window is dated from in these tests.
+    const NOW: Millis = Millis(1_700_000_000_000);
+    /// The example's failed-recordings request at [`NOW`] (2023-11-14T22:13:20Z): the
+    /// window is the last 15m.
+    const SPEAKR_FAILED: &str = "/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc&updated_since=2023-11-14T21%3A58%3A20Z";
+
+    /// A speakr v1 list item as `GET /api/v1/recordings` returns it (the fields the
+    /// adapter could look at, plus a few it does not).
+    fn speakr_item(id: u64, status: &str, has_summary: bool) -> String {
+        let error = if status == "FAILED" {
+            r#""error_message": "Transcription failed: Connection error","#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"id": {id}, "title": "Meeting {id}", "status": "{status}", {error} "created_at": "2023-11-14T20:00:00", "updated_at": "2023-11-14T21:00:00", "has_transcription": true, "has_summary": {has_summary}, "transcription_duration_seconds": null}}"#
+        )
+    }
+
+    fn speakr_list(items: &[String]) -> Reply {
+        Reply::json(&format!(
+            r#"{{"recordings": [{}], "pagination": {{"page": 1, "per_page": 100, "total": {}, "total_pages": 1, "has_next": false, "has_prev": false}}}}"#,
+            items.join(", "),
+            items.len()
+        ))
+    }
+
+    /// One poll at [`NOW`].
+    async fn poll_now(
+        client: &reqwest::Client,
+        spec: &SourceSpec,
+        params: &HttpJsonParams,
+        classes: &[ClassId],
+        env: &EnvFn,
+    ) -> Report {
+        poll_at(client, spec, params, classes, env, MAX_BODY, NOW).await
+    }
 
     fn env(name: &str) -> Option<String> {
         (name == "SPEAKR_API_TOKEN").then(|| "s3cret\n".to_string())
@@ -541,28 +663,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn speakr_counts_pending_plus_connection_error_failures() {
+    async fn speakr_counts_pending_queued_and_failed_transcriptions() {
         let server = TestServer::start().await;
         // 2 recordings waiting to be enqueued, 3 jobs queued, 1 running.
         server.set(SPEAKR_STATS, stats(2, 3, 1));
+        // Three FAILED recordings in the window: two failed transcriptions (no summary) and
+        // one failed summary (the error is stored in `summary`, so has_summary is true).
         server.set(
             SPEAKR_FAILED,
-            Reply::json(
-                r#"{"recordings": [
-                    {"id": 3, "error_message": "Connection error: whisperx unreachable"},
-                    {"id": 4, "error_message": "unsupported codec"},
-                    {"id": 5, "error_message": "APIConnectionError"}]}"#,
-            ),
+            speakr_list(&[
+                speakr_item(3, "FAILED", false),
+                speakr_item(4, "FAILED", true),
+                speakr_item(5, "FAILED", false),
+            ]),
         );
         let (spec, params, classes) = example_source("speakr-pending", &server);
-        assert_eq!(classes.len(), 1);
+        assert_eq!(classes, [ClassId::from("speakr-transcription")]);
         let client = reqwest::Client::new();
-        let report = poll(&client, &spec, &params, &classes, &env).await;
-        // 2 pending + 3 queued jobs + 2 connection-error failures (the codec failure is not
-        // demand); one job running.
+        let report = poll_now(&client, &spec, &params, &classes, &env).await;
+        // 2 pending + 3 queued jobs + 2 failed transcriptions; one job running.
         assert_eq!(demand(&report), (7, 1));
         // Two requests per poll: stats (one response, three numbers) and the failed list.
         assert_eq!(server.requests().len(), 2);
+        assert_eq!(server.requests()[1].0, SPEAKR_FAILED);
         // The secret is read from the environment, trimmed, and sent with its prefix.
         assert!(
             server
@@ -588,7 +711,7 @@ mod tests {
 
     async fn failure(server: &TestServer, params: &HttpJsonParams, spec: &SourceSpec) -> String {
         let client = build_client(params).unwrap();
-        match poll(&client, spec, params, &[], &env).await {
+        match poll_now(&client, spec, params, &[], &env).await {
             Report::Failed { source, error } => {
                 assert_eq!(source, spec.id);
                 let _ = server;
@@ -764,15 +887,10 @@ mod tests {
         // End to end with the example speakr source: a full page of failed recordings.
         let server = TestServer::start().await;
         let (spec, params, classes) = example_source("speakr-pending", &server);
-        let full: Vec<String> = (0..100)
-            .map(|i| format!("{{\"id\": {i}, \"error_message\": null}}"))
-            .collect();
+        let full: Vec<String> = (0..100).map(|i| speakr_item(i, "FAILED", false)).collect();
         server.set(SPEAKR_STATS, stats(0, 0, 0));
-        server.set(
-            SPEAKR_FAILED,
-            Reply::json(&format!("{{\"recordings\": [{}]}}", full.join(","))),
-        );
-        match poll(
+        server.set(SPEAKR_FAILED, speakr_list(&full));
+        match poll_now(
             &build_client(&params).unwrap(),
             &spec,
             &params,
@@ -835,7 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_example_speakr_source_fails_explicitly_when_list_items_lack_error_message() {
+    async fn the_example_speakr_source_fails_explicitly_when_list_items_lack_has_summary() {
         let server = TestServer::start().await;
         let (spec, params, classes) = example_source("speakr-pending", &server);
         server.set(SPEAKR_STATS, stats(3, 0, 0));
@@ -843,7 +961,7 @@ mod tests {
             SPEAKR_FAILED,
             Reply::json(r#"{"recordings": [{"id": 9, "status": "FAILED"}]}"#),
         );
-        match poll(
+        match poll_now(
             &build_client(&params).unwrap(),
             &spec,
             &params,
@@ -921,32 +1039,347 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_example_failed_request_only_asks_for_the_last_day_using_the_clock_it_is_given() {
+    async fn the_example_failed_request_only_asks_for_the_last_15m_using_the_clock_it_is_given() {
         let server = TestServer::start().await;
-        let (spec, mut params, classes) = example_source("speakr-pending", &server);
-        params.requests[1].since = Some(sched_model::SinceSpec {
-            param: "updated_since".into(),
-            ago: Millis(86_400_000),
-        });
+        let (spec, params, classes) = example_source("speakr-pending", &server);
         server.set(SPEAKR_STATS, stats(0, 0, 0));
-        let windowed = format!("{SPEAKR_FAILED}&updated_since=2023-11-13T22%3A13%3A20Z");
         server.set(
-            &windowed,
-            Reply::json(r#"{"recordings": [{"error_message": "Connection refused"}]}"#),
+            SPEAKR_FAILED,
+            speakr_list(&[speakr_item(1, "FAILED", false)]),
         );
-        let now = Millis(1_700_000_000_000);
-        let report = poll_at(
-            &build_client(&params).unwrap(),
-            &spec,
-            &params,
-            &classes,
-            &env,
-            MAX_BODY,
-            now,
-        )
-        .await;
+        let client = build_client(&params).unwrap();
+        let report = poll_now(&client, &spec, &params, &classes, &env).await;
         assert_eq!(demand(&report), (1, 0));
-        assert!(server.requests().iter().any(|(k, _)| *k == windowed));
+        assert_eq!(server.requests()[1].0, SPEAKR_FAILED);
+        // An hour later the window has moved with the clock: the same failure would be
+        // listed (or not) by a different query, here unanswered.
+        let later = Millis(NOW.as_u64() + 3_600_000);
+        let report = poll_at(&client, &spec, &params, &classes, &env, MAX_BODY, later).await;
+        assert!(matches!(report, Report::Failed { .. }), "{report:?}");
+        assert!(
+            server.requests()[3]
+                .0
+                .ends_with("&updated_since=2023-11-14T22%3A58%3A20Z"),
+            "{:?}",
+            server.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_summaries_and_an_empty_window_are_not_transcription_demand() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("speakr-pending", &server);
+        let client = build_client(&params).unwrap();
+        server.set(SPEAKR_STATS, stats(0, 0, 0));
+        server.set(
+            SPEAKR_FAILED,
+            speakr_list(&[speakr_item(7, "FAILED", true)]),
+        );
+        assert_eq!(
+            demand(&poll_now(&client, &spec, &params, &classes, &env).await),
+            (0, 0)
+        );
+        server.set(SPEAKR_FAILED, speakr_list(&[]));
+        assert_eq!(
+            demand(&poll_now(&client, &spec, &params, &classes, &env).await),
+            (0, 0)
+        );
+        // has_summary of another type than boolean (as if the API changed): a failure, not 0.
+        server.set(
+            SPEAKR_FAILED,
+            Reply::json(r#"{"recordings": [{"id": 1, "status": "FAILED", "has_summary": 0}]}"#),
+        );
+        match poll_now(&client, &spec, &params, &classes, &env).await {
+            Report::Failed { error, .. } => {
+                assert!(error.contains("not a boolean"), "{error}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn where_equals_compares_booleans_and_text_by_json_type() {
+        let filter = |equals: FilterValue| ElementFilter {
+            field: "/f".into(),
+            contains: None,
+            equals: Some(equals),
+        };
+        let d = doc(r#"[{"f": false}, {"f": true}, {"f": null}, {}, {"f": false}]"#);
+        let r = req(None, Some(""), Some(filter(false.into())));
+        assert_eq!(extract(&d, &r), Ok(2));
+        let r = req(None, Some(""), Some(filter(true.into())));
+        assert_eq!(extract(&d, &r), Ok(1));
+        // The text "false" is not the boolean false: a type mismatch, not a silent 0.
+        let r = req(None, Some(""), Some(filter("false".into())));
+        assert_eq!(
+            extract(&d, &r),
+            Err(ExtractError::FilterTypeMismatch {
+                field: "/f".into(),
+                expected: "string"
+            })
+        );
+        let d = doc(r#"[{"f": "false"}, {"f": 0}]"#);
+        let r = req(None, Some(""), Some(filter(false.into())));
+        assert_eq!(
+            extract(&d, &r),
+            Err(ExtractError::FilterTypeMismatch {
+                field: "/f".into(),
+                expected: "boolean"
+            })
+        );
+        // `contains` on a non-string value is a mismatch as well.
+        let contains = ElementFilter {
+            field: "/f".into(),
+            contains: Some("x".into()),
+            equals: None,
+        };
+        let d = doc(r#"[{"f": "x"}, {"f": 5}]"#);
+        assert!(matches!(
+            extract(&d, &req(None, Some(""), Some(contains))),
+            Err(ExtractError::FilterTypeMismatch { .. })
+        ));
+    }
+
+    /// An immich `GET /api/queues/{name}` body (immich v2.4.0 and later).
+    fn immich_queue(name: &str, waiting: u64, delayed: u64, active: u64) -> Reply {
+        immich_queue_paused(name, false, waiting, delayed, active)
+    }
+
+    /// As [`immich_queue`], paused or not. From v4.0 a paused queue's jobs are reported
+    /// under `waiting` (the deprecated `paused` statistic stays 0).
+    fn immich_queue_paused(
+        name: &str,
+        paused: bool,
+        waiting: u64,
+        delayed: u64,
+        active: u64,
+    ) -> Reply {
+        Reply::json(&format!(
+            r#"{{"name": "{name}", "isPaused": {paused}, "statistics": {{"active": {active}, "completed": 1204, "failed": 3, "delayed": {delayed}, "waiting": {waiting}, "paused": 0}}}}"#
+        ))
+    }
+
+    fn immich_env(name: &str) -> Option<String> {
+        (name == "IMMICH_API_KEY").then(|| "imm-key\n".to_string())
+    }
+
+    #[tokio::test]
+    async fn immich_sums_waiting_and_delayed_as_ready_and_active_in_flight_over_ml_queues() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("immich-queues", &server);
+        assert_eq!(classes, [ClassId::from("immich-ml")]);
+        server.set(
+            "/api/queues/smartSearch",
+            immich_queue("smartSearch", 5, 1, 2),
+        );
+        server.set(
+            "/api/queues/faceDetection",
+            immich_queue("faceDetection", 0, 0, 1),
+        );
+        server.set("/api/queues/ocr", immich_queue("ocr", 3, 2, 0));
+        // Other queues are never read.
+        server.set("/api/jobs", Reply::json(r#"{"waiting": 99}"#));
+        let client = build_client(&params).unwrap();
+        let report = poll(&client, &spec, &params, &classes, &immich_env).await;
+        // (5+1) + (0+0) + (3+2) ready; 2 + 1 + 0 running.
+        assert_eq!(demand(&report), (11, 3));
+        let seen: Vec<(String, Option<String>)> = server.requests_with_header("x-api-key");
+        assert_eq!(
+            seen,
+            [
+                (
+                    "/api/queues/smartSearch".to_string(),
+                    Some("imm-key".to_string())
+                ),
+                (
+                    "/api/queues/faceDetection".to_string(),
+                    Some("imm-key".to_string())
+                ),
+                ("/api/queues/ocr".to_string(), Some("imm-key".to_string())),
+            ]
+        );
+        // The key goes in its own header only, with no prefix and no Authorization header.
+        assert!(server.requests().iter().all(|(_, auth)| auth.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_paused_immich_queue_counts_as_zero_and_an_unreadable_pause_flag_fails() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("immich-queues", &server);
+        let client = build_client(&params).unwrap();
+        server.set(
+            "/api/queues/smartSearch",
+            immich_queue_paused("smartSearch", true, 40, 2, 1),
+        );
+        server.set(
+            "/api/queues/faceDetection",
+            immich_queue("faceDetection", 2, 1, 1),
+        );
+        server.set("/api/queues/ocr", immich_queue_paused("ocr", true, 7, 0, 0));
+        // Only faceDetection counts: (2+1) ready, 1 running.
+        assert_eq!(
+            demand(&poll(&client, &spec, &params, &classes, &immich_env).await),
+            (3, 1)
+        );
+        // Every queue paused: no demand at all, but still an observation (known zero).
+        server.set(
+            "/api/queues/faceDetection",
+            immich_queue_paused("faceDetection", true, 2, 1, 1),
+        );
+        assert_eq!(
+            demand(&poll(&client, &spec, &params, &classes, &immich_env).await),
+            (0, 0)
+        );
+        // No isPaused, a null one or a non-boolean one: a failure, not a guess either way.
+        for body in [
+            r#"{"name": "ocr", "statistics": {"active": 0, "delayed": 0, "waiting": 4}}"#,
+            r#"{"name": "ocr", "isPaused": null, "statistics": {"active": 0, "delayed": 0, "waiting": 4}}"#,
+            r#"{"name": "ocr", "isPaused": "false", "statistics": {"active": 0, "delayed": 0, "waiting": 4}}"#,
+        ] {
+            server.set("/api/queues/ocr", Reply::json(body));
+            match poll(&client, &spec, &params, &classes, &immich_env).await {
+                Report::Failed { error, .. } => {
+                    assert!(
+                        error.contains("request 2") && error.contains("/isPaused"),
+                        "{error}"
+                    )
+                }
+                other => panic!("{body}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_when_condition_gates_every_number_of_its_response() {
+        let mut r = req(Some("/a"), None, None);
+        r.also = vec![sched_model::ExtraCount {
+            count: "/b".into(),
+            counts_as: CountsAs::InFlight,
+        }];
+        r.when = Some(sched_model::ResponseCondition {
+            field: "/s/state".into(),
+            equals: "on".into(),
+        });
+        let d = doc(r#"{"s": {"state": "on"}, "a": 2, "b": 3}"#);
+        assert_eq!(
+            request_numbers(&d, &r),
+            Ok(vec![(CountsAs::Ready, 2), (CountsAs::InFlight, 3)])
+        );
+        // Not holding: nothing is read, so even missing numbers do not matter.
+        let d = doc(r#"{"s": {"state": "off"}}"#);
+        assert_eq!(request_numbers(&d, &r), Ok(vec![]));
+        assert_eq!(
+            request_numbers(&doc(r#"{"a": 2, "b": 3}"#), &r),
+            Err(ExtractError::Missing("/s/state".into()))
+        );
+        assert_eq!(
+            request_numbers(&doc(r#"{"s": {"state": 1}, "a": 2, "b": 3}"#), &r),
+            Err(ExtractError::FilterTypeMismatch {
+                field: "/s/state".into(),
+                expected: "string"
+            })
+        );
+        // Numbers compare numerically.
+        r.when = Some(sched_model::ResponseCondition {
+            field: "/v".into(),
+            equals: 2.0.into(),
+        });
+        assert_eq!(
+            request_numbers(&doc(r#"{"v": 2, "a": 1, "b": 0}"#), &r)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            request_numbers(&doc(r#"{"v": 2.0, "a": 1, "b": 0}"#), &r)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            request_numbers(&doc(r#"{"v": 3, "a": 1, "b": 0}"#), &r),
+            Ok(vec![])
+        );
+        // Without a condition, the numbers are read as before.
+        r.when = None;
+        assert_eq!(
+            request_numbers(&doc(r#"{"a": 1, "b": 0}"#), &r),
+            Ok(vec![(CountsAs::Ready, 1), (CountsAs::InFlight, 0)])
+        );
+    }
+
+    #[test]
+    fn where_equals_matches_numbers_numerically_and_never_text() {
+        let r = req(
+            None,
+            Some(""),
+            Some(ElementFilter {
+                field: "/n".into(),
+                contains: None,
+                equals: Some(123.0.into()),
+            }),
+        );
+        let d = doc(r#"[{"n": 123}, {"n": 123.0}, {"n": 124}, {"n": null}, {}]"#);
+        assert_eq!(extract(&d, &r), Ok(2));
+        // The text "123" is not the number 123: a type mismatch fails the poll.
+        assert_eq!(
+            extract(&doc(r#"[{"n": 123}, {"n": "123"}]"#), &r),
+            Err(ExtractError::FilterTypeMismatch {
+                field: "/n".into(),
+                expected: "number"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn immich_fails_on_a_missing_key_queue_or_statistic() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("immich-queues", &server);
+        let client = build_client(&params).unwrap();
+        server.set(
+            "/api/queues/smartSearch",
+            immich_queue("smartSearch", 1, 0, 0),
+        );
+        server.set(
+            "/api/queues/faceDetection",
+            immich_queue("faceDetection", 1, 0, 0),
+        );
+        server.set("/api/queues/ocr", immich_queue("ocr", 1, 0, 0));
+        match poll(&client, &spec, &params, &classes, &no_env).await {
+            Report::Failed { error, .. } => assert!(error.contains("IMMICH_API_KEY"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(server.requests().is_empty());
+        // An immich older than v2.4.0 has no such endpoint.
+        server.set("/api/queues/ocr", Reply::status(404));
+        match poll(&client, &spec, &params, &classes, &immich_env).await {
+            Report::Failed { error, .. } => {
+                assert!(
+                    error.contains("request 2") && error.contains("404"),
+                    "{error}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        // A body without the nested statistic is a failure, not a zero.
+        server.set(
+            "/api/queues/ocr",
+            Reply::json(
+                r#"{"name": "ocr", "isPaused": false, "statistics": {"active": 0, "waiting": 4}}"#,
+            ),
+        );
+        match poll(&client, &spec, &params, &classes, &immich_env).await {
+            Report::Failed { error, .. } => {
+                assert!(error.contains("/statistics/delayed"), "{error}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Wrong key: immich answers 401.
+        server.set("/api/queues/smartSearch", Reply::status(401));
+        match poll(&client, &spec, &params, &classes, &immich_env).await {
+            Report::Failed { error, .. } => assert!(error.contains("HTTP 401"), "{error}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -985,7 +1418,7 @@ mod tests {
             Reply::json(r#"{"recordings": {"pending": 4}, "queue": {"jobs_queued": 2}}"#),
         );
         let client = build_client(&params).unwrap();
-        match poll(&client, &spec, &params, &classes, &env).await {
+        match poll_now(&client, &spec, &params, &classes, &env).await {
             Report::Failed { error, .. } => {
                 assert!(error.contains("/queue/jobs_processing"), "{error}")
             }
@@ -993,7 +1426,7 @@ mod tests {
         }
         server.set(SPEAKR_STATS, stats(4, 2, 5));
         assert_eq!(
-            demand(&poll(&client, &spec, &params, &classes, &env).await),
+            demand(&poll_now(&client, &spec, &params, &classes, &env).await),
             (6, 5)
         );
     }
