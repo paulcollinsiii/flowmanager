@@ -47,8 +47,8 @@ What is carried out and what is not:
 - **Allowing, draining and pausing** take effect through the allowed set: KEDA converges
   replicas on it. The set is published in process on a `tokio::sync::watch` channel
   (`Shared::subscribe_allowed`, a `watch::Receiver<Option<PublishedAllowed>>`, `None` until
-  the first tick of the process). The KEDA scaler that serves it is a later phase; until it
-  exists nothing outside the process reads the set.
+  the first tick of the process) and served to KEDA by the external scaler in the same
+  binary (see *KEDA external scaler* below).
 - **Power is manual.** Each powered resource has `power.control: manual | managed`
   (default `manual`; the example config says `manual` for both hosts). Under `manual` the
   scheduler never emits a power step and never takes responsibility for a host's power:
@@ -83,12 +83,117 @@ PAPERLESS_API_TOKEN=... SPEAKR_API_TOKEN=... \
 restate deployments register http://localhost:9080
 ```
 
+- `--keda-listen` (or `SCHED_KEDA_LISTEN`, default `0.0.0.0:9095`) is the KEDA external
+  scaler's gRPC address; see below.
 - `--config` (or `SCHED_CONFIG`) is re-read every `--reload-interval`; an invalid file is
   logged and the last good config stays active. In the cluster this is a mounted ConfigMap.
 - Tokens come from environment variables or files named in a source's `auth`, never from the config.
 - Backstop: `arm_backstop` starts a self-scheduling `backstop` chain (delayed send to itself,
   every `--backstop`); the binary calls it through `--restate-ingress` until Restate accepts.
   Changed observations ask for an extra `tick` the same way, and so does every lease change.
+
+## KEDA external scaler
+
+The binary serves KEDA's external scaler protocol (`externalscaler.ExternalScaler`, the
+proto vendored from KEDA v2.21.0 in `crates/sched-keda/proto`) on `--keda-listen` /
+`SCHED_KEDA_LISTEN` (default `0.0.0.0:9095`), as plaintext gRPC: in the cluster Istio
+provides mTLS, so the trigger leaves `enableTLS` off. It is a lookup over the allowed set
+the latest tick published and nothing else; it runs on its own task, so a scaler call
+never waits on a tick and a tick never waits on a scaler call.
+
+**Metadata.** Each ScaledObject names exactly one subject in its trigger's `metadata`:
+
+| Key | Active while |
+| --- | --- |
+| `model: <id>` | that model is in the allowed set (its pods may run: loading, serving or winding down). For a model's own Deployment. |
+| `class: <id>` | that workload class is in the allowed set (every requirement met). For consumers gated on a class, e.g. a client that may run only while its host is ready. |
+
+Which workload follows which model or class lives only in the ScaledObjects and the
+scheduler config, never in code. KEDA passes its own trigger keys on too, so
+`scalerAddress`, `enableTLS` and `unsafeSsl` are accepted and ignored. Anything else is
+refused with gRPC `InvalidArgument` and a message naming the ScaledObject: no subject,
+both, any other key, an empty value, or an id the **active** config does not have
+(model and class ids are separate: a class id under `model` is unknown). Ids are checked
+against the config as it is now, so a reload takes effect at once: an added id is
+answered from the allowed set (inactive until a tick allows it); a removed id is refused,
+even while it is still in the last published set.
+
+**Answers.**
+
+| RPC | Answer |
+| --- | --- |
+| `IsActive` | `true` while allowed. |
+| `StreamIsActive` (`external-push`) | The current answer at once, then again each time this ScaledObject's answer changes (not when another's does, nor on a tick that leaves it as it was). The stream ends with the error if the answer turns into one (the id left the config, or the scheduler is stopping), and the server stops watching when KEDA goes away. |
+| `GetMetricSpec` | One metric, `flowmanager-model-<id>` or `flowmanager-class-<id>`, target `1`. |
+| `GetMetrics` | That metric: `1` while allowed, else `0` (both the deprecated integer and the float field). Another metric name is `InvalidArgument`. |
+| `StreamMetricSpec` | `Unimplemented` (the spec never changes; KEDA falls back to `GetMetricSpec`). |
+
+**Not ready.** Until this process has published its first tick (`None` on the channel),
+every call answers `Unavailable`, never "inactive"; so does every call once the
+scheduler has dropped its sender (the process is stopping), since that answer could no
+longer change. After a restart the scaler is not ready again until the first tick (the
+backstop, armed at startup, ticks within seconds), which answers from the decision made
+on the persisted state. KEDA v2.21 leaves the replica count as it is when the scaler
+errors and the ScaledObject has no `fallback`: it neither scales from zero nor to zero.
+An "inactive" answer instead would scale everything down whenever the scheduler
+restarts. For the same reason a ScaledObject whose metadata is broken, or whose id was
+removed from the config, keeps its current replica count (a removed model that was
+running keeps running) until it is fixed or deleted; KEDA reports the scaler error on
+the ScaledObject.
+
+**ScaledObjects.** Replicas are exactly 0 or 1, so `minReplicaCount: 0` and
+`maxReplicaCount: 1`. Keep `pollingInterval` and `cooldownPeriod` short: hysteresis is
+the scheduler's (dwell, idle grace), and a long cooldown only delays a drain the
+sequencer is waiting for. Do **not** set `fallback` (on errors it would set a replica
+count the scheduler never decided), and make the scaler the **only** trigger (KEDA
+activates on any trigger, so another one could start a model that is not allowed).
+Remove any `autoscaling.keda.sh/paused-replicas` annotation left by the retired legacy
+gating (see `kubernetes-requirements.md`).
+
+```yaml
+# A model's Deployment, polled.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: mineru
+  namespace: paperless
+spec:
+  scaleTargetRef:
+    name: mineru
+  minReplicaCount: 0
+  maxReplicaCount: 1
+  pollingInterval: 5      # seconds
+  cooldownPeriod: 15      # seconds from the last active answer to scaling to zero
+  # No fallback: when the scaler errors (not ready), KEDA keeps the replica count.
+  triggers:
+    - type: external
+      metadata:
+        scalerAddress: flowmanager.flowmanager.svc.cluster.local:9095
+        model: mineru
+---
+# A consumer gated on a class, pushed: StreamIsActive tells KEDA as soon as it changes.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: paperless-gpt
+  namespace: paperless
+spec:
+  scaleTargetRef:
+    name: paperless-gpt
+  minReplicaCount: 0
+  maxReplicaCount: 1
+  pollingInterval: 5
+  cooldownPeriod: 15
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: flowmanager.flowmanager.svc.cluster.local:9095
+        class: paperless-gpt-host   # a class id from the scheduler config
+```
+
+To query it by hand, `cargo run -p sched-keda --example scaler_probe -- <addr> model=mineru`
+calls `IsActive`, `GetMetricSpec` and `GetMetrics` once (`--stream` follows
+`StreamIsActive`); see `crates/sched-keda/examples/scaler_probe.rs`.
 
 ## How state persists
 
