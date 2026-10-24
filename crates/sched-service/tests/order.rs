@@ -114,6 +114,7 @@ fn assert_order_independent(
                 now: Millis(NOW),
                 observations: all,
                 leases: l,
+                unobservable: Default::default(),
             };
             let got = decide(&config, &snap, st).unwrap();
             runs += 1;
@@ -440,7 +441,7 @@ proptest! {
         let st = state(if serving {
             "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: 5 }\n"
         } else { IDLE });
-        let snap = |o: Vec<Observation>, l: Vec<Lease>| Snapshot { config_generation: 0, now: Millis(NOW), observations: o, leases: l };
+        let snap = |o: Vec<Observation>, l: Vec<Lease>| Snapshot { config_generation: 0, now: Millis(NOW), observations: o, leases: l, unobservable: Default::default() };
         let a = decide(&config, &snap(observations.clone(), leases.clone()), &st).unwrap();
         // A deterministic scramble from the generated seed.
         let mut o2 = observations.clone();

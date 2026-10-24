@@ -128,6 +128,7 @@ pub fn run(config: &Config, scenario: &Scenario) -> Result<Vec<FrameResult>, Cor
             now: frame.at,
             observations: world.values().cloned().collect(),
             leases: leases.clone(),
+            unobservable: Default::default(),
         };
         let (intent, decision) = decide(config, &snapshot, &state)?;
         let violations = invariants::check(config, &snapshot, &state, &intent, &decision);

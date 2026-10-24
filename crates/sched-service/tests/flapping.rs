@@ -148,6 +148,7 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
             now: Millis(now),
             observations,
             leases: vec![],
+            unobservable: Default::default(),
         };
         let (intent, decision) = decide(config, &snap, &state).unwrap();
         let bad = invariants::check(config, &snap, &state, &intent, &decision);

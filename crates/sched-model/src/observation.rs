@@ -84,7 +84,7 @@ impl ObservedValue {
 }
 
 /// Everything the planner and sequencer see for one tick.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     /// The config generation this tick is pinned to.
@@ -95,6 +95,13 @@ pub struct Snapshot {
     pub observations: Vec<Observation>,
     #[serde(default)]
     pub leases: Vec<Lease>,
+    /// Demand sources that can never report in this build (no observer for their kind, or
+    /// an observable kind configured without params, and nothing can push to them) and
+    /// that have never reported. A class fed by one of them, with no observation in the
+    /// snapshot, counts as having no demand rather than unknown demand. Decided by the
+    /// service, which knows which observers run; the core only reads it.
+    #[serde(default)]
+    pub unobservable: std::collections::BTreeSet<SourceId>,
 }
 
 impl Snapshot {
@@ -299,6 +306,7 @@ mod tests {
             now: Millis(1000),
             observations,
             leases: vec![],
+            unobservable: Default::default(),
         }
     }
 

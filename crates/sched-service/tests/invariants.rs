@@ -78,6 +78,7 @@ fn snap(observations: Vec<sched_model::Observation>, leases: Vec<Lease>) -> Snap
         now: Millis(NOW),
         observations,
         leases,
+        unobservable: Default::default(),
     }
 }
 

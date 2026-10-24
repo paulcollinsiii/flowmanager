@@ -138,6 +138,7 @@ fn snapshot(observations: Vec<Observation>) -> Snapshot {
         now: Millis(NOW),
         observations,
         leases: vec![],
+        unobservable: Default::default(),
     }
 }
 

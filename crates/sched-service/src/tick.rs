@@ -65,12 +65,14 @@ pub struct TickReport {
     /// an earlier one), and it is silent or stale. A real problem. Unknown is not zero:
     /// such a tick is never `idle`.
     pub unknown_demand: Vec<ClassId>,
-    /// Classes whose demand is unknown because this build has no observer for their source
-    /// kind (schedule, session, ...) and nothing has ever pushed to it. Expected for now,
-    /// and kept apart so it cannot drown `unknown_demand`.
+    /// Classes whose demand cannot be observed because this build has no observer for their
+    /// source kind (schedule, session, ...) and the source has never reported. Nothing can
+    /// push to it either (`observe` is ingress-private), so such a class counts as having
+    /// no demand: idle, not busy.
     pub unsupported_demand: Vec<ClassId>,
     /// Classes whose source is of an observable kind but configured without `params`, and
-    /// has never been pushed to: nothing polls it. A config gap, still not idle.
+    /// has never reported: nothing polls it. A config gap; counted as no demand, like
+    /// `unsupported_demand`.
     pub unpolled_demand: Vec<ClassId>,
     /// Distinct decision kinds (see `reason::step_kind`), `idle` for none, `error` on failure.
     pub kinds: Vec<String>,
@@ -275,22 +277,28 @@ impl Shared {
             )
         };
         snapshot.leases = leases.clone();
+        // Sources that can never report: nothing observes them in this build and, `observe`
+        // being ingress-private, nothing outside Restate can push to them. If they have
+        // never reported, their classes have no demand (see `Snapshot::unobservable`). One
+        // that has reported before (in any process) is merely silent: unknown, as before.
+        snapshot.unobservable = config
+            .sources()
+            .iter()
+            .filter(|s| observer_state(s) != ObserverState::Running)
+            .filter(|s| !reported.contains(&s.id))
+            .map(|s| s.id.clone())
+            .collect();
         let mut gaps = DemandGaps::default();
         for c in config.classes() {
             let Some(d) = &c.demand else { continue };
-            if class_work(&config, &snapshot, c).known {
-                continue;
+            if snapshot.unobservable.contains(&d.source) {
+                match config.source(&d.source).map(observer_state) {
+                    Some(ObserverState::NoParams) => gaps.unpolled.push(c.id.clone()),
+                    _ => gaps.unsupported.push(c.id.clone()),
+                }
+            } else if !class_work(&config, &snapshot, c).known {
+                gaps.unknown.push(c.id.clone());
             }
-            let state = config.source(&d.source).map(observer_state);
-            let silent_before = reported.contains(&d.source);
-            // Something that has ever reported is merely silent now, whatever feeds it.
-            let list = match state {
-                _ if silent_before => &mut gaps.unknown,
-                Some(ObserverState::NoParams) => &mut gaps.unpolled,
-                Some(ObserverState::NoImplementation) => &mut gaps.unsupported,
-                _ => &mut gaps.unknown,
-            };
-            list.push(c.id.clone());
         }
         let (kinds, reason, steps, allowed, state, error) =
             match decide(&config, &snapshot, &durable.state) {
@@ -987,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn demand_of_sources_without_an_observer_is_reported_apart_and_is_still_not_idle() {
+    fn demand_of_sources_without_an_observer_is_reported_apart_and_counts_as_idle() {
         let (s, _) = shared();
         let mut d = Durable::default();
         cluster(&s);
@@ -1013,7 +1021,17 @@ mod tests {
         // silent, and nothing is built to observe them.
         let r = s.tick(Millis(T0 + 1_000), &mut d);
         assert!(r.unknown_demand.is_empty(), "{:?}", r.unknown_demand);
-        assert_eq!(r.kinds, vec!["demand_unsupported".to_string()], "{r:?}");
+        assert_eq!(
+            r.unsupported_demand,
+            vec![ClassId::from("backup"), ClassId::from("interactive-llm")]
+        );
+        // Nothing can ever report it, so it is no demand: the tick is idle.
+        assert_eq!(
+            r.kinds,
+            vec!["demand_unsupported".to_string(), "idle".to_string()],
+            "{r:?}"
+        );
+        assert!(r.reason.contains("counted as no demand"), "{}", r.reason);
         let text = s.metrics.render();
         assert!(
             text.contains("sched_source_has_observer{source=\"backup-schedule\"} 0"),

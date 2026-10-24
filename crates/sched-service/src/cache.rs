@@ -208,6 +208,7 @@ impl ObservationCache {
                 .cloned()
                 .collect(),
             leases: Vec::new(),
+            unobservable: Default::default(),
         }
     }
 

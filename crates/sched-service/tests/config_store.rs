@@ -12,6 +12,7 @@ fn snapshot(generation: u64) -> Snapshot {
         now: Millis(1_000),
         observations: vec![],
         leases: vec![],
+        unobservable: Default::default(),
     }
 }
 

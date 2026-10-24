@@ -38,7 +38,8 @@ impl ClassWork {
     }
 }
 
-/// The current work of `class`. Classes without a demand source never have work.
+/// The current work of `class`. Classes without a demand source never have work, nor do
+/// classes whose source is listed in `Snapshot::unobservable` and has not reported.
 pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> ClassWork {
     let Some(demand) = &class.demand else {
         return ClassWork::NONE;
@@ -55,6 +56,11 @@ pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> Cl
         ..ClassWork::NONE
     };
     let Some(first) = group.first() else {
+        // A source that can never report and never has: no demand can ever arrive, so
+        // there is none (not "unknown", which would hold models and hosts forever).
+        if snapshot.unobservable.contains(&demand.source) {
+            return ClassWork::NONE;
+        }
         return unknown;
     };
     if !first.is_fresh(snapshot.now, config.policy().max_age_for(&first.value)) {
@@ -111,5 +117,44 @@ pub fn host_is_up(
         None => snapshot
             .fresh_resource_up(config, resource, config.policy().safety_max_age)
             .unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observation::{Fidelity, Observation};
+    use crate::test_support::example_config;
+
+    #[test]
+    fn a_source_that_can_never_report_is_no_demand_until_it_reports() {
+        let config = example_config();
+        let class = config.class(&"interactive-llm".into()).unwrap();
+        let mut snap = Snapshot {
+            now: Millis(1_000_000),
+            ..Snapshot::default()
+        };
+        // Missing reading of an ordinary source: unknown.
+        assert!(!class_work(&config, &snap, class).known);
+        // Listed as unobservable: known, no work.
+        snap.unobservable.insert("llm-sessions".into());
+        let w = class_work(&config, &snap, class);
+        assert!(w.known && !w.busy());
+        // A reading always wins, and a stale one is unknown again.
+        snap.observations.push(Observation {
+            source: "llm-sessions".into(),
+            observed_at: Millis(1),
+            fidelity: Fidelity::Event,
+            value: ObservedValue::Demand {
+                class: "interactive-llm".into(),
+                ready: 1,
+                in_flight: 0,
+                oldest_ready_at: None,
+            },
+        });
+        assert!(!class_work(&config, &snap, class).known);
+        snap.observations[0].observed_at = Millis(999_000);
+        let w = class_work(&config, &snap, class);
+        assert!(w.known && w.busy());
     }
 }

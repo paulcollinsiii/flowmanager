@@ -33,11 +33,12 @@ pub const KIND_ERROR: &str = "error";
 pub const KIND_DEMAND_UNKNOWN: &str = "demand_unknown";
 
 /// Metric label for demand of a source whose kind has no observer in this build and that
-/// nothing has ever pushed to. Expected for now; kept apart from [`KIND_DEMAND_UNKNOWN`].
+/// has never reported. It counts as no demand; kept apart from [`KIND_DEMAND_UNKNOWN`].
 pub const KIND_DEMAND_UNSUPPORTED: &str = "demand_unsupported";
 
 /// Metric label for demand of a source of an observable kind that was configured without
-/// `params`, so nothing polls it, and nothing has pushed to it either. A config gap.
+/// `params`, so nothing polls it, and that has never reported. A config gap; it counts as
+/// no demand.
 pub const KIND_DEMAND_UNPOLLED: &str = "demand_unpolled";
 
 /// Classes whose demand is unknown, by why. None of them is "zero demand".
@@ -54,8 +55,9 @@ impl DemandGaps {
     }
 }
 
-/// The distinct kinds in a decision, sorted; [`KIND_IDLE`] only when there are no steps and
-/// every class's demand is known.
+/// The distinct kinds in a decision, sorted; [`KIND_IDLE`] when there are no steps and no
+/// class's demand is unknown (unobservable demand counts as none, so it does not prevent
+/// `idle`, but its kind is still listed).
 pub fn kinds(steps: &[Step], gaps: &DemandGaps) -> Vec<&'static str> {
     let mut set: BTreeSet<&'static str> = steps.iter().map(step_kind).collect();
     if !gaps.unknown.is_empty() {
@@ -67,7 +69,7 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps) -> Vec<&'static str> {
     if !gaps.unpolled.is_empty() {
         set.insert(KIND_DEMAND_UNPOLLED);
     }
-    if gaps.is_empty() && set.is_empty() {
+    if gaps.unknown.is_empty() && steps.is_empty() {
         set.insert(KIND_IDLE);
     }
     set.into_iter().collect()
@@ -191,13 +193,13 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
     }
     if !gaps.unpolled.is_empty() {
         out.push_str(&format!(
-            "; demand not polled for [{}] (the source is configured without params: nothing polls it and nothing has pushed to it): not idle either",
+            "; demand not polled for [{}] (the source is configured without params and has never reported): counted as no demand",
             ids(&gaps.unpolled)
         ));
     }
     if !gaps.unsupported.is_empty() {
         out.push_str(&format!(
-            "; demand not observable yet for [{}] (no observer for the source kind and nothing has pushed to it): not idle either",
+            "; demand not observable for [{}] (no observer for the source kind in this build, and it has never reported): counted as no demand",
             ids(&gaps.unsupported)
         ));
     }
@@ -256,13 +258,14 @@ mod tests {
             kinds(&[], &gap(&["a"], &[], &[])),
             vec![KIND_DEMAND_UNKNOWN]
         );
+        // Unobservable demand counts as none: still idle, and still labelled.
         assert_eq!(
             kinds(&[], &gap(&[], &["a"], &[])),
-            vec![KIND_DEMAND_UNSUPPORTED]
+            vec![KIND_DEMAND_UNSUPPORTED, KIND_IDLE]
         );
         assert_eq!(
             kinds(&[], &gap(&[], &[], &["a"])),
-            vec![KIND_DEMAND_UNPOLLED]
+            vec![KIND_DEMAND_UNPOLLED, KIND_IDLE]
         );
         assert_eq!(
             kinds(&[], &gap(&["a"], &["b"], &["c"])),

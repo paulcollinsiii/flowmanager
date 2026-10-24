@@ -186,6 +186,11 @@ fn push_pods(p: &Process, w: &World) {
 }
 
 fn push_rest(p: &Process, w: &World) {
+    push_rest_except(p, w, &[]);
+}
+
+/// As `push_rest`, leaving out the demand sources in `skip`.
+fn push_rest_except(p: &Process, w: &World, skip: &[&str]) {
     push(
         p,
         "basestar-probe",
@@ -195,6 +200,9 @@ fn push_rest(p: &Process, w: &World) {
         }],
     );
     for (c, s) in CLASSES {
+        if skip.contains(&s) {
+            continue;
+        }
         let q = w.queues[c];
         push(
             p,
@@ -533,4 +541,54 @@ fn a_released_manual_lease_never_leads_to_a_power_off_under_manual_control() {
         world.step(p.allowed.borrow().clone());
     }
     assert!(released_at.is_some());
+}
+
+/// The user's report from M3 P1: `interactive-llm` (source `llm-sessions`, kind session, no
+/// observer, and nothing can push to it) kept the LLM loaded forever as "unknown demand".
+/// A source that can never report and never has now counts as no demand, so the LLM is
+/// released when its own work is done and other work gets the GPU. Nothing pushes to the
+/// schedule and session sources here, as in the cluster.
+#[test]
+fn demand_that_can_never_be_observed_does_not_keep_a_model_loaded() {
+    let mut store = Store::default();
+    let mut world = World::new();
+    world.queues.get_mut("paperless-tagging").unwrap().ready = 2;
+    let p = start(T0);
+    let mut log = Vec::new();
+    let mut mineru_at = None;
+    for t in 0..120usize {
+        let now = T0 + t as u64 * TICK;
+        p.clock.set(Millis(now));
+        if t == 10 {
+            world.queues.get_mut("paperless-ocr").unwrap().ready = 3;
+        }
+        push_pods(&p, &world);
+        push_rest_except(&p, &world, &["backup-schedule", "llm-sessions"]);
+        let r = tick(&p, &mut store, now);
+        assert_eq!(r.error, None);
+        assert!(r.unknown_demand.is_empty(), "t={t}: {r:?}");
+        assert!(
+            r.unsupported_demand
+                .contains(&ClassId::from("interactive-llm")),
+            "{r:?}"
+        );
+        let published = p.allowed.borrow().clone().unwrap();
+        log.push(format!(
+            "t={t} pods={:?} mode={:?} allowed={:?} steps={:?}",
+            world.pods,
+            mode(&store.load()),
+            gpu_models(&published),
+            r.steps
+        ));
+        assert!(gpu_models(&published).len() <= 1);
+        if published.allowed.models.contains(&ModelId::from("mineru")) {
+            mineru_at.get_or_insert(t);
+        }
+        world.step(p.allowed.borrow().clone());
+    }
+    let dump = log.join("\n");
+    // The LLM served tagging first, then gave way to OCR.
+    assert!(log[2].contains("\"llm\""), "{dump}");
+    assert!(mineru_at.is_some(), "the LLM was never released\n{dump}");
+    assert_eq!(world.queues["paperless-ocr"].ready, 0, "{dump}");
 }

@@ -84,7 +84,8 @@ fn host_up(config: &Config, snap: &Snapshot, res: &ResourceId, max_age: Millis) 
 }
 
 /// `Some((busy, in_flight))` for a class, `None` when its demand is unknown (missing, stale
-/// or future-dated). Conservative over ties: the busiest reading.
+/// or future-dated). Conservative over ties: the busiest reading. A source listed as
+/// unobservable that has no reading is no demand.
 fn demand(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<(bool, bool)> {
     let src = &class.demand.as_ref()?.source;
     let seen: Vec<_> = snap
@@ -101,7 +102,10 @@ fn demand(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<(bool, 
             _ => None,
         })
         .collect();
-    let latest = seen.iter().map(|x| x.0).max()?;
+    let Some(latest) = seen.iter().map(|x| x.0).max() else {
+        // A source that can never report and never has: no demand.
+        return snap.unobservable.contains(src).then_some((false, false));
+    };
     let (now, max_age) = (snap.now.as_u64(), config.policy().demand_max_age.as_u64());
     if latest > now || now - latest > max_age {
         return None;
