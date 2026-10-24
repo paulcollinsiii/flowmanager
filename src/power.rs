@@ -256,8 +256,9 @@ impl PowerObject {
     }
 
     /// Asks the host to shut down over the forced-command SSH key, then waits for
-    /// its port to stop answering. Draining is the caller's job: pause the KEDA
-    /// groups and wait for the holders to clear before calling this.
+    /// its port to stop answering. Draining is the caller's job: make sure nothing
+    /// still uses the server (the scheduler's allowed set no longer includes its
+    /// workloads, and their pods are gone) before calling this.
     #[handler]
     async fn power_off(&self, ctx: ObjectContext<'_>) -> Result<Json<PowerOutcome>, HandlerError> {
         let name = ctx.key().to_string();
@@ -360,9 +361,6 @@ mod tests {
             wol_interface: "lan".into(),
             shutdown_user: user.map(str::to_string),
             host_key: key.map(str::to_string),
-            groups: vec![],
-            drain: None,
-            exclusive_roles: false,
         }
     }
 

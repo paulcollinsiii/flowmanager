@@ -5,7 +5,6 @@ use restate_sdk::http_server::HttpServer;
 
 
 mod cluster;
-mod keda;
 mod opnsense;
 mod power;
 
@@ -48,10 +47,6 @@ struct Config {
     /// PEM bundle of the CA that signed the router's certificate. If unset, the platform roots are used.
     #[clap(long)]
     opnsense_ca_path: Option<String>,
-
-    /// How long to wait for pods to stop using a server before powering it off.
-    #[clap(long, default_value_t = 300)]
-    drain_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -71,8 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     HttpServer::new(
         Endpoint::builder()
-            .bind(keda::KedaGroup::new(kube.clone(), std::time::Duration::from_secs(config.drain_timeout_secs)))
-            .bind(keda::KedaCatalog::new(kube.clone()))
             .bind(power::PowerObject::new(
                 kube,
                 std::time::Duration::from_secs(config.wake_timeout_secs),

@@ -1,8 +1,19 @@
 # Kubernetes requirements
 
-What flowmanager reads from the cluster, and what it needs permission to do.
-Nothing is hand-listed in this repo: servers and groups are discovered from labels.
-The conventions below come from `homesvr/ops/scripts/power.py`, which this replaces.
+What the legacy flowmanager app (the root crate, `src/`: the `PowerObject` Restate
+handlers) reads from the cluster, and what it needs permission to do. Nothing is
+hand-listed in this repo: servers are discovered from labels. The conventions below
+come from `homesvr/ops/scripts/power.py`, which this replaces.
+
+> **Retired in M3: KEDA group gating.** The legacy app used to gate workloads itself
+> (`KedaGroup` / `KedaCatalog`: the `power.kaffi.internal/group` and `gpu-role` labels on
+> ScaledObjects, and the `autoscaling.keda.sh/paused-replicas` annotation it set and
+> removed). That code is gone. Workloads are now gated by the scheduler's KEDA external
+> scaler (`sched-service`, `--keda-listen`): each ScaledObject has one `external` or
+> `external-push` trigger pointing at it, with `model: <id>` or `class: <id>` in its
+> metadata. See the README section *KEDA external scaler*. The sections below that
+> belonged to the gating are kept, marked retired, so existing objects can be cleaned
+> up; see *Migrating a gated ScaledObject*.
 
 ## Servers (ConfigMaps)
 
@@ -15,34 +26,17 @@ The label value is the server name and the key of its Restate `PowerObject`.
 | `PORT` | no | TCP port that answers when the server is up. Default 2049. |
 | `MAC` | yes | MAC of the NIC that wakes the server. |
 | `WOL_INTERFACE` | no | OPNsense interface the router sends the magic packet out of (`lan`, `opt1`, ...). Default `lan`. |
-| `GROUPS` | for KEDA | Comma-separated KEDA groups this server serves. |
-| `DRAIN` | to power off a group | `nfs` or `gpu`: how to find pods still holding the server. |
 | `SHUTDOWN_USER` | to power off | SSH user with the forced-command key. |
 | `HOST_KEY_FPR` | to power off | Pinned SSH host key, as `ssh-keygen -lf` prints it: `SHA256:...`. |
-| `EXCLUSIVE_ROLES` | no | `true` or `false` (default). See below. |
 
-A group may be served by at most one server. A server may serve several groups, but
-turning one group off is refused while another group on the same server still has a
-workload that is not paused.
+**Retired (M3):** `GROUPS`, `DRAIN` and `EXCLUSIVE_ROLES` were read only by the KEDA
+group handlers. They are no longer read; a ConfigMap that still has them works, and
+they can be deleted. Which model may run on the GPU is the scheduler's decision now,
+from its own configuration (`config/example.yaml`), not from server ConfigMaps.
 
-### EXCLUSIVE_ROLES
+## ~~Workloads (KEDA ScaledObjects)~~ (retired in M3)
 
-Roles are not declared anywhere; they are the distinct values of the
-`power.kaffi.internal/gpu-role` label on a group's ScaledObjects. Whether two roles
-can run together is a fact about the hardware, so the server says so:
-
-* `EXCLUSIVE_ROLES: "true"`: the roles share one resource and cannot coexist (the
-  single GPU on cuda-central: OCR, the LLM and speech recognition). A role mode holds
-  that role's ScaledObjects at one replica and pauses every other role.
-* `EXCLUSIVE_ROLES: "false"` or absent: a role mode still holds its own role at one
-  replica, but other roles are left to KEDA.
-
-Either way, a ScaledObject with no role is not touched by a role mode. It follows
-the server: it runs whenever the server is on and KEDA wants it.
-
-Set it on cuda-central. Leave it off basestar, which has no roles.
-
-## Workloads (KEDA ScaledObjects)
+What follows described the retired gating, for reference while cleaning up.
 
 | Label | Meaning |
 |---|---|
@@ -61,10 +55,22 @@ Set it on cuda-central. Leave it off basestar, which has no roles.
   annotation out of git and set `kustomize.toolkit.fluxcd.io/ssa: Merge` on it so
   Flux keeps annotations that other tools add.
 
-## Nodes and pods (draining)
+### Migrating a gated ScaledObject
 
-Before a server is powered off, flowmanager waits (bounded by `--drain-timeout-secs`)
-for the pods that hold it to exit. It does not cordon, evict or delete anything.
+1. **Remove the `autoscaling.keda.sh/paused-replicas` annotation** (from git, and from
+   the live object if the legacy app set it). While it is set, KEDA keeps the object
+   paused at that count whatever any scaler says.
+2. Remove the `power.kaffi.internal/group` and `power.kaffi.internal/gpu-role` labels;
+   nothing reads them.
+3. Replace the triggers with the single scheduler trigger described in the README
+   (*KEDA external scaler*): `minReplicaCount: 0`, `maxReplicaCount: 1`, no `fallback`.
+
+## ~~Nodes and pods (draining)~~ (retired in M3)
+
+The drain wait belonged to the group handler's `off` mode and went with it, along with
+the `--drain-timeout-secs` flag. `PowerObject/power_off` never drained: it shuts the
+host down when asked, so the caller must make sure nothing still uses it. For reference,
+the retired rules were:
 
 * `DRAIN: gpu`: any non-terminal pod that is not owned by a DaemonSet and either
   requests `nvidia.com/gpu` or runs on a node labelled `kaffi.internal/gpu=nvidia`.
@@ -72,13 +78,12 @@ for the pods that hold it to exit. It does not cordon, evict or delete anything.
 * `DRAIN: nfs`: any non-terminal pod that mounts a PersistentVolume backed by NFS, or
   has an inline `nfs:` volume (any server, to be conservative).
 
-Pods not owned by a gated ScaledObject must be stopped by hand; the drain timeout
-lists them.
-
 ## Permissions
 
-All discovery is cluster-wide, because servers, ScaledObjects and pods live in many
-namespaces. Nothing is watched, created or deleted.
+Server discovery is cluster-wide, because the server ConfigMaps may live in any
+namespace. Nothing is watched, created, patched or deleted. (Before M3 the gating also
+needed `list` and `patch` on `keda.sh` `scaledobjects` and `list` on pods,
+persistentvolumes and nodes; drop those rules.)
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -90,23 +95,15 @@ rules:
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [list]
-  # Workloads: find gates, then pause/hold/unpause them by annotation.
-  - apiGroups: [keda.sh]
-    resources: [scaledobjects]
-    verbs: [list, patch]
-  # Draining: find the pods and volumes that hold a server.
-  - apiGroups: [""]
-    resources: [pods, persistentvolumes, nodes]
-    verbs: [list]
 ```
 
 * `configmaps: list` is cluster-wide, so flowmanager can read every ConfigMap in the
   cluster. It filters by label on the server side, but RBAC cannot restrict by label.
   If that is too broad, move the server ConfigMaps into one namespace and use a
-  Role there, then change `list_servers` to a namespaced `Api`.
+  Role there, then change `find_server` to a namespaced `Api`.
 * `get` is not needed; everything is a `list` with a label selector.
-* `patch` on ScaledObjects uses a merge patch with field manager `flowmanager`, and
-  only touches `metadata.annotations["autoscaling.keda.sh/paused-replicas"]`.
+* The scheduler's KEDA external scaler needs no Kubernetes permissions: KEDA calls it
+  over gRPC, so only the network path from KEDA's operator to `--keda-listen` is needed.
 * The SSH shutdown key is a mounted file, not read through the API, so the pod needs
   no access to Secrets.
 
