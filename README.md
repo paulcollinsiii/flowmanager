@@ -84,7 +84,16 @@ restate deployments register http://localhost:9080
   always `demand_unknown`. Dashboards or alerts on the old name need updating.
 - **Bounding `http_json` by age**: a request may carry `since: { param, ago }`; each poll
   appends `param=<now - ago>` (ISO 8601 UTC, from the scheduler's clock). The example config
-  uses it for speakr's failed recordings (a 6h window; see Known blind spots).
+  uses it for speakr's failed recordings (a 15m window; see Known blind spots).
+- **`http_json` conditions**: `where: { field, contains | equals }` keeps the items of a
+  `length` array whose field matches; `when: { field, equals }` counts a whole response (its
+  own and its `also` numbers) only if a field of it has that value, else it contributes zero.
+  `equals` keeps the YAML scalar's type: `equals: false` / `true` is a JSON boolean and
+  `equals: 3` a JSON number (compared numerically); quote it (`"true"`, `"3"`) to compare text.
+  **Behaviour change (M3):** an item whose `where` field holds a non-null value of another
+  JSON type, or a response whose `when` field is missing or of another type, now fails the
+  whole source (its demand becomes unknown) instead of silently counting low. Before M3 a
+  number after `equals:` was compared as text.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - Handlers: `observe` (push observations; dated on receipt, never by the sender), `tick`,
@@ -120,28 +129,35 @@ never reported), and whether a source is failing (`sched_source_errors_total`).
 What shadow output (and the M2 sources) cannot see or get wrong. Read these before trusting a
 "no demand" or "idle" line.
 
-- **Failed speakr transcriptions count as demand only for 6 hours, and are not re-queued.**
-  `speakr-pending` lists FAILED recordings updated in the last 6h and counts those with
-  `has_summary: false` as ready `speakr-transcription` work (speakr stores a failed summary's
-  error in `summary`, every other failure's in `transcription`), so a whisperX outage brings
-  whisperX in. Nothing re-queues them yet (that is manual), so a failure keeps counting until
-  it is re-queued or the window passes: whisperX can be held for up to 6h for failures nobody
-  re-queues, and a failure older than 6h is not seen at all. A reprocess-transcription failure
-  on a recording that already has a summary is missed; a failed merge or stitch job counts as
+- **Failed speakr transcriptions count as demand for 15 minutes.** `speakr-pending` lists
+  FAILED recordings updated in the last 15m and counts those with `has_summary: false` as
+  ready `speakr-transcription` work (speakr stores a failed summary's error in `summary`,
+  every other failure's in `transcription`), so a whisperX outage brings whisperX in. 15m is
+  below `age_threshold` (30m), so a failure never reaches starvation priority. A failure
+  counts until it is re-queued or 15m pass; any later edit of a FAILED recording (tags,
+  title, inbox, highlight, share) bumps its `updated_at` and restarts the window; permanent
+  failures (bad file, codec) count too until the window passes; a failure older than 15m is
+  not seen at all. Automatic re-queueing (a later M3 phase) is capped at 2 per recording,
+  after which the recording stays FAILED and ages out. A reprocess-transcription failure on
+  a recording that already has a summary is missed; a failed merge or stitch job counts as
   transcription. More than 100 failures in the window fails the poll rather than under-counting.
 - **Queued speakr summary, merge and stitch jobs count as transcription demand.** The speakr
   `/stats` queue counts jobs of every type, so this is a deliberate, conservative overcount.
 - **speakr `/stats` is scoped to the token's user.** Recordings of other users are not seen.
-- **basestar's reachability is one Prometheus query.** `basestar-probe` reads
-  `probe_success{instance="basestar"}`: 1 is up, 0 is down. If Prometheus is unreachable, the
-  series is missing or duplicated, or the value is anything else, the read fails and the
+- **basestar's reachability is one Prometheus query, and the probe is not set up yet.**
+  `basestar-probe` reads `probe_success{instance="basestar"}`: 1 is up, 0 is down. Until a
+  blackbox probe of basestar exists the source fails every read. If Prometheus is unreachable,
+  the series is missing or there are several (one per blackbox module or job: pin the module/job
+  label in the query), or the value is anything else (including `-0`), the read fails and the
   reading goes stale (decisions needing NFS wait) rather than reading "down". It shows what the
   blackbox probe checks (the host answering), not that the NFS export works. Up/down flips
   only after 3 agreeing readings.
-- **immich demand is the three ML queues only, and needs immich v2.4.0 or later.**
-  `immich-queues` reads `GET /api/queues/{smartSearch,faceDetection,ocr}` with an admin API key
-  (`queue.read`, `IMMICH_API_KEY`); an older immich answers 404 and the source fails. A paused
-  queue's waiting jobs still count as demand.
+- **immich demand is the three ML queues only, through an alpha API.** `immich-queues` reads
+  `GET /api/queues/{smartSearch,faceDetection,ocr}` (added in v2.4.0 and marked alpha there,
+  `.alpha('v2.4.0')`; this deployment runs v4.0 or later) with an admin API key (`queue.read`,
+  `IMMICH_API_KEY`). An immich older than v2.4.0 answers 404 and a changed response shape
+  fails the poll. A paused queue (`isPaused: true`) counts as zero, ready and in-flight; from
+  v4.0 a paused queue reports its jobs under `waiting`, so without that check they would count.
 - **"Reported, then silent" memory resets on restart.** The scheduler remembers that a source
   has reported only in memory; after a restart a silent push-fed source reads as
   "never pushed" (`demand_unsupported` / `demand_unpolled`) until it reports again.
