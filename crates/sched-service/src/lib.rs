@@ -17,6 +17,8 @@ pub mod invariants;
 pub mod leases;
 pub mod metrics;
 pub mod metrics_server;
+pub mod object;
+pub mod persist;
 pub mod reason;
 pub mod replay;
 pub mod runtime;

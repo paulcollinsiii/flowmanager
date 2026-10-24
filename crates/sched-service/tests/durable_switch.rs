@@ -231,10 +231,11 @@ fn mode(d: &Durable) -> ModePhase {
 fn tick(p: &Process, store: &mut Store, now: u64) -> TickReport {
     p.clock.set(Millis(now));
     let mut d = store.load();
+    p.shared.seed_reported(&d.reported);
     let outcome = p.shared.decide(Millis(now), &d);
     d.apply(&outcome);
     store.save(&d);
-    p.shared.publish(&outcome);
+    p.shared.publish(&outcome, false);
     outcome.report
 }
 

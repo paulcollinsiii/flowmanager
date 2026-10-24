@@ -29,6 +29,7 @@ pub struct Metrics {
     has_observer: IntGaugeVec,
     observer_labels: Mutex<HashSet<String>>,
     phase_age: GaugeVec,
+    state_errors: IntCounterVec,
     /// Per (resource, axis), the phase whose series is set and when it began.
     phases: Mutex<HashMap<PhaseKey, (&'static str, Millis)>>,
 }
@@ -137,6 +138,15 @@ impl Metrics {
         )
         .unwrap();
         registry.register(Box::new(phase_age.clone())).unwrap();
+        let state_errors = IntCounterVec::new(
+            Opts::new(
+                "sched_persisted_state_errors_total",
+                "Ticks (and lease requests) that could not read a persisted state key (undecodable or of an unknown version), by key; such a tick publishes nothing",
+            ),
+            &["key"],
+        )
+        .unwrap();
+        registry.register(Box::new(state_errors.clone())).unwrap();
         registry.register(Box::new(has_observer.clone())).unwrap();
         registry.register(Box::new(rejected.clone())).unwrap();
         registry.register(Box::new(decisions.clone())).unwrap();
@@ -170,6 +180,7 @@ impl Metrics {
             has_observer,
             observer_labels: Mutex::new(HashSet::new()),
             phase_age,
+            state_errors,
             phases: Mutex::new(HashMap::new()),
         }
     }
@@ -275,6 +286,11 @@ impl Metrics {
 
     pub fn config_reload(&self, outcome: &str) {
         self.config_reloads.with_label_values(&[outcome]).inc();
+    }
+
+    /// Counts a failed read of the persisted state `key` (a fixed set of keys).
+    pub fn persisted_state_error(&self, key: &str) {
+        self.state_errors.with_label_values(&[key]).inc();
     }
 
     pub fn trigger_failed(&self) {

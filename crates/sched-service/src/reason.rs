@@ -165,6 +165,13 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
         let up: Vec<_> = intent.power_up.keys().map(|r| r.to_string()).collect();
         out.push_str(&format!(", power up [{}]", up.join(", ")));
     }
+    if !intent.forced.is_empty() {
+        let f: Vec<_> = intent.forced.iter().map(|r| r.to_string()).collect();
+        out.push_str(&format!(
+            ", forced [{}] (a manual model lease or a reclaim cuts batch work short: intake paused, in-flight work gets a timeout)",
+            f.join(", ")
+        ));
+    }
     if !intent.reclaim.is_empty() {
         let rc: Vec<_> = intent.reclaim.iter().map(|r| r.to_string()).collect();
         out.push_str(&format!(", reclaim [{}]", rc.join(", ")));

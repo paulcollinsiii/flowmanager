@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{
-    AllowedSet, ClassId, Lease, LeaseId, Millis, ModelId, PublishedAllowed, SchedState, SourceId,
-    Step, class_work,
+    AllowedSet, Capability, ClassId, Lease, LeaseId, Millis, ModelId, PublishedAllowed, ResourceId,
+    SchedState, SourceId, Step, class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,18 @@ pub struct InputReport {
     /// Milliseconds since the newest observation arrived; absent if none ever did.
     pub age_ms: Option<u64>,
     pub last_error: Option<String>,
+    /// Whether something observes the source: `running`, `no_params` (an observable kind
+    /// configured without params) or `no_observer` (no observer for the kind).
+    #[serde(default)]
+    pub observer: String,
+}
+
+fn observer_label(o: ObserverState) -> &'static str {
+    match o {
+        ObserverState::Running => "running",
+        ObserverState::NoParams => "no_params",
+        ObserverState::NoImplementation => "no_observer",
+    }
 }
 
 impl From<&InputAge> for InputReport {
@@ -51,6 +63,29 @@ impl From<&InputAge> for InputReport {
             capability: a.capability.map(|c| c.to_string()),
             age_ms: a.age.map(Millis::as_u64),
             last_error: a.last_error.clone(),
+            observer: observer_label(a.observer).to_string(),
+        }
+    }
+}
+
+impl InputReport {
+    /// Back to the form metrics and log lines are made from.
+    pub fn to_input_age(&self) -> InputAge {
+        InputAge {
+            source: self.source.as_str().into(),
+            capability: match self.capability.as_deref() {
+                Some("pods") => Some(Capability::Pods),
+                Some("reachability") => Some(Capability::Reachability),
+                Some("demand") => Some(Capability::Demand),
+                _ => None,
+            },
+            observer: match self.observer.as_str() {
+                "no_params" => ObserverState::NoParams,
+                "no_observer" => ObserverState::NoImplementation,
+                _ => ObserverState::Running,
+            },
+            age: self.age_ms.map(Millis),
+            last_error: self.last_error.clone(),
         }
     }
 }
@@ -74,6 +109,11 @@ pub struct TickReport {
     /// has never reported: nothing polls it. A config gap; counted as no demand, like
     /// `unsupported_demand`.
     pub unpolled_demand: Vec<ClassId>,
+    /// Exclusive resources where the intent is forced: a manual model lease (or a reclaim)
+    /// cuts batch work short, so intake is paused and in-flight work gets a timeout instead
+    /// of being waited for.
+    #[serde(default)]
+    pub forced: Vec<ResourceId>,
     /// Distinct decision kinds (see `reason::step_kind`), `idle` for none, `error` on failure.
     pub kinds: Vec<String>,
     pub reason: String,
@@ -131,8 +171,6 @@ pub struct TickOutcome {
     pub report: TickReport,
     /// Sources that have ever reported, to persist (configured sources only).
     pub reported: BTreeSet<SourceId>,
-    /// The inputs as one log field.
-    pub inputs_text: String,
     /// How long deciding took, in microseconds.
     pub duration_us: u64,
 }
@@ -167,6 +205,9 @@ pub struct Shared {
     pub changed: tokio::sync::Notify,
     /// The allowed set of the latest tick this process published; `None` until then.
     allowed: watch::Sender<Option<PublishedAllowed>>,
+    /// The latest tick report this process published (decided or failed); what
+    /// `last_decision` returns. Kept in memory so the report is journaled once per tick.
+    last_report: Mutex<Option<TickReport>>,
 }
 
 impl Shared {
@@ -181,7 +222,66 @@ impl Shared {
             last_backstop: AtomicU64::new(0),
             changed: tokio::sync::Notify::new(),
             allowed: watch::channel(None).0,
+            last_report: Mutex::new(None),
         }
+    }
+
+    /// The latest tick report this process published, if any.
+    pub fn last_report(&self) -> Option<TickReport> {
+        self.last_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Remembers in the cache which sources reported before, as the durable state says.
+    /// Idempotent; done before the journaled decision so a replay does it too.
+    pub fn seed_reported(&self, reported: &BTreeSet<SourceId>) {
+        let config = self.config.current();
+        self.cache().seed_reported(&config, reported);
+    }
+
+    /// A tick that cannot decide because the persisted state could not be read: reported,
+    /// logged at error level and counted per key, and nothing is published, so the scaler
+    /// keeps what it had. `problems` are `(key, problem)`.
+    pub fn state_error(&self, now: Millis, problems: &[(String, String)]) -> TickReport {
+        let text = problems
+            .iter()
+            .map(|(k, p)| format!("{k}: {p}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        for (key, _) in problems {
+            self.metrics.persisted_state_error(key);
+        }
+        let report = TickReport {
+            config_generation: self.config.current().generation(),
+            at: now,
+            unknown_demand: vec![],
+            unsupported_demand: vec![],
+            unpolled_demand: vec![],
+            forced: vec![],
+            kinds: vec![reason::KIND_ERROR.to_string()],
+            reason: format!(
+                "no decision: the persisted state cannot be read ({text}); nothing is published and the stored state is left as it is (see the README, Recovering the persisted state)"
+            ),
+            steps: vec![],
+            not_executed: vec![],
+            allowed_models: vec![],
+            allowed_classes: vec![],
+            leases: vec![],
+            ignored_leases: vec![],
+            state: SchedState::default(),
+            inputs: vec![],
+            input_changed: false,
+            error: Some(format!("persisted state cannot be read: {text}")),
+        };
+        tracing::error!(
+            at_ms = now.as_u64(),
+            problems = %text,
+            "tick failed: the persisted state cannot be read; nothing published, stored state left untouched"
+        );
+        *self.last_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(report.clone());
+        report
     }
 
     fn cache(&self) -> std::sync::MutexGuard<'_, ObservationCache> {
@@ -258,14 +358,16 @@ impl Shared {
         let (leases, ignored_leases) = leases::effective(&config, &durable.leases);
         let (mut snapshot, ages, changed, now, reported) = {
             let mut cache = self.cache();
-            // Which sources reported before is durable; the cache only knows this process.
-            cache.seed_reported(&config, &durable.reported);
+            // Which sources reported before is durable and was seeded into the cache before
+            // this step (`seed_reported`); the cache itself only knows this process.
             // Never run before something already received: that observation would be
             // dated after `now` and read as not fresh.
             let now = now.max(cache.latest_receipt());
             (
                 cache.snapshot(&config, now),
                 cache.input_ages(&config, now),
+                // The dirty flag is taken inside the journaled step: on a replay it stays
+                // set, so the next tick reports `input_changed`, which is harmless.
                 cache.take_dirty(),
                 now,
                 config
@@ -300,19 +402,26 @@ impl Shared {
                 gaps.unknown.push(c.id.clone());
             }
         }
-        let (kinds, reason, steps, allowed, state, error) =
+        let (kinds, reason, steps, allowed, state, forced, error) =
             match decide(&config, &snapshot, &durable.state) {
-                Ok((intent, decision)) => (
-                    reason::kinds(&decision.steps, &gaps)
-                        .into_iter()
-                        .map(String::from)
-                        .collect(),
-                    reason::reason(&intent, &decision.steps, &gaps),
-                    decision.steps,
-                    decision.allowed,
-                    decision.state,
-                    None,
-                ),
+                Ok((intent, decision)) => {
+                    // Power wishes of hosts under manual control are never acted on; the
+                    // reason does not list them.
+                    let mut shown = intent.clone();
+                    shown.power_up.retain(|r, _| config.power_managed(r));
+                    (
+                        reason::kinds(&decision.steps, &gaps)
+                            .into_iter()
+                            .map(String::from)
+                            .collect(),
+                        reason::reason(&shown, &decision.steps, &gaps),
+                        decision.steps,
+                        decision.allowed,
+                        decision.state,
+                        intent.forced.iter().cloned().collect(),
+                        None,
+                    )
+                }
                 // The previous state stays, and so does the previous publication.
                 Err(e) => (
                     vec![reason::KIND_ERROR.to_string()],
@@ -320,18 +429,17 @@ impl Shared {
                     Vec::new(),
                     AllowedSet::default(),
                     durable.state.clone(),
+                    Vec::new(),
                     Some(e.to_string()),
                 ),
             };
-        // Input ages describe the cache as read now, not the decision, so they are set
-        // here rather than on publication.
-        self.metrics.set_input_ages(&ages);
         let report = TickReport {
             config_generation: config.generation(),
             at: now,
             unknown_demand: gaps.unknown,
             unsupported_demand: gaps.unsupported,
             unpolled_demand: gaps.unpolled,
+            forced,
             kinds,
             reason,
             not_executed: steps
@@ -352,34 +460,43 @@ impl Shared {
         TickOutcome {
             report,
             reported,
-            inputs_text: reason::format_inputs(&ages),
             duration_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         }
     }
 
     /// Makes a decided tick visible: publishes its allowed set (unless the tick failed),
     /// counts it, and logs it, with a warning per step that nothing carries out.
-    pub fn publish(&self, outcome: &TickOutcome) {
+    ///
+    /// `replayed` says the decision came back from the journal (the step did not run in
+    /// this attempt): it is published and logged again, since this process may be a new
+    /// one, but not counted again in `sched_tick_decisions_total` or the tick duration.
+    pub fn publish(&self, outcome: &TickOutcome, replayed: bool) {
         let r = &outcome.report;
         if let Some(p) = outcome.published() {
             self.allowed.send_replace(Some(p));
         }
-        for kind in &r.kinds {
-            self.metrics.decision(kind);
+        if !replayed {
+            for kind in &r.kinds {
+                self.metrics.decision(kind);
+            }
+            self.metrics
+                .tick_duration(outcome.duration_us as f64 / 1_000_000.0);
         }
+        let ages: Vec<InputAge> = r.inputs.iter().map(InputReport::to_input_age).collect();
+        self.metrics.set_input_ages(&ages);
         self.metrics.set_phases(r.at, &r.state);
         self.metrics.tick_finished_at(r.at);
-        self.metrics
-            .tick_duration(outcome.duration_us as f64 / 1_000_000.0);
-        log_tick(r, &outcome.inputs_text);
+        log_tick(r, &reason::format_inputs(&ages), replayed);
+        *self.last_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
     }
 
     /// Decides and publishes one tick against `durable`, then updates it as the
     /// `Scheduler` object updates its Restate state. For tests and tools; the object
     /// journals the decision in between.
     pub fn tick(&self, now: Millis, durable: &mut Durable) -> TickReport {
+        self.seed_reported(&durable.reported);
         let outcome = self.decide(now, durable);
-        self.publish(&outcome);
+        self.publish(&outcome, false);
         durable.apply(&outcome);
         outcome.report
     }
@@ -390,7 +507,7 @@ impl Shared {
     }
 }
 
-fn log_tick(r: &TickReport, inputs: &str) {
+fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
     let kinds = r.kinds.join(",");
     if r.error.is_some() {
         tracing::error!(
@@ -399,6 +516,7 @@ fn log_tick(r: &TickReport, inputs: &str) {
             decision = %kinds,
             reason = %r.reason,
             inputs = %inputs,
+            replayed,
             "tick failed; the previous state and allowed set stay"
         );
         return;
@@ -414,7 +532,9 @@ fn log_tick(r: &TickReport, inputs: &str) {
         allowed_models = ?r.allowed_models.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
         allowed_classes = ?ids(&r.allowed_classes),
         leases = ?r.leases.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+        forced = ?r.forced.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
         inputs = %inputs,
+        replayed,
         input_changed = r.input_changed,
         unknown_demand = ?ids(&r.unknown_demand),
         unsupported_demand = ?ids(&r.unsupported_demand),
@@ -732,7 +852,7 @@ mod tests {
         let outcome = s.decide(Millis(T0 + 1_000), &d);
         assert!(!rx.has_changed().unwrap());
         assert_eq!(s.published_allowed(), None);
-        s.publish(&outcome);
+        s.publish(&outcome, false);
         d.apply(&outcome);
         assert!(rx.has_changed().unwrap());
         let p = rx.borrow_and_update().clone().unwrap();
