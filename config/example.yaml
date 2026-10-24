@@ -157,20 +157,38 @@ sources:
           count: /count
       webhook: { path: /hooks/paperless }
 
+  # Speakr transcription demand.
+  #
   # Jobs fail rather than queue while whisperX is unloaded, so recordings that failed with
-  # a connection error count as pending demand, together with the pending ones. Recordings
-  # being processed are in-flight work.
-  # Field names come from speakr's v1 API reference (GET /api/v1/recordings: query `page`,
-  # `per_page` (max 100), `status` = all|pending|processing|completed|failed in lowercase;
-  # response `recordings[]` with uppercase `status` values, plus `pagination.total`).
-  # Pending and processing only need the total, so they ask for one item per page and read
-  # `/pagination/total`: no page cap, no pagination. The failed list is read in full (up to
-  # `max_items`, the page size: a truncated page fails the poll loudly instead of
-  # under-counting). `contains` is case-insensitive.
-  # UNVERIFIED: that list items carry `error_message` (the detail object does). If they do
-  # not, the poll fails with "field missing from every item" rather than counting zero.
-  # Cost: 3 requests per poll here plus 1 for speakr-summaries below, at one poll a minute
-  # each: 4 requests per minute in total on the one token, against speakr's read limit of
+  # a connection error count as pending demand, together with the waiting ones.
+  #
+  # Field names and behaviour come from speakr's v1 API reference and source
+  # (src/api/api_v1.py, src/services/job_queue.py):
+  # - GET /api/v1/recordings takes `page`, `per_page` (max 100), `status` (all|pending|
+  #   processing|completed|failed, lowercase), `updated_since` (ISO 8601), `sort_by`,
+  #   `sort_order`; items carry uppercase `status` and `error_message` (set for FAILED rows
+  #   only, null otherwise).
+  # - Enqueueing a job sets the recording to QUEUED, which NO list status filter matches
+  #   (`pending` is only the state before enqueue). So waiting recordings are counted from
+  #   GET /api/v1/stats instead: `recordings.pending` plus `queue.jobs_queued` (ProcessingJob
+  #   rows, of ALL job types for the token's user), with `queue.jobs_processing` as in-flight
+  #   work. Queued summary jobs are therefore also counted here: a deliberate, conservative
+  #   overcount (they are GPU/LLM demand of some class, not necessarily transcription), and
+  #   the planner treats ready > 0 as work.
+  # - FAILED here means transcription failed (for example whisperX was unloaded). speakr
+  #   keeps them for ever. Re-queueing them once whisperX is serving is the M7 recovery
+  #   feature (speakr-transcription: requeue_failed); until then the `since` window below
+  #   bounds the phantom demand: a failure older than 24h stops counting.
+  # - The failed request matches `error_message` containing "connection" (case-insensitive).
+  #   speakr stores the sanitized exception text; a whisperX-unreachable failure is expected
+  #   to read like "Connection error." or "... Max retries exceeded ... Connection refused".
+  #   That is an expectation, not a certainty; adjust `contains` if real texts differ. If
+  #   `error_message` were missing from every item the poll fails loudly instead of
+  #   counting zero.
+  # - `max_items` equals the page size: a full page of failures fails the poll rather than
+  #   under-counting. Sorting newest first keeps the newest failures if a page is truncated.
+  # Cost: 2 requests per poll here plus 1 for speakr-summaries below, at one poll a minute
+  # each: 3 requests per minute in total on the one token, against speakr's read limit of
   # 120/min (add up all speakr sources before raising `resync` rates).
   # Auth: `Authorization: Bearer <token>`; a token with `read` scope is enough.
   - id: speakr-pending
@@ -181,31 +199,23 @@ sources:
       timeout: 10s
       auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
       requests:
-        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=1
-          count: /pagination/total
-        # Failed recordings are never deleted by speakr, so without a bound the oldest
-        # connection failures would count as demand for ever and 100+ failures would trip
-        # `max_items` for good. `since` keeps only those updated within the last 24h (a
-        # failed job older than that stops counting; recovery by requeueing, milestone M7,
-        # clears the rest), and sorting newest first means a truncated page keeps the
-        # newest failures.
+        - url: http://speakr.media.svc:8899/api/v1/stats
+          count: /recordings/pending
+          also:
+            - { count: /queue/jobs_queued, counts_as: ready }
+            - { count: /queue/jobs_processing, counts_as: in_flight }
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc
           length: /recordings
           where: { field: /error_message, contains: connection }
           max_items: 100
           since: { param: updated_since, ago: 24h }
-        - url: http://speakr.media.svc:8899/api/v1/recordings?status=processing&per_page=1
-          count: /pagination/total
-          counts_as: in_flight
       webhook: { path: /hooks/speakr }
 
-  # *** UNVERIFIED AND POSSIBLY ALWAYS ZERO until checked against a live speakr: the API
-  # doc does not say that the `processing` filter returns SUMMARIZING recordings. ***
-  # Summarization: the status filter has no `summarizing` value, so this lists the
-  # `processing` recordings and keeps those whose `status` is SUMMARIZING.
-  # UNVERIFIED: that the `processing` filter returns SUMMARIZING recordings. If it does not
-  # the count is simply zero. (The in-flight count above then also includes recordings that
-  # are summarizing, which is the conservative direction.)
+  # Summarization. The status filter has no `summarizing` value, but `status=processing`
+  # returns both PROCESSING and SUMMARIZING recordings (speakr src/api/api_v1.py:
+  # `Recording.status.in_(['PROCESSING', 'SUMMARIZING'])`), so this lists that page and keeps
+  # those whose `status` is SUMMARIZING. Enqueueing a summary job sets SUMMARIZING at once,
+  # so queued and running summary jobs are both visible here.
   - id: speakr-summaries
     kind: http_json
     observe: [demand]

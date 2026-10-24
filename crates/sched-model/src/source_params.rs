@@ -89,6 +89,17 @@ pub struct SinceSpec {
 /// Longest accepted `since.ago`.
 pub const MAX_SINCE_AGO: Millis = Millis(365 * 86_400_000);
 
+/// A further number read from the same response as the request's own, so a service that
+/// reports several counts in one document needs one request, not several.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraCount {
+    /// JSON pointer to a number in the response.
+    pub count: String,
+    #[serde(default)]
+    pub counts_as: CountsAs,
+}
+
 /// One request and how its response becomes a number. Exactly one of `count` and `length`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +121,9 @@ pub struct RequestSpec {
     /// under-counting.
     #[serde(default)]
     pub max_items: Option<u64>,
+    /// More numbers from the same response, each added to ready or in-flight work.
+    #[serde(default)]
+    pub also: Vec<ExtraCount>,
     /// Only items changed within a window ending now (see [`SinceSpec`]).
     #[serde(default)]
     pub since: Option<SinceSpec>,
@@ -207,6 +221,9 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
         }
         for ptr in [&r.count, &r.length].into_iter().flatten() {
             out.extend(pointer_problem(ptr).map(|m| format!("{at}: {m}")));
+        }
+        for (k, e) in r.also.iter().enumerate() {
+            out.extend(pointer_problem(&e.count).map(|m| format!("{at}.also[{k}]: {m}")));
         }
         if let Some(sc) = &r.since {
             let plain = !sc.param.is_empty()
@@ -344,7 +361,8 @@ mod tests {
         let c = example_config();
         let speakr = c.source(&"speakr-pending".into()).unwrap();
         let p = speakr.http_json_params().unwrap().unwrap();
-        assert_eq!(p.requests.len(), 3);
+        assert_eq!(p.requests.len(), 2);
+        assert_eq!(p.requests[0].also.len(), 2);
         assert_eq!(
             p.auth.as_ref().unwrap().env.as_deref(),
             Some("SPEAKR_API_TOKEN")
@@ -425,6 +443,28 @@ mod tests {
     }
 
     #[test]
+    fn extra_counts_validate_and_duplicates_compare_the_whole_rule() {
+        let url = "url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting";
+        let with = |extra: &str| EXAMPLE_CONFIG.replace(url, &format!("{url}\n{extra}"));
+        let ok = with("          also: [{ count: /active, counts_as: in_flight }]");
+        assert!(Config::from_yaml(&ok).is_ok());
+        let ps = problems_of(&with("          also: [{ count: active }]"));
+        assert!(has(&ps, "also[0]"), "{ps:?}");
+        // The same URL twice with different rules is two different requests...
+        let two = EXAMPLE_CONFIG.replace(
+            url,
+            &format!("{url}\n        - {url}\n          counts_as: in_flight"),
+        );
+        assert!(Config::from_yaml(&two).is_ok());
+        // ...and a request differing only in its extra counts is not a duplicate either.
+        let three = EXAMPLE_CONFIG.replace(
+            url,
+            &format!("{url}\n        - {url}\n          also: [{{ count: /active }}]"),
+        );
+        assert!(Config::from_yaml(&three).is_ok());
+    }
+
+    #[test]
     fn rejects_bad_since_options() {
         let url = "url: http://immich-server.media.svc:2283/api/jobs\n          count: /waiting";
         let with =
@@ -452,7 +492,7 @@ mod tests {
             &EXAMPLE_CONFIG.replace(auth, "auth: { header: Authorization, token: abc, env: X }"),
         );
         assert!(has(&ps, "unknown field `token`"), "{ps:?}");
-        let ps = problems_of(&EXAMPLE_CONFIG.replace("timeout: 10s\n      auth: { header: Authorization, prefix: \"Bearer \", env: SPEAKR_API_TOKEN }\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=1", "timeout: 0\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/recordings?status=pending&per_page=1"));
+        let ps = problems_of(&EXAMPLE_CONFIG.replace("timeout: 10s\n      auth: { header: Authorization, prefix: \"Bearer \", env: SPEAKR_API_TOKEN }\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/stats", "timeout: 0\n      requests:\n        - url: http://speakr.media.svc:8899/api/v1/stats"));
         assert!(has(&ps, "timeout"), "{ps:?}");
     }
 

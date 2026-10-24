@@ -116,17 +116,7 @@ fn matches(filter: &ElementFilter, element: &Value) -> bool {
 /// the array at `length` that pass `where`.
 pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
     if let Some(ptr) = &req.count {
-        let v = doc
-            .pointer(ptr)
-            .ok_or_else(|| ExtractError::Missing(ptr.clone()))?;
-        return v
-            .as_u64()
-            .or_else(|| {
-                v.as_f64()
-                    .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < u64::MAX as f64)
-                    .map(|f| f as u64)
-            })
-            .ok_or_else(|| ExtractError::NotANumber(ptr.clone()));
+        return extract_number(doc, ptr);
     }
     let ptr = req.length.as_deref().unwrap_or("");
     let items = doc
@@ -148,6 +138,20 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
         None => items.len(),
     };
     Ok(n as u64)
+}
+
+/// The non-negative whole number at `ptr`.
+pub fn extract_number(doc: &Value, ptr: &str) -> Result<u64, ExtractError> {
+    let v = doc
+        .pointer(ptr)
+        .ok_or_else(|| ExtractError::Missing(ptr.to_string()))?;
+    v.as_u64()
+        .or_else(|| {
+            v.as_f64()
+                .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < u64::MAX as f64)
+                .map(|f| f as u64)
+        })
+        .ok_or_else(|| ExtractError::NotANumber(ptr.to_string()))
 }
 
 /// The sum rule: numbers counting as ready and as in flight are each added up.
@@ -320,9 +324,16 @@ pub async fn poll_at(
             Ok(d) => d,
             Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         };
-        match extract(&doc, req) {
-            Ok(n) => parts.push((req.counts_as, n)),
-            Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
+        let numbers = std::iter::once(extract(&doc, req).map(|n| (req.counts_as, n))).chain(
+            req.also
+                .iter()
+                .map(|e| extract_number(&doc, &e.count).map(|n| (e.counts_as, n))),
+        );
+        for n in numbers {
+            match n {
+                Ok(part) => parts.push(part),
+                Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
+            }
         }
     }
     let (ready, in_flight) = totals(&parts);
@@ -393,6 +404,7 @@ mod tests {
             filter,
             counts_as: CountsAs::Ready,
             max_items: None,
+            also: Vec::new(),
             since: None,
         }
     }
@@ -474,10 +486,15 @@ mod tests {
         (spec, params, classes)
     }
 
-    const SPEAKR_PENDING: &str = "/api/v1/recordings?status=pending&per_page=1";
+    const SPEAKR_STATS: &str = "/api/v1/stats";
+
+    fn stats(pending: u64, queued: u64, processing: u64) -> Reply {
+        Reply::json(&format!(
+            r#"{{"recordings": {{"total": 9, "pending": {pending}}}, "queue": {{"jobs_queued": {queued}, "jobs_processing": {processing}}}}}"#
+        ))
+    }
     const SPEAKR_FAILED: &str =
         "/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc";
-    const SPEAKR_PROCESSING: &str = "/api/v1/recordings?status=processing&per_page=1";
 
     fn env(name: &str) -> Option<String> {
         (name == "SPEAKR_API_TOKEN").then(|| "s3cret\n".to_string())
@@ -502,10 +519,8 @@ mod tests {
     #[tokio::test]
     async fn speakr_counts_pending_plus_connection_error_failures() {
         let server = TestServer::start().await;
-        server.set(
-            SPEAKR_PENDING,
-            Reply::json(r#"{"recordings": [{"id": 1}], "pagination": {"total": 2}}"#),
-        );
+        // 2 recordings waiting to be enqueued, 3 jobs queued, 1 running.
+        server.set(SPEAKR_STATS, stats(2, 3, 1));
         server.set(
             SPEAKR_FAILED,
             Reply::json(
@@ -515,16 +530,15 @@ mod tests {
                     {"id": 5, "error_message": "APIConnectionError"}]}"#,
             ),
         );
-        server.set(
-            SPEAKR_PROCESSING,
-            Reply::json(r#"{"recordings": [{"id": 6}], "pagination": {"total": 1}}"#),
-        );
         let (spec, params, classes) = example_source("speakr-pending", &server);
         assert_eq!(classes.len(), 1);
         let client = reqwest::Client::new();
         let report = poll(&client, &spec, &params, &classes, &env).await;
-        // 2 pending + 2 connection-error failures; the codec failure is not demand.
-        assert_eq!(demand(&report), (4, 1));
+        // 2 pending + 3 queued jobs + 2 connection-error failures (the codec failure is not
+        // demand); one job running.
+        assert_eq!(demand(&report), (7, 1));
+        // Two requests per poll: stats (one response, three numbers) and the failed list.
+        assert_eq!(server.requests().len(), 2);
         // The secret is read from the environment, trimmed, and sent with its prefix.
         assert!(
             server
@@ -564,10 +578,9 @@ mod tests {
     async fn every_kind_of_adapter_error_is_an_explicit_failure() {
         let server = TestServer::start().await;
         let (spec, mut params, _) = example_source("speakr-pending", &server);
-        let empty = r#"{"recordings": [], "pagination": {"total": 0}}"#;
-        server.set(SPEAKR_PENDING, Reply::json(empty));
+        let empty = r#"{"recordings": []}"#;
+        server.set(SPEAKR_STATS, stats(0, 0, 0));
         server.set(SPEAKR_FAILED, Reply::json(empty));
-        server.set(SPEAKR_PROCESSING, Reply::json(empty));
 
         // A server error on one request fails the whole poll, not just that request.
         server.set(SPEAKR_FAILED, Reply::status(503));
@@ -730,10 +743,7 @@ mod tests {
         let full: Vec<String> = (0..100)
             .map(|i| format!("{{\"id\": {i}, \"error_message\": null}}"))
             .collect();
-        server.set(
-            SPEAKR_PENDING,
-            Reply::json(r#"{"recordings": [], "pagination": {"total": 0}}"#),
-        );
+        server.set(SPEAKR_STATS, stats(0, 0, 0));
         server.set(
             SPEAKR_FAILED,
             Reply::json(&format!("{{\"recordings\": [{}]}}", full.join(","))),
@@ -804,17 +814,10 @@ mod tests {
     async fn the_example_speakr_source_fails_explicitly_when_list_items_lack_error_message() {
         let server = TestServer::start().await;
         let (spec, params, classes) = example_source("speakr-pending", &server);
-        server.set(
-            SPEAKR_PENDING,
-            Reply::json(r#"{"recordings": [], "pagination": {"total": 3}}"#),
-        );
+        server.set(SPEAKR_STATS, stats(3, 0, 0));
         server.set(
             SPEAKR_FAILED,
             Reply::json(r#"{"recordings": [{"id": 9, "status": "FAILED"}]}"#),
-        );
-        server.set(
-            SPEAKR_PROCESSING,
-            Reply::json(r#"{"recordings": [], "pagination": {"total": 0}}"#),
         );
         match poll(
             &build_client(&params).unwrap(),
@@ -906,9 +909,7 @@ mod tests {
             .unwrap();
         params.requests[1].since = original.requests[1].since.clone();
         assert!(params.requests[1].since.is_some());
-        let totals = r#"{"recordings": [], "pagination": {"total": 0}}"#;
-        server.set(SPEAKR_PENDING, Reply::json(totals));
-        server.set(SPEAKR_PROCESSING, Reply::json(totals));
+        server.set(SPEAKR_STATS, stats(0, 0, 0));
         let windowed = format!("{SPEAKR_FAILED}&updated_since=2023-11-13T22%3A13%3A20Z");
         server.set(
             &windowed,
@@ -951,5 +952,30 @@ mod tests {
             Report::Failed { error, .. } => assert!(error.contains("rate limited"), "{error}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn one_response_can_feed_several_numbers_and_each_must_be_present() {
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("speakr-pending", &server);
+        server.set(SPEAKR_FAILED, Reply::json(r#"{"recordings": []}"#));
+        // The extra pointer is missing from the stats document: the poll fails, it does
+        // not count the numbers it did find.
+        server.set(
+            SPEAKR_STATS,
+            Reply::json(r#"{"recordings": {"pending": 4}, "queue": {"jobs_queued": 2}}"#),
+        );
+        let client = build_client(&params).unwrap();
+        match poll(&client, &spec, &params, &classes, &env).await {
+            Report::Failed { error, .. } => {
+                assert!(error.contains("/queue/jobs_processing"), "{error}")
+            }
+            other => panic!("{other:?}"),
+        }
+        server.set(SPEAKR_STATS, stats(4, 2, 5));
+        assert_eq!(
+            demand(&poll(&client, &spec, &params, &classes, &env).await),
+            (6, 5)
+        );
     }
 }
