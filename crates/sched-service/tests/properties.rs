@@ -1,10 +1,10 @@
 //! Property tests: random worlds (including stale, missing and contradictory observations
 //! and arbitrary leases) are replayed through the loop. Whatever the world does, no safety
-//! invariant may be violated, runs must be repeatable, and the allowed set must agree with
-//! the state it was derived from.
+//! invariant may be violated, runs must be repeatable, the allowed set must agree with the
+//! state it was derived from, and pod observations must not change any decision.
 
 use proptest::prelude::*;
-use sched_model::test_support::example_config;
+use sched_model::test_support::{example_config, example_config_managed};
 use sched_model::{
     ClassId, Fidelity, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, ObservedValue,
     ResourceId, SourceId,
@@ -169,12 +169,24 @@ fn scenario(frames: &[Raw]) -> Scenario {
     }
 }
 
+/// The same world without a single pod observation.
+fn without_pods(frames: &[Raw]) -> Vec<Raw> {
+    frames
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            r.pods = vec![None; r.pods.len()];
+            r
+        })
+        .collect()
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
     #[test]
-    fn no_invariant_is_violated_in_any_world(frames in prop::collection::vec(raw(), 1..40)) {
-        let config = example_config();
+    fn no_invariant_is_violated_in_any_world(frames in prop::collection::vec(raw(), 1..40), managed in any::<bool>()) {
+        let config = if managed { example_config_managed() } else { example_config() };
         let sc = scenario(&frames);
         let results = run(&config, &sc).unwrap();
         for (i, r) in results.iter().enumerate() {
@@ -198,6 +210,19 @@ proptest! {
                 let st = r.decision.state.resource(res).unwrap();
                 prop_assert_eq!(st.mode.allowed_model(), Some(model));
             }
+            // At every tick at most one model per exclusive resource (cuda-central here).
+            prop_assert!(r.decision.allowed.models.len() <= 1, "frame {}: {:?}", i, r.decision.allowed);
+        }
+    }
+
+    #[test]
+    fn pod_observations_never_change_any_decision(frames in prop::collection::vec(raw(), 1..40), managed in any::<bool>()) {
+        let config = if managed { example_config_managed() } else { example_config() };
+        let with = run(&config, &scenario(&frames)).unwrap();
+        let without = run(&config, &scenario(&without_pods(&frames))).unwrap();
+        for (i, (a, b)) in with.iter().zip(&without).enumerate() {
+            prop_assert_eq!(&a.intent, &b.intent, "frame {}", i);
+            prop_assert_eq!(&a.decision, &b.decision, "frame {}", i);
         }
     }
 

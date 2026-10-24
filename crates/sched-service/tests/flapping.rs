@@ -1,6 +1,8 @@
 //! Flapping bounds over long, oscillating arrival streams. A small reactive world feeds the
 //! decision loop for hours of simulated time; the assertions are written from the policy
-//! (minimum dwell, idle grace) and read only the recorded log, not the sequencer's state.
+//! (minimum dwell from the tick a model is allowed, idle grace) and read only the recorded
+//! log, not the sequencer's state. The world plays Kubernetes: a model's pod becomes ready
+//! only once no other model's pod holds the GPU.
 
 use std::collections::BTreeMap;
 
@@ -65,14 +67,19 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
 
     for t in 0..TICKS {
         let now = START + t as u64 * TICK;
-        pod_events.retain(|(due, m, v)| {
-            if *due <= t {
-                pods.insert(m, *v);
-                false
+        // Kubernetes: a model's pod becomes ready only once no other model's pod holds the
+        // GPU (one nvidia.com/gpu); until then it stays pending.
+        let mut due: Vec<_> = pod_events.iter().filter(|e| e.0 <= t).cloned().collect();
+        pod_events.retain(|e| e.0 > t);
+        due.sort_by_key(|e| e.2);
+        for (d, m, v) in due {
+            let gpu_busy = MODELS.iter().any(|o| *o != m && pods[o].0 > 0);
+            if v.1 > 0 && gpu_busy {
+                pod_events.push((d, m, v));
             } else {
-                true
+                pods.insert(m, v);
             }
-        });
+        }
         nfs_events.retain(|(due, up)| {
             if *due <= t {
                 nfs_up = *up;
@@ -163,6 +170,7 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
                 }
                 Step::DrainModel { model, .. } => {
                     let m = MODELS.iter().find(|x| **x == model.as_str()).unwrap();
+                    pod_events.retain(|e| e.1 != *m);
                     pod_events.push((t + 2, m, (0, 0)));
                 }
                 Step::PowerOn { resource } if resource.as_str() == "basestar-nfs" => {
@@ -174,6 +182,8 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
                 _ => {}
             }
         }
+        let ready = MODELS.iter().filter(|m| pods[*m].1 > 0).count();
+        assert!(ready <= 1, "tick {t}: the simulated GPU ran {ready} models");
         log.push(Tick {
             now,
             steps: decision.steps.clone(),
@@ -239,6 +249,8 @@ struct Summary {
     allows: usize,
     drains: usize,
     power_offs: usize,
+    /// Ticks in which a newly allowed model's pod was pending behind the previous model's.
+    pending_behind: usize,
 }
 
 /// Checks the bounds against the log, independently of how the decisions were reached.
@@ -249,9 +261,8 @@ fn check_bounds(config: &Config, log: &[Tick]) -> Summary {
     let age_threshold = config.policy().age_threshold.as_u64();
     let mut sum = Summary::default();
     let mut last_allow: Option<u64> = None;
-    // Per model: when it was allowed, and when it was first observed ready afterwards.
+    // Per model: when it was allowed.
     let mut allowed_at: BTreeMap<&str, u64> = BTreeMap::new();
-    let mut ready_at: BTreeMap<&str, u64> = BTreeMap::new();
     let mut last_busy: BTreeMap<&str, u64> = BTreeMap::new();
     let mut wind_start: BTreeMap<&str, u64> = BTreeMap::new();
     let mut nfs_last_busy: Option<u64> = None;
@@ -259,12 +270,14 @@ fn check_bounds(config: &Config, log: &[Tick]) -> Summary {
 
     for tick in log {
         for m in MODELS {
-            if allowed_at.contains_key(m) && !ready_at.contains_key(m) && tick.pods[m].1 >= 1 {
-                ready_at.insert(m, tick.now);
-            }
             if model_busy(config, tick, m) {
                 last_busy.insert(m, tick.now);
             }
+        }
+        let pending = MODELS.iter().any(|m| tick.pods[m] == (1, 0));
+        let holding = MODELS.iter().filter(|m| tick.pods[*m].0 > 0).count() > 1;
+        if pending && holding {
+            sum.pending_behind += 1;
         }
         if nfs_busy(config, tick) {
             nfs_last_busy = Some(tick.now);
@@ -285,7 +298,6 @@ fn check_bounds(config: &Config, log: &[Tick]) -> Summary {
                     }
                     last_allow = Some(tick.now);
                     allowed_at.insert(model.as_str(), tick.now);
-                    ready_at.remove(model.as_str());
                 }
                 Step::PauseIntake { class } => {
                     // The first stop of intake for a model's classes marks the moment the
@@ -297,7 +309,8 @@ fn check_bounds(config: &Config, log: &[Tick]) -> Summary {
                         continue;
                     }
                     wind_start.insert(m, tick.now);
-                    let ready = ready_at.get(m).copied();
+                    // Dwell is counted from the tick the model was allowed (load included).
+                    let ready = allowed_at.get(m).copied();
                     if model_busy(config, tick, m) {
                         // A yield. It needs a reason: max_dwell passed, or another queue starved.
                         let served = ready.map(|r| tick.now - r).unwrap_or(0);
@@ -328,15 +341,14 @@ fn check_bounds(config: &Config, log: &[Tick]) -> Summary {
                 Step::DrainModel { model, .. } => {
                     sum.drains += 1;
                     let m = model.as_str();
-                    if let Some(ready) = ready_at.get(m) {
+                    if let Some(at) = allowed_at.get(m) {
                         assert!(
-                            tick.now - ready >= min_dwell,
-                            "{m} drained {}ms after it became ready (min_dwell {min_dwell})",
-                            tick.now - ready
+                            tick.now - at >= min_dwell,
+                            "{m} withdrawn {}ms after it was allowed (min_dwell {min_dwell})",
+                            tick.now - at
                         );
                     }
                     allowed_at.remove(m);
-                    ready_at.remove(m);
                     wind_start.remove(m);
                 }
                 Step::PowerOff { resource } if resource.as_str() == "basestar-nfs" => {
@@ -382,6 +394,7 @@ fn the_simulated_world_exercises_switching_and_power() {
     let sum = check_bounds(&config, &log);
     assert!(sum.allows >= 4, "{sum:?}");
     assert!(sum.drains >= 3, "{sum:?}");
+    assert!(sum.pending_behind >= 1, "no switch overlapped in Kubernetes: {sum:?}");
 }
 
 #[test]

@@ -224,12 +224,20 @@ pub fn check(
                 "invariant 2: {model} allowed on {res}, which is not on"
             ));
         }
-        if reclaimed(config, snapshot, res) {
-            out.push(format!("invariant 2: {model} allowed on reclaimed {res}"));
-        }
         let allowed_now = decision.steps.iter().any(
             |s| matches!(s, Step::AllowModel { resource, model: m } if resource == res && m == model),
         );
+        // A reclaim withdraws the model once its in-flight work is done or timed out; until
+        // then it stays allowed, winding down. It is never newly allowed.
+        let winding_down = matches!(
+            decision.state.resource(res).map(|s| &s.mode),
+            Some(ModePhase::Serving { model: m, wind_down: Some(_), .. }) if m == model
+        );
+        if reclaimed(config, snapshot, res) && (allowed_now || !winding_down) {
+            out.push(format!(
+                "invariant 2: {model} allowed on reclaimed {res} without winding down"
+            ));
+        }
         if !before_allowed.contains(model) && !allowed_now {
             out.push(format!(
                 "invariant 2: {model} entered the allowed set without an allow step"

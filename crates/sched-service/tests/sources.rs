@@ -1,5 +1,6 @@
 //! Observations are filtered by subject AND by the source the config says supplies them
-//! before any reduction. A stray reading (right subject, wrong source) must neither wedge
+//! before any reduction. Pod counts are information only: no source's pod reading changes a
+//! decision. A stray reading (right subject, wrong source) must neither wedge
 //! the scheduler nor make an unsafe step look safe, and the core and the independent
 //! invariant checker must agree on that.
 
@@ -250,20 +251,21 @@ fn run_check(snap: &Snapshot, st: &SchedState, steps: Vec<Step>) -> Vec<String> 
 #[test]
 fn the_checker_does_not_accept_stray_readings_as_proof_of_safety() {
     let st = state(IDLE);
-    // Allowing mineru needs fresh zero pods of the other models. Here the authoritative
-    // reading of llm is stale and only a stray source says "zero, just now".
+    // Allowing mineru needs a fresh "up" reading of cuda-central from a source declaring
+    // reachability. Here the authoritative reading is stale and only stray sources say
+    // "up, just now".
     let mut o = authoritative(None);
     o.retain(
-        |x| !matches!(&x.value, ObservedValue::ModelPods { model, .. } if model.as_str() == "llm"),
+        |x| !matches!(&x.value, ObservedValue::ResourceUp { resource, .. } if resource.as_str() == "cuda-central"),
     );
-    o.push(pods("cluster-pods", "llm", NOW - 10 * 60_000, 0));
-    o.push(pods("nowhere", "llm", NOW, 0));
-    o.push(pods("paperless-ocr-pending", "llm", NOW, 0));
+    o.push(up("cluster-pods", "cuda-central", NOW - 10 * 60_000, true));
+    o.push(up("nowhere", "cuda-central", NOW, true));
+    o.push(up("paperless-ocr-pending", "cuda-central", NOW, true));
     let v = run_check(&snapshot(o), &st, vec![step_allow("mineru")]);
-    assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
+    assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
 
-    // Powering off the NFS host needs a fresh up observation and zero pods. Strays that say
-    // "up, no pods" cannot stand in for them.
+    // Powering off the NFS host needs a fresh up observation. Strays that say "up" cannot
+    // stand in for it.
     let mut o = authoritative(None);
     o.retain(|x| !matches!(x.value, ObservedValue::ResourceUp { .. }));
     o.push(up("nowhere", "basestar-nfs", NOW, true));
@@ -395,38 +397,81 @@ fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
     out
 }
 
-fn without_llm_pods(mut o: Vec<Observation>) -> Vec<Observation> {
-    o.retain(
-        |x| !matches!(&x.value, ObservedValue::ModelPods { model, .. } if model.as_str() == "llm"),
-    );
+fn without_cuda_up(mut o: Vec<Observation>) -> Vec<Observation> {
+    o.retain(|x| {
+        !matches!(&x.value, ObservedValue::ResourceUp { resource, .. } if resource.as_str() == "cuda-central")
+    });
     o
 }
 
 #[test]
-fn an_older_nonzero_pod_count_from_one_source_blocks_allowing_and_the_checker_agrees() {
+fn pod_counts_from_any_source_never_block_allowing_and_the_checker_agrees() {
     let config = two_cluster_sources();
     let st = state(IDLE);
-    let base = without_llm_pods(authoritative(Some(("paperless-ocr", 3))));
+    let base = authoritative(Some(("paperless-ocr", 3)));
+    let (_, want) = decide(&config, &snapshot(base.clone()), &st).unwrap();
+    assert!(
+        want.steps.contains(&step_allow("mineru")),
+        "baseline: {:?}",
+        want.steps
+    );
+    // Disagreeing, stale, nonzero or future-dated pod counts from either declaring source,
+    // in any order: the same decision, which the checker accepts.
     let readings = [
         pods("cluster-pods", "llm", NOW - 2000, 2),
         pods("cluster-pods-b", "llm", NOW - 1000, 0),
+        pods("cluster-pods-b", "whisperx", NOW - 10 * 60_000, 1),
+        pods("cluster-pods", "immich-ml", NOW + 5000, 1),
     ];
-    // The same with the sources swapped, so neither source order hides the bug.
-    let swapped = [
-        pods("cluster-pods-b", "llm", NOW - 2000, 2),
-        pods("cluster-pods", "llm", NOW - 1000, 0),
-    ];
-    for order in permutations(&swapped) {
+    for order in permutations(&readings) {
         let mut o = base.clone();
         o.extend(order);
         let snap = snapshot(o);
         let (intent, d) = decide(&config, &snap, &st).unwrap();
-        assert!(!d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })));
+        assert_eq!(d, want);
         assert!(check(&config, &snap, &st, &intent, &d).is_empty());
-        let v = run_check_with(&config, &snap, &st, vec![step_allow("mineru")]);
-        assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
     }
-    // A stale reading from either source makes the model's pods unknown to the checker.
+}
+
+#[test]
+fn an_older_down_reading_from_one_source_blocks_allowing_and_the_checker_agrees() {
+    let config = two_cluster_sources();
+    let st = state(IDLE);
+    let base = without_cuda_up(authoritative(Some(("paperless-ocr", 3))));
+    // One source says up just now, the other said down a second earlier: not up.
+    let readings = [
+        up("cluster-pods", "cuda-central", NOW - 1000, true),
+        up("cluster-pods-b", "cuda-central", NOW - 2000, false),
+    ];
+    let swapped = [
+        up("cluster-pods-b", "cuda-central", NOW - 1000, true),
+        up("cluster-pods", "cuda-central", NOW - 2000, false),
+    ];
+    let mut first = None;
+    for order in permutations(&readings)
+        .into_iter()
+        .chain(permutations(&swapped))
+    {
+        let mut o = base.clone();
+        o.extend(order);
+        let snap = snapshot(o.clone());
+        let (intent, d) = decide(&config, &snap, &st).unwrap();
+        assert!(
+            !d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })),
+            "{:?}",
+            d.steps
+        );
+        assert!(d.allowed.models.is_empty());
+        assert!(check(&config, &snap, &st, &intent, &d).is_empty());
+        // Given the unsafe decision directly, the checker flags it.
+        let v = run_check_with(&config, &snap, &st, vec![step_allow("mineru")]);
+        assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
+        match &first {
+            None => first = Some(d),
+            Some(f) => assert_eq!(f, &d, "order changed the decision"),
+        }
+    }
+    // A stale reading from either source makes the host's state unknown to the checker.
     for stale_src in ["cluster-pods", "cluster-pods-b"] {
         let other = if stale_src == "cluster-pods" {
             "cluster-pods-b"
@@ -434,49 +479,22 @@ fn an_older_nonzero_pod_count_from_one_source_blocks_allowing_and_the_checker_ag
             "cluster-pods"
         };
         let mut o = base.clone();
-        o.push(pods(stale_src, "llm", NOW - 10 * 60_000, 0));
-        o.push(pods(other, "llm", NOW - 1000, 0));
+        o.push(up(stale_src, "cuda-central", NOW - 10 * 60_000, true));
+        o.push(up(other, "cuda-central", NOW - 1000, true));
         let v = run_check_with(&config, &snapshot(o), &st, vec![step_allow("mineru")]);
         assert!(
-            v.iter().any(|m| m.contains("invariant 2")),
+            v.iter().any(|m| m.contains("invariant 5")),
             "{stale_src}: {v:?}"
         );
     }
-    let mut first = None;
-    for order in permutations(&readings) {
-        let mut o = base.clone();
-        o.extend(order);
-        let snap = snapshot(o);
-        let (intent, d) = decide(&config, &snap, &st).unwrap();
-        assert!(
-            !d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })),
-            "{:?}",
-            d.steps
-        );
-        assert!(has_wait(&d, WaitReason::OtherModelPresent), "{:?}", d.steps);
-        assert!(check(&config, &snap, &st, &intent, &d).is_empty());
-        match &first {
-            None => first = Some(d),
-            Some(f) => assert_eq!(f, &d, "order changed the decision"),
-        }
-    }
-    // Once both sources agree on zero, mineru is allowed again (and the checker agrees).
+    // Once both sources agree on up, mineru is allowed (and the checker agrees).
     let mut o = base.clone();
-    o.push(pods("cluster-pods", "llm", NOW - 500, 0));
-    o.push(pods("cluster-pods-b", "llm", NOW - 1000, 0));
+    o.push(up("cluster-pods", "cuda-central", NOW - 500, true));
+    o.push(up("cluster-pods-b", "cuda-central", NOW - 1000, true));
     let snap = snapshot(o);
     let (intent, d) = decide(&config, &snap, &st).unwrap();
-    assert!(d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })));
+    assert!(d.steps.contains(&step_allow("mineru")), "{:?}", d.steps);
     assert!(check(&config, &snap, &st, &intent, &d).is_empty());
-
-    // The checker, given the unsafe decision directly, flags it (and does so from the
-    // declared sources of the config, in any order).
-    for order in permutations(&readings) {
-        let mut o = base.clone();
-        o.extend(order);
-        let v = run_check_with(&config, &snapshot(o), &st, vec![step_allow("mineru")]);
-        assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
-    }
 }
 
 fn run_check_with(

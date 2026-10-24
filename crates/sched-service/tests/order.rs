@@ -6,7 +6,7 @@ use proptest::prelude::*;
 use sched_model::test_support::example_config_managed as example_config;
 use sched_model::{
     ClassId, Fidelity, Lease, LeaseId, LeaseKind, Millis, ModelId, Observation, ObservedValue,
-    ResourceId, SchedState, Snapshot, SourceId, WaitReason,
+    ResourceId, SchedState, Snapshot, SourceId,
 };
 use sched_service::core::decide;
 
@@ -139,11 +139,13 @@ fn base_zero_pods(except: &[&str]) -> Vec<Observation> {
 const IDLE: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n";
 
 #[test]
-fn equal_timestamp_pod_counts_read_as_present_in_either_order() {
-    // Zero and one pod of llm at the same instant: the conservative reading blocks allowing.
+fn equal_timestamp_pod_counts_change_nothing_in_either_order() {
+    // Zero and one pod of llm at the same instant: pods are not consulted, so mineru is
+    // allowed, in every order.
     let mut o = base_zero_pods(&["llm"]);
     o.push(pods("llm", NOW, 0, 0));
     o.push(pods("llm", NOW, 1, 1));
+    o.push(up("cuda-central", NOW, true));
     o.push(demand(
         "paperless-ocr",
         "paperless-ocr-pending",
@@ -156,11 +158,32 @@ fn equal_timestamp_pod_counts_read_as_present_in_either_order() {
     assert!(
         d.steps.iter().any(|s| matches!(
             s,
-            sched_model::Step::Wait {
-                reason: WaitReason::OtherModelPresent,
-                ..
-            }
+            sched_model::Step::AllowModel { model, .. } if model.as_str() == "mineru"
         )),
+        "{:?}",
+        d.steps
+    );
+    assert_eq!(d.allowed.models.len(), 1);
+}
+
+#[test]
+fn equal_timestamp_reachability_of_the_gpu_host_blocks_allowing_in_either_order() {
+    let mut o = base_zero_pods(&[]);
+    o.push(up("cuda-central", NOW, true));
+    o.push(up("cuda-central", NOW, false));
+    o.push(demand(
+        "paperless-ocr",
+        "paperless-ocr-pending",
+        NOW,
+        2,
+        0,
+        Some(NOW - 1000),
+    ));
+    let (_, d) = assert_order_independent("gpu up tie", o, &[], vec![], &state(IDLE));
+    assert!(
+        !d.steps
+            .iter()
+            .any(|s| matches!(s, sched_model::Step::AllowModel { .. })),
         "{:?}",
         d.steps
     );
