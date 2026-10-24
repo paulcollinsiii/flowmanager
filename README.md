@@ -84,7 +84,7 @@ restate deployments register http://localhost:9080
   always `demand_unknown`. Dashboards or alerts on the old name need updating.
 - **Bounding `http_json` by age**: a request may carry `since: { param, ago }`; each poll
   appends `param=<now - ago>` (ISO 8601 UTC, from the scheduler's clock). The example config
-  does not currently use it (see Known blind spots); the adapter feature stays.
+  uses it for speakr's failed recordings (a 6h window; see Known blind spots).
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - Handlers: `observe` (push observations; dated on receipt, never by the sender), `tick`,
@@ -120,15 +120,28 @@ never reported), and whether a source is failing (`sched_source_errors_total`).
 What shadow output (and the M2 sources) cannot see or get wrong. Read these before trusting a
 "no demand" or "idle" line.
 
-- **Failed speakr transcription jobs are invisible.** speakr stores a failure in the
-  recording's `transcription` field (`ERROR_JSON:{...}`), not in `error_message`, and its list
-  API exposes only `has_transcription`. Retries are immediate (3 attempts), so when whisperX is
-  unloaded, jobs fail within seconds and then vanish from the demand the scheduler sees. They
-  are not counted as demand in M2. Tracked for M7 (the `requeue_failed` recovery needs a
-  per-recording detail fetch of the error, or a count of FAILED recordings).
+- **Failed speakr transcriptions count as demand only for 6 hours, and are not re-queued.**
+  `speakr-pending` lists FAILED recordings updated in the last 6h and counts those with
+  `has_summary: false` as ready `speakr-transcription` work (speakr stores a failed summary's
+  error in `summary`, every other failure's in `transcription`), so a whisperX outage brings
+  whisperX in. Nothing re-queues them yet (that is manual), so a failure keeps counting until
+  it is re-queued or the window passes: whisperX can be held for up to 6h for failures nobody
+  re-queues, and a failure older than 6h is not seen at all. A reprocess-transcription failure
+  on a recording that already has a summary is missed; a failed merge or stitch job counts as
+  transcription. More than 100 failures in the window fails the poll rather than under-counting.
 - **Queued speakr summary, merge and stitch jobs count as transcription demand.** The speakr
   `/stats` queue counts jobs of every type, so this is a deliberate, conservative overcount.
 - **speakr `/stats` is scoped to the token's user.** Recordings of other users are not seen.
+- **basestar's reachability is one Prometheus query.** `basestar-probe` reads
+  `probe_success{instance="basestar"}`: 1 is up, 0 is down. If Prometheus is unreachable, the
+  series is missing or duplicated, or the value is anything else, the read fails and the
+  reading goes stale (decisions needing NFS wait) rather than reading "down". It shows what the
+  blackbox probe checks (the host answering), not that the NFS export works. Up/down flips
+  only after 3 agreeing readings.
+- **immich demand is the three ML queues only, and needs immich v2.4.0 or later.**
+  `immich-queues` reads `GET /api/queues/{smartSearch,faceDetection,ocr}` with an admin API key
+  (`queue.read`, `IMMICH_API_KEY`); an older immich answers 404 and the source fails. A paused
+  queue's waiting jobs still count as demand.
 - **"Reported, then silent" memory resets on restart.** The scheduler remembers that a source
   has reported only in memory; after a restart a silent push-fed source reads as
   "never pushed" (`demand_unsupported` / `demand_unpolled`) until it reports again.
