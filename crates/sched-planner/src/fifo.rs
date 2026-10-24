@@ -9,7 +9,8 @@
 //!    lower `load_time` (switch cost), then the lower id.
 //!
 //! A loaded model keeps serving while it has work (exhaustive). It yields to the best
-//! *other* candidate only when it has served for at least `min_dwell` and either
+//! *other* candidate only when it has been allowed for at least `min_dwell` (counted from
+//! the tick it was allowed, so load time is included) and either
 //! `max_dwell` has passed or another queue has become starved, and only when none of its
 //! busy classes is unpreemptible. An idle model is released only after `idle_grace`.
 //! Leases override this: a manual model lease forces its model, an interactive lease pins
@@ -126,14 +127,16 @@ fn target_for(
     let candidates = candidates(config, snap, state, resource);
     let policy = config.policy();
     let mode = state.resource(resource).map(|s| &s.mode);
+    // A model the config no longer has on this resource is not loaded as far as the policy
+    // is concerned: it gets no dwell and no grace, and the best candidate is chosen.
+    let configured = |m: &ModelId| config.model(m).is_some_and(|s| &s.resource == resource);
     match mode {
-        Some(ModePhase::Loading { model, .. }) => (Some(model.clone()), false),
         Some(ModePhase::Serving {
             model,
             since,
             idle_since,
             ..
-        }) => {
+        }) if configured(model) => {
             let served = now.saturating_sub(*since);
             let (busy, preemptible) = cur_status(config, snap, model);
             if busy {

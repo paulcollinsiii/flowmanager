@@ -7,10 +7,12 @@
 //! state, and only then calls [`Shared::publish`], which makes the decision visible: the
 //! allowed set on the channel the KEDA scaler reads, logs and metrics.
 //!
-//! What is carried out: the allowed set is published, so allowing a model, draining it and
-//! pausing a class's intake take effect once the scaler converges on it. Powering a host on
-//! or off, stopping in-flight work and recovery actions have no actuator in this build;
-//! those steps are listed in `not_executed` and logged as such.
+//! What is carried out: the allowed set is published, so allowing a model and withdrawing
+//! it take effect once the scaler converges on it. A paused class leaves the set too, but
+//! nothing scales on a demand class (consumers are not gated for GPU contention), so
+//! `PauseIntake` stops nobody. Powering a host on or off, stopping in-flight work and
+//! recovery actions have no actuator in this build. All of these are listed in
+//! `not_executed` and logged as such.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,7 +121,8 @@ pub struct TickReport {
     pub reason: String,
     pub steps: Vec<Step>,
     /// The steps nothing in this build carries out (power on/off, stopping in-flight work,
-    /// recovery actions). The sequencer has recorded them as taken all the same.
+    /// recovery actions, pausing a class's intake). The sequencer has recorded them as taken
+    /// all the same.
     #[serde(default)]
     pub not_executed: Vec<Step>,
     pub allowed_models: Vec<ModelId>,
@@ -410,7 +413,11 @@ impl Shared {
                     let mut shown = intent.clone();
                     shown.power_up.retain(|r, _| config.power_managed(r));
                     (
-                        reason::kinds(&decision.steps, &gaps)
+                        reason::kinds(
+                            &decision.steps,
+                            &gaps,
+                            !reason::pinned(&intent).is_empty(),
+                        )
                             .into_iter()
                             .map(String::from)
                             .collect(),
@@ -547,7 +554,8 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
             at_ms = r.at.as_u64(),
             kind = reason::step_kind(step),
             step = ?step,
-            "step NOT EXECUTED: no actuator for it in this build"
+            why = reason::not_executed_note(step).unwrap_or_default().trim(),
+            "step NOT EXECUTED"
         );
     }
     if !r.ignored_leases.is_empty() {

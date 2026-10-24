@@ -79,12 +79,18 @@ pub enum Preemptibility {
     Kill,
 }
 
-/// One resource a class needs, and for an exclusive resource, which model.
+/// One resource a class needs, and for an exclusive resource, possibly which model.
+///
+/// - Exclusive resource with a model: that model must be serving (and not winding down).
+/// - Exclusive resource without a model: only that the host is up. This makes the class a
+///   *gate class*: it must have no demand source and never influences model choice (for
+///   example a consumer that may run only while the GPU host and the NFS share are up).
+/// - Shared resource (a model is forbidden): the host is up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Requirement {
     pub resource: ResourceId,
-    /// Required for exclusive resources, forbidden for shared ones.
+    /// Optional for exclusive resources (absent: the host is up), forbidden for shared ones.
     #[serde(default)]
     pub model: Option<ModelId>,
 }
@@ -121,7 +127,9 @@ pub struct ClassSpec {
     #[serde(default)]
     pub may_change_power: bool,
     /// Absent for classes with no demand of their own; they run whenever their
-    /// requirements are up (for example services that only need the NFS share).
+    /// requirements are up (for example services that only need the NFS share, or gate
+    /// classes on host readiness). Forbidden for a class that requires an exclusive
+    /// resource without a model (a gate class).
     #[serde(default)]
     pub demand: Option<DemandRef>,
     #[serde(default)]
@@ -169,7 +177,8 @@ impl SourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Pod counts of models (`model_pods`).
+    /// Pod counts of models (`model_pods`). Information only: no decision reads them
+    /// (Kubernetes enforces GPU exclusivity).
     Pods,
     /// Whether a powered host is reachable and up (`resource_up`): kubelet/node readiness
     /// for cluster nodes, an SSH or ping probe for hosts outside the cluster.
@@ -212,7 +221,8 @@ pub const MAX_LEASE_DURATION: Millis = Millis(86_400_000);
 pub struct PolicyConfig {
     /// Name of the planner strategy.
     pub strategy: String,
-    /// Minimum time a model stays loaded before it may be switched away from.
+    /// Minimum time a model stays allowed before it may be switched away from, counted from
+    /// the tick it was allowed: it includes the time its pods take to load.
     pub min_dwell: Millis,
     /// Maximum time a model keeps serving while other queues wait.
     pub max_dwell: Millis,
@@ -222,7 +232,8 @@ pub struct PolicyConfig {
     pub age_threshold: Millis,
     /// Oldest acceptable observation for scheduling inputs such as queue depth.
     pub demand_max_age: Millis,
-    /// Oldest acceptable observation for safety-critical checks.
+    /// Oldest acceptable observation for safety-critical checks (host reachability, before
+    /// a model is allowed or a host powered off).
     pub safety_max_age: Millis,
     /// Lifetime of an interactive lease before it must be renewed.
     pub interactive_ttl: Millis,

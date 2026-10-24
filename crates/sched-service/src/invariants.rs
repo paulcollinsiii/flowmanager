@@ -1,5 +1,11 @@
 //! The design's safety invariants, checked against one decision.
 //!
+//! No invariant is about pods: GPU exclusivity is enforced by Kubernetes, and the scheduler
+//! guarantees only what it publishes (at most one model per exclusive resource, the old one
+//! leaving in the same decision that admits the new one, never on a host that is not up).
+//! That no decision depends on pod observations at all is checked by the property tests,
+//! which compare decisions with and without them.
+//!
 //! The checker is deliberately independent of the sequencer: it reads observations and
 //! leases straight from the snapshot with its own small readers, derives "reclaimed",
 //! "forced" and "held" from the leases rather than from the intent, and shares only the
@@ -55,20 +61,6 @@ fn newest<'a>(
     Some(out)
 }
 
-fn pods_zero(config: &Config, snap: &Snapshot, model: &ModelId, max_age: Millis) -> bool {
-    newest(
-        config,
-        Capability::Pods,
-        snap,
-        max_age,
-        |v| matches!(v, ObservedValue::ModelPods { model: m, .. } if m == model),
-    )
-    .is_some_and(|g| {
-        g.iter()
-            .all(|v| matches!(v, ObservedValue::ModelPods { pods: 0, .. }))
-    })
-}
-
 fn host_up(config: &Config, snap: &Snapshot, res: &ResourceId, max_age: Millis) -> bool {
     newest(
         config,
@@ -81,6 +73,30 @@ fn host_up(config: &Config, snap: &Snapshot, res: &ResourceId, max_age: Millis) 
         g.iter()
             .all(|v| matches!(v, ObservedValue::ResourceUp { up: true, .. }))
     })
+}
+
+/// Whether a fresh reading of a declaring source says `res` is down (or disagrees about it
+/// at that source's newest instant). Nothing may be allowed on such a host.
+fn host_seen_down(config: &Config, snap: &Snapshot, res: &ResourceId, max_age: Millis) -> bool {
+    newest(
+        config,
+        Capability::Reachability,
+        snap,
+        max_age,
+        |v| matches!(v, ObservedValue::ResourceUp { resource, .. } if resource == res),
+    )
+    .is_some_and(|g| {
+        g.iter()
+            .any(|v| matches!(v, ObservedValue::ResourceUp { up: false, .. }))
+    })
+}
+
+/// Whether `model` is a configured model of `res`, read from the config's model list.
+fn model_of(config: &Config, res: &ResourceId, model: &ModelId) -> bool {
+    config
+        .models()
+        .iter()
+        .any(|m| &m.id == model && &m.resource == res)
 }
 
 /// `Some((busy, in_flight))` for a class, `None` when its demand is unknown (missing, stale
@@ -185,24 +201,131 @@ pub fn check(
         }
     }
 
-    let mut acting = BTreeSet::new();
+    // 2. Only a configured model, on a host that is up and not reclaimed, is allowed; one
+    // that was not allowed before needs an allow step in this decision.
+    let before_allowed: BTreeSet<&ModelId> = prev
+        .resources
+        .values()
+        .filter_map(|r| r.mode.allowed_model())
+        .collect();
+    for model in &decision.allowed.models {
+        let Some(spec) = config.models().iter().find(|m| &m.id == model) else {
+            out.push(format!("invariant 2: allowed {model}, which is not configured"));
+            continue;
+        };
+        let res = &spec.resource;
+        if host_seen_down(config, snapshot, res, safety) {
+            out.push(format!(
+                "invariant 2: {model} allowed on {res}, which is observed down"
+            ));
+        }
+        if !decision.state.resource(res).is_some_and(|s| s.is_on()) {
+            out.push(format!(
+                "invariant 2: {model} allowed on {res}, which is not on"
+            ));
+        }
+        if reclaimed(config, snapshot, res) {
+            out.push(format!("invariant 2: {model} allowed on reclaimed {res}"));
+        }
+        let allowed_now = decision.steps.iter().any(
+            |s| matches!(s, Step::AllowModel { resource, model: m } if resource == res && m == model),
+        );
+        if !before_allowed.contains(model) && !allowed_now {
+            out.push(format!(
+                "invariant 2: {model} entered the allowed set without an allow step"
+            ));
+        }
+    }
+
+    // Classes: every requirement holds. A model requirement needs that model allowed and
+    // not being wound down in this decision; any requirement needs its host not observed
+    // down and not reclaimed (a gate class, on an exclusive host without a model, included).
+    for class in &decision.allowed.classes {
+        let Some(spec) = config.class(class) else {
+            out.push(format!("allowed class {class}, which is not configured"));
+            continue;
+        };
+        for req in &spec.requires {
+            let r = &req.resource;
+            if host_seen_down(config, snapshot, r, safety)
+                || !decision.state.resource(r).is_some_and(|s| s.is_on())
+            {
+                out.push(format!("allowed class {class} while {r} is not up"));
+            }
+            if reclaimed(config, snapshot, r) {
+                out.push(format!("allowed class {class} on reclaimed {r}"));
+            }
+            if let Some(m) = &req.model {
+                if !decision.allowed.models.contains(m) {
+                    out.push(format!("allowed class {class} while {m} is not allowed"));
+                }
+                let winding = matches!(
+                    decision.state.resource(r).map(|s| &s.mode),
+                    Some(ModePhase::Serving { wind_down: Some(_), .. })
+                );
+                if winding {
+                    out.push(format!(
+                        "allowed class {class} while {m} is being wound down"
+                    ));
+                }
+            }
+        }
+        if decision
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::PauseIntake { class: c } if c == class))
+        {
+            out.push(format!("allowed class {class} whose intake is paused"));
+        }
+    }
+
+    // One acting step per resource, except a switch: the withdrawal of the previously
+    // allowed model and the allowance of the next one, together.
+    let mut acting: BTreeMap<&ResourceId, Vec<&Step>> = BTreeMap::new();
     for step in &decision.steps {
         if let Some(r) = step.resource()
             && !matches!(step, Step::Wait { .. })
-            && !acting.insert(r.clone())
         {
-            out.push(format!("more than one acting step for {r}"));
+            acting.entry(r).or_default().push(step);
         }
+    }
+    for (r, list) in &acting {
+        let switch = matches!(
+            list.as_slice(),
+            [Step::DrainModel { model: a, .. }, Step::AllowModel { model: b, .. }]
+                | [Step::AllowModel { model: b, .. }, Step::DrainModel { model: a, .. }]
+                if a != b
+        );
+        if list.len() > 1 && !switch {
+            out.push(format!("more than one acting step for {r}: {list:?}"));
+        }
+    }
+
+    for step in &decision.steps {
         match step {
-            // 2. A model is allowed only when every other model is observed at zero pods.
+            // 2, 5. Allowing a model: configured on the resource, on a host freshly observed
+            // up, and the model allowed before (if another) leaves in the same decision.
             Step::AllowModel { resource, model } => {
-                for other in config.models_of(resource).filter(|m| &m.id != model) {
-                    if !pods_zero(config, snapshot, &other.id, safety) {
-                        out.push(format!(
-                            "invariant 2: allowed {model} without fresh zero pods of {}",
-                            other.id
-                        ));
-                    }
+                if !model_of(config, resource, model) {
+                    out.push(format!(
+                        "invariant 2: allowed {model}, which is not a configured model of {resource}"
+                    ));
+                }
+                let powered = config.resource(resource).is_some_and(|r| r.power.is_some());
+                if powered && !host_up(config, snapshot, resource, safety) {
+                    out.push(format!(
+                        "invariant 5: allowed {model} on {resource} without a fresh up observation"
+                    ));
+                }
+                if let Some(old) = prev.resource(resource).and_then(|s| s.mode.allowed_model())
+                    && old != model
+                    && !decision.steps.iter().any(|s| {
+                        matches!(s, Step::DrainModel { resource: r, model: m } if r == resource && m == old)
+                    })
+                {
+                    out.push(format!(
+                        "invariant 2: allowed {model} on {resource} while {old} stays allowed"
+                    ));
                 }
             }
             // 4. Power-on needs a manual request or a power-changing class with work.
@@ -288,9 +411,9 @@ pub fn check(
                     ));
                 }
                 for m in config.models_of(resource) {
-                    if !pods_zero(config, snapshot, &m.id, safety) {
+                    if decision.allowed.models.contains(&m.id) {
                         out.push(format!(
-                            "invariant 5: powered off {resource} without fresh zero pods of {}",
+                            "invariant 3: powered off {resource} while {} is allowed on it",
                             m.id
                         ));
                     }
@@ -343,12 +466,23 @@ pub fn check(
                     )),
                 }
             }
-            // 8. Draining a serving model needs a settled model or a declared-safe class.
+            // 8. Withdrawing a serving model needs a settled model or a declared-safe class.
+            // A model the config no longer has on the resource is withdrawn at once: none of
+            // its work is known any more.
             Step::DrainModel { resource, model } => {
+                if !model_of(config, resource, model) {
+                    continue;
+                }
                 let Some(ModePhase::Serving {
                     since, wind_down, ..
-                }) = prev.resource(resource).map(|s| &s.mode)
+                }) = prev
+                    .resource(resource)
+                    .map(|s| &s.mode)
+                    .filter(|m| m.allowed_model() == Some(model))
                 else {
+                    out.push(format!(
+                        "withdrew {model} on {resource}, which was not allowed"
+                    ));
                     continue;
                 };
                 let forced =

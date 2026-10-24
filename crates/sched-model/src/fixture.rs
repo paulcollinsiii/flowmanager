@@ -98,10 +98,8 @@ impl Fixture {
                     "resource has no power section but is not on".to_string(),
                 );
             }
-            if let Some(m) = st.mode.allowed_model().or(match &st.mode {
-                crate::state::ModePhase::Draining { model, .. } => Some(model),
-                _ => None,
-            }) && config.model(m).is_none_or(|spec| &spec.resource != id)
+            if let Some(m) = st.mode.allowed_model()
+                && config.model(m).is_none_or(|spec| &spec.resource != id)
             {
                 add(
                     &at,

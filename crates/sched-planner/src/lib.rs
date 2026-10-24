@@ -3,8 +3,8 @@
 //!
 //! Pure: depends only on `sched-model`; no I/O, no async runtime, no wall-clock access.
 //! Deterministic: the same inputs always produce the same intent. The planner reads the
-//! sequencer's state (loaded-since, idle-since) but never changes it, and knows nothing of
-//! pods, drain timing or transitional states beyond what dwell and grace need.
+//! sequencer's state (allowed-since, idle-since) but never changes it, and knows nothing of
+//! pods or drain timing: it decides from queues, leases and policy alone.
 
 use sched_model::{Config, Intent, SchedState, Snapshot};
 
