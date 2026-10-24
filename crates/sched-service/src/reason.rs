@@ -127,7 +127,9 @@ pub const NOT_EXECUTED_PAUSE: &str = " [NOT EXECUTED: consumers are not gated on
 
 fn wait_text(reason: WaitReason) -> &'static str {
     match reason {
-        WaitReason::StaleObservation => "a reachability observation of the host is missing or stale",
+        WaitReason::StaleObservation => {
+            "a reachability observation of the host is missing or stale"
+        }
         WaitReason::StaleDemand => {
             "a demand observation needed to prove no work is in flight is missing or stale"
         }

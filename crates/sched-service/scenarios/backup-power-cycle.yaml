@@ -28,7 +28,7 @@ frames:
       - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 1 } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
   # Backup finished: the idle clock starts.
   - at: 100600000
     refresh: true
@@ -36,7 +36,7 @@ frames:
       - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
   - at: 101200000
     refresh: true
     expect:

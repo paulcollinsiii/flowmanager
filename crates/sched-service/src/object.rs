@@ -524,7 +524,10 @@ mod tests {
         assert_eq!(r.allowed_models, vec![ModelId::from("whisperx")], "{r:?}");
         let text = String::from_utf8(ctx.stored(STATE_KEY).unwrap()).unwrap();
         assert!(text.starts_with("{\"version\":1,"), "{text}");
-        assert!(!text.contains("draining") && !text.contains("loading"), "{text}");
+        assert!(
+            !text.contains("draining") && !text.contains("loading"),
+            "{text}"
+        );
         // Loading under the old build: serving since the same instant, its classes allowed.
         let (s, _) = process();
         let ctx = FakeCtx::default();
@@ -540,7 +543,10 @@ mod tests {
         assert!(r.allowed_classes.contains(&"paperless-ocr".into()), "{r:?}");
         assert!(matches!(
             gpu_mode(&ctx),
-            Some(ModePhase::Serving { since: Millis(5), .. })
+            Some(ModePhase::Serving {
+                since: Millis(5),
+                ..
+            })
         ));
     }
 
@@ -558,7 +564,11 @@ mod tests {
             let r = tick(&s, &ctx).await.unwrap();
             ctx.commit();
             assert_eq!(r.error, None, "{mode}: {r:?}");
-            assert_eq!(r.allowed_models, vec![ModelId::from("mineru")], "{mode}: {r:?}");
+            assert_eq!(
+                r.allowed_models,
+                vec![ModelId::from("mineru")],
+                "{mode}: {r:?}"
+            );
             assert!(!r.allowed_models.contains(&"retired".into()));
         }
     }

@@ -413,11 +413,7 @@ impl Shared {
                     let mut shown = intent.clone();
                     shown.power_up.retain(|r, _| config.power_managed(r));
                     (
-                        reason::kinds(
-                            &decision.steps,
-                            &gaps,
-                            !reason::pinned(&intent).is_empty(),
-                        )
+                        reason::kinds(&decision.steps, &gaps, !reason::pinned(&intent).is_empty())
                             .into_iter()
                             .map(String::from)
                             .collect(),
@@ -680,7 +676,8 @@ mod tests {
             "{r:?}"
         );
         assert!(
-            r.reason.contains("reachability observation of the host is missing or stale"),
+            r.reason
+                .contains("reachability observation of the host is missing or stale"),
             "{}",
             r.reason
         );
@@ -1205,7 +1202,10 @@ mod tests {
             );
         }
         let first = s.tick(Millis(T0 + 1_000), &mut d);
-        assert!(first.kinds.contains(&"allow_model".to_string()), "{first:?}");
+        assert!(
+            first.kinds.contains(&"allow_model".to_string()),
+            "{first:?}"
+        );
         // Pinned and settled: no step, but the LLM is held on purpose, not idle.
         let r = s.tick(Millis(T0 + 2_000), &mut d);
         assert!(r.steps.is_empty(), "{r:?}");

@@ -394,7 +394,10 @@ fn the_simulated_world_exercises_switching_and_power() {
     let sum = check_bounds(&config, &log);
     assert!(sum.allows >= 4, "{sum:?}");
     assert!(sum.drains >= 3, "{sum:?}");
-    assert!(sum.pending_behind >= 1, "no switch overlapped in Kubernetes: {sum:?}");
+    assert!(
+        sum.pending_behind >= 1,
+        "no switch overlapped in Kubernetes: {sum:?}"
+    );
 }
 
 #[test]

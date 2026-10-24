@@ -342,16 +342,35 @@ fn a_switch_must_withdraw_the_old_model_in_the_same_decision() {
     let before = prev(GPU_SERVING_OCR);
     let after = GPU_SERVING_OCR.replace("model: mineru", "model: llm");
     // The correct switch: withdraw and allow together, only the new model in the set.
-    let ok = decided(vec![withdraw("mineru"), allow("llm")], &["llm"], &[], &after);
-    assert!(check_with(&s, &before, &ok).is_empty(), "{:?}", check_with(&s, &before, &ok));
+    let ok = decided(
+        vec![withdraw("mineru"), allow("llm")],
+        &["llm"],
+        &[],
+        &after,
+    );
+    assert!(
+        check_with(&s, &before, &ok).is_empty(),
+        "{:?}",
+        check_with(&s, &before, &ok)
+    );
     // Both in the set.
-    let both = decided(vec![withdraw("mineru"), allow("llm")], &["mineru", "llm"], &[], &after);
+    let both = decided(
+        vec![withdraw("mineru"), allow("llm")],
+        &["mineru", "llm"],
+        &[],
+        &after,
+    );
     let v = check_with(&s, &before, &both);
     assert!(v.iter().any(|m| m.contains("invariant 1")), "{v:?}");
     // Allowed without withdrawing the old one (even if the set were right).
-    let v = check_with(&s, &before, &decided(vec![allow("llm")], &["llm"], &[], &after));
+    let v = check_with(
+        &s,
+        &before,
+        &decided(vec![allow("llm")], &["llm"], &[], &after),
+    );
     assert!(
-        v.iter().any(|m| m.contains("invariant 2") && m.contains("mineru stays allowed")),
+        v.iter()
+            .any(|m| m.contains("invariant 2") && m.contains("mineru stays allowed")),
         "{v:?}"
     );
     // Two allows on one resource.
@@ -360,7 +379,10 @@ fn a_switch_must_withdraw_the_old_model_in_the_same_decision() {
         &prev(GPU_ON_IDLE),
         &decided(vec![allow("llm"), allow("mineru")], &["llm"], &[], &after),
     );
-    assert!(v.iter().any(|m| m.contains("more than one acting step")), "{v:?}");
+    assert!(
+        v.iter().any(|m| m.contains("more than one acting step")),
+        "{v:?}"
+    );
 }
 
 #[test]
@@ -377,7 +399,11 @@ fn allowing_on_a_host_that_is_not_freshly_up_is_a_violation() {
     };
     let d = decided(vec![allow("mineru")], &["mineru"], &[], next);
     // Fresh and up: fine.
-    let v = check_with(&snap(vec![up_at(NOW, true)], vec![]), &prev(GPU_ON_IDLE), &d);
+    let v = check_with(
+        &snap(vec![up_at(NOW, true)], vec![]),
+        &prev(GPU_ON_IDLE),
+        &d,
+    );
     assert!(v.is_empty(), "{v:?}");
     // Stale, or missing: invariant 5.
     for obs in [vec![up_at(NOW - 31_000, true)], vec![]] {
@@ -385,12 +411,23 @@ fn allowing_on_a_host_that_is_not_freshly_up_is_a_violation() {
         assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
     }
     // Observed down: invariant 2 (nothing is allowed on a host observed off) and 5.
-    let v = check_with(&snap(vec![up_at(NOW, false)], vec![]), &prev(GPU_ON_IDLE), &d);
-    assert!(v.iter().any(|m| m.contains("invariant 2") && m.contains("observed down")), "{v:?}");
+    let v = check_with(
+        &snap(vec![up_at(NOW, false)], vec![]),
+        &prev(GPU_ON_IDLE),
+        &d,
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 2") && m.contains("observed down")),
+        "{v:?}"
+    );
     // Pods are not part of it: any pod reading leaves the verdict as it was.
     let mut obs = vec![up_at(NOW, true)];
     obs.extend(zero_pods_and_up(&[]).into_iter().map(|mut o| {
-        if let sched_model::ObservedValue::ModelPods { pods, ready_pods, .. } = &mut o.value {
+        if let sched_model::ObservedValue::ModelPods {
+            pods, ready_pods, ..
+        } = &mut o.value
+        {
             *pods = 3;
             *ready_pods = 1;
         }
@@ -411,14 +448,25 @@ fn allowing_an_unconfigured_model_or_one_without_an_allow_step_is_a_violation() 
     );
     assert!(v.iter().any(|m| m.contains("not configured")), "{v:?}");
     // mineru appears in the set with no allow step and was not allowed before.
-    let v = check_with(&s, &prev(GPU_ON_IDLE), &decided(vec![], &["mineru"], &[], GPU_SERVING_OCR));
-    assert!(v.iter().any(|m| m.contains("without an allow step")), "{v:?}");
+    let v = check_with(
+        &s,
+        &prev(GPU_ON_IDLE),
+        &decided(vec![], &["mineru"], &[], GPU_SERVING_OCR),
+    );
+    assert!(
+        v.iter().any(|m| m.contains("without an allow step")),
+        "{v:?}"
+    );
     // On a reclaimed host: kept without winding down, or newly allowed.
     let s = snap(
         zero_pods_and_up(&["cuda-central", "basestar-nfs"]),
         vec![lease("r", "cuda-central", LeaseKind::Reclaim)],
     );
-    let v = check_with(&s, &prev(GPU_SERVING_OCR), &decided(vec![], &["mineru"], &[], GPU_SERVING_OCR));
+    let v = check_with(
+        &s,
+        &prev(GPU_SERVING_OCR),
+        &decided(vec![], &["mineru"], &[], GPU_SERVING_OCR),
+    );
     assert!(v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
     let v = check_with(
         &s,
@@ -427,7 +475,11 @@ fn allowing_an_unconfigured_model_or_one_without_an_allow_step_is_a_violation() 
     );
     assert!(v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
     // Kept while it winds down: fine.
-    let v = check_with(&s, &prev(SERVING_OCR), &decided(vec![], &["mineru"], &[], SERVING_OCR));
+    let v = check_with(
+        &s,
+        &prev(SERVING_OCR),
+        &decided(vec![], &["mineru"], &[], SERVING_OCR),
+    );
     assert!(!v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
 }
 
@@ -436,14 +488,23 @@ fn allowing_a_class_whose_requirements_do_not_hold_is_a_violation() {
     let s = snap(zero_pods_and_up(&["cuda-central", "basestar-nfs"]), vec![]);
     let before = prev(GPU_SERVING_OCR);
     // OCR allowed while its model is not.
-    let v = check_with(&s, &before, &decided(vec![], &[], &["paperless-ocr"], GPU_ON_IDLE));
-    assert!(v.iter().any(|m| m.contains("mineru is not allowed")), "{v:?}");
+    let v = check_with(
+        &s,
+        &before,
+        &decided(vec![], &[], &["paperless-ocr"], GPU_ON_IDLE),
+    );
+    assert!(
+        v.iter().any(|m| m.contains("mineru is not allowed")),
+        "{v:?}"
+    );
     // OCR allowed while its intake is paused.
     let v = check_with(
         &s,
         &before,
         &decided(
-            vec![Step::PauseIntake { class: ClassId::new("paperless-ocr") }],
+            vec![Step::PauseIntake {
+                class: ClassId::new("paperless-ocr"),
+            }],
             &["mineru"],
             &["paperless-ocr"],
             GPU_SERVING_OCR,
@@ -467,11 +528,16 @@ fn allowing_a_class_whose_requirements_do_not_hold_is_a_violation() {
         &decided(vec![], &[], &["paperless-gpt"], GPU_ON_IDLE),
     );
     assert!(
-        v.iter().any(|m| m.contains("paperless-gpt") && m.contains("cuda-central is not up")),
+        v.iter()
+            .any(|m| m.contains("paperless-gpt") && m.contains("cuda-central is not up")),
         "{v:?}"
     );
     // And open while both hosts are up: fine.
-    let v = check_with(&s, &prev(GPU_ON_IDLE), &decided(vec![], &[], &["paperless-gpt"], GPU_ON_IDLE));
+    let v = check_with(
+        &s,
+        &prev(GPU_ON_IDLE),
+        &decided(vec![], &[], &["paperless-gpt"], GPU_ON_IDLE),
+    );
     assert!(v.is_empty(), "{v:?}");
 }
 
@@ -489,7 +555,8 @@ fn powering_off_a_host_with_a_model_allowed_is_a_violation() {
         ),
     );
     assert!(
-        v.iter().any(|m| m.contains("invariant 3") && m.contains("mineru is allowed")),
+        v.iter()
+            .any(|m| m.contains("invariant 3") && m.contains("mineru is allowed")),
         "{v:?}"
     );
 }

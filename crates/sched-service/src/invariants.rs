@@ -210,7 +210,9 @@ pub fn check(
         .collect();
     for model in &decision.allowed.models {
         let Some(spec) = config.models().iter().find(|m| &m.id == model) else {
-            out.push(format!("invariant 2: allowed {model}, which is not configured"));
+            out.push(format!(
+                "invariant 2: allowed {model}, which is not configured"
+            ));
             continue;
         };
         let res = &spec.resource;
@@ -269,7 +271,10 @@ pub fn check(
                 }
                 let winding = matches!(
                     decision.state.resource(r).map(|s| &s.mode),
-                    Some(ModePhase::Serving { wind_down: Some(_), .. })
+                    Some(ModePhase::Serving {
+                        wind_down: Some(_),
+                        ..
+                    })
                 );
                 if winding {
                     out.push(format!(

@@ -26,15 +26,15 @@ frames:
       - { id: webui, resource: cuda-central, granted_at: 100000000, kind: { type: interactive, model: llm, expires_at: 100900000 } }
     expect:
       steps: []
-      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-tagging, speakr-summarization, interactive-llm] }
+      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-tagging, speakr-summarization, interactive-llm] }
   - at: 100600000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-tagging, speakr-summarization, interactive-llm] }
-  # The lease expired.
+      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-tagging, speakr-summarization, interactive-llm] }
+  # The lease expired: the LLM leaves and the starved OCR model comes in, in one tick.
   - at: 100950000
     refresh: true
     expect:
-      steps: [{ type: pause_intake, class: paperless-tagging }, { type: pause_intake, class: speakr-summarization }, { type: pause_intake, class: interactive-llm }, { type: drain_model, resource: cuda-central, model: llm }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+      steps: [{ type: pause_intake, class: paperless-tagging }, { type: pause_intake, class: speakr-summarization }, { type: pause_intake, class: interactive-llm }, { type: drain_model, resource: cuda-central, model: llm }, { type: allow_model, resource: cuda-central, model: mineru }]
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }

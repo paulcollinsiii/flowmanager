@@ -30,7 +30,7 @@ macro_rules! scenarios {
 
 scenarios! {
     lifecycle_ocr_to_transcription => "lifecycle-ocr-to-transcription.yaml",
-    stale_pods_block_allow => "stale-pods-block-allow.yaml",
+    stale_reachability_blocks_allow => "stale-reachability-blocks-allow.yaml",
     manual_nfs_lease => "manual-nfs-lease.yaml",
     backup_power_cycle => "backup-power-cycle.yaml",
     reclaim => "reclaim.yaml",
@@ -39,11 +39,12 @@ scenarios! {
     readiness_precedence => "readiness-precedence.yaml",
     idle_release => "idle-release.yaml",
     nfs_probe_reachability => "nfs-probe-reachability.yaml",
+    gate_follows_host_readiness => "gate-follows-host-readiness.yaml",
 }
 
 #[test]
 fn every_scenario_file_has_a_test() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
     let count = std::fs::read_dir(dir).unwrap().count();
-    assert_eq!(count, 10, "add new scenario files to the scenarios! list");
+    assert_eq!(count, 11, "add new scenario files to the scenarios! list");
 }

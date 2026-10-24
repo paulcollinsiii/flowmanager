@@ -175,7 +175,11 @@ impl World {
             };
             self.pods.insert(m, next);
         }
-        assert!(self.running().len() <= 1, "two models on one GPU: {:?}", self.pods);
+        assert!(
+            self.running().len() <= 1,
+            "two models on one GPU: {:?}",
+            self.pods
+        );
         for (c, _) in CLASSES {
             let runs = self.class_allowed(c);
             let q = self.queues.get_mut(c).unwrap();
@@ -295,11 +299,19 @@ fn a_switch_is_one_tick_and_resumes_safely_after_a_restart_in_the_middle_of_it()
         // Restart right after the switch: mineru's pod is still terminating and holds the
         // GPU, whisperx's is pending behind it.
         if restarted_at.is_none() && switched_at.is_some_and(|s| t == s + 1) {
-            assert!(world.terminating.contains_key("mineru"), "{}", log.join("\n"));
+            assert!(
+                world.terminating.contains_key("mineru"),
+                "{}",
+                log.join("\n")
+            );
             assert_eq!(world.pods["whisperx"], (1, 0), "{}", log.join("\n"));
             restarted_at = Some(t);
             p = start(now);
-            assert_eq!(*p.allowed.borrow(), None, "nothing published by a new process");
+            assert_eq!(
+                *p.allowed.borrow(),
+                None,
+                "nothing published by a new process"
+            );
             log.push(format!("t={t}: RESTART"));
         }
         p.clock.set(Millis(now));
@@ -341,31 +353,47 @@ fn a_switch_is_one_tick_and_resumes_safely_after_a_restart_in_the_middle_of_it()
         assert_eq!(drained, allowed, "t={t}: half a switch\n{}", dump());
         if drained {
             assert!(switched_at.is_none(), "switched twice\n{}", dump());
-            assert!(!stall.contains(&t), "switched on stale reachability\n{}", dump());
+            assert!(
+                !stall.contains(&t),
+                "switched on stale reachability\n{}",
+                dump()
+            );
             // mineru's pod is still there: nothing waited for it.
             assert!(world.pods["mineru"].1 > 0, "t={t}\n{}", dump());
             switched_at = Some(t);
         }
         if switched_at.is_some() {
-            assert!(!allowed_has(&published, "mineru"), "t={t}: mineru is back\n{}", dump());
+            assert!(
+                !allowed_has(&published, "mineru"),
+                "t={t}: mineru is back\n{}",
+                dump()
+            );
             assert!(allowed_has(&published, "whisperx"), "t={t}\n{}", dump());
         }
         // The switch was due during the stall but the host's reading was stale: it waited
         // as a whole, mineru staying allowed.
         let stale = t > stall.start + (SAFETY_MAX_AGE / TICK) as usize;
-        if stall.contains(&t) && stale && switched_at.is_none() {
-            if r.steps.contains(&Step::Wait {
-                resource: GPU.into(),
-                reason: sched_model::WaitReason::StaleObservation,
-            }) {
-                assert!(allowed_has(&published, "mineru"), "t={t}\n{}", dump());
-                stale_holds += 1;
-            }
+        let held = r.steps.contains(&Step::Wait {
+            resource: GPU.into(),
+            reason: sched_model::WaitReason::StaleObservation,
+        });
+        if stall.contains(&t) && stale && switched_at.is_none() && held {
+            assert!(allowed_has(&published, "mineru"), "t={t}\n{}", dump());
+            stale_holds += 1;
         }
         if first_after_restart {
             // Nothing observed yet in this process: the persisted state carries the switch.
-            assert_eq!(gpu_models(&published), vec![&ModelId::from("whisperx")], "{}", dump());
-            assert!(r.steps.iter().all(|s| matches!(s, Step::Wait { .. })), "{}", dump());
+            assert_eq!(
+                gpu_models(&published),
+                vec![&ModelId::from("whisperx")],
+                "{}",
+                dump()
+            );
+            assert!(
+                r.steps.iter().all(|s| matches!(s, Step::Wait { .. })),
+                "{}",
+                dump()
+            );
         }
         if allowed_has(&published, "mineru") && world.pods["mineru"].1 > 0 {
             mineru_served = true;
@@ -383,7 +411,10 @@ fn a_switch_is_one_tick_and_resumes_safely_after_a_restart_in_the_middle_of_it()
     assert!(mineru_served, "{dump}");
     let switched_at = switched_at.unwrap_or_else(|| panic!("never switched\n{dump}"));
     assert!(switched_at >= stall.end, "{dump}");
-    assert!(stale_holds >= 1, "the stale reading never held the switch\n{dump}");
+    assert!(
+        stale_holds >= 1,
+        "the stale reading never held the switch\n{dump}"
+    );
     let restarted_at = restarted_at.unwrap_or_else(|| panic!("never restarted\n{dump}"));
     // whisperx ran only once mineru's pod had gone (Kubernetes), after the restart.
     let ready = whisperx_ready_at.unwrap_or_else(|| panic!("whisperx never ran\n{dump}"));

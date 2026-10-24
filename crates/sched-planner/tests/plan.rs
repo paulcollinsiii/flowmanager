@@ -677,7 +677,8 @@ fn gate_classes_never_influence_model_choice() {
     ))
     .unwrap();
     assert!(without.class(&"paperless-gpt".into()).is_none());
-    let worlds: Vec<(Vec<String>, Option<(&str, u64, Option<u64>)>)> = vec![
+    type Serving<'a> = Option<(&'a str, u64, Option<u64>)>;
+    let worlds: Vec<(Vec<String>, Serving)> = vec![
         (vec![ocr(0, T)], None),
         (vec![ocr(2, T - 9 * MIN), tagging(1, T - 5 * MIN)], None),
         (
