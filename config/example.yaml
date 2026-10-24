@@ -19,11 +19,15 @@ resources:
     power:
       actuator: wake_on_lan
       params: { mac: "00:00:00:00:00:01", shutdown: ssh_forced_command }
+      # manual: a person powers the host; the scheduler never emits power steps for it and
+      # follows its observed reachability. managed (M4): the scheduler powers it on and off.
+      control: manual
   - id: basestar-nfs
     kind: shared
     power:
       actuator: ssh_power
       params: { host: basestar }
+      control: manual
 
 models:
   - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru] }

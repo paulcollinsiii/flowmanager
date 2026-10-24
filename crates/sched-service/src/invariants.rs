@@ -133,6 +133,14 @@ fn manual_model(snap: &Snapshot, res: &ResourceId) -> bool {
     })
 }
 
+/// Whether the scheduler controls `res`'s power, read from the config spec directly.
+fn managed_power(config: &Config, res: &ResourceId) -> bool {
+    config
+        .resource(res)
+        .and_then(|r| r.power.as_ref())
+        .is_some_and(|p| p.control == sched_model::PowerControl::Managed)
+}
+
 fn needs(class: &ClassSpec, res: &ResourceId) -> bool {
     class.requires.iter().any(|r| &r.resource == res)
 }
@@ -195,6 +203,11 @@ pub fn check(
             }
             // 4. Power-on needs a manual request or a power-changing class with work.
             Step::PowerOn { resource } => {
+                if !managed_power(config, resource) {
+                    out.push(format!(
+                        "invariant 4: powered on {resource}, whose power is under manual control"
+                    ));
+                }
                 let manual = snapshot.leases.iter().any(|l| {
                     &l.resource == resource
                         && matches!(
@@ -220,6 +233,11 @@ pub fn check(
             // 3, 4, 5. Power-off needs no holds (a reclaim of an exclusive powered resource
             // is the only exception), idle grace, management, and fresh observations.
             Step::PowerOff { resource } => {
+                if !managed_power(config, resource) {
+                    out.push(format!(
+                        "invariant 4: powered off {resource}, whose power is under manual control"
+                    ));
+                }
                 let before = prev.resource(resource);
                 if !reclaimed(config, snapshot, resource) {
                     if !before.is_some_and(|s| s.managed) {

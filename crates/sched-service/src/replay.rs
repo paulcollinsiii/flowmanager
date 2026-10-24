@@ -23,6 +23,10 @@ pub struct Scenario {
     pub description: String,
     #[serde(default)]
     pub initial_state: SchedState,
+    /// Overrides `power.control` of every powered resource of the config the scenario is
+    /// replayed against (scenarios of the power machine use `managed`).
+    #[serde(default)]
+    pub power_control: Option<sched_model::PowerControl>,
     pub frames: Vec<Frame>,
 }
 

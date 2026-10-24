@@ -1,4 +1,6 @@
 description: "Reachability of basestar comes only from the Prometheus probe source (not a Kubernetes node), never from the cluster watch. A manual host lease wakes NFS; a shared hold then a release keep it up until no hold remains and idle grace has passed."
+# The power machine as under managed control (M4).
+power_control: managed
 frames:
   - at: 100000000
     observe:

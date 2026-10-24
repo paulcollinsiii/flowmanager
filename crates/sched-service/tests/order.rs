@@ -2,7 +2,8 @@
 //! same intent and decision, including duplicates tied on timestamp and conflicting leases.
 
 use proptest::prelude::*;
-use sched_model::test_support::example_config;
+// Includes power-off orderings, so managed control (M4).
+use sched_model::test_support::example_config_managed as example_config;
 use sched_model::{
     ClassId, Fidelity, Lease, LeaseId, LeaseKind, Millis, ModelId, Observation, ObservedValue,
     ResourceId, SchedState, Snapshot, SourceId, WaitReason,

@@ -1,4 +1,6 @@
 description: "The backup class may change power: it wakes NFS when due and NFS goes down again after it finishes and idle grace passes."
+# The power machine as under managed control (M4).
+power_control: managed
 frames:
   - at: 100000000
     observe:

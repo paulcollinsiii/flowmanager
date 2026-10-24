@@ -466,22 +466,16 @@ fn a_manual_lease_forces_a_switch_and_an_unexecuted_kill_does_not_stall_it() {
     assert!(world.queues["paperless-ocr"].ready > 0);
 }
 
-/// Known gap, pinned down here so that it cannot change unnoticed: nothing executes
-/// `PowerOff`, but the sequencer records the host as shutting down. A host that stays up
-/// is not read back as on (only a host that went down moves on, to off), so the GPU stays
-/// "shutting down" and no model is allowed, whatever the demand, until the host is seen
-/// down. The scheduler takes power-off responsibility for a host once a manual model lease
-/// asked for it to be up. This needs every class on the host to have known demand (with
-/// the example config `llm-sessions` has no observer, so its demand is unknown and blocks
-/// the power-off); this test pushes all of them.
+/// The user's report from M3 P1: with power steps unexecuted, a released manual LLM lease
+/// led to a power-off nobody carried out and the GPU stayed "shutting down" with nothing
+/// allowed. Under `power.control: manual` (the example config) no power step is ever
+/// emitted, the host stays on as observed, and new work is scheduled again.
 #[test]
-fn known_gap_an_unexecuted_power_off_leaves_a_running_gpu_shutting_down() {
+fn a_released_manual_lease_never_leads_to_a_power_off_under_manual_control() {
     let mut store = Store::default();
     let mut world = World::new();
     let p = start(T0);
-    let idle_grace = 10 * 60_000;
     let mut released_at = None;
-    let mut power_off_at = None;
     let mut log = Vec::new();
     for t in 0..200usize {
         let now = T0 + t as u64 * TICK;
@@ -505,7 +499,7 @@ fn known_gap_an_unexecuted_power_off_leaves_a_running_gpu_shutting_down() {
             released_at = Some(now);
         }
         if t == 150 {
-            // New OCR work long after the power-off.
+            // New OCR work long after the release and the idle grace.
             world.queues.get_mut("paperless-ocr").unwrap().ready = 5;
         }
         push_pods(&p, &world);
@@ -520,34 +514,23 @@ fn known_gap_an_unexecuted_power_off_leaves_a_running_gpu_shutting_down() {
             gpu_models(&published),
             r.steps
         ));
-        let off = Step::PowerOff {
-            resource: GPU.into(),
-        };
-        if r.steps.contains(&off) {
-            assert!(r.not_executed.contains(&off));
-            power_off_at.get_or_insert(now);
-        }
-        if t > 150 {
+        assert!(
+            !r.steps
+                .iter()
+                .any(|s| matches!(s, Step::PowerOff { .. } | Step::PowerOn { .. })),
+            "{}",
+            log.join("\n")
+        );
+        let gpu = store.load().state.resource(&GPU.into()).cloned().unwrap();
+        assert!(gpu.is_on() && !gpu.managed, "{}", log.join("\n"));
+        if t > 170 {
             assert!(
-                !published.allowed.models.contains(&ModelId::from("mineru")),
+                published.allowed.models.contains(&ModelId::from("mineru")),
                 "{}",
                 log.join("\n")
             );
-            assert!(r.steps.contains(&Step::Wait {
-                resource: GPU.into(),
-                reason: sched_model::WaitReason::ShuttingDown
-            }));
         }
         world.step(p.allowed.borrow().clone());
     }
-    let dump = log.join("\n");
-    let off = power_off_at.unwrap_or_else(|| panic!("no power-off\n{dump}"));
-    assert!(off >= released_at.unwrap() + idle_grace, "{dump}");
-    assert!(
-        matches!(
-            store.load().state.resource(&GPU.into()).unwrap().power,
-            sched_model::PowerPhase::ShuttingDown { .. }
-        ),
-        "{dump}"
-    );
+    assert!(released_at.is_some());
 }

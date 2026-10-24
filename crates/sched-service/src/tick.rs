@@ -440,8 +440,12 @@ mod tests {
     const T0: u64 = 10_000_000;
 
     fn shared() -> (Arc<Shared>, Arc<ManualClock>) {
+        shared_with(EXAMPLE_CONFIG)
+    }
+
+    fn shared_with(yaml: &str) -> (Arc<Shared>, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(Millis(T0)));
-        let holder = Arc::new(ConfigHolder::new(EXAMPLE_CONFIG).unwrap());
+        let holder = Arc::new(ConfigHolder::new(yaml).unwrap());
         let s = Shared::new(holder, Arc::new(Metrics::new()), clock.clone());
         (Arc::new(s), clock)
     }
@@ -822,7 +826,8 @@ mod tests {
 
     #[test]
     fn steps_without_an_actuator_are_reported_as_not_executed() {
-        let (s, _) = shared();
+        // Managed power control (M4), the only way a power step can appear.
+        let (s, _) = shared_with(&sched_model::test_support::example_yaml_managed());
         let mut d = Durable {
             leases: vec![llm_lease()],
             ..Durable::default()
@@ -857,6 +862,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn under_manual_power_control_a_lease_on_a_host_that_is_off_waits_for_a_person() {
+        let (s, _) = shared();
+        let mut d = Durable {
+            leases: vec![llm_lease()],
+            ..Durable::default()
+        };
+        push(
+            &s,
+            "cluster-pods",
+            vec![ObservedValue::ResourceUp {
+                resource: "cuda-central".into(),
+                up: false,
+            }],
+        );
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        assert!(r.not_executed.is_empty(), "{r:?}");
+        assert!(
+            r.steps.contains(&Step::Wait {
+                resource: "cuda-central".into(),
+                reason: sched_model::WaitReason::HostNotUp
+            }),
+            "{r:?}"
+        );
+        let gpu = d.state.resource(&"cuda-central".into()).unwrap();
+        assert_eq!(gpu.power, sched_model::PowerPhase::Off);
+        assert!(!gpu.managed);
+    }
     #[test]
     fn a_tick_never_runs_before_an_observation_it_can_read() {
         let (s, _) = shared();

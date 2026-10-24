@@ -28,9 +28,19 @@ pub(crate) fn initial(cx: &Cx, steps: &mut Vec<Step>) -> Option<ResourceState> {
 }
 
 /// Brings the power phase in line with a fresh reachability observation.
+///
+/// Under `control: manual` the scheduler is never responsible for the host's power
+/// (`managed` is cleared, also in state persisted by a build or config that managed it), and
+/// the phase is simply what is observed: on or off. A transitional phase left from managed
+/// control (powering on, shutting down) converges to the observed one.
 pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     if cx.res.power.is_none() {
         return;
+    }
+    let manual = !cx.config.power_managed(&cx.res.id);
+    if manual {
+        st.managed = false;
+        st.host_idle_since = None;
     }
     let now = cx.now();
     let Some(up) =
@@ -40,6 +50,9 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         return;
     };
     st.power = match (st.power, up) {
+        (PowerPhase::On { since }, true) => PowerPhase::On { since },
+        (_, true) if manual => PowerPhase::On { since: now },
+        (_, false) if manual => PowerPhase::Off,
         (PowerPhase::Off | PowerPhase::PoweringOn { .. }, true) => PowerPhase::On { since: now },
         (PowerPhase::On { .. }, false) => PowerPhase::Off,
         (PowerPhase::ShuttingDown { .. }, false) => PowerPhase::Off,
@@ -104,6 +117,10 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
     let now = cx.now();
     let policy = cx.config.policy();
     let want = cx.intent.power_up.get(&cx.res.id).copied();
+    if !cx.config.power_managed(&cx.res.id) {
+        manual_step(cx, st, steps, acted, want.is_some());
+        return;
+    }
     match st.power {
         PowerPhase::Off => {
             if acted {
@@ -165,6 +182,29 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 st.host_idle_since = None;
             }
         }
+    }
+}
+
+/// Under `control: manual`: never a power step. Work that needs a host that is not up
+/// waits for a person to power it on.
+fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, wanted: bool) {
+    if acted {
+        return;
+    }
+    let needed = wanted
+        || cx
+            .intent
+            .models
+            .get(&cx.res.id)
+            .is_some_and(|m| m.is_some());
+    match st.power {
+        PowerPhase::On { .. } => {}
+        _ if cx.reclaimed() => wait(cx, steps, WaitReason::Reclaimed),
+        // Only left from managed control while reachability is not fresh.
+        PowerPhase::PoweringOn { .. } => wait(cx, steps, WaitReason::PoweringOn),
+        PowerPhase::ShuttingDown { .. } => wait(cx, steps, WaitReason::ShuttingDown),
+        PowerPhase::Off if needed => wait(cx, steps, WaitReason::HostNotUp),
+        PowerPhase::Off => {}
     }
 }
 

@@ -14,7 +14,8 @@
 //!    needs it, after `idle_grace`; the one override is a reclaim.
 //! 4. Power changes come only from the intent's `power_up` (manual requests, or classes
 //!    that may change power), and a host is powered down only if the scheduler took
-//!    responsibility for it. A reclaim lease applies only to an exclusive resource with a
+//!    responsibility for it. A host under `power.control: manual` never gets a power step
+//!    and the scheduler never takes responsibility for it: its phase follows observation. A reclaim lease applies only to an exclusive resource with a
 //!    power section; on any other resource it is ignored and reported as a wait.
 //! 5. Safety-critical steps need fresh observations; otherwise the sequencer waits.
 //! 8. Early switching happens only away from classes that declare it safe, or when forced,

@@ -308,8 +308,9 @@ fn the_checker_is_not_wedged_by_stray_readings_either() {
 /// Reachability of a host outside the cluster comes from a probe source, declared as such.
 #[test]
 fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
-    use sched_model::test_support::EXAMPLE_CONFIG;
-    let text = EXAMPLE_CONFIG.replace(
+    // A manual NFS lease powers basestar up: managed control (M4).
+    let managed = sched_model::test_support::example_yaml_managed();
+    let text = managed.replace(
         "  - id: basestar-probe\n    kind: prometheus\n",
         "  - id: basestar-probe\n    kind: http_json\n",
     );
@@ -318,7 +319,7 @@ fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
         "    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n      resource: basestar-nfs\n      timeout: 5s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
         "",
     );
-    assert_ne!(text, EXAMPLE_CONFIG);
+    assert_ne!(text, managed);
     let config = sched_model::Config::from_yaml(&text).unwrap();
     let lease = sched_model::Lease {
         id: "user".into(),

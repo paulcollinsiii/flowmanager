@@ -20,6 +20,20 @@ pub enum ResourceKind {
     Shared,
 }
 
+/// Who changes a host's power.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerControl {
+    /// A person powers the host on and off. The scheduler never emits a power step for it
+    /// and never takes responsibility for its power; its power phase follows observed
+    /// reachability (on or off). Work that needs the host waits until it is up.
+    #[default]
+    Manual,
+    /// The scheduler powers the host on (manual requests, power-changing classes) and off
+    /// again once nothing holds it, through the actuator.
+    Managed,
+}
+
 /// How a host's power is changed. The actuator kind lives in code; its parameters here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +41,9 @@ pub struct PowerSpec {
     pub actuator: String,
     #[serde(default)]
     pub params: Value,
+    /// Defaults to `manual`.
+    #[serde(default)]
+    pub control: PowerControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -331,6 +348,14 @@ impl Config {
     pub fn supports_reclaim(&self, id: &ResourceId) -> bool {
         self.resource(id)
             .is_some_and(|r| r.kind == ResourceKind::Exclusive && r.power.is_some())
+    }
+
+    /// Whether the scheduler controls `id`'s power: it has a power section with
+    /// `control: managed`.
+    pub fn power_managed(&self, id: &ResourceId) -> bool {
+        self.resource(id)
+            .and_then(|r| r.power.as_ref())
+            .is_some_and(|p| p.control == PowerControl::Managed)
     }
 
     pub fn resource(&self, id: &ResourceId) -> Option<&ResourceSpec> {
