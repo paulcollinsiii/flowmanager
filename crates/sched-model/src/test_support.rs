@@ -30,6 +30,23 @@ pub const FIXTURES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The example's `basestar-probe` source, a `tcp_probe`, as written in [`EXAMPLE_CONFIG`].
+pub const EXAMPLE_TCP_PROBE_SOURCE: &str = "  - id: basestar-probe\n    kind: tcp_probe\n    observe: [reachability]\n    resync: 10s\n    params:\n      host: basestar\n      port: 2049\n      resource: basestar-nfs\n      timeout: 2s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n";
+
+/// The same source as a `prometheus` probe, for tests of that kind; see
+/// [`example_with_prometheus_probe`].
+pub const PROMETHEUS_PROBE_SOURCE: &str = "  - id: basestar-probe\n    kind: prometheus\n    observe: [reachability]\n    resync: 10s\n    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n      resource: basestar-nfs\n      timeout: 5s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n";
+
+/// [`EXAMPLE_CONFIG`] with `basestar-probe` read through Prometheus instead of a TCP probe,
+/// so the `prometheus` kind keeps a realistic test configuration.
+pub fn example_with_prometheus_probe() -> String {
+    assert!(
+        EXAMPLE_CONFIG.contains(EXAMPLE_TCP_PROBE_SOURCE),
+        "the example's basestar-probe source changed; update EXAMPLE_TCP_PROBE_SOURCE"
+    );
+    EXAMPLE_CONFIG.replace(EXAMPLE_TCP_PROBE_SOURCE, PROMETHEUS_PROBE_SOURCE)
+}
+
 pub fn example_config() -> Config {
     Config::from_yaml(EXAMPLE_CONFIG).expect("bundled example config is valid")
 }
@@ -84,6 +101,27 @@ mod tests {
         assert!(backup.may_change_power);
         assert_eq!(backup.preemptibility, Preemptibility::None);
         assert!(c.class(&"paperless-ngx".into()).unwrap().demand.is_none());
+    }
+
+    #[test]
+    fn the_prometheus_variant_of_the_example_is_valid_and_differs_only_in_the_probe() {
+        let tcp = example_config();
+        let prom = Config::from_yaml(&example_with_prometheus_probe()).unwrap();
+        let id = "basestar-probe".into();
+        assert_eq!(
+            tcp.source(&id).unwrap().kind,
+            crate::config::SourceKind::TcpProbe
+        );
+        assert_eq!(
+            prom.source(&id).unwrap().kind,
+            crate::config::SourceKind::Prometheus
+        );
+        assert_eq!(tcp.resources(), prom.resources());
+        assert_eq!(tcp.classes(), prom.classes());
+        assert_eq!(tcp.sources().len(), prom.sources().len());
+        for (a, b) in tcp.sources().iter().zip(prom.sources()) {
+            assert!(a == b || a.id == id, "{} differs", a.id);
+        }
     }
 
     #[test]

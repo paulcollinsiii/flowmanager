@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::config::{Capability, Config, MAX_LEASE_DURATION, ResourceKind};
+use crate::config::{Capability, Config, MAX_LEASE_DURATION, ResourceKind, SourceKind};
 use crate::time::Millis;
 
 /// One validation failure: where it is and what is wrong.
@@ -349,12 +349,17 @@ fn sources(c: &Config, p: &mut Problems) {
                 );
             }
         }
-        if let Ok(Some(prom)) = s.prometheus_params()
-            && c.resource(&prom.resource).is_none()
+        let probed = match s.kind {
+            SourceKind::Prometheus => s.prometheus_params().ok().flatten().map(|p| p.resource),
+            SourceKind::TcpProbe => s.tcp_probe_params().ok().flatten().map(|p| p.resource),
+            _ => None,
+        };
+        if let Some(resource) = probed
+            && c.resource(&resource).is_none()
         {
             p.add(
                 format!("{at}.params.resource"),
-                format!("unknown resource \"{}\"", prom.resource),
+                format!("unknown resource \"{resource}\""),
             );
         }
         for cap in &s.observe {
@@ -659,6 +664,7 @@ sources:
             (KubernetesWatch, [true, true, false]),
             (HttpJson, [false, true, true]),
             (Prometheus, [false, true, true]),
+            (TcpProbe, [false, true, false]),
             (Sql, [false, false, true]),
             (Schedule, [false, false, true]),
             (Session, [false, false, true]),
@@ -752,6 +758,8 @@ sources:
             );
         assert!(Config::from_yaml(&y).is_ok());
         let y = y.replace("id: probe, kind: http_json", "id: probe, kind: prometheus");
+        assert!(Config::from_yaml(&y).is_ok());
+        let y = y.replace("id: probe, kind: prometheus", "id: probe, kind: tcp_probe");
         assert!(Config::from_yaml(&y).is_ok());
     }
 

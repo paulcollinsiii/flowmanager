@@ -10,7 +10,7 @@ use sched_model::{ClassId, Config, ModelId, SourceId, SourceKind, SourceSpec};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::kube_watch::{self, Timing};
-use crate::{ReportTx, http_json, prometheus};
+use crate::{ReportTx, http_json, prometheus, tcp_probe};
 
 /// What a running observer was built from. If it is unchanged by a reload, the observer
 /// keeps running (and keeps its state, such as reachability debounce counts).
@@ -79,7 +79,10 @@ impl Observers {
         for spec in config.sources() {
             if matches!(
                 spec.kind,
-                SourceKind::HttpJson | SourceKind::KubernetesWatch | SourceKind::Prometheus
+                SourceKind::HttpJson
+                    | SourceKind::KubernetesWatch
+                    | SourceKind::Prometheus
+                    | SourceKind::TcpProbe
             ) {
                 wanted.insert(spec.id.clone(), fingerprint(config, spec));
             } else {
@@ -237,6 +240,25 @@ fn start(
                 None
             }
         },
+        SourceKind::TcpProbe => match spec.tcp_probe_params() {
+            Ok(Some(params)) => {
+                let (spec, tx2) = (spec.clone(), tx.clone());
+                Some(tokio::spawn(supervised(
+                    spec.id.clone(),
+                    tx.clone(),
+                    backoff,
+                    move || tcp_probe::run(spec.clone(), params.clone(), tx2.clone()),
+                )))
+            }
+            Ok(None) => {
+                tracing::info!(source = %spec.id, "no params: source is not probed");
+                None
+            }
+            Err(e) => {
+                tracing::error!(source = %spec.id, "{e}");
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -364,6 +386,7 @@ pub fn observer_state(spec: &SourceSpec) -> ObserverState {
         SourceKind::HttpJson => matches!(spec.http_json_params(), Ok(Some(_))),
         SourceKind::KubernetesWatch => matches!(spec.kube_watch_params(), Ok(Some(_))),
         SourceKind::Prometheus => matches!(spec.prometheus_params(), Ok(Some(_))),
+        SourceKind::TcpProbe => matches!(spec.tcp_probe_params(), Ok(Some(_))),
         _ => return ObserverState::NoImplementation,
     };
     if has_params {

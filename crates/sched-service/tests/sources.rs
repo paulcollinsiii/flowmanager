@@ -310,12 +310,12 @@ fn the_checker_is_not_wedged_by_stray_readings_either() {
 fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
     use sched_model::test_support::EXAMPLE_CONFIG;
     let text = EXAMPLE_CONFIG.replace(
-        "  - id: basestar-probe\n    kind: prometheus\n",
+        "  - id: basestar-probe\n    kind: tcp_probe\n",
         "  - id: basestar-probe\n    kind: http_json\n",
     );
-    // The prometheus-shaped params would not be valid http_json params.
+    // The tcp_probe-shaped params would not be valid http_json params.
     let text = text.replace(
-        "    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n      resource: basestar-nfs\n      timeout: 5s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
+        "    params:\n      host: basestar\n      port: 2049\n      resource: basestar-nfs\n      timeout: 2s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
         "",
     );
     assert_ne!(text, EXAMPLE_CONFIG);

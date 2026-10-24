@@ -120,29 +120,46 @@ sources:
       # Consecutive agreeing checks (one per resync) before a host's up/down flips.
       reachability_confirmations: 3
 
-  # basestar is not a Kubernetes node: its reachability comes from a blackbox probe
-  # (ssh/icmp) scraped through Prometheus, not from the cluster watch. Each resync runs one
-  # instant query (GET <url>/api/v1/query?query=...). The query must return exactly one
-  # series: value 1 is up, 0 is down. No series, several series, any other value, a
-  # non-vector result or a Prometheus/HTTP error is a failed read (the reading goes stale),
-  # never "down". Only basestar-nfs gets reachability from this source.
-  # NOT SET UP YET: no blackbox probe of basestar exists, so until one does this source
-  # fails every read and basestar's reachability stays unknown (stale). When it is set up,
-  # make sure the query matches exactly one series: probing basestar with several blackbox
-  # modules or jobs gives one probe_success series each, and then every read fails. Pin the
-  # module/job label in the query, e.g. probe_success{instance="basestar", job="blackbox-ssh"}.
+  # basestar is not a Kubernetes node: its reachability comes from a TCP connect probe,
+  # the same check power.py makes (a plain connect to the NFS port, 2049). Each resync
+  # makes one connect to host:port, closing the connection at once:
+  # - connected: up.
+  # - connection refused, or no answer within `timeout`: down.
+  # - anything else is a failed read (the reading goes stale), never "down": the name does
+  #   not resolve (or its lookup takes longer than `timeout`), an unusable address, or any
+  #   other error, such as "no route to host" or "network unreachable".
+  # Keep `timeout` below about 3s: with default neighbour settings (3 ARP requests 1s
+  # apart) Linux reports a host on the local network that does not answer ARP, such as a
+  # powered-off basestar, as "no route to host" after about 3s. With 2s that host times
+  # out first and reads as down; with a longer timeout it would be a failed read instead.
+  # It checks that the host accepts connections on the port, not that the NFS export works.
+  # Only basestar-nfs gets reachability from this source.
   - id: basestar-probe
-    kind: prometheus
+    kind: tcp_probe
     observe: [reachability]
     resync: 10s
     params:
-      url: http://prometheus.monitoring.svc:9090
-      query: probe_success{instance="basestar"}
+      host: basestar
+      port: 2049
       resource: basestar-nfs
-      timeout: 5s
+      timeout: 2s
       # Consecutive agreeing readings before up/down flips (as for cluster-pods).
       reachability_confirmations: 3
-      # Optional, as for http_json: auth: { header: Authorization, prefix: "Bearer ", env: PROMETHEUS_TOKEN }
+
+  # The `prometheus` kind is also available for reachability: one instant query per resync
+  # that must return exactly one series, 1 up and 0 down (anything else is a failed read).
+  # Not used here, as no blackbox exporter probes basestar. For a probed host it would be:
+  #   - id: some-host-probe
+  #     kind: prometheus
+  #     observe: [reachability]
+  #     resync: 10s
+  #     params:
+  #       url: http://prometheus.monitoring.svc:9090
+  #       query: probe_success{instance="some-host", job="blackbox-ssh"}
+  #       resource: some-resource
+  #       timeout: 5s
+  #       reachability_confirmations: 3
+  #       # Optional, as for http_json: auth: { header: Authorization, prefix: "Bearer ", env: PROMETHEUS_TOKEN }
 
   # Secrets are never in this file: `auth` names an environment variable (or a mounted
   # file) that holds the token.
