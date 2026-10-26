@@ -649,9 +649,13 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
   not seen at all. Automatic re-queueing is capped at 2 per recording (see *Recovery
   actions*), after which the recording stays FAILED and ages out. A reprocess-transcription failure on
   a recording that already has a summary is missed; a failed merge or stitch job counts as
-  transcription. A full page (100) of failed recordings counts as 100 ("at least"): the
-  poll does not fail, so a mass failure keeps demand fresh and recovery running. A full page
-  for a `ready` or `in_flight` request still fails the poll rather than under-counting.
+  transcription. A full page (100) of recordings in the failed request counts the ones on
+  the page that pass the filter, as "at least N" (0 if none do): the poll does not fail, so a
+  mass failure keeps demand fresh and recovery running. The list is one page sorted by
+  `updated_at`, newest first, so a page entirely filled with failures the filter rejects
+  (failed summaries, say) hides transcription failures beyond it: they are not counted until
+  the page has room. A full page for a `ready` or `in_flight` request still fails the poll
+  rather than under-counting.
 - **The failed list is written twice (source and recovery) and the two can drift.** If the
   source counts failures the recovery would not re-queue (a wider `where` or window), the
   model is brought in for nothing, and flaps as above. If the recovery's list is wider than

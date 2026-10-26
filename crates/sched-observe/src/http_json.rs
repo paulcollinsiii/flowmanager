@@ -216,15 +216,16 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
         .as_array()
         .ok_or_else(|| ExtractError::NotAnArray(ptr.to_string()))?;
     let full = req.max_items.filter(|max| items.len() as u64 >= *max);
-    if let Some(max) = full {
+    if full.is_some() {
         if req.counts_as != CountsAs::Failed {
             return Err(ExtractError::AtLimit(items.len() as u64));
         }
-        // A full page of failed items is "at least max_items": a mass failure must not make
-        // the poll fail (demand would go stale exactly when it matters). The filter is still
-        // checked, so a wrong field name is an error.
-        select_items(items, req.filter.as_ref())?;
-        return Ok(max);
+        // A full page of failed items is a lower bound ("at least N"), and the poll does not
+        // fail: a mass failure must not make demand go stale exactly when it matters. N is
+        // the number of items on the page that pass the filter, not the page size: a page
+        // filled with failures the filter rejects (say failed summaries) is not failed
+        // transcriptions. The filter is still checked, so a wrong field name is an error.
+        return Ok(select_items(items, req.filter.as_ref())?.len() as u64);
     }
     Ok(select_items(items, req.filter.as_ref())?.len() as u64)
 }
@@ -998,6 +999,36 @@ mod tests {
         ));
         r.filter = None;
         assert_eq!(extract(&d, &r), Ok(3));
+    }
+
+    #[tokio::test]
+    async fn a_full_failed_page_counts_the_items_that_pass_the_filter_not_the_page_size() {
+        // The failed request counts the matching items of a full page ("at least N"), so a
+        // page of failed summaries (has_summary: true) is not failed transcriptions.
+        let server = TestServer::start().await;
+        let (spec, params, classes) = example_source("speakr-pending", &server);
+        let client = build_client(&params).unwrap();
+        server.set(SPEAKR_STATS, stats(0, 0, 0));
+
+        let all_summaries: Vec<String> = (0..100).map(|i| speakr_item(i, "FAILED", true)).collect();
+        server.set(SPEAKR_FAILED, speakr_list(&all_summaries));
+        let report = poll_now(&client, &spec, &params, &classes, &env).await;
+        assert_eq!(demand3(&report), (0, 0, 0));
+
+        let mixed: Vec<String> = (0..100)
+            .map(|i| speakr_item(i, "FAILED", i % 10 >= 3))
+            .collect();
+        server.set(SPEAKR_FAILED, speakr_list(&mixed));
+        let report = poll_now(&client, &spec, &params, &classes, &env).await;
+        assert_eq!(demand3(&report), (0, 0, 30));
+
+        // Below a full page nothing changes: the matching items are counted.
+        let partial: Vec<String> = (0..99)
+            .map(|i| speakr_item(i, "FAILED", i % 3 != 0))
+            .collect();
+        server.set(SPEAKR_FAILED, speakr_list(&partial));
+        let report = poll_now(&client, &spec, &params, &classes, &env).await;
+        assert_eq!(demand3(&report), (0, 0, 33));
     }
 
     #[tokio::test]

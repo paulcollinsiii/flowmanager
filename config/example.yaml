@@ -288,9 +288,12 @@ sources:
   #     passes.
   #   - Failed transcriptions are re-queued automatically (the class's recovery), at most
   #     twice per recording; after that it stays FAILED and ages out of the window.
-  #   A full page of failures (100 in the window, `max_items`) counts as 100 ("at least")
-  #   for this failed request instead of failing the poll, so a mass failure keeps demand
-  #   fresh; a full page for a ready/in-flight request still fails. An item whose `has_summary` is not a boolean (null aside)
+  #   A full page of failures (100 in the window, `max_items`) counts the items on the page
+  #   that pass the `where` filter ("at least N", 0 if none) instead of failing the poll, so a
+  #   mass failure keeps demand fresh. The list is one page sorted by updated_at (newest
+  #   first): a page entirely filled with failures the filter rejects (failed summaries)
+  #   hides transcription failures beyond it. A full page for a ready/in-flight request
+  #   still fails the poll. An item whose `has_summary` is not a boolean (null aside)
   #   also fails the poll, rather than counting low.
   # Cost: 2 requests per poll here plus 1 for speakr-summaries below, at one poll a minute
   # each: 3 requests per minute in total on the one token, against speakr's read limit of
