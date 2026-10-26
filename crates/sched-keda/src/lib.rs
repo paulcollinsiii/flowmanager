@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sched_model::{AllowedSet, ClassId, Config, ModelId, PublishedAllowed};
@@ -143,17 +143,70 @@ enum Decision<'a> {
     Ready(&'a PublishedAllowed),
 }
 
+/// How many ScaledObjects' last invalid-metadata error are remembered; see [`InvalidLog`].
+const MAX_REMEMBERED: usize = 1024;
+
+/// Decides how loudly an invalid-metadata error is logged. KEDA polls every ScaledObject
+/// every `pollingInterval` (seconds), so one broken or removed-id ScaledObject would
+/// otherwise write a warning per poll for as long as it stays broken. The error is logged at
+/// warn when it is new for that ScaledObject (never seen, or different from the last one),
+/// and at debug when it repeats; a ScaledObject that answers validly is forgotten, so
+/// breaking again warns again. Memory is bounded: past [`MAX_REMEMBERED`] ScaledObjects the
+/// memory is emptied, which at worst repeats a warning.
+#[derive(Default)]
+struct InvalidLog {
+    last: Mutex<HashMap<(String, String), String>>,
+}
+
+impl InvalidLog {
+    /// Records that `r` was refused with `error`; true if that deserves a warning.
+    fn warn_for(&self, r: &ScaledObjectRef, error: &str) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (r.namespace.clone(), r.name.clone());
+        if last.get(&key).is_some_and(|seen| seen == error) {
+            return false;
+        }
+        if last.len() >= MAX_REMEMBERED && !last.contains_key(&key) {
+            last.clear();
+        }
+        last.insert(key, error.to_string());
+        true
+    }
+
+    /// Records that `r` was answered validly.
+    fn valid(&self, r: &ScaledObjectRef) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if !last.is_empty() {
+            last.remove(&(r.namespace.clone(), r.name.clone()));
+        }
+    }
+}
+
 /// One answer: the subject, and whether it is allowed. Metadata is checked first, so a
 /// broken ScaledObject reads as broken whether or not a decision exists.
 fn evaluate(
     r: &ScaledObjectRef,
     config: &Config,
     decision: Decision<'_>,
+    invalid: &InvalidLog,
 ) -> Result<(Subject, bool), Status> {
-    let subject = Subject::parse(&r.scaler_metadata, config).map_err(|e| {
-        tracing::warn!(namespace = %r.namespace, name = %r.name, "invalid ScaledObject metadata: {e}");
-        Status::invalid_argument(format!("ScaledObject {}/{}: {e}", r.namespace, r.name))
-    })?;
+    let subject = match Subject::parse(&r.scaler_metadata, config) {
+        Ok(subject) => {
+            invalid.valid(r);
+            subject
+        }
+        Err(e) => {
+            if invalid.warn_for(r, &e) {
+                tracing::warn!(namespace = %r.namespace, name = %r.name, "invalid ScaledObject metadata: {e}");
+            } else {
+                tracing::debug!(namespace = %r.namespace, name = %r.name, "invalid ScaledObject metadata (unchanged): {e}");
+            }
+            return Err(Status::invalid_argument(format!(
+                "ScaledObject {}/{}: {e}",
+                r.namespace, r.name
+            )));
+        }
+    };
     match decision {
         Decision::NotReady => Err(Status::unavailable(NOT_READY)),
         Decision::Stopped => Err(Status::unavailable(STOPPED)),
@@ -169,6 +222,7 @@ fn evaluate_now(
     r: &ScaledObjectRef,
     allowed: &mut watch::Receiver<Option<PublishedAllowed>>,
     config: &mut watch::Receiver<Arc<Config>>,
+    invalid: &InvalidLog,
 ) -> Result<(Subject, bool), Status> {
     let cfg = Arc::clone(&config.borrow_and_update());
     let stopped = allowed.has_changed().is_err();
@@ -178,7 +232,7 @@ fn evaluate_now(
         (None, false) => Decision::NotReady,
         (Some(p), false) => Decision::Ready(p),
     };
-    evaluate(r, &cfg, decision)
+    evaluate(r, &cfg, decision, invalid)
 }
 
 /// The scaler: a read-only view of the published allowed set and the active config.
@@ -186,6 +240,8 @@ fn evaluate_now(
 pub struct Scaler {
     allowed: watch::Receiver<Option<PublishedAllowed>>,
     config: watch::Receiver<Arc<Config>>,
+    /// Shared by every clone, so a repeat is a repeat whichever connection it arrives on.
+    invalid: Arc<InvalidLog>,
 }
 
 impl Scaler {
@@ -193,7 +249,11 @@ impl Scaler {
         allowed: watch::Receiver<Option<PublishedAllowed>>,
         config: watch::Receiver<Arc<Config>>,
     ) -> Scaler {
-        Scaler { allowed, config }
+        Scaler {
+            allowed,
+            config,
+            invalid: Arc::default(),
+        }
     }
 
     pub fn into_service(self) -> ExternalScalerServer<Scaler> {
@@ -212,7 +272,7 @@ impl Scaler {
 
     fn answer(&self, rpc: &str, r: &ScaledObjectRef) -> Result<(Subject, bool), Status> {
         let (mut allowed, mut config) = self.receivers();
-        let out = evaluate_now(r, &mut allowed, &mut config);
+        let out = evaluate_now(r, &mut allowed, &mut config, &self.invalid);
         log_answer(rpc, r, &out);
         out
     }
@@ -242,6 +302,7 @@ async fn stream_answers(
     first: bool,
     mut allowed: watch::Receiver<Option<PublishedAllowed>>,
     mut config: watch::Receiver<Arc<Config>>,
+    invalid: Arc<InvalidLog>,
     tx: mpsc::Sender<Result<IsActiveResponse, Status>>,
 ) {
     if tx
@@ -261,7 +322,7 @@ async fn stream_answers(
         let out = if closed {
             Err(Status::unavailable(STOPPED))
         } else {
-            evaluate_now(&r, &mut allowed, &mut config).map(|(_, a)| a)
+            evaluate_now(&r, &mut allowed, &mut config, &invalid).map(|(_, a)| a)
         };
         match out {
             Ok(a) if a == last => {}
@@ -308,11 +369,18 @@ impl ExternalScaler for Scaler {
         // The first answer marks what it read as seen on these receivers, so the stream
         // reacts to every later change and to none it has already answered.
         let (mut allowed, mut config) = self.receivers();
-        let out = evaluate_now(&r, &mut allowed, &mut config);
+        let out = evaluate_now(&r, &mut allowed, &mut config, &self.invalid);
         log_answer("StreamIsActive", &r, &out);
         let (_, first) = out?;
         let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(stream_answers(r, first, allowed, config, tx));
+        tokio::spawn(stream_answers(
+            r,
+            first,
+            allowed,
+            config,
+            Arc::clone(&self.invalid),
+            tx,
+        ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -385,4 +453,174 @@ pub async fn serve(listener: TcpListener, scaler: Scaler) -> Result<(), tonic::t
         .add_service(scaler.into_service())
         .serve_with_incoming(TcpIncoming::from(listener))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sched_model::test_support::example_config;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing::{Level, Metadata, Subscriber, span};
+
+    /// Counts events by level; nothing else of the subscriber API is needed.
+    #[derive(Default)]
+    struct Count {
+        warn: AtomicU64,
+        debug: AtomicU64,
+    }
+
+    struct Counting(Arc<Count>);
+
+    impl Subscriber for Counting {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let level = *event.metadata().level();
+            if level == Level::WARN {
+                self.0.warn.fetch_add(1, Ordering::SeqCst);
+            } else if level == Level::DEBUG {
+                self.0.debug.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    fn object(name: &str, metadata: &[(&str, &str)]) -> ScaledObjectRef {
+        ScaledObjectRef {
+            name: name.into(),
+            namespace: "ns".into(),
+            scaler_metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Runs `body` with a subscriber that counts events; returns (warn, debug).
+    fn counted(body: impl FnOnce()) -> (u64, u64) {
+        let count = Arc::new(Count::default());
+        tracing::subscriber::with_default(Counting(Arc::clone(&count)), body);
+        (
+            count.warn.load(Ordering::SeqCst),
+            count.debug.load(Ordering::SeqCst),
+        )
+    }
+
+    fn answer(r: &ScaledObjectRef, config: &Config, invalid: &InvalidLog) -> Result<(), Status> {
+        evaluate(r, config, Decision::NotReady, invalid).map(|_| ())
+    }
+
+    #[test]
+    fn a_repeated_invalid_metadata_error_warns_once_and_then_logs_at_debug() {
+        let config = example_config();
+        let invalid = InvalidLog::default();
+        let gone = object("gone", &[("model", "no-such-model")]);
+        let (warn, debug) = counted(|| {
+            for _ in 0..50 {
+                // The error the caller gets is the same every time.
+                let e = answer(&gone, &config, &invalid).unwrap_err();
+                assert_eq!(e.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    e.message().starts_with(
+                        "ScaledObject ns/gone: model \"no-such-model\" is not in the active config"
+                    ),
+                    "{}",
+                    e.message()
+                );
+            }
+        });
+        assert_eq!((warn, debug), (1, 49));
+
+        // Once fixed and broken again, the next error warns again.
+        let fixed = object("gone", &[("model", "mineru")]);
+        let (warn, debug) = counted(|| {
+            assert_eq!(
+                answer(&fixed, &config, &invalid).unwrap_err().code(),
+                tonic::Code::Unavailable
+            );
+            answer(&gone, &config, &invalid).unwrap_err();
+            answer(&gone, &config, &invalid).unwrap_err();
+        });
+        assert_eq!((warn, debug), (1, 1));
+
+        // A different error for the same ScaledObject warns again, once.
+        let other = object("gone", &[("model", "mineru"), ("class", "paperless-gpt")]);
+        let (warn, debug) = counted(|| {
+            for _ in 0..5 {
+                answer(&other, &config, &invalid).unwrap_err();
+            }
+        });
+        assert_eq!((warn, debug), (1, 4));
+
+        // Another ScaledObject with the same error warns for itself.
+        let (warn, _) = counted(|| {
+            answer(
+                &object("second", &[("model", "no-such-model")]),
+                &config,
+                &invalid,
+            )
+            .unwrap_err();
+        });
+        assert_eq!(warn, 1);
+    }
+
+    #[test]
+    fn the_scaler_rpcs_share_one_memory_of_what_they_refused() {
+        let config = Arc::new(example_config());
+        let (_allowed_tx, allowed) = watch::channel(None::<PublishedAllowed>);
+        let (_config_tx, config_rx) = watch::channel(config);
+        let scaler = Scaler::new(allowed, config_rx);
+        let gone = object("gone", &[("class", "no-such-class")]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (warn, _) = counted(|| {
+            rt.block_on(async {
+                for _ in 0..4 {
+                    // The unary RPCs, a clone of the scaler (another connection) and the
+                    // stream's first answer all count as one ScaledObject's repeats.
+                    let c = scaler.clone();
+                    let e = c.is_active(Request::new(gone.clone())).await.unwrap_err();
+                    assert_eq!(e.code(), tonic::Code::InvalidArgument);
+                    scaler
+                        .get_metric_spec(Request::new(gone.clone()))
+                        .await
+                        .unwrap_err();
+                    scaler
+                        .stream_is_active(Request::new(gone.clone()))
+                        .await
+                        .err()
+                        .unwrap();
+                }
+            });
+        });
+        assert_eq!(warn, 1);
+    }
+
+    #[test]
+    fn the_memory_of_invalid_scaled_objects_is_bounded() {
+        let config = example_config();
+        let invalid = InvalidLog::default();
+        let (warn, _) = counted(|| {
+            for i in 0..(3 * MAX_REMEMBERED) {
+                answer(
+                    &object(&format!("so-{i}"), &[("model", "no-such-model")]),
+                    &config,
+                    &invalid,
+                )
+                .unwrap_err();
+            }
+        });
+        // Each distinct ScaledObject warned (none was a repeat) and the memory stayed bounded.
+        assert_eq!(warn, (3 * MAX_REMEMBERED) as u64);
+        let held = invalid.last.lock().unwrap().len();
+        assert!(held <= MAX_REMEMBERED, "{held}");
+    }
 }
