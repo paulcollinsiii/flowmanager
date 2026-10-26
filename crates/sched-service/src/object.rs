@@ -398,7 +398,7 @@ mod tests {
     use crate::config_source::ConfigHolder;
     use crate::metrics::Metrics;
     use sched_model::test_support::EXAMPLE_CONFIG;
-    use sched_model::{Fidelity, ModePhase, ObservedValue};
+    use sched_model::{Fidelity, ModePhase, ModelId, ObservedValue};
     use sched_observe::Report;
 
     const T0: u64 = 10_000_000;
@@ -418,7 +418,7 @@ mod tests {
         });
     }
 
-    /// Fresh zero pods, both hosts up, and `ready` OCR items.
+    /// Both hosts freshly up (and zero pods, which no decision reads), and `ready` OCR items.
     fn world(s: &Shared, ready: u64) {
         let mut v: Vec<ObservedValue> = ["mineru", "llm", "whisperx", "immich-ml"]
             .iter()
@@ -472,7 +472,8 @@ mod tests {
         let r1 = tick(&s, &ctx).await.unwrap();
         ctx.commit();
         assert!(r1.kinds.contains(&"allow_model".to_string()), "{r1:?}");
-        assert!(matches!(gpu_mode(&ctx), Some(ModePhase::Loading { .. })));
+        assert!(matches!(gpu_mode(&ctx), Some(ModePhase::Serving { .. })));
+        let allowed_at = gpu_mode(&ctx);
         assert!(stored_state(&ctx).reported.contains(&"cluster-pods".into()));
         // A new process, empty cache: the stored state is what carries the tick on.
         let (s2, clock2) = process();
@@ -482,7 +483,94 @@ mod tests {
         let r2 = tick(&s2, &ctx).await.unwrap();
         ctx.commit();
         assert!(!r2.kinds.contains(&"allow_model".to_string()), "{r2:?}");
-        assert!(r2.reason.contains("still loading"), "{}", r2.reason);
+        assert!(r2.allowed_models.contains(&"mineru".into()), "{r2:?}");
+        // Serving since the first tick: the dwell clock carried across the restart.
+        assert_eq!(gpu_mode(&ctx), allowed_at);
+    }
+
+    /// `scheduler_state` as the build before the queue-only change stored it: version 1,
+    /// with the `loading` and `draining` phases it no longer writes.
+    fn legacy_state(mode: &str) -> Vec<u8> {
+        format!(
+            r#"{{"version":1,"data":{{"state":{{"resources":{{"cuda-central":{{"power":{{"phase":"on","since":1}},"mode":{mode},"managed":false,"host_idle_since":null,"pending_recovery":[]}},"basestar-nfs":{{"power":{{"phase":"on","since":1}},"mode":{{"phase":"idle"}},"managed":false,"host_idle_since":null,"pending_recovery":[]}}}}}},"reported":["cluster-pods"]}}}}"#
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_state_persisted_with_loading_or_draining_loads_and_converges() {
+        // Draining (waiting for mineru's pods) under the old build: the next model is allowed
+        // at once, with no error and no wait on pods.
+        let (s, _) = process();
+        let ctx = FakeCtx::default();
+        ctx.put(
+            STATE_KEY,
+            &legacy_state(r#"{"phase":"draining","model":"mineru","since":5}"#),
+        );
+        world(&s, 0);
+        push(
+            &s,
+            "speakr-pending",
+            vec![ObservedValue::Demand {
+                class: "speakr-transcription".into(),
+                ready: 2,
+                in_flight: 0,
+                oldest_ready_at: None,
+            }],
+        );
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.error, None, "{r:?}");
+        assert_eq!(r.allowed_models, vec![ModelId::from("whisperx")], "{r:?}");
+        let text = String::from_utf8(ctx.stored(STATE_KEY).unwrap()).unwrap();
+        assert!(text.starts_with("{\"version\":1,"), "{text}");
+        assert!(
+            !text.contains("draining") && !text.contains("loading"),
+            "{text}"
+        );
+        // Loading under the old build: serving since the same instant, its classes allowed.
+        let (s, _) = process();
+        let ctx = FakeCtx::default();
+        ctx.put(
+            STATE_KEY,
+            &legacy_state(r#"{"phase":"loading","model":"mineru","since":5}"#),
+        );
+        world(&s, 3);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.error, None, "{r:?}");
+        assert!(r.steps.is_empty(), "{r:?}");
+        assert!(r.allowed_classes.contains(&"paperless-ocr".into()), "{r:?}");
+        assert!(matches!(
+            gpu_mode(&ctx),
+            Some(ModePhase::Serving {
+                since: Millis(5),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_persisted_state_naming_an_unconfigured_model_does_not_block_the_resource() {
+        for mode in [
+            r#"{"phase":"serving","model":"retired","since":5}"#,
+            r#"{"phase":"draining","model":"retired","since":5}"#,
+            r#"{"phase":"loading","model":"retired","since":5}"#,
+        ] {
+            let (s, _) = process();
+            let ctx = FakeCtx::default();
+            ctx.put(STATE_KEY, &legacy_state(mode));
+            world(&s, 3);
+            let r = tick(&s, &ctx).await.unwrap();
+            ctx.commit();
+            assert_eq!(r.error, None, "{mode}: {r:?}");
+            assert_eq!(
+                r.allowed_models,
+                vec![ModelId::from("mineru")],
+                "{mode}: {r:?}"
+            );
+            assert!(!r.allowed_models.contains(&"retired".into()));
+        }
     }
 
     #[tokio::test]
@@ -510,7 +598,7 @@ mod tests {
         assert!(published.allowed.models.contains(&"mineru".into()));
         assert_eq!(s2.last_report(), Some(first.clone()));
         ctx.commit();
-        assert!(matches!(gpu_mode(&ctx), Some(ModePhase::Loading { .. })));
+        assert!(matches!(gpu_mode(&ctx), Some(ModePhase::Serving { .. })));
         // A replayed tick is not counted again.
         assert!(
             !s2.metrics.render().contains("sched_tick_decisions_total{"),

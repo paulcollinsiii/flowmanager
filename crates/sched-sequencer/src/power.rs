@@ -2,11 +2,10 @@
 //! them up. Resources without a power section are always on.
 
 use sched_model::{
-    ClassSpec, ModePhase, PowerPhase, PowerWant, ResourceKind, ResourceState, Step, WaitReason,
-    class_work,
+    ClassSpec, ModePhase, PowerPhase, PowerWant, ResourceState, Step, WaitReason, class_work,
 };
 
-use crate::{Cx, others_zero};
+use crate::Cx;
 
 /// State for a resource the sequencer has not seen before, from observation.
 pub(crate) fn initial(cx: &Cx, steps: &mut Vec<Step>) -> Option<ResourceState> {
@@ -208,7 +207,8 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
     }
 }
 
-/// Shuts the host down, provided the observations that make it safe are fresh.
+/// Shuts the host down, provided a fresh reading shows it up. It is only reached with no
+/// model allowed (mode idle); pod counts are not consulted.
 fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
     let max_age = cx.config.policy().safety_max_age;
     if cx
@@ -217,12 +217,6 @@ fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
         != Some(true)
     {
         wait(cx, steps, WaitReason::StaleObservation);
-        return;
-    }
-    if cx.res.kind == ResourceKind::Exclusive
-        && let Err(reason) = others_zero(cx, None)
-    {
-        wait(cx, steps, reason);
         return;
     }
     steps.push(Step::PowerOff {

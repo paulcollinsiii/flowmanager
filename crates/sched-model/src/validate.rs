@@ -210,13 +210,19 @@ fn classes(c: &Config, p: &mut Problems) {
             };
             any_power |= res.power.is_some();
             match (res.kind, &req.model) {
-                (ResourceKind::Exclusive, None) => p.add(
-                    &rat,
-                    format!(
-                        "resource {:?} is exclusive; a model is required",
-                        req.resource.as_str()
-                    ),
-                ),
+                // A gate on the host being up: the class must not have demand of its own,
+                // so it can never influence which model is chosen.
+                (ResourceKind::Exclusive, None) => {
+                    if k.demand.is_some() {
+                        p.add(
+                            &rat,
+                            format!(
+                                "resource {:?} is exclusive and no model is given, which makes this a gate class (host up only); a gate class must not have a demand source",
+                                req.resource.as_str()
+                            ),
+                        );
+                    }
+                }
                 (ResourceKind::Shared, Some(m)) => p.add(
                     &rat,
                     format!(
@@ -297,18 +303,8 @@ fn sources(c: &Config, p: &mut Problems) {
     let pol = c.policy();
     let declared = |cap: Capability| c.sources().iter().any(|s| s.observe.contains(&cap));
     // Without a declared source the safety-critical readings would never exist and every
-    // decision would wait on stale observations, so refuse such a config at load.
-    for m in c.models() {
-        if c.resource(&m.resource)
-            .is_some_and(|r| r.kind == ResourceKind::Exclusive)
-            && !declared(Capability::Pods)
-        {
-            p.add(
-                format!("models[{}]", m.id),
-                "no source declares the pods capability (observe: [pods]), so its pod count could never be observed",
-            );
-        }
-    }
+    // decision on the host would wait on stale observations, so refuse such a config at
+    // load. Pod counts are not checked: no decision reads them.
     for r in c.resources().iter().filter(|r| r.power.is_some()) {
         if !declared(Capability::Reachability) {
             p.add(
@@ -519,9 +515,41 @@ sources:
             "{ resource: gpu }, { resource: nfs, model: m1 }",
         );
         let ps = problems(&y);
-        assert!(has(&ps, "exclusive; a model is required"), "{ps:?}");
+        // A model-less requirement on an exclusive resource is a gate on the host, which a
+        // class with a demand source must not be.
+        assert!(
+            has(
+                &ps,
+                "classes[c1].requires[0]: resource \"gpu\" is exclusive and no model is given, which makes this a gate class"
+            ),
+            "{ps:?}"
+        );
         assert!(
             has(&ps, "is shared; model \"m1\" must not be given"),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn a_gate_class_requires_hosts_without_a_model_and_has_no_demand() {
+        let gate = "  - id: gate\n    requires: [ { resource: gpu }, { resource: nfs } ]\n    priority: 0\n    preemptibility: none\n";
+        let y = VALID.replace("\nsources:\n", &format!("\n{gate}sources:\n"));
+        assert_ne!(y, VALID);
+        let c = Config::from_yaml(&y).unwrap_or_else(|e| panic!("{e}"));
+        let g = c.class(&"gate".into()).unwrap();
+        assert!(g.demand.is_none() && g.requires[0].model.is_none());
+        // With a demand source it is refused: it would hold the host without naming a model.
+        let with_demand = y.replace(
+            "    priority: 0\n    preemptibility: none\n",
+            "    priority: 0\n    preemptibility: none\n    demand: { source: s1 }\n",
+        );
+        assert_ne!(with_demand, y);
+        let ps = problems(&with_demand);
+        assert!(
+            has(
+                &ps,
+                "classes[gate].requires[0]: resource \"gpu\" is exclusive and no model is given"
+            ),
             "{ps:?}"
         );
     }
@@ -621,25 +649,12 @@ sources:
     }
 
     #[test]
-    fn rejects_a_config_where_no_source_declares_pods() {
-        // Same kinds as before, but nothing declares the capability: the old inference from
-        // kind would have accepted this and then waited on stale pods forever.
+    fn a_config_where_no_source_declares_pods_is_accepted() {
+        // Pod counts are information only: no decision waits for them, so a config without
+        // a pods source is valid (it used to be refused, since every allow waited on them).
         let y = VALID.replace("observe: [pods, reachability]", "observe: [reachability]");
-        let ps = problems(&y);
-        assert!(
-            has(&ps, "models[m1]: no source declares the pods capability"),
-            "{ps:?}"
-        );
-        assert!(
-            has(&ps, "models[m2]: no source declares the pods capability"),
-            "{ps:?}"
-        );
-        // Swapping the kind away from kubernetes_watch: still no pods source.
-        let y = VALID.replace(
-            "kind: kubernetes_watch, resync: 10s, observe: [pods, reachability]",
-            "kind: http_json, resync: 10s, observe: [reachability]",
-        );
-        assert!(has(&problems(&y), "no source declares the pods capability"));
+        assert_ne!(y, VALID);
+        assert!(Config::from_yaml(&y).is_ok(), "{:?}", problems(&y));
     }
 
     #[test]

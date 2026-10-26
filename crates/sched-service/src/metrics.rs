@@ -49,15 +49,14 @@ fn power_phase(p: &PowerPhase) -> (&'static str, Option<Millis>) {
 
 /// A resource's mode phase as a metric label, with when it began if the state says. A
 /// serving model whose wind-down has started is `winding_down`, measured from its start.
+/// `serving` is measured from the tick the model was allowed.
 fn mode_phase(m: &ModePhase) -> (&'static str, Option<Millis>) {
     match m {
         ModePhase::Idle => ("idle", None),
-        ModePhase::Loading { since, .. } => ("loading", Some(*since)),
         ModePhase::Serving {
             wind_down: Some(w), ..
         } => ("winding_down", Some(w.since)),
         ModePhase::Serving { since, .. } => ("serving", Some(*since)),
-        ModePhase::Draining { since, .. } => ("draining", Some(*since)),
     }
 }
 
@@ -382,9 +381,11 @@ mod tests {
         let mut gpu = ResourceState::new(PowerPhase::On {
             since: Millis(1_000),
         });
-        gpu.mode = ModePhase::Loading {
+        gpu.mode = ModePhase::Serving {
             model: "m1".into(),
             since: Millis(4_000),
+            idle_since: None,
+            wind_down: None,
         };
         state.resources.insert("gpu".into(), gpu.clone());
         state
@@ -394,7 +395,7 @@ mod tests {
         let text = m.render();
         for needle in [
             "sched_resource_phase_age_seconds{axis=\"power\",phase=\"on\",resource=\"gpu\"} 9",
-            "sched_resource_phase_age_seconds{axis=\"mode\",phase=\"loading\",resource=\"gpu\"} 6",
+            "sched_resource_phase_age_seconds{axis=\"mode\",phase=\"serving\",resource=\"gpu\"} 6",
             // No start recorded: measured from when it was first seen.
             "sched_resource_phase_age_seconds{axis=\"power\",phase=\"off\",resource=\"nfs\"} 0",
             "sched_resource_phase_age_seconds{axis=\"mode\",phase=\"idle\",resource=\"nfs\"} 0",
@@ -424,7 +425,7 @@ mod tests {
             text.contains("{axis=\"mode\",phase=\"winding_down\",resource=\"gpu\"} 5"),
             "{text}"
         );
-        assert!(!text.contains("phase=\"loading\""), "{text}");
+        assert!(!text.contains("phase=\"serving\""), "{text}");
         // A resource that leaves the state loses its series.
         state.resources.remove(&sched_model::ResourceId::new("nfs"));
         m.set_phases(Millis(26_000), &state);

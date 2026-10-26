@@ -7,35 +7,42 @@
 //! to prefer is the planner's job.
 //!
 //! Safety rules enforced here, regardless of the intent it is given:
-//! 1. At most one model of an exclusive resource is allowed at a time.
-//! 2. A model is allowed only after every other model of the resource is observed with
-//!    zero pods, by an observation no older than `safety_max_age`.
+//! 1. At most one model of an exclusive resource is in the allowed set at a time. A switch
+//!    withdraws the old model and allows the new one in the same tick.
+//! 2. No decision is gated on pod state. GPU exclusivity is enforced by Kubernetes (every
+//!    GPU workload requests the one GPU the node exposes), so the new model's pod stays
+//!    pending until the old one has released the GPU. A model is allowed only on a host
+//!    that is up, and a model the config does not have is never allowed (one removed while
+//!    allowed leaves the set at the next tick).
 //! 3. A host is powered down only when no lease holds it and no queued or in-flight work
 //!    needs it, after `idle_grace`; the one override is a reclaim.
 //! 4. Power changes come only from the intent's `power_up` (manual requests, or classes
 //!    that may change power), and a host is powered down only if the scheduler took
 //!    responsibility for it. A host under `power.control: manual` never gets a power step
-//!    and the scheduler never takes responsibility for it: its phase follows observation. A reclaim lease applies only to an exclusive resource with a
-//!    power section; on any other resource it is ignored and reported as a wait.
-//! 5. Safety-critical steps need fresh observations; otherwise the sequencer waits.
+//!    and the scheduler never takes responsibility for it: its phase follows observation.
+//!    A reclaim lease applies only to an exclusive resource with a power section; on any
+//!    other resource it is ignored and reported as a wait.
+//! 5. Safety-critical steps (allowing a model, powering a host off) need a fresh "up"
+//!    reading of the host; otherwise the sequencer waits.
 //! 8. Early switching happens only away from classes that declare it safe, or when forced,
 //!    and forced switches still give in-flight work its timeout. In-flight work is stopped
 //!    only on a forced switch (reclaim or manual model lease), class by class, each when
-//!    its own timeout has run out.
+//!    its own timeout has run out. In-flight work is what the queues report, not pods.
 
 mod exclusive;
 mod power;
 
 use sched_model::{
-    AllowedSet, ClassSpec, Config, Intent, ModePhase, ModelId, ResourceSpec, ResourceState,
-    SchedState, Snapshot, Step, WaitReason,
+    AllowedSet, ClassSpec, Config, Intent, ModePhase, ResourceSpec, ResourceState, SchedState,
+    Snapshot, Step, WaitReason,
 };
 
 /// The outcome of one tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
-    /// At most one resource-scoped step per resource, plus class-scoped steps
-    /// (`PauseIntake`, `KillInFlight`, `RunRecovery`).
+    /// At most one resource-scoped step per resource (a switch is the one pair: the
+    /// `DrainModel` of the old model and the `AllowModel` of the new one), plus class-scoped
+    /// steps (`PauseIntake`, `KillInFlight`, `RunRecovery`).
     pub steps: Vec<Step>,
     pub allowed: AllowedSet,
     pub state: SchedState,
@@ -148,9 +155,10 @@ fn resource_tick(
 /// What KEDA may run, derived from the new state alone.
 fn allowed_set(config: &Config, state: &SchedState, intent: &Intent) -> AllowedSet {
     let mut set = AllowedSet::default();
-    for st in state.resources.values() {
+    for (id, st) in &state.resources {
         if st.is_on()
             && let Some(m) = st.mode.allowed_model()
+            && config.model(m).is_some_and(|spec| &spec.resource == id)
         {
             set.models.insert(m.clone());
         }
@@ -174,6 +182,7 @@ fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent:
             return false;
         }
         match &req.model {
+            // A shared resource, or a gate on an exclusive host: the host is up.
             None => true,
             Some(model) => matches!(
                 &st.mode,
@@ -181,21 +190,4 @@ fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent:
             ),
         }
     })
-}
-
-/// Every model of the resource except `except` must be observed with zero pods, freshly.
-pub(crate) fn others_zero(cx: &Cx, except: Option<&ModelId>) -> Result<(), WaitReason> {
-    let max_age = cx.config.policy().safety_max_age;
-    for m in cx
-        .config
-        .models_of(&cx.res.id)
-        .filter(|m| Some(&m.id) != except)
-    {
-        match cx.snapshot.fresh_model_pods(cx.config, &m.id, max_age) {
-            None => return Err(WaitReason::StaleObservation),
-            Some((0, _)) => {}
-            Some(_) => return Err(WaitReason::OtherModelPresent),
-        }
-    }
-    Ok(())
 }

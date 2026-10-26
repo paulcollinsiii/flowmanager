@@ -1,0 +1,37 @@
+description: "The paperless-gpt gate class (cuda-central and basestar-nfs up, no model) follows host readiness only: open whatever model serves, closed while the GPU host is observed off, when no model is allowed on it either."
+initial_state:
+  resources:
+    cuda-central:
+      power: { phase: "on", since: 92800000 }
+      mode: { phase: serving, model: mineru, since: 97000000 }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 2, in_flight: 1, oldest_ready_at: 99990000 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    expect:
+      steps: []
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+  # The GPU host goes down (a person powered it off): no model, and the gate closes.
+  - at: 100010000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: false } }
+    expect:
+      steps: [{ type: wait, resource: cuda-central, reason: host_not_up }]
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+  # Back up: the waiting OCR work brings mineru in again and the gate reopens.
+  - at: 100020000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+    expect:
+      steps: [{ type: allow_model, resource: cuda-central, model: mineru }]
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }

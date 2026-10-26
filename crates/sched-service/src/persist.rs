@@ -26,6 +26,12 @@ pub const LEASES_KEY: &str = "lease_book";
 pub const EPOCH_KEY: &str = "backstop_epoch";
 
 /// Version of the [`CoreState`] document this build reads and writes.
+///
+/// Not bumped by the queue-only change (no pod gating): the build before it wrote mode
+/// phases `loading` and `draining`, which this build still reads and maps (`loading` to
+/// serving since the same instant, `draining` to idle; see `sched_model::ModePhase`), and
+/// everything this build writes (`idle`, `serving`) the build before it reads too. A bump
+/// would have made both directions an error tick until the document was discarded.
 pub const STATE_VERSION: u32 = 1;
 /// Version of the [`LeaseBook`] document this build reads and writes.
 pub const LEASES_VERSION: u32 = 1;

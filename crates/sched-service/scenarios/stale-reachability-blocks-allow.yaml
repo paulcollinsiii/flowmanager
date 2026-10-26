@@ -1,13 +1,12 @@
-description: "A pod-count observation older than safety_max_age blocks allowing a model until a fresh one arrives."
+description: "A reachability reading of the GPU host older than safety_max_age blocks allowing a model until a fresh one arrives; pod counts, stale or showing another model, never do."
 frames:
-  # Pod counts are 60s old, the bound is 30s.
+  # The GPU host's reading is 60s old, the bound is 30s. Pod counts are fresh and say llm is
+  # still running: that does not matter (Kubernetes keeps a new pod pending until the GPU is free).
   - at: 100000000
     observe:
-      - { source: cluster-pods, observed_at: 99940000, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
-      - { source: cluster-pods, observed_at: 99940000, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
-      - { source: cluster-pods, observed_at: 99940000, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
-      - { source: cluster-pods, observed_at: 99940000, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
-      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 1, ready_pods: 1 } }
+      - { source: cluster-pods, observed_at: 99940000, value: { type: resource_up, resource: cuda-central, up: true } }
       - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
       - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
@@ -20,13 +19,11 @@ frames:
     expect:
       steps: [{ type: wait, resource: cuda-central, reason: stale_observation }]
       allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
-  - at: 100001000
-    refresh: true
+  # A fresh reading arrives; the pod counts are now a minute old as well: mineru is allowed.
+  - at: 100060000
     observe:
-      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
-      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
-      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
-      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 1, in_flight: 0, oldest_ready_at: 99999000 } }
     expect:
       steps: [{ type: allow_model, resource: cuda-central, model: mineru }]
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server] }
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }

@@ -73,8 +73,10 @@ pub enum ObservedValue {
 }
 
 impl ObservedValue {
-    /// Safety-critical values (pod counts, host reachability) gate irreversible steps and
-    /// are held to `safety_max_age`; everything else is a scheduling input.
+    /// Host reachability gates the safety-critical steps (allowing a model, powering a host
+    /// off) and is held to `safety_max_age`. Pod counts gate nothing any more (Kubernetes
+    /// enforces GPU exclusivity) but keep the same bound, so their ages read alike.
+    /// Everything else is a scheduling input.
     pub fn is_safety_critical(&self) -> bool {
         matches!(
             self,

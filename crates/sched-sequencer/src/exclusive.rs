@@ -1,41 +1,54 @@
-//! The mode machine of an exclusive resource: idle, loading, serving (possibly winding
-//! down), draining.
+//! The mode machine of an exclusive resource: idle, or serving one model (possibly winding
+//! down). Decided from queues, leases and policy only, never from pod state: GPU
+//! exclusivity is enforced by Kubernetes, so a switch withdraws the old model and allows the
+//! new one in the same tick, and the new pod waits (pending) until the old one has released
+//! the GPU.
 
 use sched_model::{
-    ClassSpec, Millis, ModePhase, ModelId, Preemptibility, ResourceState, Step, WaitReason,
-    WindDown, class_work, classes_of_model,
+    ClassSpec, ModePhase, ModelId, Preemptibility, ResourceState, Step, WaitReason, WindDown,
+    class_work, classes_of_model,
 };
 
+use crate::Cx;
 use crate::power::wait;
-use crate::{Cx, others_zero};
 
 /// Advances the mode machine. Returns whether a resource-scoped step was emitted.
 pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool {
     let target = if cx.reclaimed() {
         None
     } else {
-        cx.intent.models.get(&cx.res.id).cloned().flatten()
+        cx.intent
+            .models
+            .get(&cx.res.id)
+            .cloned()
+            .flatten()
+            // Never a model the config does not have on this resource, whatever the intent.
+            .filter(|m| configured(cx, m))
     };
     let forced = cx.reclaimed() || cx.intent.forced.contains(&cx.res.id);
-    // A draining model that reaches zero pods lets the next model be allowed in the same tick.
-    for _ in 0..2 {
-        match st.mode.clone() {
-            ModePhase::Draining { model, .. } => match zero_pods(cx, &model) {
-                Ok(true) => {
-                    st.mode = ModePhase::Idle;
-                    recover(st, steps);
-                }
-                Ok(false) => return waiting(cx, steps, WaitReason::Draining),
-                Err(r) => return waiting(cx, steps, r),
-            },
-            ModePhase::Idle => return idle(cx, st, steps, target.as_ref()),
-            ModePhase::Loading { model, .. } => {
-                return loading(cx, st, steps, &model, target.as_ref());
+    match st.mode.clone() {
+        ModePhase::Idle => {
+            // Left by a state from before the queue-only change (a drain in progress).
+            recover(st, steps);
+            match &target {
+                Some(m) => allow(cx, st, steps, m),
+                None => false,
             }
-            ModePhase::Serving { .. } => return serving(cx, st, steps, target.as_ref(), forced),
         }
+        ModePhase::Serving { model, .. } if !configured(cx, &model) => {
+            // Removed from the config (or moved to another resource): it leaves the allowed
+            // set now, with no dwell, grace or wind-down; nothing of it can be waited for.
+            switch(cx, st, steps, &model, target.as_ref())
+        }
+        ModePhase::Serving { .. } => serving(cx, st, steps, target.as_ref(), forced),
     }
-    false
+}
+
+/// Whether `model` is configured on this resource.
+fn configured(cx: &Cx, model: &ModelId) -> bool {
+    cx.config
+        .model(model)
+        .is_some_and(|m| m.resource == cx.res.id)
 }
 
 fn waiting(cx: &Cx, steps: &mut Vec<Step>, reason: WaitReason) -> bool {
@@ -43,14 +56,14 @@ fn waiting(cx: &Cx, steps: &mut Vec<Step>, reason: WaitReason) -> bool {
     true
 }
 
-fn zero_pods(cx: &Cx, model: &ModelId) -> Result<bool, WaitReason> {
-    match cx
-        .snapshot
-        .fresh_model_pods(cx.config, model, cx.config.policy().safety_max_age)
-    {
-        Some((pods, _)) => Ok(pods == 0),
-        None => Err(WaitReason::StaleObservation),
-    }
+/// Whether the host may be given a new model: a resource without a power section always,
+/// otherwise only on a fresh "up" reading (safety-critical, held to `safety_max_age`).
+fn fresh_up(cx: &Cx) -> bool {
+    cx.res.power.is_none()
+        || cx
+            .snapshot
+            .fresh_resource_up(cx.config, &cx.res.id, cx.config.policy().safety_max_age)
+            == Some(true)
 }
 
 /// Runs the recovery actions of classes whose work was stopped, once their model is gone.
@@ -60,61 +73,47 @@ fn recover(st: &mut ResourceState, steps: &mut Vec<Step>) {
     }
 }
 
-fn idle(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, target: Option<&ModelId>) -> bool {
-    let Some(model) = target else {
-        return false;
-    };
-    if let Err(reason) = others_zero(cx, Some(model)) {
-        return waiting(cx, steps, reason);
+/// Allows `model` on an idle resource. It is serving from this tick on.
+fn allow(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, model: &ModelId) -> bool {
+    if !fresh_up(cx) {
+        return waiting(cx, steps, WaitReason::StaleObservation);
     }
     steps.push(Step::AllowModel {
         resource: cx.res.id.clone(),
         model: model.clone(),
     });
-    st.mode = ModePhase::Loading {
+    st.mode = ModePhase::Serving {
         model: model.clone(),
         since: cx.now(),
+        idle_since: None,
+        wind_down: None,
     };
     true
 }
 
-fn loading(
+/// Replaces `old` by `next` in one tick: `old` leaves the allowed set and `next` (if any)
+/// enters it. Withdrawing needs nothing; allowing `next` needs a fresh "up" reading, and
+/// without one the switch waits as a whole (the old model stays) rather than leaving the
+/// resource empty.
+fn switch(
     cx: &Cx,
     st: &mut ResourceState,
     steps: &mut Vec<Step>,
-    model: &ModelId,
-    target: Option<&ModelId>,
+    old: &ModelId,
+    next: Option<&ModelId>,
 ) -> bool {
-    if target != Some(model) {
-        return drain(cx, st, steps, model);
+    if next.is_some() && !fresh_up(cx) {
+        return waiting(cx, steps, WaitReason::StaleObservation);
     }
-    match cx
-        .snapshot
-        .fresh_model_pods(cx.config, model, cx.config.policy().safety_max_age)
-    {
-        Some((_, ready)) if ready >= 1 => {
-            st.mode = ModePhase::Serving {
-                model: model.clone(),
-                since: cx.now(),
-                idle_since: None,
-                wind_down: None,
-            };
-            false
-        }
-        Some(_) => waiting(cx, steps, WaitReason::Loading),
-        None => waiting(cx, steps, WaitReason::StaleObservation),
-    }
-}
-
-fn drain(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, model: &ModelId) -> bool {
     steps.push(Step::DrainModel {
         resource: cx.res.id.clone(),
-        model: model.clone(),
+        model: old.clone(),
     });
-    st.mode = ModePhase::Draining {
-        model: model.clone(),
-        since: cx.now(),
-    };
+    st.mode = ModePhase::Idle;
+    recover(st, steps);
+    if let Some(m) = next {
+        allow(cx, st, steps, m);
+    }
     true
 }
 
@@ -177,38 +176,40 @@ fn serving(
         }
     }
 
-    let base: Option<Millis> = forced.then(|| {
-        if cx.reclaimed() {
-            policy.reclaim_timeout()
-        } else {
-            policy.drain_timeout
-        }
-    });
+    // Every wind-down has a timeout, forced or not: the class's own `kill_timeout` or else
+    // the cause's (`reclaim_timeout` for a reclaim, `drain_timeout` otherwise), counted from
+    // the start of the wind-down. Without it a serving model whose queue is fed
+    // continuously would never hand over, because withdrawing the allowed model is what
+    // cuts work off here. Only a busy `none` class (checked above, unforced only) blocks
+    // without a timeout.
+    //
+    // A cause change during a wind-down: the clock restarts exactly when the cause flips
+    // between reclaim and not-reclaim (the new cause's timeout counts from the change; a
+    // reclaim ending gives the work a fresh `drain_timeout`). Unforced, a manual lease and a
+    // lease released all share `drain_timeout` and keep `since`, so the cut-off neither
+    // moves nor is extended by them. A state persisted without a timeout (before unforced
+    // wind-downs had one) gets it filled in, keeping `since`. Classes already stopped stay
+    // recorded in every case.
+    let timeout = if cx.reclaimed() {
+        policy.reclaim_timeout()
+    } else {
+        policy.drain_timeout
+    };
     let started = wind_down.is_none();
-    // The wind-down follows its cause. A different cause (a reclaim arriving during a
-    // manual-lease wind-down, or the reverse) restarts the clock with the new cause's
-    // timeout; losing the forcing cause (the lease was released) removes the timeout so
-    // nothing can be stopped any more. Classes already stopped stay recorded.
-    let wd = match (wind_down, base) {
-        (Some(w), Some(t)) if w.timeout.is_some() && w.reclaim == cx.reclaimed() => WindDown {
-            timeout: Some(t),
+    let wd = match wind_down {
+        Some(w) if w.reclaim == cx.reclaimed() => WindDown {
+            timeout: Some(timeout),
             ..w
         },
-        (Some(w), Some(t)) => WindDown {
+        Some(w) => WindDown {
             since: now,
-            timeout: Some(t),
+            timeout: Some(timeout),
             reclaim: cx.reclaimed(),
             killed: w.killed,
         },
-        (Some(w), None) => WindDown {
-            since: w.since,
-            timeout: None,
-            reclaim: false,
-            killed: w.killed,
-        },
-        (None, t) => WindDown {
+        None => WindDown {
             since: now,
-            timeout: t,
+            timeout: Some(timeout),
             reclaim: cx.reclaimed(),
             killed: Default::default(),
         },
@@ -236,46 +237,33 @@ fn serving(
         .map(|(c, w)| (*c, w.known))
         .collect();
     // Each class is stopped when its own timeout runs out, not when the last one does.
-    if let Some(timeout) = wd.timeout {
-        let mut wd = wd.clone();
-        let mut stopped = Vec::new();
-        for (c, _) in &blockers {
-            if now >= wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout)) {
-                steps.push(Step::KillInFlight {
-                    class: c.id.clone(),
-                });
-                if c.recovery.is_some() {
-                    st.pending_recovery.insert(c.id.clone());
-                }
-                wd.killed.insert(c.id.clone());
-                stopped.push(c.id.clone());
+    let mut wd = wd;
+    let mut stopped = Vec::new();
+    for (c, _) in &blockers {
+        if now >= wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout)) {
+            steps.push(Step::KillInFlight {
+                class: c.id.clone(),
+            });
+            if c.recovery.is_some() {
+                st.pending_recovery.insert(c.id.clone());
             }
+            wd.killed.insert(c.id.clone());
+            stopped.push(c.id.clone());
         }
-        if !stopped.is_empty() {
-            st.mode = ModePhase::Serving {
-                model: model.clone(),
-                since,
-                idle_since,
-                wind_down: Some(wd),
-            };
-        }
-        let remaining: Vec<_> = blockers
-            .iter()
-            .filter(|(c, _)| !stopped.contains(&c.id))
-            .collect();
-        if remaining.is_empty() {
-            return drain(cx, st, steps, &model);
-        }
-        return waiting(
-            cx,
-            steps,
-            blocked_reason(blockers.iter().filter(|(c, _)| !stopped.contains(&c.id))),
-        );
     }
-    if blockers.is_empty() {
-        return drain(cx, st, steps, &model);
+    if !stopped.is_empty() {
+        st.mode = ModePhase::Serving {
+            model: model.clone(),
+            since,
+            idle_since,
+            wind_down: Some(wd),
+        };
     }
-    waiting(cx, steps, blocked_reason(blockers.iter()))
+    let remaining = || blockers.iter().filter(|(c, _)| !stopped.contains(&c.id));
+    if remaining().next().is_none() {
+        return switch(cx, st, steps, &model, target);
+    }
+    waiting(cx, steps, blocked_reason(remaining()))
 }
 
 fn blocked_reason<'a>(mut blockers: impl Iterator<Item = &'a (&'a ClassSpec, bool)>) -> WaitReason {

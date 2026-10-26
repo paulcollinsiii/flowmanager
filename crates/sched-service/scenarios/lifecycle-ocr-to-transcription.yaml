@@ -1,4 +1,4 @@
-description: "OCR serves, transcription waits past the age threshold, and the GPU switches models with intake stopped and in-flight work finished first."
+description: "OCR serves, transcription waits past the age threshold, and the GPU switches models in one tick with intake stopped and in-flight work finished first; pod counts never hold anything up."
 frames:
   # OCR work appears while the GPU holds no model: allow mineru.
   - at: 100000000
@@ -19,23 +19,23 @@ frames:
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 2, in_flight: 0, oldest_ready_at: 99999000 } }
     expect:
       steps: [{ type: allow_model, resource: cuda-central, model: mineru }]
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server] }
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+  # mineru's pod is still pulling its image: serving all the same (dwell counts from the allow).
   - at: 100005000
     refresh: true
     observe:
       - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 1, ready_pods: 0 } }
     expect:
-      steps: [{ type: wait, resource: cuda-central, reason: loading }]
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server] }
-  # mineru is ready: serving, and its class is allowed.
+      steps: []
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   - at: 100010000
     refresh: true
     observe:
       - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 1, ready_pods: 1 } }
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-ocr] }
-  # Transcription waits, but mineru has served less than min_dwell and nothing is starved: no yield.
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+  # Transcription waits, but mineru has been allowed for less than min_dwell and nothing is starved: no yield.
   - at: 100060000
     refresh: true
     observe:
@@ -43,7 +43,7 @@ frames:
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 2, in_flight: 1, oldest_ready_at: 99999000 } }
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-ocr] }
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   # Transcription has waited past age_threshold: mineru yields; intake stops and in-flight work finishes.
   - at: 103600000
     refresh: true
@@ -51,34 +51,34 @@ frames:
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 2, in_flight: 1, oldest_ready_at: 103500000 } }
     expect:
       steps: [{ type: pause_intake, class: paperless-ocr }, { type: wait, resource: cuda-central, reason: in_flight_work }]
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server] }
-  # In-flight work is done: withdraw mineru.
+      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  # In-flight work is done: mineru leaves and whisperx enters the allowed set in the same tick.
+  # mineru's pod is still running; Kubernetes keeps whisperx's pending until it is gone.
   - at: 103610000
     refresh: true
     observe:
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 2, in_flight: 0, oldest_ready_at: 103500000 } }
     expect:
-      steps: [{ type: drain_model, resource: cuda-central, model: mineru }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+      steps: [{ type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }]
+      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   - at: 103615000
     refresh: true
     observe:
-      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 1, ready_pods: 1 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 1, ready_pods: 0 } }
     expect:
-      steps: [{ type: wait, resource: cuda-central, reason: draining }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
-  # Zero pods observed: whisperx is allowed in the same tick.
+      steps: []
+      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   - at: 103620000
     refresh: true
     observe:
       - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
     expect:
-      steps: [{ type: allow_model, resource: cuda-central, model: whisperx }]
-      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server] }
+      steps: []
+      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   - at: 103625000
     refresh: true
     observe:
       - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 1, ready_pods: 1 } }
     expect:
       steps: []
-      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, speakr-transcription] }
+      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }

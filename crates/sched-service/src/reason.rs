@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use sched_model::{Intent, Millis, PowerWant, Step, WaitReason};
+use sched_model::{Intent, Millis, ModelId, PowerWant, ResourceId, Step, WaitReason};
 use sched_observe::ObserverState;
 
 use crate::cache::InputAge;
@@ -21,10 +21,15 @@ pub fn step_kind(step: &Step) -> &'static str {
     }
 }
 
-/// Metric label for a tick that produced no step at all.
+/// Metric label for a tick that produced no step at all, with no class's demand unknown
+/// and no model pinned by a manual lease.
 pub const KIND_IDLE: &str = "idle";
 /// Metric label for a tick that failed to produce a decision.
 pub const KIND_ERROR: &str = "error";
+/// Metric label for a tick in which a manual model lease pins a model on a resource (the
+/// intent is forced to that model). Such a tick is never [`KIND_IDLE`]: the model is held
+/// on purpose however little work it has.
+pub const KIND_PINNED: &str = "pinned";
 
 /// Metric label for demand that is not known although something should be reporting it:
 /// an observer runs for the source (or the source has reported before) and it is silent or
@@ -55,10 +60,25 @@ impl DemandGaps {
     }
 }
 
-/// The distinct kinds in a decision, sorted; [`KIND_IDLE`] when there are no steps and no
-/// class's demand is unknown (unobservable demand counts as none, so it does not prevent
-/// `idle`, but its kind is still listed).
-pub fn kinds(steps: &[Step], gaps: &DemandGaps) -> Vec<&'static str> {
+/// The resources a manual model lease pins, with their model: forced to a model (a reclaim
+/// is forced to none).
+pub fn pinned(intent: &Intent) -> Vec<(ResourceId, ModelId)> {
+    intent
+        .forced
+        .iter()
+        .filter(|r| !intent.reclaim.contains(*r))
+        .filter_map(|r| match intent.models.get(r) {
+            Some(Some(m)) => Some((r.clone(), m.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The distinct kinds in a decision, sorted; [`KIND_PINNED`] when a manual model lease pins
+/// a model; [`KIND_IDLE`] when there are no steps, no class's demand is unknown and nothing
+/// is pinned (unobservable demand counts as none, so it does not prevent `idle`, but its
+/// kind is still listed).
+pub fn kinds(steps: &[Step], gaps: &DemandGaps, pinned: bool) -> Vec<&'static str> {
     let mut set: BTreeSet<&'static str> = steps.iter().map(step_kind).collect();
     if !gaps.unknown.is_empty() {
         set.insert(KIND_DEMAND_UNKNOWN);
@@ -69,31 +89,50 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps) -> Vec<&'static str> {
     if !gaps.unpolled.is_empty() {
         set.insert(KIND_DEMAND_UNPOLLED);
     }
-    if gaps.unknown.is_empty() && steps.is_empty() {
+    if pinned {
+        set.insert(KIND_PINNED);
+    }
+    if gaps.unknown.is_empty() && steps.is_empty() && !pinned {
         set.insert(KIND_IDLE);
     }
     set.into_iter().collect()
 }
 
-/// Whether nothing in this build carries `step` out. Allowing, draining and pausing are
-/// carried out through the published allowed set (KEDA converges on it); powering a host on
-/// or off, stopping in-flight work and running a recovery action have no actuator yet.
-pub fn not_executed(step: &Step) -> bool {
-    matches!(
-        step,
-        Step::PowerOn { .. }
-            | Step::PowerOff { .. }
-            | Step::KillInFlight { .. }
-            | Step::RunRecovery { .. }
-    )
+/// Why nothing carries `step` out, if nothing does. Allowing and withdrawing a model, and a
+/// class leaving or entering the allowed set, are published (KEDA converges on the set).
+/// But nothing scales on a demand class: consumers are not gated for GPU contention (only
+/// gate classes, whose requirements are hosts, gate a consumer), so a `PauseIntake` does not
+/// stop anyone taking new work. `KillInFlight` has no actuator of its own either: the work
+/// is cut off because the same tick withdraws its model (KEDA scales the workload to 0).
+/// Powering a host on or off and running a recovery action have no actuator yet.
+pub fn not_executed_note(step: &Step) -> Option<&'static str> {
+    match step {
+        Step::PowerOn { .. } | Step::PowerOff { .. } | Step::RunRecovery { .. } => {
+            Some(NOT_EXECUTED)
+        }
+        Step::KillInFlight { .. } => Some(NOT_EXECUTED_KILL),
+        Step::PauseIntake { .. } => Some(NOT_EXECUTED_PAUSE),
+        Step::Wait { .. } | Step::AllowModel { .. } | Step::DrainModel { .. } => None,
+    }
 }
 
-/// Appended to the reason of every step for which [`not_executed`] holds.
+/// Whether nothing in this build carries `step` out (see [`not_executed_note`]).
+pub fn not_executed(step: &Step) -> bool {
+    not_executed_note(step).is_some()
+}
+
+/// Appended to the reason of a step that has no actuator in this build.
 pub const NOT_EXECUTED: &str = " [NOT EXECUTED: no actuator for this step in this build]";
+/// Appended to the reason of a `KillInFlight` step.
+pub const NOT_EXECUTED_KILL: &str = " [NOT EXECUTED: nothing stops the work directly; it ends because the model is withdrawn (its workload is scaled to 0), and the class's recovery, if any, is not run either]";
+/// Appended to the reason of a `PauseIntake` step.
+pub const NOT_EXECUTED_PAUSE: &str = " [NOT EXECUTED: consumers are not gated on their demand class, so nothing stops them taking new work; the class only leaves the allowed set]";
 
 fn wait_text(reason: WaitReason) -> &'static str {
     match reason {
-        WaitReason::StaleObservation => "a pod or reachability observation is missing or stale",
+        WaitReason::StaleObservation => {
+            "a reachability observation of the host is missing or stale"
+        }
         WaitReason::StaleDemand => {
             "a demand observation needed to prove no work is in flight is missing or stale"
         }
@@ -102,12 +141,9 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::HostNotUp => "the host is not up",
         WaitReason::PoweringOn => "the host is powering on",
         WaitReason::ShuttingDown => "the host is shutting down",
-        WaitReason::MinDwell => "the loaded model has not served its minimum dwell",
-        WaitReason::NotPreemptible => "the loaded model's active work is not preemptible",
-        WaitReason::InFlightWork => "in-flight work is still running",
-        WaitReason::OtherModelPresent => "another model still has pods",
-        WaitReason::Loading => "the model is still loading",
-        WaitReason::Draining => "the model is still draining",
+        WaitReason::MinDwell => "the allowed model has not been allowed for its minimum dwell",
+        WaitReason::NotPreemptible => "the allowed model's active work is not preemptible",
+        WaitReason::InFlightWork => "in-flight work reported by its queue is still running",
     }
 }
 
@@ -125,7 +161,10 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
             format!("allow {model} on {resource}: {}", wants(resource))
         }
         Step::DrainModel { resource, model } => {
-            format!("drain {model} on {resource}: {}", wants(resource))
+            format!(
+                "withdraw {model} on {resource}: {} (it leaves the allowed set now; nothing waits for its pods)",
+                wants(resource)
+            )
         }
         Step::PowerOn { resource } => {
             let why = match intent.power_up.get(resource) {
@@ -139,10 +178,14 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
             format!("power off {resource}: nothing holds it and its idle grace has passed")
         }
         Step::PauseIntake { class } => {
-            format!("pause intake for {class}: its model is being wound down")
+            format!(
+                "pause intake for {class}: its model is being wound down, so the class leaves the allowed set"
+            )
         }
         Step::KillInFlight { class } => {
-            format!("stop in-flight work of {class}: its timeout ran out")
+            format!(
+                "cut off in-flight work of {class}: its timeout ran out, so the model is withdrawn with the work still running"
+            )
         }
         Step::RunRecovery { class } => {
             format!("run recovery for {class}: its in-flight work was stopped")
@@ -176,14 +219,22 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
         let rc: Vec<_> = intent.reclaim.iter().map(|r| r.to_string()).collect();
         out.push_str(&format!(", reclaim [{}]", rc.join(", ")));
     }
+    let pins = pinned(intent);
+    if !pins.is_empty() {
+        let p: Vec<_> = pins.iter().map(|(r, m)| format!("{r}={m}")).collect();
+        out.push_str(&format!(
+            ", pinned by a manual model lease [{}] (held until the lease is released, however little work it has)",
+            p.join(", ")
+        ));
+    }
     if steps.is_empty() {
         out.push_str("; no step needed");
     }
     for s in steps {
         out.push_str("; ");
         out.push_str(&step_reason(s, intent));
-        if not_executed(s) {
-            out.push_str(NOT_EXECUTED);
+        if let Some(note) = not_executed_note(s) {
+            out.push_str(note);
         }
     }
     let ids = |v: &[sched_model::ClassId]| {
@@ -260,22 +311,28 @@ mod tests {
             unpolled: p.iter().map(|n| (*n).into()).collect(),
         };
         let _ = c;
-        assert_eq!(kinds(&[], &DemandGaps::default()), vec![KIND_IDLE]);
+        assert_eq!(kinds(&[], &DemandGaps::default(), false), vec![KIND_IDLE]);
         assert_eq!(
-            kinds(&[], &gap(&["a"], &[], &[])),
+            kinds(&[], &gap(&["a"], &[], &[]), false),
             vec![KIND_DEMAND_UNKNOWN]
         );
         // Unobservable demand counts as none: still idle, and still labelled.
         assert_eq!(
-            kinds(&[], &gap(&[], &["a"], &[])),
+            kinds(&[], &gap(&[], &["a"], &[]), false),
             vec![KIND_DEMAND_UNSUPPORTED, KIND_IDLE]
         );
         assert_eq!(
-            kinds(&[], &gap(&[], &[], &["a"])),
+            kinds(&[], &gap(&[], &[], &["a"]), false),
             vec![KIND_DEMAND_UNPOLLED, KIND_IDLE]
         );
+        // A model pinned by a manual lease is held on purpose: never idle.
         assert_eq!(
-            kinds(&[], &gap(&["a"], &["b"], &["c"])),
+            kinds(&[], &gap(&[], &["a"], &[]), true),
+            vec![KIND_DEMAND_UNSUPPORTED, KIND_PINNED]
+        );
+        assert_eq!(kinds(&[], &DemandGaps::default(), true), vec![KIND_PINNED]);
+        assert_eq!(
+            kinds(&[], &gap(&["a"], &["b"], &["c"]), false),
             vec![
                 KIND_DEMAND_UNKNOWN,
                 KIND_DEMAND_UNPOLLED,
@@ -285,7 +342,7 @@ mod tests {
         let steps = vec![
             Step::Wait {
                 resource: "a".into(),
-                reason: WaitReason::Loading,
+                reason: WaitReason::InFlightWork,
             },
             Step::AllowModel {
                 resource: "b".into(),
@@ -297,7 +354,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            kinds(&steps, &DemandGaps::default()),
+            kinds(&steps, &DemandGaps::default(), false),
             vec!["allow_model", "wait"]
         );
         assert_eq!(
@@ -306,10 +363,33 @@ mod tests {
                 &DemandGaps {
                     unknown: vec!["x".into()],
                     ..Default::default()
-                }
+                },
+                false
             ),
             vec!["allow_model", "demand_unknown", "wait"]
         );
+    }
+
+    #[test]
+    fn only_a_forced_intent_with_a_model_is_pinned() {
+        let mut i = intent();
+        assert!(pinned(&i).is_empty(), "unforced");
+        i.forced.insert("cuda-central".into());
+        assert_eq!(
+            pinned(&i),
+            vec![(ResourceId::from("cuda-central"), ModelId::from("mineru"))]
+        );
+        let r = reason(&i, &[], &DemandGaps::default());
+        assert!(
+            r.contains("pinned by a manual model lease [cuda-central=mineru]"),
+            "{r}"
+        );
+        // A reclaim is forced to no model: not a pin.
+        let mut rc = Intent::default();
+        rc.models.insert("cuda-central".into(), None);
+        rc.forced.insert("cuda-central".into());
+        rc.reclaim.insert("cuda-central".into());
+        assert!(pinned(&rc).is_empty());
     }
 
     #[test]
@@ -352,16 +432,34 @@ mod tests {
             },
         ];
         let r = reason(&intent(), &steps, &DemandGaps::default());
-        assert_eq!(r.matches(NOT_EXECUTED).count(), 2, "{r}");
+        assert_eq!(r.matches(NOT_EXECUTED).count(), 1, "{r}");
+        assert_eq!(r.matches(NOT_EXECUTED_KILL).count(), 1, "{r}");
+        assert!(
+            r.contains(&format!(
+                "cut off in-flight work of paperless-ocr: its timeout ran out, so the model is withdrawn with the work still running{NOT_EXECUTED_KILL}"
+            )),
+            "{r}"
+        );
         assert!(
             r.contains(&format!(
                 "power on cuda-central: the sequencer needs it up{NOT_EXECUTED}"
             )),
             "{r}"
         );
-        assert!(!r.contains(&format!(
-            "drain mineru on cuda-central: the planner wants mineru on cuda-central{NOT_EXECUTED}"
-        )));
+        // Withdrawing a model is carried out (published), so its reason carries no note.
+        let withdraw = reason(
+            &intent(),
+            &[Step::DrainModel {
+                resource: "cuda-central".into(),
+                model: "mineru".into(),
+            }],
+            &DemandGaps::default(),
+        );
+        assert!(
+            withdraw.contains("withdraw mineru on cuda-central: the planner wants "),
+            "{withdraw}"
+        );
+        assert!(!withdraw.contains("NOT EXECUTED"), "{withdraw}");
         for (step, want) in [
             (
                 Step::PowerOff {
@@ -370,7 +468,8 @@ mod tests {
                 true,
             ),
             (Step::RunRecovery { class: "c".into() }, true),
-            (Step::PauseIntake { class: "c".into() }, false),
+            (Step::KillInFlight { class: "c".into() }, true),
+            (Step::PauseIntake { class: "c".into() }, true),
             (
                 Step::AllowModel {
                     resource: "r".into(),
@@ -381,7 +480,7 @@ mod tests {
             (
                 Step::Wait {
                     resource: "r".into(),
-                    reason: WaitReason::Loading,
+                    reason: WaitReason::InFlightWork,
                 },
                 false,
             ),

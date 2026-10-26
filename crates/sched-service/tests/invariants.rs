@@ -168,22 +168,23 @@ fn with_wind_down(since: u64, reclaim: bool) -> SchedState {
 }
 
 #[test]
-fn killing_without_a_forcing_lease_is_a_violation() {
+fn an_unforced_kill_is_allowed_only_after_drain_timeout() {
+    // No lease at all: the wind-down is unforced, and still bounded by drain_timeout.
     let mut obs = zero_pods_and_up(&["cuda-central"]);
     obs.push(in_flight_ocr());
     let v = run(
-        &snap(obs, vec![]),
-        &with_wind_down(NOW - 11 * MIN, false),
+        &snap(obs.clone(), vec![]),
+        &with_wind_down(NOW - 9 * MIN, false),
         vec![kill()],
     );
-    assert!(
-        v.iter()
-            .any(|m| m.contains("without a reclaim or manual model lease")),
-        "{v:?}"
+    assert!(v.iter().any(|m| m.contains("early")), "{v:?}");
+    let v = run(
+        &snap(obs.clone(), vec![]),
+        &with_wind_down(NOW - 10 * MIN, false),
+        vec![kill()],
     );
-    // An interactive lease is not a forcing lease either.
-    let mut obs = zero_pods_and_up(&["cuda-central"]);
-    obs.push(in_flight_ocr());
+    assert!(v.is_empty(), "{v:?}");
+    // An interactive lease is not a forcing lease, and changes nothing about the timeout.
     let l = lease(
         "i",
         "cuda-central",
@@ -194,14 +195,10 @@ fn killing_without_a_forcing_lease_is_a_violation() {
     );
     let v = run(
         &snap(obs, vec![l]),
-        &with_wind_down(NOW - 11 * MIN, false),
+        &with_wind_down(NOW - 9 * MIN, false),
         vec![kill()],
     );
-    assert!(
-        v.iter()
-            .any(|m| m.contains("without a reclaim or manual model lease")),
-        "{v:?}"
-    );
+    assert!(v.iter().any(|m| m.contains("early")), "{v:?}");
 }
 
 #[test]
@@ -241,8 +238,7 @@ fn killing_on_a_clock_that_should_have_restarted_is_a_violation() {
         vec![kill()],
     );
     assert!(
-        v.iter()
-            .any(|m| m.contains("without a running forced wind-down")),
+        v.iter().any(|m| m.contains("without a running wind-down")),
         "{v:?}"
     );
 }
@@ -276,43 +272,289 @@ fn killing_a_class_with_nothing_in_flight_is_a_violation() {
     );
 }
 
-fn pods_obs(model: &str, pods: u32) -> sched_model::Observation {
-    sched_model::Observation {
-        source: "cluster-pods".into(),
-        observed_at: Millis(NOW),
-        fidelity: sched_model::Fidelity::Event,
-        value: sched_model::ObservedValue::ModelPods {
-            model: ModelId::new(model),
-            pods,
-            ready_pods: pods,
-        },
+fn allow(model: &str) -> Step {
+    Step::AllowModel {
+        resource: ResourceId::new("cuda-central"),
+        model: ModelId::new(model),
     }
 }
 
-#[test]
-fn tied_pod_readings_count_as_zero_only_when_every_reading_is_zero() {
-    let allow = || Step::AllowModel {
+fn withdraw(model: &str) -> Step {
+    Step::DrainModel {
         resource: ResourceId::new("cuda-central"),
-        model: ModelId::new("mineru"),
-    };
-    // Zero and one pod of llm at the same newest instant, in both orders: not zero.
-    for tied in [
-        vec![pods_obs("llm", 0), pods_obs("llm", 1)],
-        vec![pods_obs("llm", 1), pods_obs("llm", 0)],
-    ] {
-        let mut obs = zero_pods_and_up(&["cuda-central"]);
-        obs.retain(|o| {
-            !matches!(&o.value, sched_model::ObservedValue::ModelPods { model, .. } if model.as_str() == "llm")
-        });
-        obs.extend(tied);
-        let v = run(&snap(obs, vec![]), &SchedState::default(), vec![allow()]);
-        assert!(v.iter().any(|m| m.contains("invariant 2")), "{v:?}");
+        model: ModelId::new(model),
     }
-    // Two zero readings are zero.
-    let mut obs = zero_pods_and_up(&["cuda-central"]);
-    obs.push(pods_obs("llm", 0));
-    let v = run(&snap(obs, vec![]), &SchedState::default(), vec![allow()]);
+}
+
+const GPU_ON_IDLE: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n";
+const GPU_SERVING_OCR: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n";
+
+/// A decision with these steps and this allowed set, the new state `next`.
+fn decided(steps: Vec<Step>, models: &[&str], classes: &[&str], next: &str) -> Decision {
+    Decision {
+        steps,
+        allowed: sched_model::AllowedSet {
+            models: models.iter().map(|m| ModelId::new(*m)).collect(),
+            classes: classes.iter().map(|c| ClassId::new(*c)).collect(),
+        },
+        state: prev(next),
+    }
+}
+
+fn idle_demand() -> Vec<sched_model::Observation> {
+    [
+        ("paperless-ocr", "paperless-ocr-pending"),
+        ("paperless-tagging", "paperless-post-ocr"),
+        ("speakr-transcription", "speakr-pending"),
+        ("speakr-summarization", "speakr-summaries"),
+        ("immich-ml", "immich-queues"),
+        ("backup", "backup-schedule"),
+        ("interactive-llm", "llm-sessions"),
+    ]
+    .iter()
+    .map(|(c, src)| sched_model::Observation {
+        source: (*src).into(),
+        observed_at: Millis(NOW),
+        fidelity: sched_model::Fidelity::Polled,
+        value: sched_model::ObservedValue::Demand {
+            class: ClassId::new(*c),
+            ready: 0,
+            in_flight: 0,
+            oldest_ready_at: None,
+        },
+    })
+    .collect()
+}
+
+fn check_with(snap: &Snapshot, prev_state: &SchedState, d: &Decision) -> Vec<String> {
+    check(&example_config(), snap, prev_state, &Intent::default(), d)
+}
+
+#[test]
+fn a_switch_must_withdraw_the_old_model_in_the_same_decision() {
+    let mut obs = zero_pods_and_up(&["cuda-central", "basestar-nfs"]);
+    obs.extend(idle_demand());
+    let s = snap(obs, vec![]);
+    let before = prev(GPU_SERVING_OCR);
+    let after = GPU_SERVING_OCR.replace("model: mineru", "model: llm");
+    // The correct switch: withdraw and allow together, only the new model in the set.
+    let ok = decided(
+        vec![withdraw("mineru"), allow("llm")],
+        &["llm"],
+        &[],
+        &after,
+    );
+    assert!(
+        check_with(&s, &before, &ok).is_empty(),
+        "{:?}",
+        check_with(&s, &before, &ok)
+    );
+    // Both in the set.
+    let both = decided(
+        vec![withdraw("mineru"), allow("llm")],
+        &["mineru", "llm"],
+        &[],
+        &after,
+    );
+    let v = check_with(&s, &before, &both);
+    assert!(v.iter().any(|m| m.contains("invariant 1")), "{v:?}");
+    // Allowed without withdrawing the old one (even if the set were right).
+    let v = check_with(
+        &s,
+        &before,
+        &decided(vec![allow("llm")], &["llm"], &[], &after),
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 2") && m.contains("mineru stays allowed")),
+        "{v:?}"
+    );
+    // Two allows on one resource.
+    let v = check_with(
+        &s,
+        &prev(GPU_ON_IDLE),
+        &decided(vec![allow("llm"), allow("mineru")], &["llm"], &[], &after),
+    );
+    assert!(
+        v.iter().any(|m| m.contains("more than one acting step")),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn allowing_on_a_host_that_is_not_freshly_up_is_a_violation() {
+    let next = GPU_SERVING_OCR;
+    let up_at = |at: u64, up: bool| sched_model::Observation {
+        source: "cluster-pods".into(),
+        observed_at: Millis(at),
+        fidelity: sched_model::Fidelity::Event,
+        value: sched_model::ObservedValue::ResourceUp {
+            resource: ResourceId::new("cuda-central"),
+            up,
+        },
+    };
+    let d = decided(vec![allow("mineru")], &["mineru"], &[], next);
+    // Fresh and up: fine.
+    let v = check_with(
+        &snap(vec![up_at(NOW, true)], vec![]),
+        &prev(GPU_ON_IDLE),
+        &d,
+    );
     assert!(v.is_empty(), "{v:?}");
+    // Stale, or missing: invariant 5.
+    for obs in [vec![up_at(NOW - 31_000, true)], vec![]] {
+        let v = check_with(&snap(obs, vec![]), &prev(GPU_ON_IDLE), &d);
+        assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
+    }
+    // Observed down: invariant 2 (nothing is allowed on a host observed off) and 5.
+    let v = check_with(
+        &snap(vec![up_at(NOW, false)], vec![]),
+        &prev(GPU_ON_IDLE),
+        &d,
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 2") && m.contains("observed down")),
+        "{v:?}"
+    );
+    // Pods are not part of it: any pod reading leaves the verdict as it was.
+    let mut obs = vec![up_at(NOW, true)];
+    obs.extend(zero_pods_and_up(&[]).into_iter().map(|mut o| {
+        if let sched_model::ObservedValue::ModelPods {
+            pods, ready_pods, ..
+        } = &mut o.value
+        {
+            *pods = 3;
+            *ready_pods = 1;
+        }
+        o
+    }));
+    assert!(check_with(&snap(obs, vec![]), &prev(GPU_ON_IDLE), &d).is_empty());
+}
+
+#[test]
+fn allowing_an_unconfigured_model_or_one_without_an_allow_step_is_a_violation() {
+    let obs = zero_pods_and_up(&["cuda-central", "basestar-nfs"]);
+    let s = snap(obs, vec![]);
+    let next = GPU_SERVING_OCR.replace("model: mineru", "model: retired");
+    let v = check_with(
+        &s,
+        &prev(GPU_ON_IDLE),
+        &decided(vec![allow("retired")], &["retired"], &[], &next),
+    );
+    assert!(v.iter().any(|m| m.contains("not configured")), "{v:?}");
+    // mineru appears in the set with no allow step and was not allowed before.
+    let v = check_with(
+        &s,
+        &prev(GPU_ON_IDLE),
+        &decided(vec![], &["mineru"], &[], GPU_SERVING_OCR),
+    );
+    assert!(
+        v.iter().any(|m| m.contains("without an allow step")),
+        "{v:?}"
+    );
+    // On a reclaimed host: kept without winding down, or newly allowed.
+    let s = snap(
+        zero_pods_and_up(&["cuda-central", "basestar-nfs"]),
+        vec![lease("r", "cuda-central", LeaseKind::Reclaim)],
+    );
+    let v = check_with(
+        &s,
+        &prev(GPU_SERVING_OCR),
+        &decided(vec![], &["mineru"], &[], GPU_SERVING_OCR),
+    );
+    assert!(v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
+    let v = check_with(
+        &s,
+        &prev(GPU_ON_IDLE),
+        &decided(vec![allow("mineru")], &["mineru"], &[], SERVING_OCR),
+    );
+    assert!(v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
+    // Kept while it winds down: fine.
+    let v = check_with(
+        &s,
+        &prev(SERVING_OCR),
+        &decided(vec![], &["mineru"], &[], SERVING_OCR),
+    );
+    assert!(!v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
+}
+
+#[test]
+fn allowing_a_class_whose_requirements_do_not_hold_is_a_violation() {
+    let s = snap(zero_pods_and_up(&["cuda-central", "basestar-nfs"]), vec![]);
+    let before = prev(GPU_SERVING_OCR);
+    // OCR allowed while its model is not.
+    let v = check_with(
+        &s,
+        &before,
+        &decided(vec![], &[], &["paperless-ocr"], GPU_ON_IDLE),
+    );
+    assert!(
+        v.iter().any(|m| m.contains("mineru is not allowed")),
+        "{v:?}"
+    );
+    // OCR allowed while its intake is paused.
+    let v = check_with(
+        &s,
+        &before,
+        &decided(
+            vec![Step::PauseIntake {
+                class: ClassId::new("paperless-ocr"),
+            }],
+            &["mineru"],
+            &["paperless-ocr"],
+            GPU_SERVING_OCR,
+        ),
+    );
+    assert!(v.iter().any(|m| m.contains("intake is paused")), "{v:?}");
+    // The gate class while the GPU host is observed down.
+    let mut obs = zero_pods_and_up(&["basestar-nfs"]);
+    obs.push(sched_model::Observation {
+        source: "cluster-pods".into(),
+        observed_at: Millis(NOW),
+        fidelity: sched_model::Fidelity::Event,
+        value: sched_model::ObservedValue::ResourceUp {
+            resource: ResourceId::new("cuda-central"),
+            up: false,
+        },
+    });
+    let v = check_with(
+        &snap(obs, vec![]),
+        &prev(GPU_ON_IDLE),
+        &decided(vec![], &[], &["paperless-gpt"], GPU_ON_IDLE),
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("paperless-gpt") && m.contains("cuda-central is not up")),
+        "{v:?}"
+    );
+    // And open while both hosts are up: fine.
+    let v = check_with(
+        &s,
+        &prev(GPU_ON_IDLE),
+        &decided(vec![], &[], &["paperless-gpt"], GPU_ON_IDLE),
+    );
+    assert!(v.is_empty(), "{v:?}");
+}
+
+#[test]
+fn powering_off_a_host_with_a_model_allowed_is_a_violation() {
+    let leases = vec![lease("r", "cuda-central", LeaseKind::Reclaim)];
+    let v = check_with(
+        &snap(zero_pods_and_up(&["cuda-central"]), leases),
+        &prev(GPU_SERVING_OCR),
+        &decided(
+            vec![power_off("cuda-central")],
+            &["mineru"],
+            &[],
+            GPU_SERVING_OCR,
+        ),
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 3") && m.contains("mineru is allowed")),
+        "{v:?}"
+    );
 }
 
 #[test]
