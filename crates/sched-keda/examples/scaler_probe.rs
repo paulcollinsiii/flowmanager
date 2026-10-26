@@ -1,9 +1,9 @@
 //! Calls a running scaler the way KEDA does, and prints what it answers.
 //!
 //! ```sh
-//! cargo run -p sched-keda --example scaler_probe -- 127.0.0.1:9095 model=mineru
-//! cargo run -p sched-keda --example scaler_probe -- 127.0.0.1:9095 --watch 30 class=paperless-ngx
-//! cargo run -p sched-keda --example scaler_probe -- 127.0.0.1:9095 --stream model=mineru
+//! cargo run -p sched-keda --example scaler_probe -- 127.0.0.1:9095 model=<model-id>
+//! cargo run -p sched-keda --example scaler_probe -- 127.0.0.1:9095 --watch 30 class=<class-id>
+//! cargo run -p sched-keda --example scaler_probe -- 127.0.0.1:9095 --stream model=<model-id>
 //! ```
 //!
 //! Each `key=value` becomes trigger metadata. Without options it calls `IsActive`,
