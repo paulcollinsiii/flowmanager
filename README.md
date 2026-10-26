@@ -214,7 +214,7 @@ scheduler config, never in code. KEDA passes its own trigger keys on too, so
 `scalerAddress`, `enableTLS` and `unsafeSsl` are accepted and ignored. Anything else is
 refused with gRPC `InvalidArgument` and a message naming the ScaledObject: no subject,
 both, any other key, an empty value, or an id the **active** config does not have
-(model and class ids are separate: a class id under `model` is unknown). Ids are checked
+(model and class ids are separate: a class id under `model` is unknown). Model and class ids are validated at config load because the scaler builds a metric name from them: lowercase letters, digits and `-`, starting and ending with a letter or digit, at most 50 characters. Ids are checked
 against the config as it is now, so a reload takes effect at once: an added id is
 answered from the allowed set (inactive until a tick allows it); a removed id is refused,
 even while it is still in the last published set.

@@ -47,6 +47,44 @@ fn check_ids<'a>(p: &mut Problems, section: &str, ids: impl Iterator<Item = &'a 
     }
 }
 
+/// Longest model or class id. The KEDA scaler builds a metric name from an id
+/// (`flowmanager-model-<id>`), which KEDA prefixes (`sN-`) and uses as a metric name.
+pub(crate) const MAX_SCALER_ID_LEN: usize = 50;
+
+/// Why `id` cannot name a model or a class, or `None` if it can: lowercase letters, digits
+/// and `-`, starting and ending with a letter or digit, at most [`MAX_SCALER_ID_LEN`]
+/// characters. A free-form id would end up in a metric name and in a ScaledObject.
+pub(crate) fn scaler_id_problem(id: &str) -> Option<String> {
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let rule = "an id may use only lowercase letters, digits and '-', must start and end with a letter or digit, and be at most 50 characters (the KEDA scaler builds a metric name from it)";
+    if id.is_empty() || id != id.trim() {
+        return None; // reported by check_ids
+    }
+    if let Some(bad) = id.chars().find(|c| !alnum(*c) && *c != '-') {
+        return Some(format!("id {id:?} has the character {bad:?}; {rule}"));
+    }
+    if !id.starts_with(alnum) || !id.ends_with(alnum) {
+        return Some(format!(
+            "id {id:?} must start and end with a letter or digit; {rule}"
+        ));
+    }
+    if id.chars().count() > MAX_SCALER_ID_LEN {
+        return Some(format!(
+            "id {id:?} is {} characters, more than {MAX_SCALER_ID_LEN}; {rule}",
+            id.chars().count()
+        ));
+    }
+    None
+}
+
+fn check_scaler_ids<'a>(p: &mut Problems, section: &str, ids: impl Iterator<Item = &'a str>) {
+    for id in ids {
+        if let Some(why) = scaler_id_problem(id) {
+            p.add(format!("{section}[{id}]"), why);
+        }
+    }
+}
+
 pub(crate) fn validate(c: &Config) -> Vec<Problem> {
     let mut p = Problems(Vec::new());
     policy(c, &mut p);
@@ -58,6 +96,8 @@ pub(crate) fn validate(c: &Config) -> Vec<Problem> {
     check_ids(&mut p, "models", c.models().iter().map(|m| m.id.as_str()));
     check_ids(&mut p, "classes", c.classes().iter().map(|k| k.id.as_str()));
     check_ids(&mut p, "sources", c.sources().iter().map(|s| s.id.as_str()));
+    check_scaler_ids(&mut p, "models", c.models().iter().map(|m| m.id.as_str()));
+    check_scaler_ids(&mut p, "classes", c.classes().iter().map(|k| k.id.as_str()));
     models(c, &mut p);
     classes(c, &mut p);
     sources(c, &mut p);
@@ -484,6 +524,51 @@ sources:
         assert!(has(&ps, "resources[nfs]: duplicate id"), "{ps:?}");
         assert!(has(&ps, "models[m1]: duplicate id"), "{ps:?}");
         assert!(has(&ps, "sources[s1]: duplicate id"), "{ps:?}");
+    }
+
+    #[test]
+    fn model_and_class_ids_must_be_usable_in_a_scaler_metric_name() {
+        let fifty = "a".repeat(50);
+        for good in ["a", "mineru", "immich-ml", "0a-1", "x--y", fifty.as_str()] {
+            for (what, y) in [
+                ("model", VALID.replace("m1", good)),
+                ("class", VALID.replace("c1", good)),
+            ] {
+                if let Err(e) = Config::from_yaml(&y) {
+                    panic!("{what} id {good:?} should be accepted: {e}");
+                }
+            }
+        }
+        let fifty_one = "a".repeat(51);
+        let bad = [
+            ("Upper", "character 'U'"),
+            ("under_score", "character '_'"),
+            ("dot.id", "character '.'"),
+            ("sp ace", "character ' '"),
+            ("caf\u{e9}", "character '\u{e9}'"),
+            ("-lead", "must start and end"),
+            ("trail-", "must start and end"),
+            ("-", "must start and end"),
+            (fifty_one.as_str(), "51 characters, more than 50"),
+        ];
+        for (id, why) in bad {
+            for (section, y) in [
+                ("models", VALID.replace("m1", &format!("\"{id}\""))),
+                ("classes", VALID.replace("c1", &format!("\"{id}\""))),
+            ] {
+                let ps = problems(&y);
+                let at = format!("{section}[{id}]: ");
+                assert!(
+                    ps.iter().any(|p| p.starts_with(&at) && p.contains(why)),
+                    "{section} {id:?}: {ps:?}"
+                );
+                assert!(
+                    ps.iter()
+                        .any(|p| p.contains("lowercase letters, digits and '-'")),
+                    "the message names the rule: {ps:?}"
+                );
+            }
+        }
     }
 
     #[test]
