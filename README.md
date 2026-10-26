@@ -95,7 +95,8 @@ How a model is chosen and kept:
   and basestar-nfs up: paperless-gpt's deployment scales on it, so it runs only while both
   hosts are up. Consumers are not gated for GPU contention: switching a model away
   mid-job is safe for paperless-gpt (it reprocesses the document), speakr (the job is
-  marked failed, and re-queued later) and immich (its CPU replica takes over).
+  marked failed, and re-queued by the class's recovery) and immich (its CPU replica takes
+  over).
 
 What is carried out and what is not:
 
@@ -112,11 +113,12 @@ What is carried out and what is not:
   it on, including a manual model lease. A powering-on or shutting-down phase left in the
   persisted state by managed control converges to the observed phase. `managed` (the
   scheduler powers hosts on and off) is for M4, with the power actuators.
-- **Stopping in-flight work and recovery actions have no actuator** (nor do power steps
-  under `managed`). The sequencer still takes these steps (its state moves on as if they
-  happened), and each one is reported as not executed: listed in the tick's
-  `not_executed`, marked `[NOT EXECUTED: ...]` in the reason, and logged as a warning. See
-  Known blind spots.
+- **Stopping in-flight work has no actuator** (nor do power steps under `managed`). The
+  sequencer still takes these steps (its state moves on as if they happened), and each one
+  is reported as not executed: listed in the tick's `not_executed`, marked
+  `[NOT EXECUTED: ...]` in the reason, and logged as a warning. See Known blind spots.
+- **Recovery actions are carried out**, by the class's `Recovery` object (see *Recovery
+  actions* below); `RunRecovery` is no longer listed as not executed.
 - **Pausing intake stops nobody.** A `pause_intake` step takes a demand class (say
   `paperless-ocr`) out of the allowed set when its model starts winding down, but no
   consumer scales on a demand class (consumers are gated on gate classes, by host
@@ -130,7 +132,26 @@ What is carried out and what is not:
   unfinished documents (paperless-ocr, paperless-tagging are `kill` for that reason), immich
   leaves it pending, speakr marks a transcription failed (re-queued by its recovery), and
   an interrupted speakr summary is not re-queued automatically (speakr-summarization stays
-  `pause_intake` to mark that; the planned recovery covers failed transcriptions only).
+  `pause_intake` to mark that, and has no recovery; the recovery covers failed
+  transcriptions only).
+- **Failed items are a third demand bucket.** Next to ready and in-flight, a source can
+  count a request `counts_as: failed` (the example does, for speakr's failed
+  transcriptions). Failed items are work waiting to be *re-queued*, not ready work:
+  - they never age: they contribute no "oldest ready" time, so they cannot starve another
+    model's queue or force a switch by `age_threshold`, however long they stay listed;
+  - they make their class's model *wanted*, at the class's normal priority, so the model is
+    brought in to re-queue them. A model wanted only for failed items ranks as if its work
+    had arrived this instant: it loses ties on age to real work of its priority;
+  - they never hold the model that is serving: for the serving model they count as nothing,
+    so they neither keep it from going idle nor make it the pick when it is released. A
+    model loaded only for failed items, whose items were re-queued (they then show as ready
+    work through the source's other request, and as none failed), is released after the usual
+    `min_dwell` and `idle_grace`, not longer. If the items cannot be re-queued (the cap
+    is used), the model idles for `idle_grace` and is released while they remain listed; the
+    items stop bringing a model in when they leave the source's `since` window (15m in the
+    example). They do not power a host on and do not keep one on;
+  - a window shorter than `idle_grace` plus load time means a model may come and go without
+    ever serving a re-queue, which is harmless.
 - **Demand that can never be observed counts as none.** A class whose demand source has no
   observer in this build (a `schedule` or `session` source, for example) or is an
   observable kind configured without `params`, and that has never reported, counts as
@@ -156,7 +177,11 @@ restate deployments register http://localhost:9080
   scaler's gRPC address; see below.
 - `--config` (or `SCHED_CONFIG`) is re-read every `--reload-interval`; an invalid file is
   logged and the last good config stays active. In the cluster this is a mounted ConfigMap.
-- Tokens come from environment variables or files named in a source's `auth`, never from the config.
+- Tokens come from environment variables or files named in a source's `auth` (or a
+  recovery action's `auth`), never from the config. `SPEAKR_API_TOKEN` is one speakr API
+  token with the **read and process** scopes: `read` for the demand polls, `process` for the
+  re-queue request (`POST /api/v1/recordings/{id}/transcribe`). The token's user must also
+  be allowed to edit the recordings.
 - Backstop: `arm_backstop` starts a self-scheduling `backstop` chain (delayed send to itself,
   every `--backstop`); the binary calls it through `--restate-ingress` until Restate accepts.
   Changed observations ask for an extra `tick` the same way, and so does every lease change.
@@ -274,6 +299,12 @@ The object keeps its state in Restate, under these keys:
 | `lease_book` | Versioned document: the leases held and the counter lease ids are drawn from. |
 | `backstop_epoch` | The current backstop chain (a number). |
 
+The `Recovery` virtual object (one instance per class id) keeps its own state:
+
+| Key | Holds |
+| --- | --- |
+| `recovery_attempts` | Versioned document (`{"version":1,"data":{"last_run_at":..., "attempts":{"<id>":{"count":N,"last_at":...}}}}`): re-queue attempts per item id and when the action last ran. Read by `Recovery/<class>/attempts`; an unreadable one is discarded with `discard_attempts` (`{"force":true}` for a readable one, which gives every item fresh attempts). |
+
 A tick loads `scheduler_state` and `lease_book`, decides inside a journaled step
 (`ctx.run`, named `decide`), stores the new `scheduler_state`, and only then publishes the
 allowed set in process. A retried or replayed invocation gets the journaled decision back
@@ -348,9 +379,74 @@ host that went down meanwhile still has its gate open until the first reading sa
 otherwise (a reading of "down" closes it at that tick). The same holds for the serving
 model's classes. Only allowing something new waits for a fresh "up" reading.
 
+## Recovery actions
+
+A class may declare `recovery: { action, source, params }`. The only action is
+`requeue_failed`, which re-queues the class's failed items through the service's API. It is
+carried out by the `Recovery` Restate object (key: the class id), not by the `Scheduler`.
+
+**When.** The sequencer emits `RunRecovery` for a class that has a recovery, while the class
+is in the allowed set (its model serving and not winding down, its hosts up, no reclaim) and
+the snapshot reports failed items for it (fresh demand, `failed > 0`). It is emitted on
+every such tick; the action is idempotent and rate-limited by itself, so that is cheap.
+It never runs for a class that is not allowed: the action re-checks the allowed set the tick
+published before listing and again **before every request**, and stops when the class has
+left it. After in-flight work is cut off the model is withdrawn, so an action that needs the
+model is not run then (it runs when the model is back and items are still failed). Failed
+items are counted by the `failed` demand bucket (see above); `speakr-summarization` has no
+recovery: a failed summary is not re-queued.
+
+**Where it runs, and why.** A `Scheduler` handler holds the object's exclusive lock, so HTTP
+requests there would queue every tick and lease request behind a slow service. The `tick`
+handler therefore only sends the class's `Recovery` object a one-way request, after
+publishing the allowed set; the object has its own lock and state, so a hung or failing
+action cannot delay a tick (checked live: ticks kept their cadence while the mock service
+was stopped). Every request is bounded by the action's `timeout`; a run is at most one list
+request plus `max_per_run` re-queue requests, with `min_interval` between runs (the example:
+at most 6 requests a minute against speakr's 120).
+
+**A run.** (1) a journaled gate: the class has an action, is allowed, `min_interval` has
+passed (otherwise it stops there, one cheap step); (2) one journaled list request, filtered
+by the configured `where` and `since`; (3) per item with attempts left, at most
+`max_per_run`: re-check allowed, **record the attempt and make it durable, then** send the
+re-queue request, each a journaled step, so a replay cannot send it again. A crash between
+recording and sending wastes an attempt and cannot allow a third; a crash after the request
+was sent but before its result was journaled makes Restate's retry send it once more for
+the same recorded attempt (steps are at least once), the one case with more requests than
+recorded attempts.
+
+**The cap.** `max_attempts` per item id (default 2), counted in `recovery_attempts`. A
+request counts as an attempt whether or not it succeeded (the attempt is recorded first).
+An item that used its attempts is skipped (`skipped_cap`) and stays failed until it leaves
+the list's `since` window. An item's record is forgotten only when its latest attempt is
+older than `window` (default 15m) **and** the item is no longer listed: while it is listed it
+is still failing, and forgetting it would give it fresh attempts. A later edit of a failed
+recording restarts its window but not its attempts while it stays listed.
+
+**Params** (`recovery.params`; validated at config load, an unknown action is refused):
+
+| Param | Meaning |
+| --- | --- |
+| `list.url`, `list.items`, `list.id` | The list request, the JSON pointer to the items array, the pointer (inside an item) to its id (a string or an integer made of letters, digits and `-_.`; anything else is skipped). |
+| `list.where`, `list.since`, `list.max_items` | As for an `http_json` request. A full page (`max_items`) is processed and warned about; the rest follows on later runs. |
+| `requeue.method`, `requeue.url` | `POST` (default), `PUT` or `PATCH`; the URL with `{id}` once. |
+| `requeue.expect` | Conditions on the JSON answer (`{field, equals}`), all of which must hold for the request to count as queued. A non-2xx answer never does. |
+| `auth` | As for a source: an env var or file, never the secret. |
+| `max_attempts` / `window` / `min_interval` / `max_per_run` / `timeout` | 2 / 15m / 60s / 5 / 10s by default. |
+
+Failures (network, 4xx, 5xx, an answer that is not JSON or does not match `expect`) are
+logged, counted and never panic; the item's attempt stays used and the next run retries it
+while attempts are left. A list that fails sends nothing and leaves the attempts alone.
+Metrics: `sched_recovery_runs_total{class,outcome}` (`ran`, `skipped_interval`,
+`skipped_not_allowed`, `not_wired`, `list_failed`, `state_error`) and
+`sched_recovery_requeues_total{class,outcome}` (`attempted`, `queued`, `failed`,
+`skipped_cap`, `skipped_not_allowed`, `deferred`).
+
 ## Handlers
 
-All are called as `POST {ingress}/Scheduler/main/{handler}`.
+All are called as `POST {ingress}/Scheduler/main/{handler}`. The `Recovery` object's
+handlers are `POST {ingress}/Recovery/{class}/run` (sent by the `tick`; harmless by hand: it
+gates itself), `.../attempts` (the stored document) and `.../discard_attempts`.
 
 | Handler | Ingress | What it does |
 | --- | --- | --- |
@@ -432,6 +528,8 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
 - `sched_source_errors_total{source}`: failed reads reported by a source.
 - `sched_rejected_reports_total{reason}`: reports (`unknown_source`) or values
   (`unknown_subject`) dropped because the config has no place for them.
+- `sched_recovery_runs_total{class,outcome}` and `sched_recovery_requeues_total{class,outcome}`:
+  runs and items of a class's recovery action (see *Recovery actions* for the outcomes).
 - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
   `sched_tick_trigger_failures_total`.
 - `sched_config_generation`, `sched_config_reloads_total{outcome}`.
@@ -490,15 +588,19 @@ Notes:
 
 Read these before trusting a "no demand" or "idle" line, or a phase.
 
-- **Kill and recovery steps are not executed** (nor power steps, which only appear under
-  `power.control: managed`). The sequencer records them as taken:
+- **Kill steps are not executed** (nor power steps, which only appear under
+  `power.control: managed`). Recovery is: see *Recovery actions*. The sequencer records
+  them as taken:
   - `KillInFlight` marks the class as stopped and stops waiting for it (at `drain_timeout`
     or the class's `kill_timeout` after the wind-down started, forced or not); the model is
     withdrawn (and the next one allowed) in the same tick. The in-flight work actually ends
     when KEDA scales the old model's pods down; the next model's pod starts once they are
     gone (Kubernetes).
-  - `RunRecovery` is emitted once, in the tick the model is withdrawn, and then forgotten:
-    failed jobs (speakr) stay failed until re-queued by hand.
+  - `RunRecovery` (carried out) is emitted while the class is allowed and items are
+    failed, not when the model is withdrawn. A recording that fails again after its
+    attempts are used stays FAILED (re-queue it by hand) until it leaves the window. A
+    crash between sending a re-queue request and journaling its result can repeat that one
+    request.
   - `PauseIntake` stops no consumer (see above).
   - Under `managed` without an actuator (not a supported setup before M4): `PowerOn` moves
     the host to "powering on" until it is seen up; `PowerOff` moves it to "shutting down",
@@ -516,16 +618,18 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
 - **Demand that cannot be observed is treated as none.** A `schedule` or `session` source
   (backup, interactive LLM) that never reported counts as no demand, so the scheduler will
   not keep the LLM loaded for interactive use or NFS up for a backup it cannot see.
-- **Failed speakr transcriptions count as demand for 15 minutes.** `speakr-pending` lists
-  FAILED recordings updated in the last 15m and counts those with `has_summary: false` as
-  ready `speakr-transcription` work (speakr stores a failed summary's error in `summary`,
-  every other failure's in `transcription`), so a whisperX outage brings whisperX in. 15m is
-  below `age_threshold` (30m), so a failure never reaches starvation priority. A failure
-  counts until it is re-queued or 15m pass; any later edit of a FAILED recording (tags,
+- **Failed speakr transcriptions are `failed` demand for 15 minutes.** `speakr-pending` lists
+  FAILED recordings updated in the last 15m and counts those with `has_summary: false` in
+  the `failed` bucket of `speakr-transcription` (speakr stores a failed summary's error in
+  `summary`, every other failure's in `transcription`), so a whisperX outage brings whisperX
+  in, to re-queue them. They are not ready work and never age: a failure cannot reach
+  starvation priority whatever its age or the window (the earlier claim that the 15m window
+  being under `age_threshold` guaranteed that is replaced by this rule). A failure counts until it is re-queued
+  or 15m pass; any later edit of a FAILED recording (tags,
   title, inbox, highlight, share) bumps its `updated_at` and restarts the window; permanent
   failures (bad file, codec) count too until the window passes; a failure older than 15m is
-  not seen at all. Automatic re-queueing (a later M3 phase) is capped at 2 per recording,
-  after which the recording stays FAILED and ages out. A reprocess-transcription failure on
+  not seen at all. Automatic re-queueing is capped at 2 per recording (see *Recovery
+  actions*), after which the recording stays FAILED and ages out. A reprocess-transcription failure on
   a recording that already has a summary is missed; a failed merge or stitch job counts as
   transcription. More than 100 failures in the window fails the poll rather than under-counting.
 - **Queued speakr summary, merge and stitch jobs count as transcription demand.** The speakr
