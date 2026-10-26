@@ -59,6 +59,10 @@ EXPOSE 9080 9090 9095
 ENTRYPOINT ["/usr/local/bin/sched-service"]
 ```
 
+The repository root has a `.dockerignore` (`target/`, `.git/`, scratch and worktree
+directories); keep it when building from the repository, or `COPY . .` sends the whole
+`target/` directory into the build context.
+
 (Use `COPY Cargo.toml Cargo.lock crates ...` layering or cargo-chef if build time matters;
 `--locked` requires `Cargo.lock` in the context.)
 
@@ -91,12 +95,15 @@ scaler. All three bind at start; a port already in use stops the process.
 
 Put the scheduler configuration (see `config/example.yaml`) in a ConfigMap and mount the
 **directory** (not `subPath`: Kubernetes does not update `subPath` mounts, so reloads would
-never arrive). The file is re-read every `--reload-interval` (5 s); the text is compared
-and only a changed text is validated and applied. Behaviour, from `config_source.rs`:
+never arrive). The file is re-read every `--reload-interval` (5 s). Text identical to the active
+config is skipped (outcome `unchanged`); any other text is validated, and a persistently
+invalid file is validated again at every interval, so
+`sched_config_reloads_total{outcome="rejected"}` grows each interval (the log line is
+written once per distinct problem). Behaviour, from `config_source.rs`:
 
 - the file is validated in full before it replaces the active config; an invalid or
   unreadable file is logged once per distinct problem at `error` and the **last good
-  config stays active** (`sched_config_reloads_total{outcome="rejected"|"unreadable"}`);
+  config stays active** (`sched_config_reloads_total{outcome="rejected"|"unreadable"}`, one count per interval while the file stays bad);
 - an invalid file **at start-up** stops the process (no earlier config exists), so a bad
   ConfigMap breaks a restart, not a running pod;
 - each tick uses one config generation (`sched_config_generation`);
@@ -320,13 +327,22 @@ Things that need care:
 
 - **The TCP probe and the sidecar.** With a sidecar, an outbound connection is redirected
   to Envoy and the application's `connect()` succeeds at once, before Envoy has tried
-  the upstream. A connect probe would then read "up" whatever basestar does. Exclude the
+  the upstream. A connect probe would then read "up" whatever basestar does. (Istio ambient
+  mode, with ztunnel instead of sidecars, may behave differently; not verified.) Exclude the
   probe's destination from interception on the flowmanager pod, for example
   `traffic.sidecar.istio.io/excludeOutboundIPRanges: "<basestar ip>/32"` (or
   `excludeOutboundPorts: "2049"`), and use an IP address in the probe's `host`. Not
-  checked against this cluster; **check it**: with basestar powered off, the probe must
-  turn it down (`sched_resource_phase_age_seconds{resource="basestar-nfs",axis="power",phase="off"}`
-  appears and the `last_decision` inputs show it down), not stay up. Egress to speakr, paperless and immich goes through the mesh normally.
+  checked against this cluster; **check it** with metrics that discriminate (verified live
+  against a local listener, a closed port and an unresolvable name): for the probe source
+  (`basestar-probe`) `sched_observation_age_seconds{source="basestar-probe",capability="reachability"}`
+  must stay small (a few seconds, one reading per `resync`) and
+  `sched_source_errors_total{source="basestar-probe"}` must not grow; an age of `inf` or a
+  growing error count means the reads fail (for example the name does not resolve), which
+  looks like a stale host, not a down one. Then
+  `sched_resource_phase_age_seconds{resource="basestar-nfs",axis="power",phase="on"}` must
+  exist while basestar is up and `phase="off"` (not `on`) within about three resyncs of
+  powering it off. The `phase="off"` series alone proves nothing: it exists from the first
+  tick, before any reading. Egress to speakr, paperless and immich goes through the mesh normally.
 - If the mesh's outbound policy is `REGISTRY_ONLY`, basestar and the Kubernetes API need
   `ServiceEntry`s.
 - The Restate server must be able to reach flowmanager on 9080 for discovery as well as for
@@ -406,7 +422,7 @@ and the code reads no other secret:
 | --- | --- | --- |
 | `PAPERLESS_API_TOKEN` | `paperless-ocr-pending`, `paperless-post-ocr` (header `Authorization: Token <token>`) | A paperless-ngx API token that can list documents (the polls use `page_size=1` and read only `count`). |
 | `SPEAKR_API_TOKEN` | `speakr-pending`, `speakr-summaries`, and the `speakr-transcription` recovery (`Authorization: Bearer <token>`) | **One speakr API token with the `read` and `process` scopes**: `read` lists recordings and reads `/api/v1/stats`; `process` re-queues failed transcriptions (`POST /api/v1/recordings/{id}/transcribe`). The token's user must be allowed to edit the recordings, and `/stats` is scoped to that user (other users' recordings are not seen). |
-| `IMMICH_API_KEY` | `immich-queues` (header `x-api-key: <key>`, no prefix) | An **admin** API key with the permission **`queue.read`**; immich v4.0 or later. The `GET /api/queues/*` API is marked alpha upstream (since immich v2.4.0), so a future immich may change its shape; the poll then fails and demand goes stale (it does not read as zero). |
+| `IMMICH_API_KEY` | `immich-queues` (header `x-api-key: <key>`, no prefix) | An **admin** API key with the permission **`queue.read`**; an immich that serves `/api/queues` (upstream spec: v2.4.0 and later, not v2.3.1; alpha, may change; the deployment is expected to run v4.0 or later, though no release numbered 4.0 could be found). The API is marked alpha upstream, so a future immich may change its shape; the poll then fails and demand goes stale (it does not read as zero). |
 | `PROMETHEUS_TOKEN` (optional) | only a `prometheus`-kind source with `auth` | Not used by the example config (it is a commented, spare source). |
 
 A missing or empty variable is not a start-up error: the affected source reports an error
@@ -509,6 +525,12 @@ model's `workloads` list in the config is informational (pod counts).
 
 ### Failure behaviour you must know
 
+- **Any scaler error resets KEDA's view of the scaler.** Per KEDA's scale handler
+  (`scale_handler.go`, upstream; not run here), an error from the scaler, including the
+  `Unavailable` window after a flowmanager restart, makes KEDA clear its cached scaler for
+  that ScaledObject and, for `external-push`, restart the stream. Streams re-open with
+  backoff, and the replica count is held meanwhile, so a flowmanager restart does not scale
+  anything; it can delay a change that is due until the stream is back.
 - **Not ready**: before the first tick of this process, and once the process is stopping,
   every call answers `Unavailable`. Observed live: after a restart the first scaler call
   answered `Unavailable`, and within about two seconds the answers were real.
@@ -662,7 +684,10 @@ well.
   `lease_book`, `backstop_epoch`); `restate state get Recovery <class>` the attempts. Verified
   with `restate` CLI 1.8.1. A single key can be edited with `restate state patch`
   (JSON Patch) or cleared with `restate state clear Scheduler/main` (clears all of it; the
-  backstop is then re-armed by restarting the pod).
+  backstop chain then ends, and the process's watchdog re-arms it by itself: it checks once
+  per backstop interval and re-arms when no backstop has run for more than three intervals
+  plus 10 s, so within about 100 to 130 s with the default 30 s; `backstop_overdue` in
+  `runtime.rs`, read from the code, not re-run).
 - `discard_state` (and `Recovery/{class}/discard_attempts`) delete a stored document that
   cannot be read; a readable one only with `"force": true`. They return what was stored:
   keep a copy.
@@ -732,7 +757,7 @@ when deploying:
 - RBAC against a real API server (the observer has only run against a fake API in tests);
 - the pod-label mapping `app.kubernetes.io/name` for pod counts (information only);
 - speakr (scopes, user edit permission, `/stats` scoping), paperless-ngx and immich
-  (`queue.read`, v4.0, the alpha queue API) as documented upstream; the speakr response
+  (`queue.read`, the immich version, the alpha queue API) as documented upstream; the speakr response
   shapes were checked against its source, not a live instance;
 - that cluster DNS resolves basestar's name; that a fully qualified name or an IP is used;
 - NotReady timing of the node (a Kubernetes setting);

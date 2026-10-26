@@ -388,7 +388,8 @@ curl -X POST localhost:8080/Scheduler/main/discard_state \
 
 With the Restate CLI (1.8): `restate state get Scheduler main` shows every key;
 `restate state clear Scheduler/main` deletes all of the object's state (both documents and
-the backstop epoch; re-arm the backstop by restarting the binary); one key alone is removed
+the backstop epoch; the process re-arms the backstop by itself once it has not run for more than three
+backstop intervals plus 10 s); one key alone is removed
 with `restate state patch` and a JSON Patch `remove` operation (see `restate state patch
 --help`).
 
@@ -735,11 +736,13 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
     address without IPv6 routing, for example) therefore never reads down; use an IP
     address or a name with only reachable addresses.
 - **immich demand is the three ML queues only, through an alpha API.** `immich-queues` reads
-  `GET /api/queues/{smartSearch,faceDetection,ocr}` (added in v2.4.0 and marked alpha there,
-  `.alpha('v2.4.0')`; this deployment runs v4.0 or later) with an admin API key (`queue.read`,
-  `IMMICH_API_KEY`). An immich older than v2.4.0 answers 404 and a changed response shape
+  `GET /api/queues/{smartSearch,faceDetection,ocr}` (the upstream API spec has it from v2.4.0, not in
+  v2.3.1, marked alpha there with `.alpha('v2.4.0')`; the deployment is expected to run
+  v4.0 or later, as the user stated, though no release numbered 4.0 could be found) with an
+  admin API key (`queue.read`, `IMMICH_API_KEY`). An immich that does not serve
+  `/api/queues` (older than v2.4.0) answers 404 and a changed response shape
   fails the poll. A paused queue (`isPaused: true`) counts as zero, ready and in-flight; from
-  v4.0 a paused queue reports its jobs under `waiting`, so without that check they would count.
+  the versions this was written against a paused queue reports its jobs under `waiting`, so without that check they would count.
   What that means when an operator pauses or unpauses a queue (the `when` condition skips
   the whole response, so every number of that request reads zero):
   - **Pausing** takes the queue's waiting jobs out of the demand at the next poll (the

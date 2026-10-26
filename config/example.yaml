@@ -343,13 +343,14 @@ sources:
       webhook: { path: /hooks/speakr }
 
   # immich ML demand: the three ML-backed queues (smartSearch, faceDetection, ocr), read
-  # with GET /api/queues/{name} (added in immich v2.4.0, where GET /api/jobs became
-  # deprecated; this deployment runs v4.0 or later). The endpoint is marked alpha in immich
+  # with GET /api/queues/{name} (upstream spec: from immich v2.4.0, not in
+  # v2.3.1, where GET /api/jobs became deprecated; the deployment is expected to run v4.0 or
+  # later, which could not be matched to a release). The endpoint is marked alpha in immich
   # (`.alpha('v2.4.0')` in queue.controller.ts), so its shape may still change; a changed
   # shape fails the poll rather than counting zero. Each returns `{"name", "isPaused",
   # "statistics": {"active", "completed", "failed", "delayed", "waiting", "paused"}}`:
   # `waiting` + `delayed` count as ready, `active` as in-flight, summed over the three
-  # queues. A paused queue counts as zero (ready and in-flight): from v4.0 a paused queue
+  # queues. A paused queue counts as zero (ready and in-flight): in the versions this was written against a paused queue
   # reports its jobs under `waiting`, so `when` skips a response whose top-level `isPaused`
   # is not false (a missing or non-boolean `isPaused` fails the poll).
   # Auth: an API key with the `queue.read` permission (the endpoint is admin-only), sent as
