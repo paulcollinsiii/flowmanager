@@ -103,7 +103,8 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps, pinned: bool) -> Vec<&'static st
 /// But nothing scales on a demand class: consumers are not gated for GPU contention (only
 /// gate classes, whose requirements are hosts, gate a consumer), so a `PauseIntake` does not
 /// stop anyone taking new work. `KillInFlight` has no actuator of its own either: the work
-/// is cut off because the same tick withdraws its model (KEDA scales the workload to 0).
+/// is cut off because its model is withdrawn (KEDA scales the workload to 0): in the same
+/// tick, or when the last blocking class of the model is cut off or finishes.
 /// Powering a host on or off has no actuator yet. `RunRecovery` is carried out: the tick
 /// sends the class's `Recovery` object a request, which runs the action (config load refuses
 /// an action this build cannot run, and the sequencer emits the step only for such a class).
@@ -127,7 +128,7 @@ pub fn not_executed(step: &Step) -> bool {
 /// Appended to the reason of a step that has no actuator in this build.
 pub const NOT_EXECUTED: &str = " [NOT EXECUTED: no actuator for this step in this build]";
 /// Appended to the reason of a `KillInFlight` step.
-pub const NOT_EXECUTED_KILL: &str = " [NOT EXECUTED: nothing stops the work directly; it ends because the model is withdrawn (its workload is scaled to 0), and the class's recovery, which re-queues failed items, runs while its model is allowed, not after the cut-off]";
+pub const NOT_EXECUTED_KILL: &str = " [NOT EXECUTED: nothing stops the work directly; it ends when its model is withdrawn (its workload is scaled to 0), in the same tick or, while other classes of the model are still blocking, when the last of them is cut off or finishes; the class's recovery, which re-queues failed items, runs while its model is allowed, not after the cut-off]";
 /// Appended to the reason of a `PauseIntake` step.
 pub const NOT_EXECUTED_PAUSE: &str = " [NOT EXECUTED: consumers are not gated on their demand class, so nothing stops them taking new work; the class only leaves the allowed set]";
 
@@ -148,6 +149,24 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::NotPreemptible => "the allowed model's active work is not preemptible",
         WaitReason::InFlightWork => "in-flight work reported by its queue is still running",
     }
+}
+
+/// Why `class`'s in-flight work is cut off. Each class is cut off when its own timeout runs
+/// out, but the model is withdrawn only when no class of it is still blocking, so the same
+/// tick withdraws it only if the tick's steps say so: `withdrawn_now` is `Some(true)` when
+/// the tick also withdraws a model, `Some(false)` when it does not, and `None` when the
+/// other steps are not known (the text then covers both).
+fn kill_reason(class: &sched_model::ClassId, withdrawn_now: Option<bool>) -> String {
+    let rest = match withdrawn_now {
+        Some(true) => "so the model is withdrawn in this same tick, with the work still running",
+        Some(false) => {
+            "but other classes of its model are still blocking, so the model stays allowed and the work keeps running until the last of them is cut off at its own timeout or finishes"
+        }
+        None => {
+            "its model is withdrawn in the same tick if no other class of it is still blocking, otherwise the work keeps running until the last blocking class is cut off at its own timeout or finishes"
+        }
+    };
+    format!("cut off in-flight work of {class}: its timeout ran out, {rest}")
 }
 
 /// Why one step is taken, from the intent that produced it.
@@ -185,11 +204,7 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
                 "pause intake for {class}: its model is being wound down, so the class leaves the allowed set"
             )
         }
-        Step::KillInFlight { class } => {
-            format!(
-                "cut off in-flight work of {class}: its timeout ran out, so the model is withdrawn with the work still running"
-            )
-        }
+        Step::KillInFlight { class } => kill_reason(class, None),
         Step::RunRecovery { class } => {
             format!(
                 "run recovery for {class}: items failed while its model is allowed; the Recovery object re-queues them, bounded per item and per run (see sched_recovery_* metrics)"
@@ -235,9 +250,15 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
     if steps.is_empty() {
         out.push_str("; no step needed");
     }
+    // A class's cut-off withdraws its model in the same tick only if no other class of the
+    // model is still blocking, which shows as the tick's withdrawal of a model.
+    let withdrawn_now = steps.iter().any(|s| matches!(s, Step::DrainModel { .. }));
     for s in steps {
         out.push_str("; ");
-        out.push_str(&step_reason(s, intent));
+        match s {
+            Step::KillInFlight { class } => out.push_str(&kill_reason(class, Some(withdrawn_now))),
+            _ => out.push_str(&step_reason(s, intent)),
+        }
         if let Some(note) = not_executed_note(s) {
             out.push_str(note);
         }
@@ -441,7 +462,7 @@ mod tests {
         assert_eq!(r.matches(NOT_EXECUTED_KILL).count(), 1, "{r}");
         assert!(
             r.contains(&format!(
-                "cut off in-flight work of paperless-ocr: its timeout ran out, so the model is withdrawn with the work still running{NOT_EXECUTED_KILL}"
+                "cut off in-flight work of paperless-ocr: its timeout ran out, so the model is withdrawn in this same tick, with the work still running{NOT_EXECUTED_KILL}"
             )),
             "{r}"
         );
@@ -450,6 +471,20 @@ mod tests {
                 "power on cuda-central: the sequencer needs it up{NOT_EXECUTED}"
             )),
             "{r}"
+        );
+        // The model is withdrawn in the same tick only when the tick says so: with no
+        // withdrawal, other classes of the model are still blocking.
+        let alone = reason(&intent(), &steps[1..2], &DemandGaps::default());
+        assert!(
+            alone.contains("its timeout ran out, but other classes of its model are still blocking, so the model stays allowed"),
+            "{alone}"
+        );
+        assert!(!alone.contains("withdrawn in this same tick"), "{alone}");
+        // Without the tick's other steps the text covers both cases.
+        let both = step_reason(&steps[1], &intent());
+        assert!(
+            both.contains("in the same tick if no other class of it is still blocking"),
+            "{both}"
         );
         // Withdrawing a model is carried out (published), so its reason carries no note.
         let withdraw = reason(
