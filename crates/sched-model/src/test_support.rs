@@ -92,6 +92,11 @@ pub fn load_fixture_file(path: impl AsRef<Path>, config: &Config) -> Result<Fixt
     Fixture::from_yaml_checked(&text, config).map_err(|e| e.to_string())
 }
 
+/// A recovery spec from YAML, for tests in other crates.
+pub fn recovery_spec(yaml: &str) -> crate::RecoverySpec {
+    serde_yaml_ng::from_str(yaml).expect("a recovery spec")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,3 +8,13 @@ workspace = true
 
 [dependencies]
 sched-model = { workspace = true }
+sched-observe = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+sched-model = { workspace = true, features = ["test-support"] }
+sched-observe = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true }

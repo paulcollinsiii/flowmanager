@@ -148,6 +148,8 @@ struct Inner {
     /// Every header of each request in `requests`, names lower-cased.
     headers: Vec<Vec<(String, String)>>,
     times: Vec<std::time::Instant>,
+    /// The HTTP method of each request in `requests`.
+    methods: Vec<String>,
 }
 
 pub struct TestServer {
@@ -185,6 +187,7 @@ impl TestServer {
                     let svc = service_fn(move |req: Request<Incoming>| {
                         let shared = Arc::clone(&shared);
                         async move {
+                            let method = req.method().as_str().to_string();
                             let key = req
                                 .uri()
                                 .path_and_query()
@@ -210,6 +213,7 @@ impl TestServer {
                                 g.requests.push((key.clone(), auth));
                                 g.headers.push(headers);
                                 g.times.push(std::time::Instant::now());
+                                g.methods.push(method);
                                 let (path, query) = key.split_once('?').unwrap_or((&key, ""));
                                 match g.dynamic.get(path) {
                                     Some(f) => Some(f(query)),
@@ -309,6 +313,11 @@ impl TestServer {
                 (key.clone(), value)
             })
             .collect()
+    }
+
+    /// The HTTP method of each request in `requests()`, in order.
+    pub fn methods(&self) -> Vec<String> {
+        self.inner.lock().unwrap().methods.clone()
     }
 
     /// Every request seen so far: path and query, and the Authorization header if any.

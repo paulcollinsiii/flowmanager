@@ -3743,7 +3743,13 @@ dependencies = [
 name = "sched-actuate"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "sched-model",
+ "sched-observe",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

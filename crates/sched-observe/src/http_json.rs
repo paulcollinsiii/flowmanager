@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sched_model::{
     AuthSpec, ClassId, CountsAs, ElementFilter, Fidelity, FilterValue, HttpJsonParams, Millis,
-    ObservedValue, RequestSpec, SourceSpec,
+    ObservedValue, RequestSpec, ResponseCondition, SinceSpec, SourceSpec,
 };
 use serde_json::Value;
 
@@ -53,20 +53,25 @@ pub fn iso8601_query(ms: Millis) -> String {
     )
 }
 
-/// The URL to request: `req.url`, plus the `since` window ending at `now` if set.
-pub fn request_url(req: &RequestSpec, now: Millis) -> String {
-    match &req.since {
-        None => req.url.clone(),
+/// `url`, plus the `since` window ending at `now` if there is one.
+pub fn url_with_since(url: &str, since: Option<&SinceSpec>, now: Millis) -> String {
+    match since {
+        None => url.to_string(),
         Some(s) => {
             let from = now.saturating_sub(s.ago);
-            let sep = if req.url.contains('?') { '&' } else { '?' };
-            format!("{}{sep}{}={}", req.url, s.param, iso8601_query(from))
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}{}={}", s.param, iso8601_query(from))
         }
     }
 }
 
+/// The URL to request: `req.url`, plus the `since` window ending at `now` if set.
+pub fn request_url(req: &RequestSpec, now: Millis) -> String {
+    url_with_since(&req.url, req.since.as_ref(), now)
+}
+
 /// Largest response body read.
-pub(crate) const MAX_BODY: usize = 8 * 1024 * 1024;
+pub const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Why a response could not be turned into a number.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,9 +166,15 @@ fn comparable(filter: &ElementFilter, value: &Value) -> bool {
 /// Whether the response is to be counted: `true` without a `when`, else whether its field
 /// equals the value. A missing field or one of another JSON type is an error.
 pub fn condition_holds(doc: &Value, req: &RequestSpec) -> Result<bool, ExtractError> {
-    let Some(w) = &req.when else {
-        return Ok(true);
-    };
+    match &req.when {
+        None => Ok(true),
+        Some(w) => field_equals(doc, w),
+    }
+}
+
+/// Whether the field of `doc` named by `w` equals its value. A missing field or one of
+/// another JSON type is an error, never a quiet `false`.
+pub fn field_equals(doc: &Value, w: &ResponseCondition) -> Result<bool, ExtractError> {
     let value = doc
         .pointer(&w.field)
         .ok_or_else(|| ExtractError::Missing(w.field.clone()))?;
@@ -207,28 +218,33 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
     if req.max_items.is_some_and(|max| items.len() as u64 >= max) {
         return Err(ExtractError::AtLimit(items.len() as u64));
     }
-    if let Some(f) = &req.filter
-        && !items.is_empty()
-        && items.iter().all(|e| e.pointer(&f.field).is_none())
-    {
+    Ok(select_items(items, req.filter.as_ref())?.len() as u64)
+}
+
+/// The elements of `items` that pass `filter` (all of them without one). A filter whose
+/// field is in none of a non-empty array's items, or whose field holds a value of another
+/// JSON type than the filter compares, is an error rather than a quiet "matches nothing".
+pub fn select_items<'a>(
+    items: &'a [Value],
+    filter: Option<&ElementFilter>,
+) -> Result<Vec<&'a Value>, ExtractError> {
+    let Some(f) = filter else {
+        return Ok(items.iter().collect());
+    };
+    if !items.is_empty() && items.iter().all(|e| e.pointer(&f.field).is_none()) {
         return Err(ExtractError::FilterFieldMissing(f.field.clone()));
     }
-    if let Some(f) = &req.filter
-        && items
-            .iter()
-            .filter_map(|e| e.pointer(&f.field))
-            .any(|v| !v.is_null() && !comparable(f, v))
+    if items
+        .iter()
+        .filter_map(|e| e.pointer(&f.field))
+        .any(|v| !v.is_null() && !comparable(f, v))
     {
         return Err(ExtractError::FilterTypeMismatch {
             field: f.field.clone(),
             expected: filter_type(f),
         });
     }
-    let n = match &req.filter {
-        Some(f) => items.iter().filter(|e| matches(f, e)).count(),
-        None => items.len(),
-    };
-    Ok(n as u64)
+    Ok(items.iter().filter(|e| matches(f, e)).collect())
 }
 
 /// The non-negative whole number at `ptr`.
@@ -332,12 +348,23 @@ pub async fn resolve_auth(auth: &AuthSpec, env: &EnvFn) -> Result<(String, Strin
 }
 
 /// A GET of `url`, with the auth header (marked sensitive) if any, sent.
-pub(crate) async fn send_get(
+pub async fn send_get(
     client: &reqwest::Client,
     url: &str,
     auth: Option<&(String, String)>,
 ) -> Result<reqwest::Response, String> {
-    let mut builder = client.get(url);
+    send_request(client, reqwest::Method::GET, url, auth).await
+}
+
+/// A request with `method` to `url` and no body, with the auth header (marked sensitive)
+/// if any, sent. Errors never contain the URL or the secret.
+pub async fn send_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    auth: Option<&(String, String)>,
+) -> Result<reqwest::Response, String> {
+    let mut builder = client.request(method, url);
     if let Some((name, value)) = auth {
         let mut v = reqwest::header::HeaderValue::from_str(value)
             .map_err(|_| "the secret is not a valid header value".to_string())?;
@@ -352,7 +379,7 @@ pub(crate) async fn send_get(
 
 /// The error text for a non-success response: the status, and for a 429 when the service
 /// asked us to come back (polling cadence is unchanged).
-pub(crate) fn status_error(resp: &reqwest::Response) -> String {
+pub fn status_error(resp: &reqwest::Response) -> String {
     let status = resp.status();
     let retry_after = resp
         .headers()
@@ -368,10 +395,7 @@ pub(crate) fn status_error(resp: &reqwest::Response) -> String {
 
 /// The body, read chunk by chunk and abandoned at the limit, so a huge or endless body is
 /// never held.
-pub(crate) async fn read_body(
-    resp: &mut reqwest::Response,
-    max_body: usize,
-) -> Result<Vec<u8>, String> {
+pub async fn read_body(resp: &mut reqwest::Response, max_body: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = resp
         .chunk()
@@ -471,7 +495,7 @@ pub fn build_client(params: &HttpJsonParams) -> Result<reqwest::Client, reqwest:
 }
 
 /// As [`build_client`], for any adapter's timeout.
-pub(crate) fn client_with_timeout(timeout: Millis) -> Result<reqwest::Client, reqwest::Error> {
+pub fn client_with_timeout(timeout: Millis) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout.as_u64()))
         .redirect(reqwest::redirect::Policy::none())
