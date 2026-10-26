@@ -59,9 +59,33 @@ How a model is chosen and kept:
   so it includes the time its pods take to load (and to wait for the previous model's pods).
 - **When** to switch is decided from the queues and leases: a busy model yields only after
   `min_dwell`, only past `max_dwell` or when another queue is older than `age_threshold`,
-  and only if none of its busy classes is unpreemptible; an idle one after `idle_grace`; in-flight work (as its queue reports it)
-  is awaited, or, on a forced switch (manual model lease, reclaim), given `drain_timeout`
-  (or a class's `kill_timeout`) and then stopped. Only the pod-based gating is gone.
+  and only if none of its busy classes is unpreemptible; an idle one after `idle_grace`.
+  Once the planner's intent has moved away, in-flight work (as its queue reports it) is
+  awaited for at most `drain_timeout` (a class's own `kill_timeout` if set; `reclaim_timeout`
+  on a reclaim), counted from the start of the wind-down, and then cut off. Forced or not,
+  the bound is the same. Only the pod-based gating is gone.
+- **The wait is bounded, except for a busy `none` class.** Nothing gates a consumer on its
+  queue, so a queue that is fed without end shows in-flight work without end (immich-ml's
+  `statistics.active` stays above zero throughout a large import; a whisperx job is always
+  processing). Withdrawing the model is what stops that work (KEDA scales the workload to
+  0), so no wind-down waits for it for ever. End to end, with `none` classes not busy and
+  another model's queue holding runnable ready work: a model allowed at `t0` is no longer
+  wanted by the planner at the first tick after `t0 + max_dwell` (earlier if that queue's
+  oldest item is older than `age_threshold`, but never before `t0 + min_dwell`), and the
+  switch is done at most `drain_timeout` (or the class's `kill_timeout`) after that; so the
+  model is replaced by `t0 + max_dwell + drain_timeout` plus a tick period (2h10m with the
+  example policy). An idle model is replaced once it has been idle for `idle_grace` and
+  has served `min_dwell`, with no wait. The bound counts from the last wind-down that was not abandoned: if
+  the planner's intent returns to the serving model the wind-down is dropped and a later
+  one starts its clock again. The one unbounded wait is a class with preemptibility `none`
+  that has work (an interactive session): the switch is not even started, with no timeout,
+  and the wait reason is `not_preemptible`. (A demand source that has gone silent also
+  holds a switch, as `stale_demand`, until it reports or is removed.)
+- **A change of cause mid wind-down** (a manual lease or a reclaim arriving or ending)
+  restarts the clock exactly when the cause flips between reclaim and not-reclaim, with the
+  new cause's timeout counted from that tick (so a reclaim ending gives the work a fresh
+  `drain_timeout`). A manual lease coming or going changes nothing: same timeout, same
+  clock. Classes already cut off stay recorded.
 - A **model removed from the config** while it is allowed leaves the allowed set at the
   next tick after the reload (no dwell, grace or wind-down). Persisted state naming a model
   the config no longer has does not block the resource.
@@ -97,8 +121,16 @@ What is carried out and what is not:
   `paperless-ocr`) out of the allowed set when its model starts winding down, but no
   consumer scales on a demand class (consumers are gated on gate classes, by host
   readiness, if at all). So it is listed in `not_executed` as well, with its own note: the
-  consumer keeps taking work, its queue's in-flight count may stay up until the queue is
-  empty, and an unforced wind-down can last that long.
+  consumer keeps taking work and its queue's in-flight count may stay up. The wind-down does
+  not wait for that: it ends at the timeout (see above).
+- **Cutting off in-flight work is the withdrawal of the model.** `KillInFlight` has no
+  actuator of its own; the work ends because the same tick withdraws its model and KEDA
+  scales the workload to 0. The step is reported as not executed, with a note saying so.
+  What re-runs the interrupted work is up to the consumer: paperless-gpt reprocesses
+  unfinished documents (paperless-ocr, paperless-tagging are `kill` for that reason), immich
+  leaves it pending, speakr marks a transcription failed (re-queued by its recovery), and
+  an interrupted speakr summary is not re-queued automatically (speakr-summarization stays
+  `pause_intake` to mark that; the planned recovery covers failed transcriptions only).
 - **Demand that can never be observed counts as none.** A class whose demand source has no
   observer in this build (a `schedule` or `session` source, for example) or is an
   observable kind configured without `params`, and that has never reported, counts as
@@ -164,6 +196,12 @@ included). Instead:
 - the lease handlers keep working if only `scheduler_state` is unreadable; if `lease_book`
   is, they (and `leases`) answer `503` naming this section.
 
+**Rolling the binary back needs the config rolled back too.** The build before queue-only
+switching rejects the shipped config: a gate class (a requirement on an exclusive resource
+without a model) fails validation with "exclusive; a model is required", and a config
+without a pods source is refused as well. Deploy the previous binary with the previous
+config (the persisted state itself is readable by both builds).
+
 To recover, either deploy the build that wrote the document, or discard it. Discarding
 `scheduler_state` restarts the sequencer from observation: no model is allowed until the
 planner picks one again (any running pod of a model it does not pick is scaled down by
@@ -197,6 +235,13 @@ dwell clock, a wind-down goes on) and holds every safety-critical step (allowing
 powering off) until the observers have reported fresh reachability again. Which sources
 had reported before is seeded from `scheduler_state`, so a source that went silent before
 the restart still reads as `demand_unknown` (busy), not as never reported (no demand).
+
+Gate classes follow the same rule. The persisted "on" power phase keeps the serving model
+**and every gate class** (such as paperless-gpt) allowed for the seconds between the start
+and the first fresh reachability reading: nothing re-checks the hosts before then, so a
+host that went down meanwhile still has its gate open until the first reading says
+otherwise (a reading of "down" closes it at that tick). The same holds for the serving
+model's classes. Only allowing something new waits for a fresh "up" reading.
 
 ## Handlers
 
@@ -332,7 +377,8 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
 
 - **Kill and recovery steps are not executed** (nor power steps, which only appear under
   `power.control: managed`). The sequencer records them as taken:
-  - `KillInFlight` marks the class as stopped and stops waiting for it; the model is
+  - `KillInFlight` marks the class as stopped and stops waiting for it (at `drain_timeout`
+    or the class's `kill_timeout` after the wind-down started, forced or not); the model is
     withdrawn (and the next one allowed) in the same tick. The in-flight work actually ends
     when KEDA scales the old model's pods down; the next model's pod starts once they are
     gone (Kubernetes).
