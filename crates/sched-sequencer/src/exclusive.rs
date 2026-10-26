@@ -154,16 +154,29 @@ fn serving(
         .zip(&works)
         .any(|(c, w)| w.busy() || (c.demand.is_some() && !w.known));
 
+    // Idleness is tracked on every path, not only when staying: the planner reads
+    // `idle_since` to decide when an idle model has waited `idle_grace`, so a value left from
+    // a tick when the queue read empty would make a model that is busy again (one still being
+    // wound down, say) look idle for as long as that tick was ago, and the grace could be
+    // satisfied by blips added together.
+    let idle_since = if busy { None } else { idle_since.or(Some(now)) };
+
     if target == Some(&model) {
-        // Staying: resume intake if a switch was abandoned, and track idleness.
+        // Staying: resume intake if a switch was abandoned.
         st.mode = ModePhase::Serving {
             model,
             since,
-            idle_since: if busy { None } else { idle_since.or(Some(now)) },
+            idle_since,
             wind_down: None,
         };
         return false;
     }
+    st.mode = ModePhase::Serving {
+        model: model.clone(),
+        since,
+        idle_since,
+        wind_down: wind_down.clone(),
+    };
 
     if !forced && now.saturating_sub(since) < policy.min_dwell {
         return waiting(cx, steps, WaitReason::MinDwell);

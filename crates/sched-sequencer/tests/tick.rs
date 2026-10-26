@@ -1464,6 +1464,100 @@ fn wind_down(d: &Decision) -> Option<sched_model::WindDown> {
     }
 }
 
+/// A wind-down persisted before unforced wind-downs had a timeout (`timeout` absent) gets the
+/// policy's timeout filled in, and keeps its own `since`: the clock neither restarts nor
+/// stays without a bound.
+#[test]
+fn a_legacy_wind_down_without_a_timeout_gets_one_and_keeps_its_clock() {
+    let busy = |state: &str| {
+        Case::new()
+            .gpu(state)
+            .obs(pods("mineru", 1, 1, 0))
+            .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+            .target(Some("llm"))
+            .run()
+    };
+    let legacy = format!(
+        "{{ phase: serving, model: mineru, since: {}, wind_down: {{ since: {} }} }}",
+        T - 30 * MIN,
+        T - 3 * MIN
+    );
+    let d = busy(&legacy);
+    assert_eq!(
+        wind_down(&d),
+        Some(sched_model::WindDown {
+            since: sched_model::Millis(T - 3 * MIN),
+            timeout: Some(sched_model::Millis(10 * MIN)),
+            reclaim: false,
+            killed: Default::default(),
+        })
+    );
+    // Not started again: no new PauseIntake, and still waiting for the in-flight work.
+    assert_steps(&d, vec![wait(G, WaitReason::InFlightWork)], "continuing");
+}
+
+/// The planner reads `idle_since` to decide when an idle model has waited `idle_grace`, so
+/// it must follow the queue on every path: a value left from a tick when the queue read empty
+/// must not survive into ticks when the model is busy (here, while it winds down).
+#[test]
+fn idle_since_is_cleared_while_busy_even_when_winding_down_or_waiting() {
+    let stale = |since_ago: u64, wind_down: &str| {
+        format!(
+            "{{ phase: serving, model: mineru, since: {}, idle_since: {}{wind_down} }}",
+            T - since_ago,
+            T - 9 * MIN
+        )
+    };
+    let idle_since = |d: &Decision| match mode_of(d, G) {
+        ModePhase::Serving { idle_since, .. } => idle_since,
+        other => panic!("{other:?}"),
+    };
+    let busy = |state: String| {
+        Case::new()
+            .gpu(&state)
+            .obs(pods("mineru", 1, 1, 0))
+            .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+            .target(Some("llm"))
+            .run()
+    };
+    // Starting a wind-down.
+    let d = busy(stale(30 * MIN, ""));
+    assert!(wind_down(&d).is_some());
+    assert_eq!(idle_since(&d), None, "starting a wind-down");
+    // Continuing one.
+    let d = busy(stale(
+        30 * MIN,
+        &format!(", wind_down: {{ since: {}, timeout: 600000 }}", T - MIN),
+    ));
+    assert_eq!(idle_since(&d), None, "continuing a wind-down");
+    // Waiting out min_dwell.
+    let d = busy(stale(MIN, ""));
+    assert_steps(&d, vec![wait(G, WaitReason::MinDwell)], "min dwell");
+    assert_eq!(idle_since(&d), None, "waiting out min_dwell");
+}
+
+/// A state that says the host is off but a model is serving (never written by this build, but
+/// persisted state is data) must not publish the model: with no fresh reachability reading to
+/// reconcile it, the allowed set itself must refuse a model on a host that is not on.
+#[test]
+fn a_model_on_a_host_recorded_as_off_is_never_allowed() {
+    let c = Case::new()
+        .gpu_state(&format!(
+            "{{ power: {{ phase: off }}, mode: {{ phase: serving, model: mineru, since: {} }} }}",
+            T - 30 * MIN
+        ))
+        .drop_obs("resource: cuda-central")
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+        .target(Some("mineru"));
+    let d = c.run();
+    assert!(
+        !d.allowed.models.contains(&mid("mineru")),
+        "host recorded off and unobserved, yet {:?}",
+        d.allowed
+    );
+    assert!(!d.allowed.classes.contains(&cid("paperless-ocr")));
+}
+
 #[test]
 fn each_class_is_stopped_when_its_own_timeout_expires() {
     let yaml = managed_yaml().replace(
