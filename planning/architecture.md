@@ -115,7 +115,7 @@ The workspace splits into three pure crates that hold the decision logic and fou
 | `sched-planner` | Policy strategies that turn a snapshot and leases into an intent | No |
 | `sched-sequencer` | Resource state machines and safety rules that turn an intent and current state into the next step | No |
 | `sched-observe` | Adapter kinds (Kubernetes watch, HTTP/JSON, SQL, Prometheus, webhook receiver) and their registry | Yes |
-| `sched-actuate` | Restate workflow definitions: power, recovery actions, backup | Yes |
+| `sched-actuate` | Actuator I/O: recovery actions (`requeue_failed`: list, re-queue request, attempt bookkeeping), later power and backup. The Restate object that sequences and journals an action (`Recovery`) lives in `sched-service`, which owns the Restate SDK | Yes |
 | `sched-keda` | KEDA external scaler server | Yes |
 | `sched-service` | The flowmanager binary: Restate service wiring (the scheduler virtual object, invoked directly by Restate), the KEDA scaler endpoint, config loading, startup | Yes |
 
