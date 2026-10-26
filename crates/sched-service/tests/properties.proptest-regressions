@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 38825d916953a9856b2f314b0ce17f9c569e2330fe3b80a1de5497b39f0049ae # shrinks to frames = [Raw { dt: 1, pods: [None, None, None, None], up: [None, None], demand: [None, None, None, None, None, None, None], leases: Some([5]), refresh: false }, Raw { dt: 1, pods: [None, None, None, None], up: [Some(true), None], demand: [None, None, None, None, None, None, None], leases: None, refresh: false }, Raw { dt: 699998, pods: [None, None, None, None], up: [None, None], demand: [None, None, Some((0, 1, 0)), None, None, None, Some((1, 0, 1800001))], leases: None, refresh: false }], managed = false

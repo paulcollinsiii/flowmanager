@@ -102,14 +102,15 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps, pinned: bool) -> Vec<&'static st
 /// class leaving or entering the allowed set, are published (KEDA converges on the set).
 /// But nothing scales on a demand class: consumers are not gated for GPU contention (only
 /// gate classes, whose requirements are hosts, gate a consumer), so a `PauseIntake` does not
-/// stop anyone taking new work. Powering a host on or off, stopping in-flight work and
-/// running a recovery action have no actuator yet.
+/// stop anyone taking new work. `KillInFlight` has no actuator of its own either: the work
+/// is cut off because the same tick withdraws its model (KEDA scales the workload to 0).
+/// Powering a host on or off and running a recovery action have no actuator yet.
 pub fn not_executed_note(step: &Step) -> Option<&'static str> {
     match step {
-        Step::PowerOn { .. }
-        | Step::PowerOff { .. }
-        | Step::KillInFlight { .. }
-        | Step::RunRecovery { .. } => Some(NOT_EXECUTED),
+        Step::PowerOn { .. } | Step::PowerOff { .. } | Step::RunRecovery { .. } => {
+            Some(NOT_EXECUTED)
+        }
+        Step::KillInFlight { .. } => Some(NOT_EXECUTED_KILL),
         Step::PauseIntake { .. } => Some(NOT_EXECUTED_PAUSE),
         Step::Wait { .. } | Step::AllowModel { .. } | Step::DrainModel { .. } => None,
     }
@@ -122,6 +123,8 @@ pub fn not_executed(step: &Step) -> bool {
 
 /// Appended to the reason of a step that has no actuator in this build.
 pub const NOT_EXECUTED: &str = " [NOT EXECUTED: no actuator for this step in this build]";
+/// Appended to the reason of a `KillInFlight` step.
+pub const NOT_EXECUTED_KILL: &str = " [NOT EXECUTED: nothing stops the work directly; it ends because the model is withdrawn (its workload is scaled to 0), and the class's recovery, if any, is not run either]";
 /// Appended to the reason of a `PauseIntake` step.
 pub const NOT_EXECUTED_PAUSE: &str = " [NOT EXECUTED: consumers are not gated on their demand class, so nothing stops them taking new work; the class only leaves the allowed set]";
 
@@ -180,7 +183,9 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
             )
         }
         Step::KillInFlight { class } => {
-            format!("stop in-flight work of {class}: its timeout ran out")
+            format!(
+                "cut off in-flight work of {class}: its timeout ran out, so the model is withdrawn with the work still running"
+            )
         }
         Step::RunRecovery { class } => {
             format!("run recovery for {class}: its in-flight work was stopped")
@@ -427,16 +432,34 @@ mod tests {
             },
         ];
         let r = reason(&intent(), &steps, &DemandGaps::default());
-        assert_eq!(r.matches(NOT_EXECUTED).count(), 2, "{r}");
+        assert_eq!(r.matches(NOT_EXECUTED).count(), 1, "{r}");
+        assert_eq!(r.matches(NOT_EXECUTED_KILL).count(), 1, "{r}");
+        assert!(
+            r.contains(&format!(
+                "cut off in-flight work of paperless-ocr: its timeout ran out, so the model is withdrawn with the work still running{NOT_EXECUTED_KILL}"
+            )),
+            "{r}"
+        );
         assert!(
             r.contains(&format!(
                 "power on cuda-central: the sequencer needs it up{NOT_EXECUTED}"
             )),
             "{r}"
         );
-        assert!(!r.contains(&format!(
-            "withdraw mineru on cuda-central: the planner wants mineru on cuda-central (it leaves the allowed set now; nothing waits for its pods){NOT_EXECUTED}"
-        )));
+        // Withdrawing a model is carried out (published), so its reason carries no note.
+        let withdraw = reason(
+            &intent(),
+            &[Step::DrainModel {
+                resource: "cuda-central".into(),
+                model: "mineru".into(),
+            }],
+            &DemandGaps::default(),
+        );
+        assert!(
+            withdraw.contains("withdraw mineru on cuda-central: the planner wants "),
+            "{withdraw}"
+        );
+        assert!(!withdraw.contains("NOT EXECUTED"), "{withdraw}");
         for (step, want) in [
             (
                 Step::PowerOff {
@@ -445,6 +468,7 @@ mod tests {
                 true,
             ),
             (Step::RunRecovery { class: "c".into() }, true),
+            (Step::KillInFlight { class: "c".into() }, true),
             (Step::PauseIntake { class: "c".into() }, true),
             (
                 Step::AllowModel {

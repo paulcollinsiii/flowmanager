@@ -5,8 +5,8 @@
 //! the GPU.
 
 use sched_model::{
-    ClassSpec, Millis, ModePhase, ModelId, Preemptibility, ResourceState, Step, WaitReason,
-    WindDown, class_work, classes_of_model,
+    ClassSpec, ModePhase, ModelId, Preemptibility, ResourceState, Step, WaitReason, WindDown,
+    class_work, classes_of_model,
 };
 
 use crate::Cx;
@@ -176,38 +176,40 @@ fn serving(
         }
     }
 
-    let base: Option<Millis> = forced.then(|| {
-        if cx.reclaimed() {
-            policy.reclaim_timeout()
-        } else {
-            policy.drain_timeout
-        }
-    });
+    // Every wind-down has a timeout, forced or not: the class's own `kill_timeout` or else
+    // the cause's (`reclaim_timeout` for a reclaim, `drain_timeout` otherwise), counted from
+    // the start of the wind-down. Without it a serving model whose queue is fed
+    // continuously would never hand over, because withdrawing the allowed model is what
+    // cuts work off here. Only a busy `none` class (checked above, unforced only) blocks
+    // without a timeout.
+    //
+    // A cause change during a wind-down: the clock restarts exactly when the cause flips
+    // between reclaim and not-reclaim (the new cause's timeout counts from the change; a
+    // reclaim ending gives the work a fresh `drain_timeout`). Unforced, a manual lease and a
+    // lease released all share `drain_timeout` and keep `since`, so the cut-off neither
+    // moves nor is extended by them. A state persisted without a timeout (before unforced
+    // wind-downs had one) gets it filled in, keeping `since`. Classes already stopped stay
+    // recorded in every case.
+    let timeout = if cx.reclaimed() {
+        policy.reclaim_timeout()
+    } else {
+        policy.drain_timeout
+    };
     let started = wind_down.is_none();
-    // The wind-down follows its cause. A different cause (a reclaim arriving during a
-    // manual-lease wind-down, or the reverse) restarts the clock with the new cause's
-    // timeout; losing the forcing cause (the lease was released) removes the timeout so
-    // nothing can be stopped any more. Classes already stopped stay recorded.
-    let wd = match (wind_down, base) {
-        (Some(w), Some(t)) if w.timeout.is_some() && w.reclaim == cx.reclaimed() => WindDown {
-            timeout: Some(t),
+    let wd = match wind_down {
+        Some(w) if w.reclaim == cx.reclaimed() => WindDown {
+            timeout: Some(timeout),
             ..w
         },
-        (Some(w), Some(t)) => WindDown {
+        Some(w) => WindDown {
             since: now,
-            timeout: Some(t),
+            timeout: Some(timeout),
             reclaim: cx.reclaimed(),
             killed: w.killed,
         },
-        (Some(w), None) => WindDown {
-            since: w.since,
-            timeout: None,
-            reclaim: false,
-            killed: w.killed,
-        },
-        (None, t) => WindDown {
+        None => WindDown {
             since: now,
-            timeout: t,
+            timeout: Some(timeout),
             reclaim: cx.reclaimed(),
             killed: Default::default(),
         },
@@ -235,46 +237,33 @@ fn serving(
         .map(|(c, w)| (*c, w.known))
         .collect();
     // Each class is stopped when its own timeout runs out, not when the last one does.
-    if let Some(timeout) = wd.timeout {
-        let mut wd = wd.clone();
-        let mut stopped = Vec::new();
-        for (c, _) in &blockers {
-            if now >= wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout)) {
-                steps.push(Step::KillInFlight {
-                    class: c.id.clone(),
-                });
-                if c.recovery.is_some() {
-                    st.pending_recovery.insert(c.id.clone());
-                }
-                wd.killed.insert(c.id.clone());
-                stopped.push(c.id.clone());
+    let mut wd = wd;
+    let mut stopped = Vec::new();
+    for (c, _) in &blockers {
+        if now >= wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout)) {
+            steps.push(Step::KillInFlight {
+                class: c.id.clone(),
+            });
+            if c.recovery.is_some() {
+                st.pending_recovery.insert(c.id.clone());
             }
+            wd.killed.insert(c.id.clone());
+            stopped.push(c.id.clone());
         }
-        if !stopped.is_empty() {
-            st.mode = ModePhase::Serving {
-                model: model.clone(),
-                since,
-                idle_since,
-                wind_down: Some(wd),
-            };
-        }
-        let remaining: Vec<_> = blockers
-            .iter()
-            .filter(|(c, _)| !stopped.contains(&c.id))
-            .collect();
-        if remaining.is_empty() {
-            return switch(cx, st, steps, &model, target);
-        }
-        return waiting(
-            cx,
-            steps,
-            blocked_reason(blockers.iter().filter(|(c, _)| !stopped.contains(&c.id))),
-        );
     }
-    if blockers.is_empty() {
+    if !stopped.is_empty() {
+        st.mode = ModePhase::Serving {
+            model: model.clone(),
+            since,
+            idle_since,
+            wind_down: Some(wd),
+        };
+    }
+    let remaining = || blockers.iter().filter(|(c, _)| !stopped.contains(&c.id));
+    if remaining().next().is_none() {
         return switch(cx, st, steps, &model, target);
     }
-    waiting(cx, steps, blocked_reason(blockers.iter()))
+    waiting(cx, steps, blocked_reason(remaining()))
 }
 
 fn blocked_reason<'a>(mut blockers: impl Iterator<Item = &'a (&'a ClassSpec, bool)>) -> WaitReason {

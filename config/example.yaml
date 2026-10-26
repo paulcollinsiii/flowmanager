@@ -12,6 +12,9 @@ policy:
   demand_max_age: 10m
   safety_max_age: 30s
   interactive_ttl: 15m
+  # Once the planner wants another model, in-flight work (whatever its preemptibility,
+  # except a busy `none` class) is cut off this long after the wind-down starts, unless a
+  # class sets its own kill_timeout. Cutting off means the model is withdrawn.
   drain_timeout: 10m
 
 resources:
@@ -42,7 +45,9 @@ classes:
       - { resource: cuda-central, model: mineru }
       - { resource: basestar-nfs }
     priority: 50
-    preemptibility: pause_intake
+    # Cut off after drain_timeout (or kill_timeout) when another model is wanted.
+    # paperless-gpt reprocesses documents it did not finish, so nothing needs re-queuing.
+    preemptibility: kill
     demand: { source: paperless-ocr-pending }
 
   - id: paperless-tagging
@@ -50,7 +55,8 @@ classes:
       - { resource: cuda-central, model: llm }
       - { resource: basestar-nfs }
     priority: 50
-    preemptibility: pause_intake
+    # As paperless-ocr: paperless-gpt reprocesses unfinished documents.
+    preemptibility: kill
     demand: { source: paperless-post-ocr }
 
   - id: speakr-transcription
@@ -70,6 +76,9 @@ classes:
       - { resource: cuda-central, model: llm }
       - { resource: basestar-nfs }
     priority: 60
+    # Not `kill`, to mark the difference: this work is cut off after drain_timeout all the
+    # same (nothing waits for a model without a bound), but an interrupted summary is NOT
+    # re-queued automatically; the planned speakr recovery covers failed transcriptions only.
     preemptibility: pause_intake
     demand: { source: speakr-summaries }
 
@@ -79,7 +88,9 @@ classes:
       - { resource: basestar-nfs }
     # An accelerator only: a CPU replica always serves, so it ranks below work that would wait.
     priority: 10
-    # immich leaves interrupted work pending and easy to find.
+    # immich leaves interrupted work pending and easy to find. Its queues stay active
+    # through a large import, so this class is cut off after drain_timeout when another
+    # model is wanted (a bounded wait is what lets the GPU change hands).
     preemptibility: kill
     demand: { source: immich-queues }
 

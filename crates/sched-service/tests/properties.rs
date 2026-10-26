@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use sched_model::test_support::{example_config, example_config_managed};
 use sched_model::{
     ClassId, Fidelity, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, ObservedValue,
-    ResourceId, SourceId,
+    ResourceId, SourceId, Step, WaitReason, classes_of_model,
 };
 use sched_service::replay::{Frame, Observe, Scenario, run};
 
@@ -209,6 +209,30 @@ proptest! {
                 let res = &config.model(model).unwrap().resource;
                 let st = r.decision.state.resource(res).unwrap();
                 prop_assert_eq!(st.mode.allowed_model(), Some(model));
+            }
+            // No wind-down waits for in-flight work past its timeout: a decision that still
+            // waits on in-flight work is within the wind-down's timeout, or the longest
+            // `kill_timeout` of the model's classes.
+            for step in &r.decision.steps {
+                let Step::Wait { resource, reason: WaitReason::InFlightWork } = step else {
+                    continue;
+                };
+                let Some(ModePhase::Serving { model, wind_down: Some(wd), .. }) =
+                    r.decision.state.resource(resource).map(|s| &s.mode)
+                else {
+                    continue;
+                };
+                let limit = classes_of_model(&config, model)
+                    .filter_map(|c| c.kill_timeout)
+                    .chain(wd.timeout)
+                    .max();
+                prop_assert!(wd.timeout.is_some(), "frame {}: a wind-down without a timeout", i);
+                let due = wd.since.saturating_add(limit.unwrap());
+                prop_assert!(
+                    r.at < due,
+                    "frame {}: still waiting on in-flight work at {:?}, past its cut-off {:?}",
+                    i, r.at, due
+                );
             }
             // At every tick at most one model per exclusive resource (cuda-central here).
             prop_assert!(r.decision.allowed.models.len() <= 1, "frame {}: {:?}", i, r.decision.allowed);

@@ -616,6 +616,36 @@ fn a_model_removed_from_the_config_leaves_the_allowed_set_at_the_next_tick() {
 }
 
 #[test]
+fn a_removed_model_stays_out_of_the_allowed_set_while_the_switch_waits_for_the_host() {
+    // whisperx is gone from the config but still recorded as serving; mineru is wanted and
+    // the host reading is stale, so the switch cannot happen yet. The state keeps the old
+    // mode, but the published set must not contain a model the config does not have.
+    let d = Case::new()
+        .drop_obs("resource: cuda-central")
+        .obs(up(G, true, 5 * 60_000))
+        .gpu(&serving("whisperx", MIN))
+        .obs(pods("whisperx", 1, 1, 0))
+        .target(Some("mineru"));
+    let mut d = d;
+    d.config = without_whisperx();
+    let d = d.run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::StaleObservation)],
+        "waits for a fresh reading",
+    );
+    assert!(
+        matches!(mode_of(&d, G), ModePhase::Serving { model, .. } if model == mid("whisperx")),
+        "the recorded mode is unchanged"
+    );
+    assert!(
+        d.allowed.models.is_empty(),
+        "an unconfigured model is never published: {:?}",
+        d.allowed
+    );
+}
+
+#[test]
 fn gate_classes_follow_their_hosts_and_nothing_else() {
     let gate = cid("paperless-gpt");
     // Both hosts up, no model: the gate is open.
@@ -687,21 +717,34 @@ fn switching_away_from_a_serving_model() {
         "intake is stopped only once",
     );
 
-    // Without a timeout (not forced) in-flight work is awaited forever.
-    let late = serve(10 * MIN)
-        .target(Some("llm"))
-        .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
-        .run_fresh_at(&d.state, T + 24 * 60 * MIN);
+    // Not forced: in-flight work is still given only drain_timeout (10m) from the start of
+    // the wind-down, then cut off by withdrawing the model.
+    let feed = || {
+        serve(10 * MIN).target(Some("llm")).obs(demand(
+            "paperless-ocr",
+            "paperless-ocr-pending",
+            2,
+            1,
+            0,
+        ))
+    };
+    let before = feed().run_fresh_at(&d.state, T + 10 * MIN - 1);
     assert_steps(
-        &late,
+        &before,
         vec![wait(G, WaitReason::InFlightWork)],
-        "waits a day",
+        "one ms before drain_timeout",
     );
     assert!(
-        !late
+        !before
             .steps
             .iter()
             .any(|s| matches!(s, Step::KillInFlight { .. } | Step::DrainModel { .. }))
+    );
+    let late = feed().run_fresh_at(&d.state, T + 10 * MIN);
+    assert_steps(
+        &late,
+        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        "cut off at drain_timeout",
     );
 
     let d = serve(10 * MIN)
@@ -808,8 +851,8 @@ fn forced_switches_give_in_flight_work_its_timeout() {
 fn reclaim_uses_reclaim_timeout_and_class_kill_timeout() {
     // A class-level kill_timeout shortens the wait for that class.
     let yaml = managed_yaml().replace(
-        "    priority: 50\n    preemptibility: pause_intake\n    demand: { source: paperless-ocr-pending }",
-        "    priority: 50\n    preemptibility: pause_intake\n    kill_timeout: 1m\n    demand: { source: paperless-ocr-pending }",
+        "    preemptibility: kill\n    demand: { source: paperless-ocr-pending }",
+        "    preemptibility: kill\n    kill_timeout: 1m\n    demand: { source: paperless-ocr-pending }",
     );
     assert_ne!(yaml, managed_yaml());
     let config = Config::from_yaml(&yaml).unwrap();
@@ -1242,11 +1285,12 @@ fn a_reclaim_on_a_shared_resource_is_ignored_and_never_overrides_holds() {
 }
 
 #[test]
-fn only_a_forced_switch_ever_stops_in_flight_work() {
+fn an_unforced_switch_is_cut_off_at_the_class_timeout() {
     let yaml = managed_yaml().replace(
-        "    priority: 50\n    preemptibility: pause_intake\n    demand: { source: paperless-ocr-pending }",
-        "    priority: 50\n    preemptibility: pause_intake\n    kill_timeout: 1m\n    demand: { source: paperless-ocr-pending }",
+        "    preemptibility: kill\n    demand: { source: paperless-ocr-pending }",
+        "    preemptibility: kill\n    kill_timeout: 1m\n    demand: { source: paperless-ocr-pending }",
     );
+    assert_ne!(yaml, managed_yaml());
     let busy = || {
         let mut c = Case::new()
             .gpu(&serving("mineru", 10 * MIN))
@@ -1257,17 +1301,160 @@ fn only_a_forced_switch_ever_stops_in_flight_work() {
         c
     };
     let d = busy().run();
-    for later in [MIN, 10 * MIN, 24 * 60 * MIN] {
-        let d = busy().run_fresh_at(&d.state, T + later);
-        assert!(
-            !d.steps
-                .iter()
-                .any(|s| matches!(s, Step::KillInFlight { .. } | Step::DrainModel { .. })),
-            "unforced switch acted at +{later}: {:?}",
-            d.steps
+    // The wind-down's own timeout is drain_timeout; the class's kill_timeout is shorter.
+    assert_eq!(
+        wind_down(&d).unwrap().timeout,
+        Some(sched_model::Millis(10 * MIN))
+    );
+    let before = busy().run_fresh_at(&d.state, T + MIN - 1);
+    assert_steps(
+        &before,
+        vec![wait(G, WaitReason::InFlightWork)],
+        "just before",
+    );
+    let after = busy().run_fresh_at(&d.state, T + MIN);
+    assert_steps(
+        &after,
+        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        "at the class's kill_timeout, long before drain_timeout",
+    );
+}
+
+/// A serving class that is fed for ever and another that is starved: the switch happens
+/// exactly drain_timeout after the wind-down starts, minute by minute, whichever class is fed.
+#[test]
+fn a_continuously_fed_serving_class_cannot_hold_the_resource() {
+    for (fed, source, preempt_note) in [
+        ("speakr-summarization", "speakr-summaries", "pause_intake"),
+        ("paperless-tagging", "paperless-post-ocr", "kill"),
+    ] {
+        let tick = |state: &SchedState, now: u64| {
+            let mut c = Case::new()
+                .gpu(&serving("llm", 30 * MIN))
+                .obs(pods("llm", 1, 1, 0))
+                .obs(demand(fed, source, 5, 1, 0))
+                .target(Some("mineru"));
+            c.config = Config::from_yaml(&managed_yaml()).unwrap();
+            c.run_fresh_at(state, now)
+        };
+        // The serving state is built by the helper; its first tick starts the wind-down.
+        let mut d = Case::new()
+            .gpu(&serving("llm", 30 * MIN))
+            .obs(pods("llm", 1, 1, 0))
+            .obs(demand(fed, source, 5, 1, 0))
+            .target(Some("mineru"))
+            .run();
+        let start = T;
+        assert_eq!(wind_down(&d).unwrap().since, sched_model::Millis(start));
+        for m in 1..10 {
+            d = tick(&d.state, start + m * MIN);
+            assert!(
+                !d.steps
+                    .iter()
+                    .any(|s| matches!(s, Step::KillInFlight { .. } | Step::DrainModel { .. })),
+                "{fed} ({preempt_note}) switched at +{m}m: {:?}",
+                d.steps
+            );
+        }
+        let d = tick(&d.state, start + 10 * MIN - 1);
+        assert_steps(&d, vec![wait(G, WaitReason::InFlightWork)], "1ms before");
+        let d = tick(&d.state, start + 10 * MIN);
+        assert_steps(
+            &d,
+            vec![kill(fed), drain("llm"), allow("mineru")],
+            &format!("{fed} cut off exactly at drain_timeout"),
         );
     }
-    assert_eq!(wind_down(&d).unwrap().timeout, None);
+}
+
+/// Only a busy `none` class blocks without a timeout.
+#[test]
+fn a_busy_class_that_cannot_be_preempted_still_blocks_without_a_timeout() {
+    let busy = |interactive_in_flight: u64| {
+        Case::new()
+            .gpu(&serving("llm", 30 * MIN))
+            .obs(pods("llm", 1, 1, 0))
+            .obs(demand("speakr-summarization", "speakr-summaries", 5, 1, 0))
+            .obs(demand(
+                "interactive-llm",
+                "llm-sessions",
+                0,
+                interactive_in_flight,
+                0,
+            ))
+            .target(Some("mineru"))
+    };
+    // Blocked from the start: no wind-down begins, the other class is not even paused.
+    let d = busy(1).run();
+    assert_steps(&d, vec![wait(G, WaitReason::NotPreemptible)], "blocked");
+    assert_eq!(wind_down(&d), None);
+    for later in [10 * MIN, 24 * 60 * MIN, 7 * 24 * 60 * MIN] {
+        let d = busy(1).run_fresh_at(&d.state, T + later);
+        assert_steps(
+            &d,
+            vec![wait(G, WaitReason::NotPreemptible)],
+            "no timeout for a none class",
+        );
+    }
+    // It becomes busy during a wind-down that is already past its timeout: still blocked,
+    // and the other class is cut off as soon as it is free (its clock kept running).
+    let started = busy(0).run();
+    assert_steps(
+        &started,
+        vec![
+            pause("paperless-tagging"),
+            pause("speakr-summarization"),
+            pause("interactive-llm"),
+            wait(G, WaitReason::InFlightWork),
+        ],
+        "wind-down started",
+    );
+    let held = busy(1).run_fresh_at(&started.state, T + 60 * MIN);
+    assert_steps(&held, vec![wait(G, WaitReason::NotPreemptible)], "held");
+    let freed = busy(0).run_fresh_at(&held.state, T + 61 * MIN);
+    assert_steps(
+        &freed,
+        vec![kill("speakr-summarization"), drain("llm"), allow("mineru")],
+        "released: the elapsed timeout applies",
+    );
+}
+
+#[test]
+fn per_class_timeouts_also_apply_unforced() {
+    let yaml = managed_yaml().replace(
+        "    preemptibility: kill\n    demand: { source: paperless-post-ocr }",
+        "    preemptibility: kill\n    kill_timeout: 1m\n    demand: { source: paperless-post-ocr }",
+    );
+    assert_ne!(yaml, managed_yaml());
+    let busy = || {
+        let mut c = Case::new()
+            .gpu(&serving("llm", 10 * MIN))
+            .obs(pods("llm", 1, 1, 0))
+            .obs(demand("paperless-tagging", "paperless-post-ocr", 0, 1, 0))
+            .obs(demand("speakr-summarization", "speakr-summaries", 0, 1, 0))
+            .target(Some("mineru"));
+        c.config = Config::from_yaml(&yaml).unwrap();
+        c
+    };
+    let d0 = busy().run();
+    let d1 = busy().run_fresh_at(&d0.state, T + MIN);
+    assert_steps(
+        &d1,
+        vec![kill("paperless-tagging"), wait(G, WaitReason::InFlightWork)],
+        "the shorter class is cut off first, alone",
+    );
+    let d2 = busy().run_fresh_at(&d1.state, T + 10 * MIN - 1);
+    assert_steps(
+        &d2,
+        vec![wait(G, WaitReason::InFlightWork)],
+        "no second kill",
+    );
+    let d3 = busy().run_fresh_at(&d2.state, T + 10 * MIN);
+    assert_steps(
+        &d3,
+        vec![kill("speakr-summarization"), drain("llm"), allow("mineru")],
+        "the other at drain_timeout",
+    );
 }
 
 fn wind_down(d: &Decision) -> Option<sched_model::WindDown> {
@@ -1280,8 +1467,8 @@ fn wind_down(d: &Decision) -> Option<sched_model::WindDown> {
 #[test]
 fn each_class_is_stopped_when_its_own_timeout_expires() {
     let yaml = managed_yaml().replace(
-        "    priority: 50\n    preemptibility: pause_intake\n    demand: { source: paperless-post-ocr }",
-        "    priority: 50\n    preemptibility: pause_intake\n    kill_timeout: 1m\n    demand: { source: paperless-post-ocr }",
+        "    preemptibility: kill\n    demand: { source: paperless-post-ocr }",
+        "    preemptibility: kill\n    kill_timeout: 1m\n    demand: { source: paperless-post-ocr }",
     );
     assert_ne!(yaml, managed_yaml());
     let busy = || {
@@ -1427,70 +1614,133 @@ fn future_dated_observations_are_not_fresh() {
     assert!(d.state.resource(&rid(G)).is_none());
 }
 
+/// What a change of cause during a wind-down does to `since` and the timeout: the clock
+/// restarts exactly when the cause flips between reclaim and not-reclaim; a manual lease
+/// coming or going (both use drain_timeout) leaves it alone.
 #[test]
-fn a_different_forcing_cause_restarts_the_clock_and_losing_it_removes_the_timeout() {
+fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
     let yaml = managed_yaml().replace(
         "  drain_timeout: 10m",
         "  drain_timeout: 10m\n  reclaim_timeout: 2m",
     );
-    let base = |reclaim: bool, forced: bool| {
+    // `cause`: 0 unforced, 1 manual lease, 2 reclaim.
+    let base = |cause: u8| {
         let mut c = Case::new()
             .gpu(&serving("mineru", 30 * MIN))
             .obs(pods("mineru", 1, 1, 0))
             .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0));
-        c = if reclaim {
+        c = if cause == 2 {
             c.reclaim()
         } else {
             c.target(Some("llm"))
         };
-        if forced && !reclaim {
+        if cause == 1 {
             c = c.forced();
         }
         c.config = Config::from_yaml(&yaml).unwrap();
         c
     };
-    // A manual lease starts a 10m wind-down; five minutes in, a reclaim arrives.
-    let d0 = base(false, true).run();
-    assert_eq!(
-        wind_down(&d0).unwrap().timeout,
-        Some(sched_model::Millis(10 * MIN))
-    );
-    let d1 = base(true, true).run_at(&d0.state, T + 5 * MIN);
+    let ms = sched_model::Millis;
+    let shape = |d: &Decision| {
+        let wd = wind_down(d).unwrap();
+        (wd.since, wd.timeout, wd.reclaim)
+    };
+    // Unforced start: already bounded by drain_timeout.
+    let d0 = base(0).run();
+    assert_eq!(shape(&d0), (ms(T), Some(ms(10 * MIN)), false));
+
+    // unforced -> manual lease: same timeout, same clock.
+    let d1 = base(1).run_fresh_at(&d0.state, T + 5 * MIN);
+    assert_eq!(shape(&d1), (ms(T), Some(ms(10 * MIN)), false));
+    // manual lease -> unforced again: likewise.
+    let d1b = base(0).run_fresh_at(&d1.state, T + 6 * MIN);
+    assert_eq!(shape(&d1b), (ms(T), Some(ms(10 * MIN)), false));
     assert_steps(
-        &d1,
-        vec![wait(G, WaitReason::InFlightWork)],
-        "the reclaim restarts rather than inheriting the elapsed time",
+        &base(0).run_fresh_at(&d1b.state, T + 10 * MIN),
+        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        "the original cut-off still holds after the lease came and went",
     );
-    let wd = wind_down(&d1).unwrap();
-    assert_eq!(
-        (wd.since, wd.timeout, wd.reclaim),
-        (
-            sched_model::Millis(T + 5 * MIN),
-            Some(sched_model::Millis(2 * MIN)),
-            true
-        )
-    );
-    let d2 = base(true, true).run_at(&d1.state, T + 7 * MIN - 1);
+
+    // unforced -> reclaim: restarts with the reclaim timeout.
+    let d2 = base(2).run_fresh_at(&d0.state, T + 5 * MIN);
     assert_steps(
         &d2,
         vec![wait(G, WaitReason::InFlightWork)],
-        "reclaim timeout not yet over",
+        "the reclaim restarts rather than inheriting the elapsed time",
     );
-    let d3 = base(true, true).run_at(&d2.state, T + 7 * MIN);
+    assert_eq!(shape(&d2), (ms(T + 5 * MIN), Some(ms(2 * MIN)), true));
+    let d2b = base(2).run_fresh_at(&d2.state, T + 7 * MIN - 1);
+    assert_steps(&d2b, vec![wait(G, WaitReason::InFlightWork)], "not yet");
     assert_steps(
-        &d3,
+        &base(2).run_fresh_at(&d2b.state, T + 7 * MIN),
         vec![kill("paperless-ocr"), drain("mineru")],
         "reclaim timeout over",
     );
 
-    // The manual lease is released while winding down: nothing may be stopped any more.
-    let d4 = base(false, false).run_fresh_at(&d0.state, T + 60 * MIN);
-    assert_eq!(wind_down(&d4).unwrap().timeout, None);
+    // reclaim -> unforced (the reclaim ended): restarts with drain_timeout, never no timeout.
+    let d3 = base(0).run_fresh_at(&d2.state, T + 6 * MIN);
+    assert_eq!(shape(&d3), (ms(T + 6 * MIN), Some(ms(10 * MIN)), false));
     assert_steps(
-        &d4,
+        &base(0).run_fresh_at(&d3.state, T + 16 * MIN - 1),
         vec![wait(G, WaitReason::InFlightWork)],
-        "unforced again",
+        "fresh drain_timeout not yet over",
     );
+    assert_steps(
+        &base(0).run_fresh_at(&d3.state, T + 16 * MIN),
+        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        "fresh drain_timeout over",
+    );
+
+    // manual lease -> reclaim -> manual lease: each flip restarts.
+    let m0 = base(1).run();
+    let m1 = base(2).run_fresh_at(&m0.state, T + MIN);
+    let m2 = base(1).run_fresh_at(&m1.state, T + 2 * MIN);
+    assert_eq!(shape(&m2), (ms(T + 2 * MIN), Some(ms(10 * MIN)), false));
+
+    // A state written before unforced wind-downs had a timeout (None) gets one, keeping
+    // `since`; it is then due at once if that is old enough.
+    let mut old = d0.state.clone();
+    if let Some(ModePhase::Serving { wind_down, .. }) =
+        old.resources.values_mut().next().map(|r| &mut r.mode)
+    {
+        wind_down.as_mut().unwrap().timeout = None;
+    }
+    let d4 = base(0).run_fresh_at(&old, T + 3 * MIN);
+    assert_eq!(shape(&d4), (ms(T), Some(ms(10 * MIN)), false));
+    assert_steps(&d4, vec![wait(G, WaitReason::InFlightWork)], "filled in");
+
+    // Classes already stopped stay recorded across a flip.
+    let yaml_k = yaml.replace(
+        "    preemptibility: kill\n    demand: { source: paperless-post-ocr }",
+        "    preemptibility: kill\n    kill_timeout: 1m\n    demand: { source: paperless-post-ocr }",
+    );
+    assert_ne!(yaml_k, yaml);
+    let llm = |reclaim: bool| {
+        let mut c = Case::new()
+            .gpu(&serving("llm", 30 * MIN))
+            .obs(pods("llm", 1, 1, 0))
+            .obs(demand("paperless-tagging", "paperless-post-ocr", 0, 1, 0))
+            .obs(demand("speakr-summarization", "speakr-summaries", 0, 1, 0));
+        c = if reclaim {
+            c.reclaim()
+        } else {
+            c.target(Some("mineru"))
+        };
+        c.config = Config::from_yaml(&yaml_k).unwrap();
+        c
+    };
+    let k0 = llm(false).run();
+    let k1 = llm(false).run_fresh_at(&k0.state, T + MIN);
+    assert!(
+        k1.steps.contains(&kill("paperless-tagging")),
+        "{:?}",
+        k1.steps
+    );
+    let k2 = llm(true).run_fresh_at(&k1.state, T + 2 * MIN);
+    assert_steps(&k2, vec![wait(G, WaitReason::InFlightWork)], "flipped");
+    let wd = wind_down(&k2).unwrap();
+    assert_eq!((wd.since, wd.reclaim), (ms(T + 2 * MIN), true));
+    assert!(wd.killed.contains(&cid("paperless-tagging")));
 }
 
 // ---- power.control: manual (the example config as shipped) ----

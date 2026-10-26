@@ -432,21 +432,22 @@ pub fn check(
                     }
                 }
             }
-            // 8. Stopping in-flight work is allowed only on a forced switch, per class, after
-            // that class's own timeout has run out.
+            // 8. Stopping in-flight work is allowed only per class, after that class's own
+            // timeout (`kill_timeout`, else the cause's: `reclaim_timeout` under a reclaim,
+            // `drain_timeout` otherwise) has run out within a running wind-down.
             Step::KillInFlight { class } => {
                 let Some(spec) = config.class(class) else {
                     continue;
                 };
-                let res_forcing: Vec<&ResourceId> = spec
+                let Some(res) = spec
                     .requires
                     .iter()
-                    .filter(|r| r.model.is_some())
+                    .find(|r| r.model.is_some())
                     .map(|r| &r.resource)
-                    .filter(|r| reclaimed(config, snapshot, r) || manual_model(snapshot, r))
-                    .collect();
-                let Some(res) = res_forcing.first() else {
-                    out.push(format!("invariant 8: stopped in-flight work of {class} without a reclaim or manual model lease"));
+                else {
+                    out.push(format!(
+                        "invariant 8: stopped in-flight work of {class}, which requires no model"
+                    ));
                     continue;
                 };
                 if demand(config, snapshot, spec).is_some_and(|d| !d.1) {
@@ -475,7 +476,7 @@ pub fn check(
                         }
                     }
                     _ => out.push(format!(
-                        "invariant 8: stopped {class} without a running forced wind-down"
+                        "invariant 8: stopped {class} without a running wind-down on the current cause"
                     )),
                 }
             }

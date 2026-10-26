@@ -168,22 +168,23 @@ fn with_wind_down(since: u64, reclaim: bool) -> SchedState {
 }
 
 #[test]
-fn killing_without_a_forcing_lease_is_a_violation() {
+fn an_unforced_kill_is_allowed_only_after_drain_timeout() {
+    // No lease at all: the wind-down is unforced, and still bounded by drain_timeout.
     let mut obs = zero_pods_and_up(&["cuda-central"]);
     obs.push(in_flight_ocr());
     let v = run(
-        &snap(obs, vec![]),
-        &with_wind_down(NOW - 11 * MIN, false),
+        &snap(obs.clone(), vec![]),
+        &with_wind_down(NOW - 9 * MIN, false),
         vec![kill()],
     );
-    assert!(
-        v.iter()
-            .any(|m| m.contains("without a reclaim or manual model lease")),
-        "{v:?}"
+    assert!(v.iter().any(|m| m.contains("early")), "{v:?}");
+    let v = run(
+        &snap(obs.clone(), vec![]),
+        &with_wind_down(NOW - 10 * MIN, false),
+        vec![kill()],
     );
-    // An interactive lease is not a forcing lease either.
-    let mut obs = zero_pods_and_up(&["cuda-central"]);
-    obs.push(in_flight_ocr());
+    assert!(v.is_empty(), "{v:?}");
+    // An interactive lease is not a forcing lease, and changes nothing about the timeout.
     let l = lease(
         "i",
         "cuda-central",
@@ -194,14 +195,10 @@ fn killing_without_a_forcing_lease_is_a_violation() {
     );
     let v = run(
         &snap(obs, vec![l]),
-        &with_wind_down(NOW - 11 * MIN, false),
+        &with_wind_down(NOW - 9 * MIN, false),
         vec![kill()],
     );
-    assert!(
-        v.iter()
-            .any(|m| m.contains("without a reclaim or manual model lease")),
-        "{v:?}"
-    );
+    assert!(v.iter().any(|m| m.contains("early")), "{v:?}");
 }
 
 #[test]
@@ -241,8 +238,7 @@ fn killing_on_a_clock_that_should_have_restarted_is_a_violation() {
         vec![kill()],
     );
     assert!(
-        v.iter()
-            .any(|m| m.contains("without a running forced wind-down")),
+        v.iter().any(|m| m.contains("without a running wind-down")),
         "{v:?}"
     );
 }

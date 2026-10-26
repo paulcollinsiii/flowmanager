@@ -71,11 +71,14 @@ pub struct ModelSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Preemptibility {
-    /// Must not be interrupted; the scheduler waits for in-flight work.
+    /// Must not be interrupted: while it has work, the scheduler does not switch away,
+    /// and that wait has no timeout. The only unbounded case.
     None,
-    /// Intake can be paused; in-flight work finishes.
+    /// Intake can be paused and in-flight work is given until the timeout; then it is cut
+    /// off (the model is withdrawn). Nothing re-queues it unless the class has a recovery.
     PauseIntake,
-    /// In-flight work can be killed and safely retried.
+    /// As `PauseIntake`, for work that can be killed and safely retried (by the workload
+    /// itself, or by the class's recovery). The scheduler treats both the same way today.
     Kill,
 }
 
@@ -134,7 +137,7 @@ pub struct ClassSpec {
     pub demand: Option<DemandRef>,
     #[serde(default)]
     pub recovery: Option<RecoverySpec>,
-    /// How long this class's in-flight work may run once a forced switch starts.
+    /// How long this class's in-flight work may run once a wind-down starts (forced or not).
     /// Defaults to the policy's reclaim or drain timeout.
     #[serde(default)]
     pub kill_timeout: Option<Millis>,

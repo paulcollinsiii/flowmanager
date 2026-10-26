@@ -18,20 +18,22 @@ pub enum PowerPhase {
 }
 
 /// A serving model that is being switched away from: its classes have left the allowed
-/// set and the sequencer is waiting for the in-flight work its queues report to end (or,
-/// on a forced switch, for each class's timeout). Nothing here is about pods: the model's
+/// set and the sequencer is waiting for the in-flight work its queues report to end or for
+/// each class's timeout, whichever comes first (forced or not: no wind-down is unbounded
+/// except by a busy class that cannot be preempted, which prevents it from starting). Nothing here is about pods: the model's
 /// pods stay allowed until the switch, and Kubernetes keeps the next model's pod pending
 /// until they have released the GPU.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindDown {
     pub since: Millis,
-    /// Set when the switch is forced: in-flight work gets this long (unless a class
-    /// declares its own `kill_timeout`) and is then stopped.
+    /// In-flight work gets this long from `since` (unless a class declares its own
+    /// `kill_timeout`) and is then cut off. The sequencer always sets it; `None` is only
+    /// read from a state persisted before unforced wind-downs had a timeout.
     #[serde(default)]
     pub timeout: Option<Millis>,
-    /// Whether the forcing cause is a reclaim (rather than a manual model lease), so that a
-    /// different cause arriving later restarts the clock with its own timeout.
+    /// Whether the cause is a reclaim (rather than a manual lease or none), so that the
+    /// cause flipping later restarts the clock with the new cause's timeout.
     #[serde(default)]
     pub reclaim: bool,
     /// Classes already stopped. Each class is stopped once, when its own timeout expires.

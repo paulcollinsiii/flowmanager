@@ -10,8 +10,9 @@
 //! What is carried out: the allowed set is published, so allowing a model and withdrawing
 //! it take effect once the scaler converges on it. A paused class leaves the set too, but
 //! nothing scales on a demand class (consumers are not gated for GPU contention), so
-//! `PauseIntake` stops nobody. Powering a host on or off, stopping in-flight work and
-//! recovery actions have no actuator in this build. All of these are listed in
+//! `PauseIntake` stops nobody. `KillInFlight` has no actuator either: the work is cut off
+//! because the same tick withdraws its model. Powering a host on or off and recovery
+//! actions have no actuator in this build. All of these are listed in
 //! `not_executed` and logged as such.
 
 use std::collections::BTreeSet;
