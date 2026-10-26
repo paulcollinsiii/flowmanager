@@ -158,7 +158,7 @@ impl Metrics {
         let recovery_requeues = IntCounterVec::new(
             Opts::new(
                 "sched_recovery_requeues_total",
-                "Items the recovery action handled, by class and outcome: attempted (an attempt was recorded and the request sent), queued (the service accepted it), failed (the request failed or the answer said it was not queued), skipped_cap (the item used all its attempts), skipped_not_allowed (the model was no longer allowed before the request), deferred (over max_per_run, left for a later run)",
+                "Items the recovery action handled, by class and outcome: attempted (an attempt was recorded and the request sent), queued (the service accepted it), failed (the request failed or the answer said it was not queued), skipped_cap (an item listed in a run had used all its attempts; counted per item and run, so one stuck item adds one per run), skipped_not_allowed (the model was no longer allowed before the request), deferred (over max_per_run, left for a later run)",
             ),
             &["class", "outcome"],
         )

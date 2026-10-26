@@ -80,10 +80,17 @@ pub struct RequeueFailedParams {
     /// Re-queue requests one item may be given within `window` (default 2).
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
-    /// How long an item's attempts are remembered after the last one, once the item is no
-    /// longer listed (default 15m; use the list's `since.ago`).
+    /// The list's `since` window, for reference (default 15m): how long a failure stays
+    /// listed. `retention` must not be shorter.
     #[serde(default = "default_window")]
     pub window: Millis,
+    /// How long an item's attempts are remembered after the last one, listed or not
+    /// (default 24h). Independent of `window`: a recording that used its attempts leaves the
+    /// list after the window and returns when it is edited, and must not get fresh attempts
+    /// then. After `retention` the record is forgotten and an edited recording may get a
+    /// fresh set (the deliberate limit); it also bounds the stored book.
+    #[serde(default = "default_retention")]
+    pub retention: Millis,
     /// Least time between two runs that list and re-queue (default 60s).
     #[serde(default = "default_min_interval")]
     pub min_interval: Millis,
@@ -100,6 +107,9 @@ fn default_max_attempts() -> u32 {
 }
 fn default_window() -> Millis {
     Millis(15 * 60_000)
+}
+fn default_retention() -> Millis {
+    Millis(24 * 3_600_000)
 }
 fn default_min_interval() -> Millis {
     Millis(60_000)
@@ -166,6 +176,16 @@ fn requeue_problems(p: &RequeueFailedParams) -> Vec<String> {
     if p.list.id.is_empty() {
         out.push("list.id must point at the identifier inside one item, not be empty".into());
     }
+    for (at, url) in [("list.url", &p.list.url), ("requeue.url", &p.requeue.url)] {
+        let authority = url
+            .split_once("://")
+            .map_or("", |(_, r)| r.split(['/', '?']).next().unwrap_or(""));
+        if authority.contains('@') {
+            out.push(format!(
+                "{at} must not contain credentials (userinfo); use auth"
+            ));
+        }
+    }
     if p.requeue.url.matches("{id}").count() != 1 {
         out.push("requeue.url must contain {id} exactly once".to_string());
     }
@@ -228,6 +248,12 @@ fn requeue_problems(p: &RequeueFailedParams) -> Vec<String> {
             p.window
         ));
     }
+    if p.retention < p.window || p.retention > MAX_SINCE_AGO {
+        out.push(format!(
+            "retention ({}) must be at least window ({}) and at most {MAX_SINCE_AGO}",
+            p.retention, p.window
+        ));
+    }
     if p.min_interval > MAX_MIN_INTERVAL {
         out.push(format!(
             "min_interval ({}) must be at most {MAX_MIN_INTERVAL}",
@@ -271,6 +297,7 @@ requeue: { url: 'http://x/api/{id}/again' }";
         let p = s.requeue_failed_params().unwrap();
         assert_eq!(p.max_attempts, 2);
         assert_eq!(p.window, Millis(15 * 60_000));
+        assert_eq!(p.retention, Millis(24 * 3_600_000));
         assert_eq!(p.min_interval, Millis(60_000));
         assert_eq!(p.max_per_run, 5);
         assert_eq!(p.timeout, Millis(10_000));
@@ -327,6 +354,14 @@ requeue: { url: 'http://x/api/{id}/again' }";
             (
                 "list: { url: 'http://x', items: /r, id: /id }\nrequeue: { url: 'http://x/{id}' }\ntimeout: 0",
                 "timeout",
+            ),
+            (
+                "list: { url: 'http://x', items: /r, id: /id }\nrequeue: { url: 'http://x/{id}' }\nretention: 1m",
+                "retention (60000ms)",
+            ),
+            (
+                "list: { url: 'http://x', items: /r, id: /id }\nrequeue: { url: 'http://user:pw@x/{id}' }",
+                "must not contain credentials",
             ),
             (
                 "list: { url: 'http://x', items: /r, id: /id }\nrequeue: { url: 'http://x/{id}' }\nauth: { header: Authorization, env: A, file: /f }",

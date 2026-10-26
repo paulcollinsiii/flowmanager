@@ -146,10 +146,17 @@ What is carried out and what is not:
     so they neither keep it from going idle nor make it the pick when it is released. A
     model loaded only for failed items, whose items were re-queued (they then show as ready
     work through the source's other request, and as none failed), is released after the usual
-    `min_dwell` and `idle_grace`, not longer. If the items cannot be re-queued (the cap
-    is used), the model idles for `idle_grace` and is released while they remain listed; the
-    items stop bringing a model in when they leave the source's `since` window (15m in the
-    example). They do not power a host on and do not keep one on;
+    `min_dwell` and `idle_grace`, not longer. **Flapping while spent items stay listed.**
+    If the items cannot be re-queued (the cap is used, or every request fails) and they stay
+    listed, the model is released after `min_dwell` + `idle_grace` (about 11 minutes in the
+    example), then the failed-only class wants it again at the next tick and it is allowed
+    again: allowed about 11 minutes, one empty tick, allowed again, repeating about every
+    12 minutes (seen in replay). It is bounded: it stops when the items leave the source's
+    `since` window (15m after their last update), so at most about two cycles per failure in
+    the example, and any edit of a failed recording starts the window again. To reduce it,
+    shorten the failed request's `since.ago` (and the recovery's, which must match), or
+    lower the class's `priority` so real work wins when it competes. Failed items do not
+    power a host on and do not keep one on;
   - a window shorter than `idle_grace` plus load time means a model may come and go without
     ever serving a re-queue, which is harmless.
 - **Demand that can never be observed counts as none.** A class whose demand source has no
@@ -386,8 +393,11 @@ A class may declare `recovery: { action, source, params }`. The only action is
 carried out by the `Recovery` Restate object (key: the class id), not by the `Scheduler`.
 
 **When.** The sequencer emits `RunRecovery` for a class that has a recovery, while the class
-is in the allowed set (its model serving and not winding down, its hosts up, no reclaim) and
-the snapshot reports failed items for it (fresh demand, `failed > 0`). It is emitted on
+is in the published allowed set (its model serving and not winding down in the sequencer's
+state, every host it needs on in that state, no reclaim) and the snapshot reports failed items
+for it (fresh demand, `failed > 0`). That is the existing allowed-set rule, not a fresh
+host check: a serving model stays allowed on a stale reachability reading until a reading
+says the host is down, and recovery follows it. It is emitted on
 every such tick; the action is idempotent and rate-limited by itself, so that is cheap.
 It never runs for a class that is not allowed: the action re-checks the allowed set the tick
 published before listing and again **before every request**, and stops when the class has
@@ -417,22 +427,25 @@ recorded attempts.
 
 **The cap.** `max_attempts` per item id (default 2), counted in `recovery_attempts`. A
 request counts as an attempt whether or not it succeeded (the attempt is recorded first).
-An item that used its attempts is skipped (`skipped_cap`) and stays failed until it leaves
-the list's `since` window. An item's record is forgotten only when its latest attempt is
-older than `window` (default 15m) **and** the item is no longer listed: while it is listed it
-is still failing, and forgetting it would give it fresh attempts. A later edit of a failed
-recording restarts its window but not its attempts while it stays listed.
+An item that used its attempts is skipped (`skipped_cap`, counted per item and run) and stays
+failed until it leaves the list's `since` window. Records are kept for `retention` (default
+24h, at least `window`) after the latest attempt **whether or not the item is listed**, and
+only then forgotten, which also bounds the stored document. So a recording that used both
+attempts, left the list after 15m and is listed again by a later edit gets no fresh attempts.
+The deliberate limit: a recording edited more than `retention` after its last attempt may get
+a fresh set of two. Two classes with recoveries each keep their own book, so a recording id
+shared by two classes is counted per class (nothing to fix; the ids are the service's).
 
 **Params** (`recovery.params`; validated at config load, an unknown action is refused):
 
 | Param | Meaning |
 | --- | --- |
 | `list.url`, `list.items`, `list.id` | The list request, the JSON pointer to the items array, the pointer (inside an item) to its id (a string or an integer made of letters, digits and `-_.`; anything else is skipped). |
-| `list.where`, `list.since`, `list.max_items` | As for an `http_json` request. A full page (`max_items`) is processed and warned about; the rest follows on later runs. |
+| `list.where`, `list.since`, `list.max_items` | As for an `http_json` request. A full page (`max_items`) is normal here: up to `max_per_run` items are re-queued per run, it is warned about, and the rest follows on later runs. |
 | `requeue.method`, `requeue.url` | `POST` (default), `PUT` or `PATCH`; the URL with `{id}` once. |
 | `requeue.expect` | Conditions on the JSON answer (`{field, equals}`), all of which must hold for the request to count as queued. A non-2xx answer never does. |
 | `auth` | As for a source: an env var or file, never the secret. |
-| `max_attempts` / `window` / `min_interval` / `max_per_run` / `timeout` | 2 / 15m / 60s / 5 / 10s by default. |
+| `max_attempts` / `window` / `retention` / `min_interval` / `max_per_run` / `timeout` | 2 / 15m / 24h / 60s / 5 / 10s by default. `window` is the list's `since` window, for reference; `retention` must be at least it. URLs must carry no userinfo (`user:pw@`); use `auth`. |
 
 Failures (network, 4xx, 5xx, an answer that is not JSON or does not match `expect`) are
 logged, counted and never panic; the item's attempt stays used and the next run retries it
@@ -445,8 +458,13 @@ Metrics: `sched_recovery_runs_total{class,outcome}` (`ran`, `skipped_interval`,
 ## Handlers
 
 All are called as `POST {ingress}/Scheduler/main/{handler}`. The `Recovery` object's
-handlers are `POST {ingress}/Recovery/{class}/run` (sent by the `tick`; harmless by hand: it
-gates itself), `.../attempts` (the stored document) and `.../discard_attempts`.
+handlers are `Recovery/{class}/run` (**ingress-private**, like `observe`: only the `tick`
+can send it), `.../attempts` (the stored document) and `.../discard_attempts`. The last two
+are public on the ingress like `Scheduler.discard_state` and the lease handlers: anyone who
+can reach the Restate ingress can read the attempts or discard them (`discard_attempts`
+with `"force": true` gives every item fresh attempts), so keep the ingress on a trusted
+network (see *Trust boundary*). Metrics label only configured classes (an invented key is
+counted under `unknown`).
 
 | Handler | Ingress | What it does |
 | --- | --- | --- |
@@ -631,7 +649,16 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
   not seen at all. Automatic re-queueing is capped at 2 per recording (see *Recovery
   actions*), after which the recording stays FAILED and ages out. A reprocess-transcription failure on
   a recording that already has a summary is missed; a failed merge or stitch job counts as
-  transcription. More than 100 failures in the window fails the poll rather than under-counting.
+  transcription. A full page (100) of failed recordings counts as 100 ("at least"): the
+  poll does not fail, so a mass failure keeps demand fresh and recovery running. A full page
+  for a `ready` or `in_flight` request still fails the poll rather than under-counting.
+- **The failed list is written twice (source and recovery) and the two can drift.** If the
+  source counts failures the recovery would not re-queue (a wider `where` or window), the
+  model is brought in for nothing, and flaps as above. If the recovery's list is wider than
+  the source's, it re-queues the extra recordings, but only while the source counts
+  something. Keep the two identical in URL, filter and window. A duplicate re-queue request
+  after a crash between sending and its journal entry stays possible (see *Recovery
+  actions*).
 - **Queued speakr summary, merge and stitch jobs count as transcription demand.** The speakr
   `/stats` queue counts jobs of every type, so this is a deliberate, conservative overcount.
 - **speakr `/stats` is scoped to the token's user.** Recordings of other users are not seen.

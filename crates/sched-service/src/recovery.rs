@@ -85,12 +85,18 @@ pub async fn run<C: ObjectCtx>(
     class: &str,
 ) -> Result<RunAck, HandlerError> {
     let metrics = &shared.metrics;
+    // The key is whatever the caller invoked; only a configured class gets its own series.
+    let label = shared
+        .config
+        .current()
+        .class(&ClassId::new(class))
+        .map_or("unknown", |_| class);
     let mut ack = RunAck {
         class: class.to_string(),
         ..RunAck::default()
     };
     let stop = |mut ack: RunAck, outcome: &str, error: Option<String>| {
-        metrics.recovery_run(class, outcome);
+        metrics.recovery_run(label, outcome);
         ack.outcome = outcome.to_string();
         ack.error = error;
         ack
@@ -166,12 +172,12 @@ pub async fn run<C: ObjectCtx>(
         );
     }
     ack.listed = listed.ids.len();
-    let pruned = book.prune(now, params.window, &listed.ids);
+    let pruned = book.prune(now, params.retention);
     let plan = book.plan(&params, &listed.ids);
     ack.capped = plan.capped;
     ack.deferred = plan.deferred;
-    metrics.recovery_requeue(class, "skipped_cap", plan.capped as u64);
-    metrics.recovery_requeue(class, "deferred", plan.deferred as u64);
+    metrics.recovery_requeue(label, "skipped_cap", plan.capped as u64);
+    metrics.recovery_requeue(label, "deferred", plan.deferred as u64);
     if pruned > 0 {
         tracing::debug!(
             class,
@@ -189,7 +195,7 @@ pub async fn run<C: ObjectCtx>(
         if !allowed {
             let left = plan.send.len() - i;
             ack.not_allowed = left;
-            metrics.recovery_requeue(class, "skipped_not_allowed", left as u64);
+            metrics.recovery_requeue(label, "skipped_not_allowed", left as u64);
             tracing::info!(
                 class,
                 left,
@@ -201,7 +207,7 @@ pub async fn run<C: ObjectCtx>(
         ctx.record_durably(RECOVERY_KEY, persist::encode_attempts(&book))
             .await?;
         ack.attempted += 1;
-        metrics.recovery_requeue(class, "attempted", 1);
+        metrics.recovery_requeue(label, "attempted", 1);
         let (c, p, e, item) = (client.clone(), params.clone(), Arc::clone(env), id.clone());
         let outcome: PostOutcome = ctx
             .run_journaled_async("recovery_requeue", move || {
@@ -216,18 +222,18 @@ pub async fn run<C: ObjectCtx>(
         match outcome {
             PostOutcome::Queued => {
                 ack.queued += 1;
-                metrics.recovery_requeue(class, "queued", 1);
+                metrics.recovery_requeue(label, "queued", 1);
                 tracing::info!(class, id = %id, attempt = book.count(id), "recovery: re-queued");
             }
             PostOutcome::Failed(why) => {
                 ack.failed += 1;
-                metrics.recovery_requeue(class, "failed", 1);
+                metrics.recovery_requeue(label, "failed", 1);
                 tracing::warn!(class, id = %id, attempt = book.count(id), "recovery: re-queue failed: {why}");
             }
         }
     }
     ctx.set_raw(RECOVERY_KEY, persist::encode_attempts(&book));
-    metrics.recovery_run(class, "ran");
+    metrics.recovery_run(label, "ran");
     ack.outcome = "ran".to_string();
     Ok(ack)
 }
@@ -576,25 +582,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attempts_are_forgotten_only_when_old_and_no_longer_listed() {
+    async fn a_full_page_of_failures_is_normal_work_for_the_action() {
+        let mut w = world(|y| y).await;
+        let ids: Vec<u64> = (1..=100).collect();
+        w.failed_ids(&ids);
+        w.tick_with_failed(100);
+        let a = w.run_commit().await;
+        assert_eq!(a.outcome, "ran", "{a:?}");
+        assert_eq!((a.listed, a.attempted, a.deferred), (100, 5, 95), "{a:?}");
+    }
+
+    #[tokio::test]
+    async fn a_spent_cap_survives_leaving_and_re_entering_the_list_until_the_retention() {
         let mut w = world(|y| y).await;
         w.mock.lock().unwrap().queued_leaves = false;
-        w.failed_ids(&[1, 2]);
-        w.tick_with_failed(2);
-        w.run_commit().await;
-        assert_eq!(w.book().attempts.len(), 2);
-        // 2 leaves the list (it recovered); an hour later 2's attempts are forgotten but 1,
-        // still listed (still failing), keeps its count, so it cannot be given fresh ones.
         w.failed_ids(&[1]);
-        w.advance(60 * MIN);
-        w.run_commit().await;
-        let b = w.book();
-        assert_eq!(b.count("1"), 2, "{b:?}");
-        assert_eq!(b.attempts.len(), 1, "{b:?}");
+        w.tick_with_failed(1);
+        // Recording 1 uses both attempts.
+        for _ in 0..2 {
+            w.run_commit().await;
+            w.advance(MIN);
+        }
+        assert_eq!(w.posts(), [1, 1]);
+        // It drops out of the list (its window passed); other failures keep runs going for
+        // longer than the window, so any window-based pruning would forget it.
+        w.failed_ids(&[2]);
+        for _ in 0..4 {
+            w.advance(10 * MIN);
+            w.run_commit().await;
+        }
+        assert_eq!(w.book().count("1"), 2, "kept past the list window");
+        // An edit lists it again: no fresh attempts.
+        w.failed_ids(&[1, 2]);
+        w.advance(MIN);
+        let a = w.run_commit().await;
+        assert_eq!(a.capped, 2, "{a:?}");
         assert_eq!(
-            w.posts(),
-            [1, 2, 1],
-            "1 got its second attempt, nothing more"
+            w.posts().iter().filter(|i| **i == 1).count(),
+            2,
+            "{:?}",
+            w.posts()
+        );
+        // After the retention (24h) the records are forgotten and an edit may get two more.
+        w.advance(25 * 60 * MIN);
+        w.run_commit().await;
+        assert_eq!(w.book().attempts.len(), 2, "only what this run recorded");
+        assert_eq!(w.book().count("1"), 1);
+        w.advance(MIN);
+        w.run_commit().await;
+        assert_eq!(w.posts().iter().filter(|i| **i == 1).count(), 4);
+        w.advance(MIN);
+        w.run_commit().await;
+        assert_eq!(
+            w.posts().iter().filter(|i| **i == 1).count(),
+            4,
+            "capped again"
         );
     }
 
@@ -719,6 +761,17 @@ mod tests {
             .unwrap();
         assert_eq!(a.outcome, "not_wired");
         assert!(w.server.requests().is_empty());
+        // An invented class never becomes a label value.
+        let text = w.shared.metrics.render();
+        assert!(!text.contains("no-such-class"), "{text}");
+        assert_eq!(
+            w.metric("sched_recovery_runs_total", "unknown", "not_wired"),
+            1.0
+        );
+        assert_eq!(
+            w.metric("sched_recovery_runs_total", "paperless-ocr", "not_wired"),
+            1.0
+        );
     }
 
     #[tokio::test]

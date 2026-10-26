@@ -92,12 +92,15 @@ classes:
             - { field: /success, equals: true }
             - { field: /status, equals: QUEUED }
         auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
-        # Re-queue requests per recording (and how long they are remembered once the
-        # recording is no longer listed), at most `max_per_run` requests per run, runs at
-        # least `min_interval` apart (one list request plus the POSTs: well inside
+        # `max_attempts` re-queue requests per recording, remembered for `retention` (24h,
+        # at least `window`, the list's since window) whether or not the recording is still
+        # listed: a recording that used its attempts must not get fresh ones when an edit
+        # lists it again; after `retention` an edited recording may get a fresh set. At
+        # most `max_per_run` requests per run, runs at least `min_interval` apart (one list request plus the POSTs: well inside
         # speakr's limit of 120 requests a minute), each request bounded by `timeout`.
         max_attempts: 2
         window: 15m
+        retention: 24h
         min_interval: 60s
         max_per_run: 5
         timeout: 10s
@@ -285,8 +288,9 @@ sources:
   #     passes.
   #   - Failed transcriptions are re-queued automatically (the class's recovery), at most
   #     twice per recording; after that it stays FAILED and ages out of the window.
-  #   More than 100 failures in the window is a full page and fails the poll (max_items)
-  #   instead of under-counting. An item whose `has_summary` is not a boolean (null aside)
+  #   A full page of failures (100 in the window, `max_items`) counts as 100 ("at least")
+  #   for this failed request instead of failing the poll, so a mass failure keeps demand
+  #   fresh; a full page for a ready/in-flight request still fails. An item whose `has_summary` is not a boolean (null aside)
   #   also fails the poll, rather than counting low.
   # Cost: 2 requests per poll here plus 1 for speakr-summaries below, at one poll a minute
   # each: 3 requests per minute in total on the one token, against speakr's read limit of

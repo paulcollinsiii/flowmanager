@@ -68,18 +68,17 @@ impl AttemptBook {
         e.last_at = now;
     }
 
-    /// Forgets items whose latest attempt is older than `window` AND that are not in the
-    /// list: an item still listed is still failed, and forgetting it would give it fresh
-    /// attempts. Returns how many were forgotten. Call it only with a list that was read
-    /// successfully (a failed read says nothing about what is listed).
-    pub fn prune(&mut self, now: Millis, window: Millis, listed: &[String]) -> usize {
-        let listed: BTreeSet<&str> = listed.iter().map(String::as_str).collect();
+    /// Forgets items whose latest attempt is older than `retention`, whether or not they
+    /// are listed. Retention is deliberately independent of the list's `since` window: a
+    /// recording that used its attempts drops out of the list after the window and comes
+    /// back when it is edited, and it must not get fresh attempts then. Only after
+    /// `retention` (much longer than the window) is a record forgotten, which bounds the
+    /// book's size; an item edited after that may get a fresh set of attempts. Returns how
+    /// many were forgotten.
+    pub fn prune(&mut self, now: Millis, retention: Millis) -> usize {
         let before = self.attempts.len();
-        self.attempts.retain(|id, a| {
-            listed.contains(id.as_str())
-                || a.last_at > now
-                || now.saturating_sub(a.last_at) <= window
-        });
+        self.attempts
+            .retain(|_, a| a.last_at > now || now.saturating_sub(a.last_at) <= retention);
         before - self.attempts.len()
     }
 
@@ -151,20 +150,19 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_listed_items_and_recent_attempts() {
-        let w = Millis(15 * 60_000);
+    fn records_are_forgotten_only_after_the_retention_whatever_the_list_says() {
+        let r = Millis(24 * 3_600_000);
         let mut b = AttemptBook::default();
-        b.record("old-listed", Millis(0));
-        b.record("old-gone", Millis(0));
-        b.record("recent-gone", Millis(1_000_000));
-        let now = Millis(1_000_000 + 60_000);
-        assert_eq!(b.prune(now, w, &ids(&["old-listed"])), 1);
-        assert!(b.attempts.contains_key("old-listed"));
-        assert!(b.attempts.contains_key("recent-gone"));
-        assert!(!b.attempts.contains_key("old-gone"));
-        // Exactly at the window it is kept; after it, forgotten.
-        let listed = ids(&["old-listed"]);
-        assert_eq!(b.prune(Millis(1_000_000 + 900_000), w, &listed), 0);
-        assert_eq!(b.prune(Millis(1_000_000 + 900_001), w, &listed), 1);
+        b.record("old", Millis(0));
+        b.record("recent", Millis(1_000_000));
+        // Long past any list window but within retention: kept.
+        assert_eq!(b.prune(Millis(r.as_u64()), r), 0);
+        // Past retention: forgotten; the newer record stays.
+        assert_eq!(b.prune(Millis(r.as_u64() + 1), r), 1);
+        assert!(!b.attempts.contains_key("old"));
+        assert!(b.attempts.contains_key("recent"));
+        // Exactly at the retention it is kept.
+        assert_eq!(b.prune(Millis(1_000_000 + r.as_u64()), r), 0);
+        assert_eq!(b.prune(Millis(1_000_001 + r.as_u64()), r), 1);
     }
 }

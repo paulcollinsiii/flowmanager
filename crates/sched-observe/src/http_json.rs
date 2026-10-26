@@ -215,8 +215,16 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
         .ok_or_else(|| ExtractError::Missing(ptr.to_string()))?
         .as_array()
         .ok_or_else(|| ExtractError::NotAnArray(ptr.to_string()))?;
-    if req.max_items.is_some_and(|max| items.len() as u64 >= max) {
-        return Err(ExtractError::AtLimit(items.len() as u64));
+    let full = req.max_items.filter(|max| items.len() as u64 >= *max);
+    if let Some(max) = full {
+        if req.counts_as != CountsAs::Failed {
+            return Err(ExtractError::AtLimit(items.len() as u64));
+        }
+        // A full page of failed items is "at least max_items": a mass failure must not make
+        // the poll fail (demand would go stale exactly when it matters). The filter is still
+        // checked, so a wrong field name is an error.
+        select_items(items, req.filter.as_ref())?;
+        return Ok(max);
     }
     Ok(select_items(items, req.filter.as_ref())?.len() as u64)
 }
@@ -932,7 +940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_page_fails_instead_of_under_counting() {
+    async fn a_full_page_fails_a_ready_request_and_counts_as_at_least_for_failed_ones() {
         let d = doc(r#"{"r": [1,2,3]}"#);
         let mut r = req(None, Some("/r"), None);
         r.max_items = Some(3);
@@ -946,10 +954,24 @@ mod tests {
         let full: Vec<String> = (0..100).map(|i| speakr_item(i, "FAILED", false)).collect();
         server.set(SPEAKR_STATS, stats(0, 0, 0));
         server.set(SPEAKR_FAILED, speakr_list(&full));
-        match poll_now(
+        // The failed request counts a full page as "at least max_items": the poll does not
+        // fail, so a mass failure keeps demand fresh and recovery running.
+        let report = poll_now(
             &build_client(&params).unwrap(),
             &spec,
             &params,
+            &classes,
+            &env,
+        )
+        .await;
+        assert_eq!(demand3(&report), (0, 0, 100));
+        // The same full page for a READY request still fails the poll.
+        let mut ready_params = params.clone();
+        ready_params.requests[1].counts_as = CountsAs::Ready;
+        match poll_now(
+            &build_client(&ready_params).unwrap(),
+            &spec,
+            &ready_params,
             &classes,
             &env,
         )
@@ -958,6 +980,24 @@ mod tests {
             Report::Failed { error, .. } => assert!(error.contains("full page"), "{error}"),
             other => panic!("{other:?}"),
         }
+        // A full page whose filter field is missing is still an error for failed requests.
+        let mut r = req(
+            None,
+            Some("/r"),
+            Some(ElementFilter {
+                field: "/nope".into(),
+                contains: None,
+                equals: Some(true.into()),
+            }),
+        );
+        r.counts_as = CountsAs::Failed;
+        r.max_items = Some(3);
+        assert!(matches!(
+            extract(&d, &r),
+            Err(ExtractError::FilterFieldMissing(_))
+        ));
+        r.filter = None;
+        assert_eq!(extract(&d, &r), Ok(3));
     }
 
     #[tokio::test]

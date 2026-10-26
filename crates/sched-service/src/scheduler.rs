@@ -333,8 +333,8 @@ impl Scheduler {
 /// is the key `recovery_attempts` (versioned).
 ///
 /// Handlers:
-/// - `run`: one run of the class's recovery action. Sent by the `tick` handler, one way,
-///   whenever the decision carries a `RunRecovery` step for the class.
+/// - `run` (ingress-private): one run of the class's recovery action. Sent by the `tick`
+///   handler, one way, whenever the decision carries a `RunRecovery` step for the class.
 /// - `discard_attempts`: the recovery path for an attempts document that cannot be read.
 /// - `attempts`: the stored document, as text (`null` if none).
 pub struct Recovery {
@@ -351,7 +351,7 @@ impl Recovery {
 #[object]
 impl Recovery {
     /// Runs the class's recovery action once (the key is the class id).
-    #[handler]
+    #[handler(ingress_private)]
     async fn run(&self, ctx: ObjectContext<'_>) -> Result<Json<RunAck>, HandlerError> {
         let class = ctx.key().to_string();
         Ok(Json(
@@ -464,7 +464,15 @@ mod tests {
         let mut seen: Vec<String> = d.handlers.iter().map(|h| h.name.to_string()).collect();
         seen.sort();
         assert_eq!(seen, ["attempts", "discard_attempts", "run"]);
-        assert!(d.handlers.iter().all(|h| h.ingress_private.is_none()));
+        // `run` is called only by the tick; `attempts` and `discard_attempts` stay public,
+        // like the Scheduler's `discard_state`.
+        let private: Vec<_> = d
+            .handlers
+            .iter()
+            .filter(|h| h.ingress_private == Some(true))
+            .map(|h| h.name.to_string())
+            .collect();
+        assert_eq!(private, ["run"]);
     }
 
     #[test]
