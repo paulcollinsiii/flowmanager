@@ -101,7 +101,10 @@ and only a changed text is validated and applied. Behaviour, from `config_source
   ConfigMap breaks a restart, not a running pod;
 - each tick uses one config generation (`sched_config_generation`);
 - model and class ids must be lowercase letters, digits and `-`, starting and ending with
-  a letter or digit, at most 50 characters (the KEDA metric name is built from them).
+  a letter or digit, at most 50 characters. This is a deliberately conservative rule that keeps
+  ids usable in resource-style names, not a Kubernetes or KEDA metric-name requirement
+  (Kubernetes only validates an external metric name as a path segment; KEDA's 63 character
+  limit applies to the ScaledObject name and the HPA name `keda-hpa-<name>`).
 
 ### Replicas: exactly 1
 

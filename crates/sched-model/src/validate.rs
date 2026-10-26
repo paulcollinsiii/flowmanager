@@ -47,16 +47,19 @@ fn check_ids<'a>(p: &mut Problems, section: &str, ids: impl Iterator<Item = &'a 
     }
 }
 
-/// Longest model or class id. The KEDA scaler builds a metric name from an id
-/// (`flowmanager-model-<id>`), which KEDA prefixes (`sN-`) and uses as a metric name.
+/// Longest model or class id. A deliberately conservative rule, not a Kubernetes
+/// requirement: the scaler builds a metric name from an id (`flowmanager-model-<id>`), and
+/// Kubernetes validates an external metric name only as a path segment (no length limit),
+/// while the real 63 character limit of KEDA applies to ScaledObject and HPA names. The rule
+/// keeps ids usable in resource-style names (ScaledObject names, labels, URLs).
 pub(crate) const MAX_SCALER_ID_LEN: usize = 50;
 
 /// Why `id` cannot name a model or a class, or `None` if it can: lowercase letters, digits
 /// and `-`, starting and ending with a letter or digit, at most [`MAX_SCALER_ID_LEN`]
-/// characters. A free-form id would end up in a metric name and in a ScaledObject.
+/// characters. A free-form id would end up in a metric name and in ScaledObject names.
 pub(crate) fn scaler_id_problem(id: &str) -> Option<String> {
     let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
-    let rule = "an id may use only lowercase letters, digits and '-', must start and end with a letter or digit, and be at most 50 characters (the KEDA scaler builds a metric name from it)";
+    let rule = "an id may use only lowercase letters, digits and '-', must start and end with a letter or digit, and be at most 50 characters (a conservative rule that keeps ids usable in resource-style names and in the scaler's metric names; Kubernetes itself would accept more)";
     if id.is_empty() || id != id.trim() {
         return None; // reported by check_ids
     }
@@ -527,7 +530,7 @@ sources:
     }
 
     #[test]
-    fn model_and_class_ids_must_be_usable_in_a_scaler_metric_name() {
+    fn model_and_class_ids_follow_the_conservative_resource_style_rule() {
         let fifty = "a".repeat(50);
         for good in ["a", "mineru", "immich-ml", "0a-1", "x--y", fifty.as_str()] {
             for (what, y) in [
