@@ -41,6 +41,8 @@ GPU, and publishes the resulting **allowed set** (models and workload classes) f
 external scaler. It runs as the `Scheduler` Restate virtual object (key `main`); a tick is
 snapshot, then planner, then sequencer, then publication and a log line with the decision,
 its reason, the config generation and each input's age (per source and capability).
+To deploy it on Kubernetes (image, flags, Restate, Istio, RBAC, KEDA, secrets, operations),
+see `docs/kubernetes_setup.md`.
 
 **GPU exclusivity is Kubernetes' job (deployment requirement).** Every GPU workload must
 request `nvidia.com/gpu: 1`, the device plugin must expose exactly one GPU on cuda-central
@@ -81,6 +83,21 @@ How a model is chosen and kept:
   that has work (an interactive session): the switch is not even started, with no timeout,
   and the wait reason is `not_preemptible`. (A demand source that has gone silent also
   holds a switch, as `stale_demand`, until it reports or is removed.)
+- **When the bound does not hold.** The bound above assumes the planner's intent stays
+  away from the serving model for the whole wind-down. If the intent flickers back to it,
+  the wind-down is dropped (the serving mode returns to "no wind-down") and a later one
+  starts its clock again, so the switch can be postponed without limit. Two ways to flicker:
+  the waiting queue reads `ready = 0` for one tick every few minutes, or the serving
+  class's demand goes stale for one tick every few minutes. Reproduced in simulation (a
+  one-tick blip every 9 minutes never switched in 6 hours, with a 10 minute
+  `drain_timeout`; `crates/sched-service/tests/blips.rs` pins the idleness side of it). Two
+  more limits of the same bound: a class's `kill_timeout` that is shorter than another
+  blocking class's timeout does not end the wind-down early, because each class is cut off
+  at its own timeout but the model is withdrawn only when no class of it is still blocking,
+  so the effective bound is the **maximum** over the blocking classes' timeouts; and a
+  reclaim that starts and ends in the middle of a wind-down restarts the clock twice (a
+  10 minute timeout took 16 minutes in a test). Watch `sched_resource_phase_age_seconds`
+  for `winding_down` (section *Metrics*) when a switch seems stuck.
 - **A change of cause mid wind-down** (a manual lease or a reclaim arriving or ending)
   restarts the clock exactly when the cause flips between reclaim and not-reclaim, with the
   new cause's timeout counted from that tick (so a reclaim ending gives the work a fresh
@@ -126,8 +143,12 @@ What is carried out and what is not:
   consumer keeps taking work and its queue's in-flight count may stay up. The wind-down does
   not wait for that: it ends at the timeout (see above).
 - **Cutting off in-flight work is the withdrawal of the model.** `KillInFlight` has no
-  actuator of its own; the work ends because the same tick withdraws its model and KEDA
-  scales the workload to 0. The step is reported as not executed, with a note saying so.
+  actuator of its own; the work ends because the model is withdrawn and KEDA scales the
+  workload to 0. Each class is cut off at its own timeout, but the model is withdrawn only
+  when no class of it is still blocking: in the same tick if the cut-off class was the last
+  one, otherwise the model stays allowed and the other classes' work keeps running until
+  the last of them is cut off or finishes. The step is reported as not executed, with a
+  note saying so (and the reason says which of the two cases it is).
   What re-runs the interrupted work is up to the consumer: paperless-gpt reprocesses
   unfinished documents (paperless-ocr, paperless-tagging are `kill` for that reason), immich
   leaves it pending, speakr marks a transcription failed (re-queued by its recovery), and
@@ -289,7 +310,7 @@ spec:
     - type: external-push
       metadata:
         scalerAddress: flowmanager.flowmanager.svc.cluster.local:9095
-        class: paperless-gpt-host   # a class id from the scheduler config
+        class: paperless-gpt   # a class id from the scheduler config (config/example.yaml)
 ```
 
 To query it by hand, `cargo run -p sched-keda --example scaler_probe -- <addr> model=mineru`
@@ -500,7 +521,9 @@ model stays allowed however much other work waits. While it is pinned, ticks lis
 - Lease ids are `manual-model-<n>`, from a counter in the object's state.
 - A lease whose model or resource later disappears from the config is kept but ignored
   (listed in the tick's `ignored_leases` and logged).
-- Other lease kinds (interactive, reclaim, manual host power, shared holds) have no API yet.
+- Other lease kinds (reclaim, manual host power, shared holds) have no API yet; interactive
+  leases with expiry are no longer planned (see `planning/milestones.md`, *Scope reset
+  during M3*).
 - A manual model lease also asks for its host to be up. Under `power.control: manual` this
   only means it waits until a person powers the host on; under `managed` (M4) the scheduler
   powers the host on and later takes responsibility for powering it down.
@@ -580,12 +603,17 @@ Notes:
 - **`http_json` conditions**: `where: { field, contains | equals }` keeps the items of a
   `length` array whose field matches; `when: { field, equals }` counts a whole response (its
   own and its `also` numbers) only if a field of it has that value, else it contributes zero.
-  `equals` keeps the YAML scalar's type: `equals: false` / `true` is a JSON boolean and
-  `equals: 3` a JSON number (compared numerically); quote it (`"true"`, `"3"`) to compare text.
+  `where.equals` (and `when.equals`) keeps the YAML scalar's type: `equals: false` / `true`
+  is a JSON boolean and `equals: 3` a JSON number (compared numerically), as well as text
+  for a string; quote a scalar (`"true"`, `"3"`) to compare it as text.
   **Behaviour change (M3):** an item whose `where` field holds a non-null value of another
   JSON type, or a response whose `when` field is missing or of another type, now fails the
   whole source (its demand becomes unknown) instead of silently counting low. Before M3 a
   number after `equals:` was compared as text.
+- **`webhook:` in an `http_json` source's params is accepted and ignored.** The example
+  config carries `webhook: { path: ... }` for paperless and speakr, but this build has no
+  webhook receiver (event-driven observation is not built yet; see `planning/milestones.md`):
+  sources are polled at their `resync` only.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - **Reachability sources for hosts outside the cluster**: `tcp_probe` (params `host`,
@@ -610,10 +638,11 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
   `power.control: managed`). Recovery is: see *Recovery actions*. The sequencer records
   them as taken:
   - `KillInFlight` marks the class as stopped and stops waiting for it (at `drain_timeout`
-    or the class's `kill_timeout` after the wind-down started, forced or not); the model is
-    withdrawn (and the next one allowed) in the same tick. The in-flight work actually ends
-    when KEDA scales the old model's pods down; the next model's pod starts once they are
-    gone (Kubernetes).
+    or the class's `kill_timeout` after the wind-down started, forced or not). The model is
+    withdrawn (and the next one allowed) in the same tick when no other class of it is
+    still blocking; otherwise it stays allowed until the last blocking class is cut off or
+    finishes. The in-flight work actually ends when KEDA scales the old model's pods down;
+    the next model's pod starts once they are gone (Kubernetes).
   - `RunRecovery` (carried out) is emitted while the class is allowed and items are
     failed, not when the model is withdrawn. A recording that fails again after its
     attempts are used stays FAILED (re-queue it by hand) until it leaves the window. A
@@ -677,6 +706,10 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
   route at all), an unusable address or any other local error fails the read and the
   reading goes stale (decisions needing NFS wait) rather than reading "down". Up/down flips
   only after 3 agreeing readings; a failed read is not a reading. What it misses:
+  - Behind an Istio sidecar the application's connect is accepted by the sidecar before
+    the upstream is tried, which would read "up" whatever basestar does: exclude basestar's
+    address from outbound interception on the flowmanager pod (see
+    `docs/kubernetes_setup.md`). Not checked against the cluster.
   - It shows that something accepts connections on port 2049, not that the NFS export
     works: a hung `nfsd` that still completes the TCP handshake, or a stale or full export,
     reads as up.
@@ -705,4 +738,20 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
   `IMMICH_API_KEY`). An immich older than v2.4.0 answers 404 and a changed response shape
   fails the poll. A paused queue (`isPaused: true`) counts as zero, ready and in-flight; from
   v4.0 a paused queue reports its jobs under `waiting`, so without that check they would count.
+  What that means when an operator pauses or unpauses a queue (the `when` condition skips
+  the whole response, so every number of that request reads zero):
+  - **Pausing** takes the queue's waiting jobs out of the demand at the next poll (the
+    source polls every 120s), and so does any job still running: active jobs read as not in
+    flight while the queue is paused (whether immich lets them finish is not checked here).
+    A wind-down does not wait for them, and if all three queues are paused the class reads
+    idle: the model is released after `min_dwell` and `idle_grace` even while a job
+    finishes. Withdrawing the GPU replica mid-job is safe (the CPU replica serves; the job
+    stays in immich's queue).
+  - **Unpausing** brings the waiting jobs back as ready work at the next poll, and the
+    model is wanted again as new work. Their age starts there: the scheduler's "oldest
+    ready" time is when the class's ready count last went from zero to something, so
+    the time spent paused (or waiting before a restart of this process) does not count
+    toward `age_threshold`.
+  - A model that is serving when a queue is unpaused simply sees ready work again; nothing
+    is interrupted.
 - **The Restate ingress is trusted-network only.** The public handlers have no authentication.

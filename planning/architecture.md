@@ -28,8 +28,8 @@ The scheduler arbitrates two resources and observes the services that use them; 
 - Power actuation for cuda-central and basestar, triggered only by manual requests or by workloads explicitly allowed to change power (the backup job, in v1).
 - Observing job demand from each service through configurable adapters.
 - Gating service pods through a KEDA external scaler.
-- Running the weekly backup as a scheduler-managed workflow.
-- Interactive LLM sessions (Open WebUI, editor code assist) as time-limited leases, and manual requests: release, cuda-central reclaim, and manual LLM leases that cut batch work short.
+- Running scheduled jobs, starting with the weekly backup, as scheduler-managed Kubernetes Jobs (M4, rescoped: see `milestones.md`, *Scope reset during M3*).
+- Manual requests: release, cuda-central reclaim, and manual LLM leases that cut batch work short. Open WebUI will hold such a lease and a person releases it (M6, reduced); time-limited interactive leases with renewal are no longer planned.
 
 **Non-goals**
 
@@ -74,7 +74,7 @@ The scheduler reasons only about generic resources, models, and workload classes
   - *Shared*: any number of holders, tracked by a reference count. The basestar NFS share is shared.
 - **Model.** A mode of an exclusive resource, implemented by one or more scaled workloads, with an estimated load time used as its switch cost.
 - **Workload class.** A unit of demand: its resource requirements, priority, preemptibility, whether it may change power state, and where its demand is observed.
-- **Lease.** A durable record that a holder is using a shared resource or has an interactive claim on a model. Interactive leases expire unless renewed, and while held they pin their model: batch work cannot evict it. The client renews the lease while the user is active, so a session never drops mid-use. An LLM loaded only for batch work has no such pin and can be evicted when higher-priority work arrives. A manual power-on of a host is a lease held by the user until they release it. Releasing it powers the host down only after every other hold ends: other leases on basestar, such as a running backup, and queued or in-flight GPU work on cuda-central. A manual lease on the LLM is the interactive counterpart of a reclaim: it cuts batch work short (intake stops; in-flight jobs finish or are stopped after a timeout) and keeps the LLM loaded until released.
+- **Lease.** A durable record that a holder is using a shared resource or has an interactive claim on a model. Interactive leases expire unless renewed, and while held they pin their model: batch work cannot evict it. The client renews the lease while the user is active, so a session never drops mid-use. (The lease type exists in the core, but nothing issues it: the plan was reduced to the manual model lease, which has no expiry and is released by a person; see `milestones.md`.) An LLM loaded only for batch work has no such pin and can be evicted when higher-priority work arrives. A manual power-on of a host is a lease held by the user until they release it. Releasing it powers the host down only after every other hold ends: other leases on basestar, such as a running backup, and queued or in-flight GPU work on cuda-central. A manual lease on the LLM is the interactive counterpart of a reclaim: it cuts batch work short (intake stops; in-flight jobs finish or are stopped after a timeout) and keeps the LLM loaded until released.
 - **Reclaim.** The forceful alternative to releasing, for cuda-central only: the user takes the host back despite pending work. Intake stops at once, in-flight jobs finish or are stopped after a configured timeout, pending jobs stay queued, and the host is not woken or scheduled until the user returns it. A reclaim ends with a full shutdown of the host, since it is rebooted into another operating system; while reclaimed, the node's absence from the cluster is expected rather than an error.
 - **Gate class.** A workload class whose requirements are hosts only: on an exclusive resource it names no model, which means "that host is up". It has no demand source and never influences which model is chosen. It gates a consumer on host readiness, for example paperless-gpt, which may run only while cuda-central is up and paperless-ngx (its documents on basestar-nfs) is reachable. Consumers are not gated for GPU contention at all: that is Kubernetes' job (invariant 2).
 - **Precedence vs. priority.** Precedence (OCR before tagging for one document) is a property of jobs and is handled by readiness: a job is not counted until its upstream step is done. Priority decides which ready model to load next. The two are never mixed.
@@ -98,8 +98,8 @@ Each component has one job, and only the planner and sequencer make decisions.
 | Observation cache | Latest observation per source, its age, and a dirty flag | Interpret observations |
 | Planner | Intent: which model the GPU should serve and which shared resources should be held, based on demand, leases, and policy | I/O; knowledge of pods, drain timing, or transitional states |
 | Sequencer | Per-resource state machines and the next safe step toward the intent | I/O; scheduling policy |
-| Lease manager | Durable leases: NFS reference counts, manual host and LLM leases, and interactive TTL leases | Grant leases on its own; the planner and sequencer decide |
-| KEDA external scaler | Exposing which workload classes are currently allowed (every requirement met, GPU or not) to KEDA, which converges replicas | Any logic beyond a lookup |
+| Lease manager | Durable leases. Built: manual model leases. Planned (M4): NFS reference counts and manual host leases (a manual NFS lease brings up the host and its consumers). Interactive TTL leases are no longer planned | Grant leases on its own; the planner and sequencer decide |
+| KEDA external scaler | Exposing which models and which workload classes are currently allowed (a model in the allowed set; a class with every requirement met, GPU or not) to KEDA, which converges replicas | Any logic beyond a lookup |
 | Restate workflows | Imperative, multi-step actions: power on and off, recovery actions such as re-queueing failed jobs (a `Recovery` virtual object per class, beside the `Scheduler`), the backup procedure | Choose when to run; report success as truth without observation |
 | Config loader | Loading, validating, and versioning configuration; keeping the last good config | Partial application of invalid config |
 
@@ -114,7 +114,7 @@ The workspace splits into three pure crates that hold the decision logic and fou
 | `sched-model` | Shared types: snapshot, observation, intent, step, lease, resource, model, workload class, config schema | No |
 | `sched-planner` | Policy strategies that turn a snapshot and leases into an intent | No |
 | `sched-sequencer` | Resource state machines and safety rules that turn an intent and current state into the next step | No |
-| `sched-observe` | Adapter kinds (Kubernetes watch, HTTP/JSON, SQL, Prometheus, webhook receiver) and their registry | Yes |
+| `sched-observe` | Adapter kinds and their registry. Built: Kubernetes watch, HTTP/JSON, Prometheus, TCP probe (`tcp_probe`). Planned, no observer yet: SQL, webhook receiver, and the `schedule` and `session` kinds | Yes |
 | `sched-actuate` | Actuator I/O: recovery actions (`requeue_failed`: list, re-queue request, attempt bookkeeping), later power and backup. The Restate object that sequences and journals an action (`Recovery`) lives in `sched-service`, which owns the Restate SDK | Yes |
 | `sched-keda` | KEDA external scaler server | Yes |
 | `sched-service` | The flowmanager binary: Restate service wiring (the scheduler virtual object, invoked directly by Restate), the KEDA scaler endpoint, config loading, startup | Yes |
@@ -133,6 +133,7 @@ Observers push into a cache on their own schedules, and a short decision step, t
 
 - Observers run outside the decision step and push results into the scheduler. A slow source never holds up decisions or lease requests.
 - Kubernetes state (node readiness, and pods per model for information only) comes from watch streams, not polling.
+- Reachability of a host that is not a Kubernetes node (basestar) comes from a TCP connect probe (`tcp_probe`, as the user's `power.py` checks it): one connect per resync to a host and port, connected is up, refused, no answer or "no route to host" is down, anything else is a failed read. The `prometheus` kind remains available for hosts a Prometheus probe covers.
 - Other sources use webhooks where the service offers them, treated as notify-then-fetch: a webhook marks the source dirty, and the observer re-reads the source's current state.
 - Every source also has a slow periodic resync, so a missed event cannot leave the scheduler stuck.
 - Each observation carries its age. Safety-critical checks, such as "the host is up" before a model is allowed or a host powered off, require fresh data; scheduling inputs such as queue depth tolerate some staleness. No decision reads pod state.
@@ -145,7 +146,7 @@ Observers push into a cache on their own schedules, and a short decision step, t
 
 **Example: switching from OCR to transcription**
 
-1. The planner's intent changes to whisperX (mineru has served its minimum dwell, counted from the tick it was allowed, and is idle past its grace, or another queue is starved). The sequencer withdraws mineru's classes from the allowed set (intake paused, as far as anything is gated on them) and waits for the in-flight OCR work its queue reports to finish, but only for `drain_timeout` (or the class's `kill_timeout`; `reclaim_timeout` on a reclaim) from the start of the wind-down, forced or not. Nothing gates a consumer on its queue, so a queue fed without end would otherwise hold the GPU for ever; the cut-off is the withdrawal in step 2 (KEDA scales the workload to 0). Only a class with preemptibility `none` and work blocks without a timeout. End to end, a model allowed at `t0` is replaced by about `t0 + max_dwell + drain_timeout` when another model has runnable ready work and no `none` class of the serving model is busy.
+1. The planner's intent changes to whisperX (mineru has served its minimum dwell, counted from the tick it was allowed, and is idle past its grace, or another queue is starved). The sequencer withdraws mineru's classes from the allowed set (intake paused, as far as anything is gated on them) and waits for the in-flight OCR work its queue reports to finish, but only for `drain_timeout` (or the class's `kill_timeout`; `reclaim_timeout` on a reclaim) from the start of the wind-down, forced or not. Nothing gates a consumer on its queue, so a queue fed without end would otherwise hold the GPU for ever; the cut-off is the withdrawal in step 2 (KEDA scales the workload to 0). Only a class with preemptibility `none` and work blocks without a timeout. End to end, a model allowed at `t0` is replaced by about `t0 + max_dwell + drain_timeout` (plus a tick) when another model has runnable ready work and no `none` class of the serving model is busy. That bound holds only while the planner's intent stays away from the serving model: if it flickers back (the waiting queue reading `ready = 0` for one tick every few minutes, or the serving class's demand going stale for one tick every few minutes) the wind-down is dropped and its clock restarts, which can postpone the switch indefinitely (a one-tick blip every 9 minutes never switched in a 6 hour simulation). A class's `kill_timeout` shorter than another blocking class's timeout does not end the wind-down early: each class is cut off at its own timeout but the model is withdrawn only when none of its classes still blocks, so the bound is the maximum over the blocking classes' timeouts. A reclaim that starts and ends mid wind-down restarts the clock twice.
 2. With no work in flight (or at the timeout), in one tick and on a fresh "up" reading of cuda-central, the sequencer replaces mineru by whisperX in the allowed set: mineru leaves and whisperX enters together, and whisperX is serving from that tick. KEDA scales mineru to zero and whisperX to one.
 3. Kubernetes keeps the whisperX pod pending until mineru's pod has terminated and released the GPU (both request `nvidia.com/gpu: 1`, the node exposes one GPU, and the GPU node is tainted so nothing else lands there). The scheduler does not watch for this: pod counts are information only.
 
@@ -161,11 +162,11 @@ Kinds live in code and instances live in configuration, so adding a service that
 | Policy parameters (dwell, grace, age thresholds) | Config | Tuning |
 | Resource kinds (exclusive, shared) | Code | Almost never |
 | Resources, models, workload classes | Config | Hardware, model, or service added |
-| Adapter kinds (HTTP/JSON, SQL, Prometheus, webhook, Kubernetes) | Code (`sched-observe`) | A new protocol is needed |
+| Adapter kinds (HTTP/JSON, Prometheus, TCP probe, Kubernetes watch built; SQL, webhook planned) | Code (`sched-observe`) | A new protocol is needed |
 | Adapter instances (endpoint, query, field extraction) | Config | A service is added |
 | Power actuator kinds | Code (`sched-actuate`) | New power hardware |
 
-**Adding a service** requires its Deployment, a ScaledObject pointing at the scheduler's scaler with its workload class in the metadata, one workload class entry, and one source entry. Neither the planner nor the sequencer changes.
+**Adding a service** requires its Deployment, a ScaledObject pointing at the scheduler's scaler with its model or its workload class in the metadata (`model: <id>` for a model's own workload, `class: <id>` for a consumer gated on a class), one workload class entry, and one source entry. Neither the planner nor the sequencer changes.
 
 **Code extension points** are narrow traits selected by a `kind` or `strategy` name in config: queue sources, policy strategies, and power actuators. A new policy strategy can run alongside the current one against recorded snapshots before it is switched on.
 
@@ -187,7 +188,7 @@ These hold regardless of policy or configuration, and every milestone's tests sh
 5. Safety-critical steps (allowing a model, powering a host off) require a reachability observation of the host newer than a configured bound (`safety_max_age`); otherwise the sequencer holds, and a switch waits as a whole (the old model stays) rather than leaving the GPU empty. Pod observations are not safety-critical: no decision reads them.
 6. The planner and sequencer are deterministic and have no side effects.
 7. Only the scheduler makes decisions; actuators carry them out and never decide.
-8. Work is switched away from early only for workload classes that declare it safe, or when the user forces it with a reclaim or a manual LLM lease; every switch, forced or not, gives in-flight jobs only a timeout (`drain_timeout`, a class's `kill_timeout`, or `reclaim_timeout`) to finish, except that a busy `none` class holds an unforced switch without one. An interactive lease pins its model against batch eviction.
+8. Work is switched away from early only for workload classes that declare it safe, or when the user forces it with a reclaim or a manual LLM lease; every switch, forced or not, gives in-flight jobs only a timeout (`drain_timeout`, a class's `kill_timeout`, or `reclaim_timeout`) to finish, except that a busy `none` class holds an unforced switch without one (and the bound assumes a stable intent; see the example in *Control loop and event model*). An interactive lease pins its model against batch eviction.
 9. Invalid configuration never replaces the last good configuration.
 
 ## Open questions

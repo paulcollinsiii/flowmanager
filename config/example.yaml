@@ -239,6 +239,7 @@ sources:
         # page_size=1: only the `count` of the document list is used.
         - url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=ocr-pending&page_size=1
           count: /count
+      # Accepted and ignored: this build has no webhook receiver, sources are polled only.
       webhook: { path: /hooks/paperless }
 
   - id: paperless-post-ocr

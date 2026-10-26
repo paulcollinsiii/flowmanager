@@ -5,6 +5,10 @@ handlers) reads from the cluster, and what it needs permission to do. Nothing is
 hand-listed in this repo: servers are discovered from labels. The conventions below
 come from `homesvr/ops/scripts/power.py`, which this replaces.
 
+> **For deploying the scheduler (`sched-service`) see `docs/kubernetes_setup.md`**: its image,
+> flags, Restate registration, Istio policy, RBAC, secrets and ScaledObjects. This file covers
+> the legacy power app and its conventions.
+
 > **Retired in M3: KEDA group gating.** The legacy app used to gate workloads itself
 > (`KedaGroup` / `KedaCatalog`: the `power.kaffi.internal/group` and `gpu-role` labels on
 > ScaledObjects, and the `autoscaling.keda.sh/paused-replicas` annotation it set and
