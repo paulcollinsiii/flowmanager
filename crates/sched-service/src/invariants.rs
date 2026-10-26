@@ -91,6 +91,29 @@ fn host_seen_down(config: &Config, snap: &Snapshot, res: &ResourceId, max_age: M
     })
 }
 
+/// Failed items fresh readings report for a class: `None` when its demand is unknown (as
+/// for `demand`), else the most any reading at the newest timestamp reports.
+fn failed_items(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<u64> {
+    let src = &class.demand.as_ref()?.source;
+    let seen: Vec<(u64, u64)> = snap
+        .observations
+        .iter()
+        .filter(|o| &o.source == src)
+        .filter_map(|o| match &o.value {
+            ObservedValue::Demand {
+                class: c, failed, ..
+            } if c == &class.id => Some((o.observed_at.as_u64(), *failed)),
+            _ => None,
+        })
+        .collect();
+    let latest = seen.iter().map(|x| x.0).max()?;
+    let (now, max_age) = (snap.now.as_u64(), config.policy().demand_max_age.as_u64());
+    if latest > now || now - latest > max_age {
+        return None;
+    }
+    seen.iter().filter(|x| x.0 == latest).map(|x| x.1).max()
+}
+
 /// Whether `model` is a configured model of `res`, read from the config's model list.
 fn model_of(config: &Config, res: &ResourceId, model: &ModelId) -> bool {
     config
@@ -531,6 +554,29 @@ pub fn check(
                             class.id
                         ));
                     }
+                }
+            }
+            // 9. A recovery runs only for a class in the allowed set (its model serving, not
+            // winding down) that has a recovery action, and only for failed items that a
+            // fresh reading reports. Recovery never runs for a model that is not allowed.
+            Step::RunRecovery { class } => {
+                let Some(spec) = config.class(class) else {
+                    continue;
+                };
+                if spec.recovery.is_none() {
+                    out.push(format!(
+                        "invariant 9: ran recovery for {class}, which declares none"
+                    ));
+                }
+                if !decision.allowed.classes.contains(class) {
+                    out.push(format!(
+                        "invariant 9: ran recovery for {class}, which is not in the allowed set"
+                    ));
+                }
+                if failed_items(config, snapshot, spec).is_none_or(|n| n == 0) {
+                    out.push(format!(
+                        "invariant 9: ran recovery for {class} without fresh failed items"
+                    ));
                 }
             }
             _ => {}

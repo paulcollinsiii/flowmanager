@@ -30,6 +30,8 @@ pub struct Metrics {
     observer_labels: Mutex<HashSet<String>>,
     phase_age: GaugeVec,
     state_errors: IntCounterVec,
+    recovery_runs: IntCounterVec,
+    recovery_requeues: IntCounterVec,
     /// Per (resource, axis), the phase whose series is set and when it began.
     phases: Mutex<HashMap<PhaseKey, (&'static str, Millis)>>,
 }
@@ -145,6 +147,26 @@ impl Metrics {
             &["key"],
         )
         .unwrap();
+        let recovery_runs = IntCounterVec::new(
+            Opts::new(
+                "sched_recovery_runs_total",
+                "Recovery action runs by class and outcome: ran, skipped_interval (min_interval has not passed), skipped_not_allowed (the class is not in the allowed set), not_wired (the class has no runnable action), list_failed, state_error",
+            ),
+            &["class", "outcome"],
+        )
+        .unwrap();
+        let recovery_requeues = IntCounterVec::new(
+            Opts::new(
+                "sched_recovery_requeues_total",
+                "Items the recovery action handled, by class and outcome: attempted (an attempt was recorded and the request sent), queued (the service accepted it), failed (the request failed or the answer said it was not queued), skipped_cap (the item used all its attempts), skipped_not_allowed (the model was no longer allowed before the request), deferred (over max_per_run, left for a later run)",
+            ),
+            &["class", "outcome"],
+        )
+        .unwrap();
+        registry.register(Box::new(recovery_runs.clone())).unwrap();
+        registry
+            .register(Box::new(recovery_requeues.clone()))
+            .unwrap();
         registry.register(Box::new(state_errors.clone())).unwrap();
         registry.register(Box::new(has_observer.clone())).unwrap();
         registry.register(Box::new(rejected.clone())).unwrap();
@@ -180,6 +202,8 @@ impl Metrics {
             observer_labels: Mutex::new(HashSet::new()),
             phase_age,
             state_errors,
+            recovery_runs,
+            recovery_requeues,
             phases: Mutex::new(HashMap::new()),
         }
     }
@@ -290,6 +314,22 @@ impl Metrics {
     /// Counts a failed read of the persisted state `key` (a fixed set of keys).
     pub fn persisted_state_error(&self, key: &str) {
         self.state_errors.with_label_values(&[key]).inc();
+    }
+
+    /// Counts one run of a class's recovery action by outcome (see the metric's help).
+    pub fn recovery_run(&self, class: &str, outcome: &str) {
+        self.recovery_runs
+            .with_label_values(&[class, outcome])
+            .inc();
+    }
+
+    /// Counts `n` items of a class's recovery action by outcome (see the metric's help).
+    pub fn recovery_requeue(&self, class: &str, outcome: &str, n: u64) {
+        if n > 0 {
+            self.recovery_requeues
+                .with_label_values(&[class, outcome])
+                .inc_by(n);
+        }
     }
 
     pub fn trigger_failed(&self) {

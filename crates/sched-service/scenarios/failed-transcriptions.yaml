@@ -1,0 +1,55 @@
+description: "Failed transcriptions alone bring whisperx in, and RunRecovery is emitted for the class in the tick that allows it and on every tick while it serves and items are still failed; once they are re-queued (no failed items) no recovery step is emitted, and the model is released only after idle_grace."
+initial_state:
+  resources:
+    cuda-central:
+      power: { phase: "on", since: 92800000 }
+      mode: { phase: idle }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0, failed: 2 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    expect:
+      steps: [{ type: allow_model, resource: cuda-central, model: whisperx }, { type: run_recovery, class: speakr-transcription }]
+      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+  # Still failed a minute later (the re-queue is paced by the action itself): emitted again.
+  - at: 100060000
+    refresh: true
+    expect:
+      steps: [{ type: run_recovery, class: speakr-transcription }]
+      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+  # Re-queued: the work shows as ready (stats), nothing failed.
+  - at: 100120000
+    observe:
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 2, in_flight: 0, failed: 0 } }
+    refresh: true
+    expect:
+      steps: []
+      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+  # Done. Idle clock starts here; grace is not over a minute before 10m.
+  - at: 100180000
+    observe:
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0, failed: 0 } }
+    refresh: true
+    expect:
+      steps: []
+  - at: 100779000
+    refresh: true
+    expect:
+      steps: []
+  - at: 100780000
+    refresh: true
+    expect:
+      steps: [{ type: pause_intake, class: speakr-transcription }, { type: drain_model, resource: cuda-central, model: whisperx }]
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }

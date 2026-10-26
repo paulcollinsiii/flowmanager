@@ -38,8 +38,30 @@ pub trait ObjectCtx: Sync {
     where
         T: Serialize + DeserializeOwned + Send + 'static,
         F: FnOnce() -> T + Send + 'static;
+    /// As [`ObjectCtx::run_journaled`] for a step that does I/O: the recorded result is
+    /// returned on a retry or replay and the future is not run again. The step's own errors
+    /// belong in `T`: a step that fails is recorded, never retried by Restate.
+    fn run_journaled_async<T, F>(
+        &self,
+        name: &'static str,
+        f: F,
+    ) -> BoxFut<'_, Result<T, HandlerError>>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: FnOnce() -> BoxFut<'static, T> + Send + 'static;
+    /// Stores `value` under `key` and does not return before it is durable: whatever runs
+    /// after this call may rely on it, even across a crash (a plain `set_raw` only counts
+    /// once the invocation completes or a later step is journaled).
+    fn record_durably<'a>(
+        &'a self,
+        key: &'a str,
+        value: Vec<u8>,
+    ) -> BoxFut<'a, Result<(), HandlerError>>;
     /// Asks for a `tick` once this invocation is done.
     fn request_tick(&self);
+    /// Sends the `Recovery` object of `class` a one-way request to run its action. It never
+    /// blocks this invocation: the `Recovery` object has its own lock.
+    fn request_recovery(&self, class: &str);
 }
 
 /// `acquire_model_lease` request.
@@ -164,6 +186,13 @@ pub async fn tick<C: ObjectCtx>(shared: &Arc<Shared>, ctx: &C) -> Result<TickRep
         }),
     );
     shared.publish(&outcome, !ran.load(Ordering::SeqCst));
+    // Recovery runs in its own object, after the allowed set is published (it re-checks it).
+    // Asked for on every tick that emits the step: the action is idempotent and gates itself.
+    for step in &outcome.report.steps {
+        if let sched_model::Step::RunRecovery { class } = step {
+            ctx.request_recovery(class.as_str());
+        }
+    }
     Ok(outcome.report)
 }
 
@@ -282,6 +311,24 @@ pub(crate) mod fake {
         /// Names of the steps whose closures ran in this attempt.
         pub ran: Mutex<Vec<String>>,
         pub ticks_requested: AtomicUsize,
+        /// Classes whose recovery was requested, in order.
+        pub recoveries: Mutex<Vec<String>>,
+        /// Values `get_raw` returned in this attempt, replayed on a retry as Restate does.
+        gets: Mutex<Vec<(String, Option<Vec<u8>>)>>,
+        get_replay: Mutex<VecDeque<(String, Option<Vec<u8>>)>>,
+        /// Simulated crash: at the n-th execution (1-based) of the named step in this
+        /// invocation the attempt fails, before the step runs (`Before`) or after it ran but
+        /// before its result was journaled (`After`).
+        crash: Mutex<Option<(String, usize, Crash)>>,
+        executions: Mutex<BTreeMap<String, usize>>,
+        /// Number of times each key was made durable by `record_durably`.
+        pub durable_writes: Mutex<Vec<String>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Crash {
+        Before,
+        After,
     }
 
     impl FakeCtx {
@@ -291,6 +338,25 @@ pub(crate) mod fake {
 
         pub fn ticks(&self) -> usize {
             self.ticks_requested.load(Ordering::SeqCst)
+        }
+
+        /// Makes the `n`-th execution (1-based) of step `name` fail (see [`Crash`]).
+        pub fn crash_at(&self, name: &str, n: usize, when: Crash) {
+            *self.crash.lock().unwrap() = Some((name.to_string(), n, when));
+            self.executions.lock().unwrap().clear();
+        }
+
+        fn should_crash(&self, name: &str) -> Option<Crash> {
+            let n = {
+                let mut e = self.executions.lock().unwrap();
+                let c = e.entry(name.to_string()).or_insert(0);
+                *c += 1;
+                *c
+            };
+            match &*self.crash.lock().unwrap() {
+                Some((nm, at, when)) if nm == name && *at == n => Some(*when),
+                _ => None,
+            }
         }
 
         pub fn put(&self, key: &str, value: &[u8]) {
@@ -314,6 +380,9 @@ pub(crate) mod fake {
             self.journal.lock().unwrap().clear();
             self.replay.lock().unwrap().clear();
             self.ran.lock().unwrap().clear();
+            self.gets.lock().unwrap().clear();
+            self.get_replay.lock().unwrap().clear();
+            *self.crash.lock().unwrap() = None;
         }
 
         /// The attempt failed after its steps were journaled: its writes are lost, and the
@@ -323,6 +392,11 @@ pub(crate) mod fake {
             let j = std::mem::take(&mut *self.journal.lock().unwrap());
             *self.replay.lock().unwrap() = j.into();
             self.ran.lock().unwrap().clear();
+            let g = std::mem::take(&mut *self.gets.lock().unwrap());
+            *self.get_replay.lock().unwrap() = g.into();
+            self.executions.lock().unwrap().clear();
+            // A crash is simulated once: the retry runs without it.
+            *self.crash.lock().unwrap() = None;
         }
 
         pub fn stored(&self, key: &str) -> Option<Vec<u8>> {
@@ -335,10 +409,20 @@ pub(crate) mod fake {
             &'a self,
             key: &'a str,
         ) -> BoxFut<'a, Result<Option<Vec<u8>>, HandlerError>> {
-            let v = match self.pending.lock().unwrap().get(key) {
-                Some(v) => v.clone(),
-                None => self.store.lock().unwrap().get(key).cloned(),
+            // A retry sees what the first attempt read (Restate journals reads), plus
+            // nothing newer; a first attempt reads the pending write, else the store.
+            let replayed = self.get_replay.lock().unwrap().pop_front();
+            let v = match replayed {
+                Some((k, v)) => {
+                    assert_eq!(k, key, "replay out of order: journal has a read of {k}");
+                    v
+                }
+                None => match self.pending.lock().unwrap().get(key) {
+                    Some(v) => v.clone(),
+                    None => self.store.lock().unwrap().get(key).cloned(),
+                },
             };
+            self.gets.lock().unwrap().push((key.to_string(), v.clone()));
             Box::pin(async move { Ok(v) })
         }
 
@@ -384,9 +468,78 @@ pub(crate) mod fake {
             Box::pin(async move { Ok(v) })
         }
 
+        fn run_journaled_async<T, F>(
+            &self,
+            name: &'static str,
+            f: F,
+        ) -> BoxFut<'_, Result<T, HandlerError>>
+        where
+            T: Serialize + DeserializeOwned + Send + 'static,
+            F: FnOnce() -> BoxFut<'static, T> + Send + 'static,
+        {
+            let replayed = self.replay.lock().unwrap().pop_front();
+            let crash = match replayed {
+                Some(_) => None,
+                None => self.should_crash(name),
+            };
+            Box::pin(async move {
+                let json = match replayed {
+                    Some((n, json)) => {
+                        assert_eq!(
+                            n, name,
+                            "replay out of order: journal has {n}, code runs {name}"
+                        );
+                        json
+                    }
+                    None => {
+                        if crash == Some(Crash::Before) {
+                            return Err(crash_error(name));
+                        }
+                        self.ran.lock().unwrap().push(name.to_string());
+                        let value = f().await;
+                        if crash == Some(Crash::After) {
+                            return Err(crash_error(name));
+                        }
+                        serde_json::to_string(&value).unwrap()
+                    }
+                };
+                self.journal
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), json.clone()));
+                Ok(serde_json::from_str(&json).unwrap())
+            })
+        }
+
+        fn record_durably<'a>(
+            &'a self,
+            key: &'a str,
+            value: Vec<u8>,
+        ) -> BoxFut<'a, Result<(), HandlerError>> {
+            // The write is applied to the store at once (it survives a crash of this
+            // attempt) and a replay applies the same write again.
+            let crash = self.should_crash(&format!("record:{key}"));
+            Box::pin(async move {
+                if crash == Some(Crash::Before) {
+                    return Err(crash_error("record"));
+                }
+                self.store.lock().unwrap().insert(key.to_string(), value);
+                self.durable_writes.lock().unwrap().push(key.to_string());
+                Ok(())
+            })
+        }
+
         fn request_tick(&self) {
             self.ticks_requested.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn request_recovery(&self, class: &str) {
+            self.recoveries.lock().unwrap().push(class.to_string());
+        }
+    }
+
+    fn crash_error(at: &str) -> HandlerError {
+        HandlerError::from(std::io::Error::other(format!("simulated crash at {at}")))
     }
 }
 
@@ -487,6 +640,72 @@ mod tests {
         assert!(r2.allowed_models.contains(&"mineru".into()), "{r2:?}");
         // Serving since the first tick: the dwell clock carried across the restart.
         assert_eq!(gpu_mode(&ctx), allowed_at);
+    }
+
+    fn failed_transcriptions(s: &Shared, failed: u64) {
+        push(
+            s,
+            "speakr-pending",
+            vec![ObservedValue::Demand {
+                class: "speakr-transcription".into(),
+                ready: 0,
+                in_flight: 0,
+                failed,
+                oldest_ready_at: None,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tick_with_failed_items_asks_the_recovery_object_after_publishing() {
+        let (s, _) = process();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        failed_transcriptions(&s, 2);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.allowed_models, vec![ModelId::from("whisperx")], "{r:?}");
+        // The step is reported as carried out (not in `not_executed`), the object asked once.
+        assert!(
+            r.steps
+                .iter()
+                .any(|st| matches!(st, sched_model::Step::RunRecovery { .. })),
+            "{:?}",
+            r.steps
+        );
+        assert!(r.not_executed.is_empty(), "{:?}", r.not_executed);
+        assert_eq!(*ctx.recoveries.lock().unwrap(), ["speakr-transcription"]);
+        // A recovery request is made on every tick that emits the step (it is cheap and
+        // gates itself), and never from a tick without failed items.
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert!(r.error.is_none());
+        assert_eq!(ctx.recoveries.lock().unwrap().len(), 2);
+        failed_transcriptions(&s, 0);
+        tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(ctx.recoveries.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_retried_tick_does_not_decide_again_and_the_request_follows_the_journaled_decision() {
+        let (s, _) = process();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        failed_transcriptions(&s, 2);
+        tick(&s, &ctx).await.unwrap();
+        ctx.crash_and_retry();
+        // The retry reads the same state, replays the decision, and asks again for the same
+        // class (Restate journals the send, so the call is made once).
+        let before = ctx.recoveries.lock().unwrap().len();
+        let r = tick(&s, &ctx).await.unwrap();
+        assert_eq!(ctx.ran().len(), 0, "decided once");
+        assert!(
+            r.steps
+                .iter()
+                .any(|st| matches!(st, sched_model::Step::RunRecovery { .. }))
+        );
+        assert_eq!(ctx.recoveries.lock().unwrap().len(), before + 1);
     }
 
     /// `scheduler_state` as the build before the queue-only change stored it: version 1,

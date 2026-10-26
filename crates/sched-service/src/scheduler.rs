@@ -22,6 +22,9 @@
 //! - `last_decision`: the latest tick report this process published (kept in memory, so
 //!   the report is journaled once per tick; `null` until the first tick of the process).
 //!
+//! A second object, `Recovery` (one instance per class, below), carries out recovery actions
+//! beside the ticks; the `tick` handler only sends it a one-way request.
+//!
 //! Durable state (the object's Restate state, see [`crate::persist`]): `scheduler_state`
 //! (the sequencer state and which sources have ever reported), `lease_book`, and
 //! `backstop_epoch`. The observation cache lives in this process, not in Restate:
@@ -42,7 +45,8 @@ use crate::leases::LeaseGrant;
 use crate::object::{
     self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseLease, TickAck,
 };
-use crate::persist::{EPOCH_KEY, LEASES_KEY};
+use crate::persist::{EPOCH_KEY, LEASES_KEY, RECOVERY_KEY};
+use crate::recovery::{self, DiscardAttempts, Env, RunAck};
 use crate::tick::{Shared, TickReport};
 
 /// The key of the single scheduler instance.
@@ -126,11 +130,51 @@ impl ObjectCtx for Rctx<'_, '_> {
         })
     }
 
+    fn run_journaled_async<T, F>(
+        &self,
+        name: &'static str,
+        f: F,
+    ) -> BoxFut<'_, Result<T, HandlerError>>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: FnOnce() -> BoxFut<'static, T> + Send + 'static,
+    {
+        Box::pin(async move {
+            let Json(v) = self
+                .0
+                .run(move || async move { Ok(Json(f().await)) })
+                .name(name)
+                .await?;
+            Ok(v)
+        })
+    }
+
+    fn record_durably<'a>(
+        &'a self,
+        key: &'a str,
+        value: Vec<u8>,
+    ) -> BoxFut<'a, Result<(), HandlerError>> {
+        // A journaled step completes only after every command before it (the state write)
+        // is stored, so once it has returned the write survives a crash.
+        Box::pin(async move {
+            self.0.set(key, value);
+            self.0
+                .run(|| async { Ok(Json(0u8)) })
+                .name("durable_barrier")
+                .await?;
+            Ok(())
+        })
+    }
+
     fn request_tick(&self) {
         self.0
             .object_client::<SchedulerClient>(self.0.key())
             .tick()
             .send();
+    }
+
+    fn request_recovery(&self, class: &str) {
+        self.0.object_client::<RecoveryClient>(class).run().send();
     }
 }
 
@@ -284,6 +328,58 @@ impl Scheduler {
     }
 }
 
+/// The recovery action of one class (the object key is the class id), kept apart from the
+/// `Scheduler` so that its requests never hold up a tick (see [`crate::recovery`]). Its state
+/// is the key `recovery_attempts` (versioned).
+///
+/// Handlers:
+/// - `run`: one run of the class's recovery action. Sent by the `tick` handler, one way,
+///   whenever the decision carries a `RunRecovery` step for the class.
+/// - `discard_attempts`: the recovery path for an attempts document that cannot be read.
+/// - `attempts`: the stored document, as text (`null` if none).
+pub struct Recovery {
+    shared: Arc<Shared>,
+    env: Env,
+}
+
+impl Recovery {
+    pub fn new(shared: Arc<Shared>, env: Env) -> Recovery {
+        Recovery { shared, env }
+    }
+}
+
+#[object]
+impl Recovery {
+    /// Runs the class's recovery action once (the key is the class id).
+    #[handler]
+    async fn run(&self, ctx: ObjectContext<'_>) -> Result<Json<RunAck>, HandlerError> {
+        let class = ctx.key().to_string();
+        Ok(Json(
+            recovery::run(&self.shared, &self.env, &Rctx(&ctx), &class).await?,
+        ))
+    }
+
+    /// Discards an attempts document that cannot be read; a readable one only with `force`.
+    #[handler]
+    async fn discard_attempts(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<DiscardAttempts>,
+    ) -> Result<Json<Option<String>>, HandlerError> {
+        Ok(Json(recovery::discard_attempts(&Rctx(&ctx), req).await?))
+    }
+
+    /// The stored attempts document, as text.
+    #[handler]
+    async fn attempts(
+        &self,
+        ctx: SharedObjectContext<'_>,
+    ) -> Result<Json<Option<String>>, HandlerError> {
+        let raw = ctx.get::<Vec<u8>>(RECOVERY_KEY).await?;
+        Ok(Json(raw.map(|b| String::from_utf8_lossy(&b).into_owned())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +455,16 @@ mod tests {
             ]
         );
         assert_eq!(d.ingress_private, None);
+    }
+
+    #[test]
+    fn the_recovery_object_is_registered_with_its_own_handlers() {
+        use restate_sdk::service::Discoverable;
+        let d = <Recovery as Discoverable>::discover();
+        let mut seen: Vec<String> = d.handlers.iter().map(|h| h.name.to_string()).collect();
+        seen.sort();
+        assert_eq!(seen, ["attempts", "discard_attempts", "run"]);
+        assert!(d.handlers.iter().all(|h| h.ingress_private.is_none()));
     }
 
     #[test]

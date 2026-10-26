@@ -15,9 +15,9 @@ use sched_model::Millis;
 use sched_service::clock::SystemClock;
 use sched_service::config_source::{ConfigHolder, watch_file};
 use sched_service::metrics::Metrics;
-use sched_service::scheduler::Scheduler;
+use sched_service::scheduler::{Recovery, Scheduler};
 use sched_service::tick::Shared;
-use sched_service::{keda_scaler, metrics_server, runtime};
+use sched_service::{keda_scaler, metrics_server, recovery, runtime};
 
 fn duration(text: &str) -> Result<Duration, String> {
     Millis::parse(text).map(|m| Duration::from_millis(m.as_u64()))
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         generation = holder.current().generation(),
         path = %args.config.display(),
-        "scheduler starting; state is kept in Restate; power, kill and recovery steps are not executed (no actuator)"
+        "scheduler starting; state is kept in Restate; the recovery action runs in the Recovery object; power and kill steps are not executed (no actuator)"
     );
 
     let (tx, rx) = runtime::report_channel();
@@ -124,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(addr = %args.listen, "serving the Restate endpoint");
     HttpServer::new(
         Endpoint::builder()
+            .bind(Recovery::new(Arc::clone(&shared), recovery::process_env()))
             .bind(Scheduler::new(shared, args.backstop))
             .build(),
     )

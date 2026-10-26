@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 
+use sched_actuate::AttemptBook;
 use sched_model::{SchedState, SourceId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,9 @@ use crate::leases::LeaseBook;
 pub const STATE_KEY: &str = "scheduler_state";
 /// The lease book ([`LeaseBook`]).
 pub const LEASES_KEY: &str = "lease_book";
+/// The recovery action's attempts, kept by the `Recovery` object under the key of each
+/// class ([`sched_actuate::AttemptBook`]).
+pub const RECOVERY_KEY: &str = "recovery_attempts";
 /// The backstop chain's epoch (a plain number, not versioned).
 pub const EPOCH_KEY: &str = "backstop_epoch";
 
@@ -35,6 +39,9 @@ pub const EPOCH_KEY: &str = "backstop_epoch";
 pub const STATE_VERSION: u32 = 1;
 /// Version of the [`LeaseBook`] document this build reads and writes.
 pub const LEASES_VERSION: u32 = 1;
+
+/// Version of the [`AttemptBook`] document this build reads and writes.
+pub const RECOVERY_VERSION: u32 = 1;
 
 /// The keys a tick or a lease request may fail to read, and the recovery handler may clear.
 pub const DOCUMENT_KEYS: [&str; 2] = [STATE_KEY, LEASES_KEY];
@@ -122,6 +129,14 @@ pub fn decode_leases(raw: Option<&[u8]>) -> Result<LeaseBook, StateError> {
     decode(LEASES_KEY, LEASES_VERSION, raw)
 }
 
+pub fn decode_attempts(raw: Option<&[u8]>) -> Result<AttemptBook, StateError> {
+    decode(RECOVERY_KEY, RECOVERY_VERSION, raw)
+}
+
+pub fn encode_attempts(b: &AttemptBook) -> Vec<u8> {
+    encode(RECOVERY_VERSION, b)
+}
+
 pub fn encode_state(s: &CoreState) -> Vec<u8> {
     encode(STATE_VERSION, s)
 }
@@ -143,6 +158,20 @@ mod tests {
         assert_eq!(decode_leases(None).unwrap(), LeaseBook::default());
         let text = String::from_utf8(encode_state(&s)).unwrap();
         assert!(text.starts_with("{\"version\":1,\"data\":"), "{text}");
+    }
+
+    #[test]
+    fn attempts_are_a_versioned_document_of_their_own() {
+        let mut b = AttemptBook::default();
+        b.record("7", sched_model::Millis(5));
+        let bytes = encode_attempts(&b);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.starts_with("{\"version\":1,\"data\":"), "{text}");
+        assert_eq!(decode_attempts(Some(&bytes)).unwrap(), b);
+        assert_eq!(decode_attempts(None).unwrap(), AttemptBook::default());
+        let e = decode_attempts(Some(br#"{"version":2,"data":{}}"#)).unwrap_err();
+        assert_eq!(e.key, RECOVERY_KEY);
+        assert!(e.problem.contains("version 2"), "{e}");
     }
 
     #[test]

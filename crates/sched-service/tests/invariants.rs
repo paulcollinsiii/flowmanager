@@ -591,3 +591,87 @@ fn tied_reachability_readings_count_as_up_only_when_every_reading_is_up() {
     );
     assert!(v.is_empty(), "{v:?}");
 }
+
+fn failed_transcriptions(n: u64, at: u64) -> sched_model::Observation {
+    sched_model::Observation {
+        source: "speakr-pending".into(),
+        observed_at: Millis(at),
+        fidelity: sched_model::Fidelity::Polled,
+        value: sched_model::ObservedValue::Demand {
+            class: ClassId::new("speakr-transcription"),
+            ready: 0,
+            in_flight: 0,
+            failed: n,
+            oldest_ready_at: None,
+        },
+    }
+}
+
+#[test]
+fn recovery_for_a_class_that_is_not_allowed_or_has_no_failed_items_is_a_violation() {
+    let rec = || {
+        vec![Step::RunRecovery {
+            class: ClassId::new("speakr-transcription"),
+        }]
+    };
+    let with = |obs: sched_model::Observation, allowed: bool| {
+        let mut o = zero_pods_and_up(&["cuda-central"]);
+        o.push(obs);
+        let mut d = decision(rec());
+        if allowed {
+            d.allowed
+                .classes
+                .insert(ClassId::new("speakr-transcription"));
+        }
+        // Only this invariant's messages: the allowed set is hand-made here.
+        check(
+            &example_config(),
+            &snap(o, vec![]),
+            &SchedState::default(),
+            &Intent::default(),
+            &d,
+        )
+        .into_iter()
+        .filter(|m| m.contains("invariant 9"))
+        .collect::<Vec<_>>()
+    };
+    // The class is in the allowed set and failed items are reported: no violation.
+    let v = with(failed_transcriptions(2, NOW), true);
+    assert!(v.is_empty(), "{v:?}");
+    // Not in the allowed set.
+    let v = with(failed_transcriptions(2, NOW), false);
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 9") && m.contains("not in the allowed set")),
+        "{v:?}"
+    );
+    // No failed items.
+    let v = with(failed_transcriptions(0, NOW), true);
+    assert!(
+        v.iter().any(|m| m.contains("without fresh failed items")),
+        "{v:?}"
+    );
+    // Stale failed items are unknown, not failed.
+    let v = with(failed_transcriptions(2, NOW - 11 * MIN), true);
+    assert!(
+        v.iter().any(|m| m.contains("without fresh failed items")),
+        "{v:?}"
+    );
+    // A class that declares no recovery.
+    let mut d = decision(vec![Step::RunRecovery {
+        class: ClassId::new("paperless-ocr"),
+    }]);
+    d.allowed.classes.insert(ClassId::new("paperless-ocr"));
+    let v = check(
+        &example_config(),
+        &snap(zero_pods_and_up(&["cuda-central"]), vec![]),
+        &SchedState::default(),
+        &Intent::default(),
+        &d,
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 9") && m.contains("declares none")),
+        "{v:?}"
+    );
+}

@@ -11,9 +11,11 @@
 //! it take effect once the scaler converges on it. A paused class leaves the set too, but
 //! nothing scales on a demand class (consumers are not gated for GPU contention), so
 //! `PauseIntake` stops nobody. `KillInFlight` has no actuator either: the work is cut off
-//! because the same tick withdraws its model. Powering a host on or off and recovery
-//! actions have no actuator in this build. All of these are listed in
-//! `not_executed` and logged as such.
+//! because the same tick withdraws its model. Powering a host on or off has no actuator in
+//! this build. All of these are listed in `not_executed` and logged as such. A recovery
+//! action is carried out, but not here: after publishing, the `tick` handler sends the
+//! class's `Recovery` object a one-way request (see `recovery`), so a slow or failing
+//! service can never delay a tick.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,7 +124,7 @@ pub struct TickReport {
     pub reason: String,
     pub steps: Vec<Step>,
     /// The steps nothing in this build carries out (power on/off, stopping in-flight work,
-    /// recovery actions, pausing a class's intake). The sequencer has recorded them as taken
+    /// pausing a class's intake). `RunRecovery` is carried out by the `Recovery` object. The sequencer has recorded them as taken
     /// all the same.
     #[serde(default)]
     pub not_executed: Vec<Step>,
@@ -296,6 +298,16 @@ impl Shared {
     /// the first tick of this process has been published, then the latest tick's set.
     pub fn subscribe_allowed(&self) -> watch::Receiver<Option<PublishedAllowed>> {
         self.allowed.subscribe()
+    }
+
+    /// Whether the allowed set this process published contains `class`: its model is
+    /// serving and not winding down, its hosts are up, no reclaim. False until a tick has
+    /// been published, so nothing runs on a guess.
+    pub fn class_is_allowed(&self, class: &ClassId) -> bool {
+        self.allowed
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.allowed.classes.contains(class))
     }
 
     /// The allowed set currently published.

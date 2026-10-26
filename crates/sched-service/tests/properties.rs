@@ -28,7 +28,8 @@ struct Raw {
     dt: u64,
     pods: Vec<Option<(u32, u32)>>,
     up: Vec<Option<bool>>,
-    demand: Vec<Option<(u64, u64, u64)>>,
+    /// (ready, in_flight, age of the oldest ready item, failed)
+    demand: Vec<Option<(u64, u64, u64, u64)>>,
     leases: Option<Vec<usize>>,
     refresh: bool,
 }
@@ -42,7 +43,7 @@ fn raw() -> impl Strategy<Value = Raw> {
         ),
         prop::collection::vec(prop::option::weighted(0.8, any::<bool>()), 2),
         prop::collection::vec(
-            prop::option::weighted(0.7, (0u64..4, 0u64..3, 0u64..4_000_000)),
+            prop::option::weighted(0.7, (0u64..4, 0u64..3, 0u64..4_000_000, 0u64..3)),
             7,
         ),
         prop::option::weighted(0.3, prop::collection::vec(0usize..8, 0..4)),
@@ -133,13 +134,13 @@ fn scenario(frames: &[Raw]) -> Scenario {
             }
         }
         for ((c, s), d) in CLASSES.iter().zip(&r.demand) {
-            if let Some((ready, in_flight, age)) = d {
+            if let Some((ready, in_flight, age, failed)) = d {
                 observe.push(Observe {
                     source: SourceId::new(*s),
                     observed_at: None,
                     fidelity: Fidelity::Polled,
                     value: ObservedValue::Demand {
-                        failed: 0,
+                        failed: *failed,
                         class: ClassId::new(*c),
                         ready: *ready,
                         in_flight: *in_flight,

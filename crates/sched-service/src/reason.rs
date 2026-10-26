@@ -104,15 +104,18 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps, pinned: bool) -> Vec<&'static st
 /// gate classes, whose requirements are hosts, gate a consumer), so a `PauseIntake` does not
 /// stop anyone taking new work. `KillInFlight` has no actuator of its own either: the work
 /// is cut off because the same tick withdraws its model (KEDA scales the workload to 0).
-/// Powering a host on or off and running a recovery action have no actuator yet.
+/// Powering a host on or off has no actuator yet. `RunRecovery` is carried out: the tick
+/// sends the class's `Recovery` object a request, which runs the action (config load refuses
+/// an action this build cannot run, and the sequencer emits the step only for such a class).
 pub fn not_executed_note(step: &Step) -> Option<&'static str> {
     match step {
-        Step::PowerOn { .. } | Step::PowerOff { .. } | Step::RunRecovery { .. } => {
-            Some(NOT_EXECUTED)
-        }
+        Step::PowerOn { .. } | Step::PowerOff { .. } => Some(NOT_EXECUTED),
         Step::KillInFlight { .. } => Some(NOT_EXECUTED_KILL),
         Step::PauseIntake { .. } => Some(NOT_EXECUTED_PAUSE),
-        Step::Wait { .. } | Step::AllowModel { .. } | Step::DrainModel { .. } => None,
+        Step::Wait { .. }
+        | Step::AllowModel { .. }
+        | Step::DrainModel { .. }
+        | Step::RunRecovery { .. } => None,
     }
 }
 
@@ -124,7 +127,7 @@ pub fn not_executed(step: &Step) -> bool {
 /// Appended to the reason of a step that has no actuator in this build.
 pub const NOT_EXECUTED: &str = " [NOT EXECUTED: no actuator for this step in this build]";
 /// Appended to the reason of a `KillInFlight` step.
-pub const NOT_EXECUTED_KILL: &str = " [NOT EXECUTED: nothing stops the work directly; it ends because the model is withdrawn (its workload is scaled to 0), and the class's recovery, if any, is not run either]";
+pub const NOT_EXECUTED_KILL: &str = " [NOT EXECUTED: nothing stops the work directly; it ends because the model is withdrawn (its workload is scaled to 0), and the class's recovery, which re-queues failed items, runs while its model is allowed, not after the cut-off]";
 /// Appended to the reason of a `PauseIntake` step.
 pub const NOT_EXECUTED_PAUSE: &str = " [NOT EXECUTED: consumers are not gated on their demand class, so nothing stops them taking new work; the class only leaves the allowed set]";
 
@@ -188,7 +191,9 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
             )
         }
         Step::RunRecovery { class } => {
-            format!("run recovery for {class}: its in-flight work was stopped")
+            format!(
+                "run recovery for {class}: items failed while its model is allowed; the Recovery object re-queues them, bounded per item and per run (see sched_recovery_* metrics)"
+            )
         }
     }
 }
@@ -460,6 +465,21 @@ mod tests {
             "{withdraw}"
         );
         assert!(!withdraw.contains("NOT EXECUTED"), "{withdraw}");
+        // Running a recovery is carried out too, and its reason says what happens.
+        let rec = reason(
+            &intent(),
+            &[Step::RunRecovery {
+                class: "speakr-transcription".into(),
+            }],
+            &DemandGaps::default(),
+        );
+        assert!(
+            rec.contains(
+                "run recovery for speakr-transcription: items failed while its model is allowed"
+            ),
+            "{rec}"
+        );
+        assert!(!rec.contains("NOT EXECUTED"), "{rec}");
         for (step, want) in [
             (
                 Step::PowerOff {
@@ -467,7 +487,8 @@ mod tests {
                 },
                 true,
             ),
-            (Step::RunRecovery { class: "c".into() }, true),
+            // Carried out by the class's Recovery object.
+            (Step::RunRecovery { class: "c".into() }, false),
             (Step::KillInFlight { class: "c".into() }, true),
             (Step::PauseIntake { class: "c".into() }, true),
             (
