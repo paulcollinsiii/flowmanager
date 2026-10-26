@@ -287,6 +287,7 @@ mod tests {
 
     fn demand(class: &str, ready: u64, oldest: Option<u64>) -> ObservedValue {
         ObservedValue::Demand {
+            failed: 0,
             class: class.into(),
             ready,
             in_flight: 0,

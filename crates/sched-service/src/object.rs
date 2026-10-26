@@ -445,6 +445,7 @@ mod tests {
             s,
             "paperless-ocr-pending",
             vec![ObservedValue::Demand {
+                failed: 0,
                 class: "paperless-ocr".into(),
                 ready,
                 in_flight: 0,
@@ -512,6 +513,7 @@ mod tests {
             &s,
             "speakr-pending",
             vec![ObservedValue::Demand {
+                failed: 0,
                 class: "speakr-transcription".into(),
                 ready: 2,
                 in_flight: 0,

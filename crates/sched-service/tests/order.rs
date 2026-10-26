@@ -56,6 +56,7 @@ fn demand(
         source,
         at,
         ObservedValue::Demand {
+            failed: 0,
             class: ClassId::new(class),
             ready,
             in_flight,

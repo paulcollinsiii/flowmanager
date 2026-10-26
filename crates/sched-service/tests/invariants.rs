@@ -138,6 +138,7 @@ fn in_flight_ocr() -> sched_model::Observation {
         observed_at: Millis(NOW),
         fidelity: sched_model::Fidelity::Polled,
         value: sched_model::ObservedValue::Demand {
+            failed: 0,
             class: ClassId::new("paperless-ocr"),
             ready: 1,
             in_flight: 1,
@@ -248,6 +249,7 @@ fn killing_a_class_with_nothing_in_flight_is_a_violation() {
     let mut obs = zero_pods_and_up(&["cuda-central"]);
     let mut idle = in_flight_ocr();
     idle.value = sched_model::ObservedValue::Demand {
+        failed: 0,
         class: ClassId::new("paperless-ocr"),
         ready: 1,
         in_flight: 0,
@@ -317,6 +319,7 @@ fn idle_demand() -> Vec<sched_model::Observation> {
         observed_at: Millis(NOW),
         fidelity: sched_model::Fidelity::Polled,
         value: sched_model::ObservedValue::Demand {
+            failed: 0,
             class: ClassId::new(*c),
             ready: 0,
             in_flight: 0,

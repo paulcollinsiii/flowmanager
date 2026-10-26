@@ -2,11 +2,23 @@
 //!
 //! Model selection:
 //! 1. A model's *priority* is the highest priority among its classes that have runnable
-//!    ready work. Higher priority tiers win.
+//!    work: ready items, or failed ones (see below). Higher priority tiers win.
 //! 2. A model with a ready queue older than `age_threshold` is *starved* and ranks above
 //!    every tier; among starved models the usual order applies.
 //! 3. Within a tier, the model whose oldest ready item has waited longest wins, then the
 //!    lower `load_time` (switch cost), then the lower id.
+//!
+//! *Failed* items (a separate demand bucket, waiting for the class's recovery action to
+//! re-queue them) make their model wanted, at the class's normal priority, so the model
+//! is brought in to re-queue them. They are not ready work: they have no age (a model
+//! wanted only for failed items ranks as if its oldest item arrived this instant, so it
+//! never starves and loses ties on age to real work of the same priority), and failed
+//! items never hold a model: for the model currently serving they count as nothing, so
+//! they neither keep it from going idle (`idle_grace` counts as for any idle model) nor
+//! make it the pick when it is released. A failed-only model that was just loaded and
+//! has re-queued its items is therefore released after the usual `min_dwell` and
+//! `idle_grace`, not longer. Failed items stay listed only for the source's `since`
+//! window, which bounds how long they can bring a model in.
 //!
 //! A loaded model keeps serving while it has work (exhaustive). It yields to the best
 //! *other* candidate only when it has been allowed for at least `min_dwell` (counted from
@@ -124,9 +136,14 @@ fn target_for(
         return (l.pinned_model(now).cloned(), false);
     }
 
-    let candidates = candidates(config, snap, state, resource);
     let policy = config.policy();
     let mode = state.resource(resource).map(|s| &s.mode);
+    // Failed items bring a model in but never keep or re-pick the one serving.
+    let serving = match mode {
+        Some(ModePhase::Serving { model, .. }) => Some(model),
+        _ => None,
+    };
+    let candidates = candidates(config, snap, state, resource, serving);
     // A model the config no longer has on this resource is not loaded as far as the policy
     // is concerned: it gets no dwell and no grace, and the best candidate is chosen.
     let configured = |m: &ModelId| config.model(m).is_some_and(|s| &s.resource == resource);
@@ -200,10 +217,11 @@ fn candidates(
     snap: &Snapshot,
     state: &SchedState,
     resource: &ResourceId,
+    serving: Option<&ModelId>,
 ) -> Vec<Candidate> {
     config
         .models_of(resource)
-        .filter_map(|m| candidate(config, snap, state, m))
+        .filter_map(|m| candidate(config, snap, state, m, serving != Some(&m.id)))
         .collect()
 }
 
@@ -212,6 +230,7 @@ fn candidate(
     snap: &Snapshot,
     state: &SchedState,
     m: &ModelSpec,
+    count_failed: bool,
 ) -> Option<Candidate> {
     let now = snap.now;
     let mut top: Option<u64> = None;
@@ -219,13 +238,19 @@ fn candidate(
     let mut starved = false;
     for class in classes_of_model(config, &m.id) {
         let w = class_work(config, snap, class);
-        if w.ready == 0 || !runnable(config, snap, state, class) {
+        let wanted = w.ready > 0 || (count_failed && w.failed > 0);
+        if !wanted || !runnable(config, snap, state, class) {
             continue;
         }
         top = top.max(Some(u64::from(class.priority)));
-        let at = w.oldest_ready_at.unwrap_or(now);
-        oldest = Some(oldest.map_or(at, |o| o.min(at)));
-        starved |= now.saturating_sub(at) > config.policy().age_threshold;
+        if w.ready > 0 {
+            let at = w.oldest_ready_at.unwrap_or(now);
+            oldest = Some(oldest.map_or(at, |o| o.min(at)));
+            starved |= now.saturating_sub(at) > config.policy().age_threshold;
+        } else {
+            // Failed items only: no age, so no starvation, and last in a tie of ages.
+            oldest = Some(oldest.map_or(now, |o| o.min(now)));
+        }
     }
     Some(Candidate {
         model: m.id.clone(),

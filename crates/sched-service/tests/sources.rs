@@ -52,6 +52,7 @@ fn demand(source: &str, class: &str, at: u64, ready: u64, oldest: Option<u64>) -
         source,
         at,
         ObservedValue::Demand {
+            failed: 0,
             class: ClassId::new(class),
             ready,
             in_flight: 0,

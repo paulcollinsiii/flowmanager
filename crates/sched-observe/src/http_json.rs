@@ -245,22 +245,36 @@ pub fn extract_number(doc: &Value, ptr: &str) -> Result<u64, ExtractError> {
         .ok_or_else(|| ExtractError::NotANumber(ptr.to_string()))
 }
 
-/// The sum rule: numbers counting as ready and as in flight are each added up.
-pub fn totals(parts: &[(CountsAs, u64)]) -> (u64, u64) {
-    parts.iter().fold((0, 0), |(r, i), (kind, n)| match kind {
-        CountsAs::Ready => (r.saturating_add(*n), i),
-        CountsAs::InFlight => (r, i.saturating_add(*n)),
+/// What a poll found: the sums of the numbers counting as ready, in flight and failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Totals {
+    pub ready: u64,
+    pub in_flight: u64,
+    pub failed: u64,
+}
+
+/// The sum rule: numbers counting as ready, in flight and failed are each added up.
+pub fn totals(parts: &[(CountsAs, u64)]) -> Totals {
+    parts.iter().fold(Totals::default(), |mut t, (kind, n)| {
+        let bucket = match kind {
+            CountsAs::Ready => &mut t.ready,
+            CountsAs::InFlight => &mut t.in_flight,
+            CountsAs::Failed => &mut t.failed,
+        };
+        *bucket = bucket.saturating_add(*n);
+        t
     })
 }
 
 /// One demand observation per class that takes its demand from this source.
-pub fn demand_values(classes: &[ClassId], ready: u64, in_flight: u64) -> Vec<ObservedValue> {
+pub fn demand_values(classes: &[ClassId], totals: Totals) -> Vec<ObservedValue> {
     classes
         .iter()
         .map(|class| ObservedValue::Demand {
             class: class.clone(),
-            ready,
-            in_flight,
+            ready: totals.ready,
+            in_flight: totals.in_flight,
+            failed: totals.failed,
             oldest_ready_at: None,
         })
         .collect()
@@ -443,11 +457,10 @@ pub async fn poll_at(
             Err(e) => return fail(format!("request {i} ({}): {e}", redact_url(&req.url))),
         }
     }
-    let (ready, in_flight) = totals(&parts);
     Report::Observed {
         source: spec.id.clone(),
         fidelity: Fidelity::Polled,
-        values: demand_values(classes, ready, in_flight),
+        values: demand_values(classes, totals(&parts)),
     }
 }
 
@@ -574,9 +587,18 @@ mod tests {
     #[test]
     fn totals_sum_by_role() {
         use CountsAs::*;
-        assert_eq!(totals(&[(Ready, 2), (InFlight, 5), (Ready, 3)]), (5, 5));
-        assert_eq!(totals(&[(Ready, u64::MAX), (Ready, 1)]).0, u64::MAX);
-        assert_eq!(totals(&[]), (0, 0));
+        let t = |ready, in_flight, failed| Totals {
+            ready,
+            in_flight,
+            failed,
+        };
+        assert_eq!(
+            totals(&[(Ready, 2), (InFlight, 5), (Ready, 3), (Failed, 4)]),
+            t(5, 5, 4)
+        );
+        assert_eq!(totals(&[(Ready, u64::MAX), (Ready, 1)]).ready, u64::MAX);
+        assert_eq!(totals(&[(Failed, u64::MAX), (Failed, 1)]).failed, u64::MAX);
+        assert_eq!(totals(&[]), t(0, 0, 0));
     }
 
     /// The example source `id`, with every request pointed at `server`.

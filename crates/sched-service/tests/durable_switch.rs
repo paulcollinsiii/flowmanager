@@ -240,6 +240,7 @@ fn push_rest_except(p: &Process, w: &World, skip: &[&str]) {
             p,
             s,
             vec![ObservedValue::Demand {
+                failed: 0,
                 class: c.into(),
                 ready: q.ready,
                 in_flight: q.in_flight,

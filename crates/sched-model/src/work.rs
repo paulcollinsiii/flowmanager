@@ -12,6 +12,12 @@ pub struct ClassWork {
     /// Items whose upstream steps are done. Zero when the demand is not known.
     pub ready: u64,
     pub in_flight: u64,
+    /// Items that failed and wait to be re-queued by the class's recovery action. A separate
+    /// bucket: failed items are not `ready`, never contribute to `oldest_ready_at` (so they
+    /// never age into starvation priority) and do not make the class `busy` (they hold no
+    /// model, host or lease). They do make the class's model *wanted* (see
+    /// [`ClassWork::wanted`]), so the model is brought in to re-queue them.
+    pub failed: u64,
     pub oldest_ready_at: Option<Millis>,
     /// False when the class has demand but its observation is missing or older than
     /// `demand_max_age`. Unknown work must be assumed possibly in flight.
@@ -22,6 +28,7 @@ impl ClassWork {
     const NONE: ClassWork = ClassWork {
         ready: 0,
         in_flight: 0,
+        failed: 0,
         oldest_ready_at: None,
         known: true,
     };
@@ -29,6 +36,13 @@ impl ClassWork {
     /// Ready or in-flight work is known to exist.
     pub fn busy(&self) -> bool {
         self.ready > 0 || self.in_flight > 0
+    }
+
+    /// Work that makes the class's model worth loading: ready, in-flight or failed items
+    /// (failed ones are waiting for the model to be allowed so they can be re-queued).
+    /// Starvation never looks at failed items; only `ready` ages.
+    pub fn wanted(&self) -> bool {
+        self.busy() || self.failed > 0
     }
 
     /// Age of the oldest ready item; zero if it has no timestamp.
@@ -71,12 +85,14 @@ pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> Cl
         if let ObservedValue::Demand {
             ready,
             in_flight,
+            failed,
             oldest_ready_at,
             ..
         } = o.value
         {
             work.ready = work.ready.max(ready);
             work.in_flight = work.in_flight.max(in_flight);
+            work.failed = work.failed.max(failed);
             work.oldest_ready_at = match (work.oldest_ready_at, oldest_ready_at) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -149,6 +165,7 @@ mod tests {
                 class: "interactive-llm".into(),
                 ready: 1,
                 in_flight: 0,
+                failed: 0,
                 oldest_ready_at: None,
             },
         });

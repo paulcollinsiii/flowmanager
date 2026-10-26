@@ -198,6 +198,7 @@ mod tests {
             source: "paperless-ocr-pending".into(),
             fidelity: Fidelity::Polled,
             values: vec![ObservedValue::Demand {
+                failed: 0,
                 class: "paperless-ocr".into(),
                 ready: 2,
                 in_flight: 0,

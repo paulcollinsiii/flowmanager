@@ -620,6 +620,7 @@ mod tests {
             s,
             "paperless-ocr-pending",
             vec![ObservedValue::Demand {
+                failed: 0,
                 class: "paperless-ocr".into(),
                 ready,
                 in_flight: 0,
@@ -779,6 +780,7 @@ mod tests {
                 &s,
                 src,
                 vec![ObservedValue::Demand {
+                    failed: 0,
                     class: class.into(),
                     ready: 0,
                     in_flight: 0,
@@ -910,6 +912,7 @@ mod tests {
             &s,
             "backup-schedule",
             vec![ObservedValue::Demand {
+                failed: 0,
                 class: "backup".into(),
                 ready: 0,
                 in_flight: 0,
@@ -1043,6 +1046,7 @@ mod tests {
                 source: "paperless-ocr-pending".into(),
                 fidelity: Fidelity::Polled,
                 values: vec![ObservedValue::Demand {
+                    failed: 0,
                     class: "paperless-ocr".into(),
                     ready: 3,
                     in_flight: 0,
@@ -1111,6 +1115,7 @@ mod tests {
             fidelity: Fidelity::Polled,
             values: (0..20)
                 .map(|i| ObservedValue::Demand {
+                    failed: 0,
                     class: format!("c{i}").as_str().into(),
                     ready: 1,
                     in_flight: 0,
@@ -1143,6 +1148,7 @@ mod tests {
                 &s,
                 src,
                 vec![ObservedValue::Demand {
+                    failed: 0,
                     class: class.into(),
                     ready: 0,
                     in_flight: 0,
@@ -1195,6 +1201,7 @@ mod tests {
                 &s,
                 src,
                 vec![ObservedValue::Demand {
+                    failed: 0,
                     class: class.into(),
                     ready: 0,
                     in_flight: 0,
@@ -1242,6 +1249,7 @@ mod tests {
             &s,
             "backup-schedule",
             vec![ObservedValue::Demand {
+                failed: 0,
                 class: "backup".into(),
                 ready: 0,
                 in_flight: 0,
@@ -1303,6 +1311,7 @@ mod tests {
             &s,
             "immich-queues",
             vec![ObservedValue::Demand {
+                failed: 0,
                 class: "immich-ml".into(),
                 ready: 0,
                 in_flight: 0,

@@ -59,6 +59,9 @@ pub enum CountsAs {
     Ready,
     /// Work already running.
     InFlight,
+    /// Work that failed and waits to be re-queued (by the class's recovery action). It is
+    /// not ready work: it never ages into starvation priority.
+    Failed,
 }
 
 /// A value a `where` or `when` condition compares a field with exactly. An unquoted YAML

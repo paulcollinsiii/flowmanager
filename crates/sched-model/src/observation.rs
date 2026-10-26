@@ -58,6 +58,10 @@ pub enum ObservedValue {
         ready: u64,
         #[serde(default)]
         in_flight: u64,
+        /// Items that failed and are waiting to be re-queued by the class's recovery action.
+        /// Not `ready` work: they have no age for starvation (see `ClassWork::failed`).
+        #[serde(default)]
+        failed: u64,
         /// When the oldest ready item became ready; absent if nothing is ready.
         #[serde(default)]
         oldest_ready_at: Option<Millis>,
@@ -385,6 +389,7 @@ mod tests {
             observed_at: Millis(at),
             fidelity: Fidelity::Polled,
             value: ObservedValue::Demand {
+                failed: 0,
                 class: "paperless-ocr".into(),
                 ready,
                 in_flight,

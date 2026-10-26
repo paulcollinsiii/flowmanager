@@ -139,6 +139,7 @@ fn scenario(frames: &[Raw]) -> Scenario {
                     observed_at: None,
                     fidelity: Fidelity::Polled,
                     value: ObservedValue::Demand {
+                        failed: 0,
                         class: ClassId::new(*c),
                         ready: *ready,
                         in_flight: *in_flight,

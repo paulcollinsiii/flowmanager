@@ -699,3 +699,139 @@ fn gate_classes_never_influence_model_choice() {
         );
     }
 }
+
+// Failed items: a separate demand bucket that brings a model in but never ages, never holds
+// the model that is serving and never counts as ready work.
+
+/// A demand observation with `failed` items and `ready` ready ones (oldest as given).
+fn failed_demand(
+    class: &str,
+    source: &str,
+    failed: u64,
+    ready: u64,
+    oldest: Option<u64>,
+) -> String {
+    let o = oldest
+        .filter(|_| ready > 0)
+        .map_or(String::new(), |t| format!(", oldest_ready_at: {t}"));
+    format!(
+        "    - {{ source: {source}, observed_at: {T}, fidelity: polled, value: {{ type: demand, class: {class}, ready: {ready}, in_flight: 0, failed: {failed}{o} }} }}\n"
+    )
+}
+
+fn failed_transcription(failed: u64) -> String {
+    // Failed items carry no timestamp: a fixture refuses one on a demand with nothing ready.
+    failed_demand("speakr-transcription", "speakr-pending", failed, 0, None)
+}
+
+const HOUR: u64 = 60 * MIN;
+
+#[test]
+fn failed_items_alone_bring_their_model_in_at_the_class_priority() {
+    // Idle resource: whisperx is wanted although nothing is ready.
+    let f = fixture(&[failed_transcription(2)], &[], None);
+    assert_eq!(target(&f), Some("whisperx".into()));
+    // Normal priority: transcription (60) beats ocr (50) even for failed items only.
+    let f = fixture(&[failed_transcription(2), ocr(1, T - 20 * MIN)], &[], None);
+    assert_eq!(target(&f), Some("whisperx".into()));
+    // A class that does not outrank real work does not win: immich (10) failed vs ocr ready.
+    let f = fixture(
+        &[
+            failed_demand("immich-ml", "immich-queues", 5, 0, None),
+            ocr(1, T - MIN),
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(target(&f), Some("mineru".into()));
+    // Zero failed and zero ready is nothing.
+    let f = fixture(&[failed_transcription(0)], &[], None);
+    assert_eq!(target(&f), None);
+}
+
+#[test]
+fn failed_items_have_no_age_and_lose_ties_to_real_work_of_their_tier() {
+    // Same priority (50): ocr ready beats tagging failed-only, which ranks as brand new.
+    let f = fixture(
+        &[
+            ocr(1, T - 2 * MIN),
+            failed_demand("paperless-tagging", "paperless-post-ocr", 4, 0, None),
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(target(&f), Some("mineru".into()));
+}
+
+#[test]
+fn failed_items_never_age_into_starvation_phantom_demand() {
+    // mineru has served 10 minutes (past min_dwell) and has ready work. whisperx has failed
+    // items only. If they counted as ready work with a 90 minute old timestamp, whisperx
+    // would be starved (> age_threshold 30m) and win the switch.
+    let f = fixture(
+        &[ocr(1, T - MIN), failed_transcription(3)],
+        &[],
+        Some(("mineru", T - 10 * MIN, None)),
+    );
+    assert_eq!(target(&f), Some("mineru".into()));
+    // Control: the same items as READY work, 90 minutes old, do starve and switch.
+    let f = fixture(
+        &[ocr(1, T - MIN), transcription(3, T - 90 * MIN)],
+        &[],
+        Some(("mineru", T - 10 * MIN, None)),
+    );
+    assert_eq!(target(&f), Some("whisperx".into()));
+    // Past max_dwell the busy model yields to the best other candidate by the usual rule.
+    let f = fixture(
+        &[ocr(1, T - MIN), failed_transcription(3)],
+        &[],
+        Some(("mineru", T - (2 * HOUR + MIN), None)),
+    );
+    assert_eq!(target(&f), Some("whisperx".into()));
+}
+
+#[test]
+fn failed_items_never_hold_the_model_that_is_serving() {
+    let serving = |since: u64, idle: Option<u64>| Some(("whisperx", since, idle));
+    // Just loaded for the failed items, idle clock not past idle_grace: stays.
+    let f = fixture(
+        &[failed_transcription(2)],
+        &[],
+        serving(T - 6 * MIN, Some(T - 6 * MIN)),
+    );
+    assert_eq!(target(&f), Some("whisperx".into()));
+    // Idle for idle_grace (10m) and past min_dwell: released although failed items remain.
+    let f = fixture(
+        &[failed_transcription(2)],
+        &[],
+        serving(T - 11 * MIN, Some(T - 10 * MIN)),
+    );
+    assert_eq!(target(&f), None);
+    // ... and the other model with real work gets the GPU.
+    let f = fixture(
+        &[failed_transcription(2), ocr(1, T - MIN)],
+        &[],
+        serving(T - 11 * MIN, Some(T - 10 * MIN)),
+    );
+    assert_eq!(target(&f), Some("mineru".into()));
+    // Not released before min_dwell.
+    let f = fixture(
+        &[failed_transcription(2)],
+        &[],
+        serving(T - 4 * MIN, Some(T - 10 * MIN)),
+    );
+    assert_eq!(target(&f), Some("whisperx".into()));
+    // With ready work as well, the model is busy and stays.
+    let f = fixture(
+        &[failed_demand(
+            "speakr-transcription",
+            "speakr-pending",
+            2,
+            1,
+            Some(T - MIN),
+        )],
+        &[],
+        serving(T - 30 * MIN, None),
+    );
+    assert_eq!(target(&f), Some("whisperx".into()));
+}

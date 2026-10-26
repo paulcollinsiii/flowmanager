@@ -143,6 +143,7 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
                 s,
                 now,
                 ObservedValue::Demand {
+                    failed: 0,
                     class: ClassId::new(c),
                     ready: q.ready,
                     in_flight: q.in_flight,
