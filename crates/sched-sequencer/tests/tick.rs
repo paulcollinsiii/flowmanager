@@ -510,7 +510,9 @@ fn modes_persisted_by_the_build_with_pod_gating_converge_without_blocking() {
     let d = draining().target(None).run();
     assert_steps(&d, vec![], "nothing wanted");
     assert!(matches!(mode_of(&d, G), ModePhase::Idle));
-    // A recovery that was waiting for the drain runs now.
+    // A recovery recorded by an older build while it waited for the drain is not run: its
+    // action re-queues failed items and needs its model allowed, which a drain just ended.
+    // It runs while the model serves and items fail (see the recovery tests below).
     let d = Case::new()
         .gpu_state(&format!(
             "{{ power: {}, mode: {{ phase: draining, model: whisperx, since: 1 }}, pending_recovery: [speakr-transcription] }}",
@@ -520,10 +522,8 @@ fn modes_persisted_by_the_build_with_pod_gating_converge_without_blocking() {
         .run();
     assert_steps(
         &d,
-        vec![Step::RunRecovery {
-            class: cid("speakr-transcription"),
-        }],
-        "pending recovery",
+        vec![],
+        "pending recovery of an action that needs the model",
     );
     assert!(
         d.state
@@ -1878,4 +1878,163 @@ fn manual_control_reclaim_clears_the_model_but_does_not_power_off() {
     );
     assert!(d.allowed.models.is_empty());
     assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+}
+
+// RunRecovery for a class whose action re-queues failed items: while the class is allowed
+// and the snapshot reports failed items, never otherwise.
+
+fn failed(class: &str, source: &str, failed: u64, age: u64) -> String {
+    format!(
+        "    - {{ source: {source}, observed_at: {}, fidelity: polled, value: {{ type: demand, class: {class}, ready: 0, in_flight: 0, failed: {failed} }} }}\n",
+        T - age
+    )
+}
+
+fn failed_transcriptions(n: u64) -> String {
+    failed("speakr-transcription", "speakr-pending", n, 0)
+}
+
+fn recovery() -> Step {
+    Step::RunRecovery {
+        class: cid("speakr-transcription"),
+    }
+}
+
+fn recoveries(d: &Decision) -> usize {
+    d.steps
+        .iter()
+        .filter(|s| matches!(s, Step::RunRecovery { .. }))
+        .count()
+}
+
+#[test]
+fn recovery_runs_while_the_model_serves_and_items_have_failed() {
+    let serve = || {
+        Case::new()
+            .gpu(&serving("whisperx", 10 * MIN))
+            .target(Some("whisperx"))
+    };
+    // Failed items, model serving: emitted, on every tick (it is idempotent).
+    let d = serve().obs(failed_transcriptions(2)).run();
+    assert_steps(&d, vec![recovery()], "failed items");
+    let d2 = serve().obs(failed_transcriptions(2)).run_at(&d.state, T);
+    assert_steps(&d2, vec![recovery()], "again on the next tick");
+    // No failed items: nothing.
+    let d = serve().obs(failed_transcriptions(0)).run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // Ready work alone is no failure.
+    let d = serve()
+        .obs(demand("speakr-transcription", "speakr-pending", 3, 0, 0))
+        .run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+}
+
+#[test]
+fn recovery_never_runs_while_the_class_is_not_allowed() {
+    let items = || failed_transcriptions(2);
+    // Another model is serving.
+    let d = Case::new()
+        .gpu(&serving("mineru", 10 * MIN))
+        .target(Some("mineru"))
+        .obs(items())
+        .run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // Nothing serving and nothing wanted.
+    let d = Case::new().target(None).obs(items()).run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // The model is winding down (forced switch with work in flight).
+    let d = Case::new()
+        .gpu(&serving("whisperx", 10 * MIN))
+        .target(Some("llm"))
+        .forced()
+        .obs(items())
+        .obs(
+            demand("speakr-transcription", "speakr-pending", 0, 1, 0).replace(
+                "ready: 0, in_flight: 1",
+                "ready: 0, in_flight: 1, failed: 2",
+            ),
+        )
+        .run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    assert!(matches!(
+        mode_of(&d, G),
+        ModePhase::Serving {
+            wind_down: Some(_),
+            ..
+        }
+    ));
+    // The model is withdrawn in this tick: no recovery with it.
+    let d = Case::new()
+        .gpu(&serving("whisperx", 10 * MIN))
+        .target(Some("mineru"))
+        .obs(items())
+        .run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // The NFS share the class also needs is down.
+    let d = Case::new()
+        .gpu(&serving("whisperx", 10 * MIN))
+        .target(Some("whisperx"))
+        .nfs_state("{ power: { phase: \"off\" }, mode: { phase: idle } }")
+        .obs(up(N, false, 0))
+        .obs(items())
+        .run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // Reclaimed.
+    let d = Case::new()
+        .gpu(&serving("whisperx", 10 * MIN))
+        .reclaim()
+        .obs(items())
+        .run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // Stale demand is unknown, not failed.
+    let d = Case::new()
+        .gpu(&serving("whisperx", 10 * MIN))
+        .target(Some("whisperx"))
+        .obs(failed(
+            "speakr-transcription",
+            "speakr-pending",
+            2,
+            11 * MIN,
+        ))
+        .run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+}
+
+#[test]
+fn recovery_is_emitted_in_the_tick_that_allows_the_model() {
+    let d = Case::new()
+        .target(Some("whisperx"))
+        .obs(failed_transcriptions(1))
+        .run();
+    assert!(d.steps.contains(&allow("whisperx")), "{:?}", d.steps);
+    assert!(d.steps.contains(&recovery()), "{:?}", d.steps);
+}
+
+#[test]
+fn a_killed_class_whose_action_needs_its_model_records_no_recovery() {
+    // Cut off after its timeout: the model is withdrawn, so re-queueing would have to wait
+    // for the model anyway; the failed items it leaves bring the model back instead.
+    let busy = || {
+        Case::new()
+            .gpu(&serving("whisperx", 10 * MIN))
+            .target(Some("llm"))
+            .forced()
+            .obs(demand("speakr-transcription", "speakr-pending", 0, 1, 0))
+    };
+    let d = busy().run();
+    let after = busy().run_fresh_at(&d.state, T + 10 * MIN);
+    assert!(
+        after.steps.contains(&kill("speakr-transcription")),
+        "{:?}",
+        after.steps
+    );
+    assert_eq!(recoveries(&after), 0);
+    assert!(
+        after
+            .state
+            .resource(&rid(G))
+            .unwrap()
+            .pending_recovery
+            .is_empty()
+    );
 }

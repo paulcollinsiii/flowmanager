@@ -64,12 +64,43 @@ classes:
       - { resource: cuda-central, model: whisperx }
       - { resource: basestar-nfs }
     priority: 60
-    # speakr marks interrupted jobs failed; they are re-queued through its API.
+    # speakr marks interrupted jobs failed. Its failed transcriptions are the `failed` demand
+    # of this class (see speakr-pending), and `recovery` re-queues them through speakr's API
+    # while whisperx is allowed: at most `max_attempts` times per recording, then the
+    # recording stays failed and leaves speakr-pending's window. The same list request is
+    # written twice (here and in speakr-pending) on purpose: keep `list.url`, `where` and
+    # `since` in step with it. Needs `SPEAKR_API_TOKEN` with the read AND process scopes
+    # (re-queueing is `process`), and a token user who may edit the recordings.
     preemptibility: kill
     demand: { source: speakr-pending }
     recovery:
       action: requeue_failed
       source: speakr-pending
+      params:
+        list:
+          url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc
+          items: /recordings
+          id: /id
+          where: { field: /has_summary, equals: false }
+          since: { param: updated_since, ago: 15m }
+          max_items: 100
+        requeue:
+          method: POST
+          url: http://speakr.media.svc:8899/api/v1/recordings/{id}/transcribe
+          # Queued only if the answer says so: {"success": true, "job_id": ..., "status": "QUEUED"}.
+          expect:
+            - { field: /success, equals: true }
+            - { field: /status, equals: QUEUED }
+        auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
+        # Re-queue requests per recording (and how long they are remembered once the
+        # recording is no longer listed), at most `max_per_run` requests per run, runs at
+        # least `min_interval` apart (one list request plus the POSTs: well inside
+        # speakr's limit of 120 requests a minute), each request bounded by `timeout`.
+        max_attempts: 2
+        window: 15m
+        min_interval: 60s
+        max_per_run: 5
+        timeout: 10s
 
   - id: speakr-summarization
     requires:
@@ -78,7 +109,7 @@ classes:
     priority: 60
     # Not `kill`, to mark the difference: this work is cut off after drain_timeout all the
     # same (nothing waits for a model without a bound), but an interrupted summary is NOT
-    # re-queued automatically; the planned speakr recovery covers failed transcriptions only.
+    # re-queued automatically; the speakr recovery covers failed transcriptions only.
     preemptibility: pause_intake
     demand: { source: speakr-summaries }
 
@@ -230,8 +261,12 @@ sources:
   #   work. Queued summary (and other non-transcription) jobs are therefore also counted
   #   here: a deliberate, conservative overcount (they are GPU/LLM demand of some class, not
   #   necessarily transcription), and the planner treats ready > 0 as work.
-  # - Failed transcriptions are ready demand too, so that a whisperX outage brings whisperX
-  #   in rather than hiding the work. Retries are immediate (JOB_MAX_RETRIES = 3), so with
+  # - Failed transcriptions are `failed` demand (counts_as: failed, a third bucket next to
+  #   ready and in-flight), so that a whisperX outage brings whisperX in, to re-queue them
+  #   (the class's `recovery`), rather than hiding the work. They are NOT ready work: they
+  #   never age (so never reach starvation priority, however long they stay listed), never
+  #   count toward the oldest ready item and never keep whisperX loaded. Retries are
+  #   immediate (JOB_MAX_RETRIES = 3), so with
   #   whisperX unloaded a job fails within seconds and leaves the queue counts above. When a
   #   job gives up, speakr sets the recording FAILED and stores the error in `summary` for
   #   summarize/reprocess_summary jobs and in `transcription` for every other job type; list
@@ -240,22 +275,24 @@ sources:
   #   `equals: false` is the JSON boolean; `equals: "false"` would be the text.
   #   A reprocess_transcription failure on a recording that already has a summary is missed
   #   (accepted), and a failed merge/stitch job counts as transcription (overcount).
-  #   The window: only recordings updated in the last `since.ago` (15m) are listed. 15m is
-  #   below policy.age_threshold (30m), so a failure never reaches starvation priority.
-  #   - A failure counts as whisperX demand until it is re-queued or 15m pass.
+  #   The window: only recordings updated in the last `since.ago` (15m) are listed; that
+  #   bounds how long a failure can bring whisperX in. Failed items have no age, so the
+  #   window is not what keeps them from starving: nothing ages them.
+  #   - A failure counts as failed demand until it is re-queued or 15m pass.
   #   - Any later edit of a FAILED recording (tags, title, inbox, highlight, share) bumps its
   #     `updated_at` and restarts its window.
   #   - Permanent failures (a bad file, an unsupported codec) count too, until the window
   #     passes.
-  #   - Failed transcriptions are re-queued automatically (a later M3 phase), at most twice
-  #     per recording; after that it stays FAILED and ages out of the window.
+  #   - Failed transcriptions are re-queued automatically (the class's recovery), at most
+  #     twice per recording; after that it stays FAILED and ages out of the window.
   #   More than 100 failures in the window is a full page and fails the poll (max_items)
   #   instead of under-counting. An item whose `has_summary` is not a boolean (null aside)
   #   also fails the poll, rather than counting low.
   # Cost: 2 requests per poll here plus 1 for speakr-summaries below, at one poll a minute
   # each: 3 requests per minute in total on the one token, against speakr's read limit of
   # 120/min (add up all speakr sources before raising `resync` rates).
-  # Auth: `Authorization: Bearer <token>`; a token with `read` scope is enough.
+  # Auth: `Authorization: Bearer <token>`. This source only reads, but the same token
+  # (SPEAKR_API_TOKEN) also re-queues, so it needs the `read` AND `process` scopes.
   - id: speakr-pending
     kind: http_json
     observe: [demand]
@@ -275,6 +312,7 @@ sources:
           where: { field: /has_summary, equals: false }
           max_items: 100
           since: { param: updated_since, ago: 15m }
+          counts_as: failed
       webhook: { path: /hooks/speakr }
 
   # Summarization. The status filter has no `summarizing` value, but `status=processing`

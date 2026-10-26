@@ -673,11 +673,20 @@ mod tests {
     }
 
     fn demand(r: &Report) -> (u64, u64) {
+        let (ready, in_flight, _) = demand3(r);
+        (ready, in_flight)
+    }
+
+    /// (ready, in_flight, failed).
+    fn demand3(r: &Report) -> (u64, u64, u64) {
         match r {
             Report::Observed { values, .. } => match &values[0] {
                 ObservedValue::Demand {
-                    ready, in_flight, ..
-                } => (*ready, *in_flight),
+                    ready,
+                    in_flight,
+                    failed,
+                    ..
+                } => (*ready, *in_flight, *failed),
                 v => panic!("{v:?}"),
             },
             Report::Failed { error, .. } => panic!("failed: {error}"),
@@ -703,8 +712,9 @@ mod tests {
         assert_eq!(classes, [ClassId::from("speakr-transcription")]);
         let client = reqwest::Client::new();
         let report = poll_now(&client, &spec, &params, &classes, &env).await;
-        // 2 pending + 3 queued jobs + 2 failed transcriptions; one job running.
-        assert_eq!(demand(&report), (7, 1));
+        // 2 pending + 3 queued jobs are ready; one job runs; the 2 failed transcriptions
+        // are their own bucket, not ready work.
+        assert_eq!(demand3(&report), (5, 1, 2));
         // Two requests per poll: stats (one response, three numbers) and the failed list.
         assert_eq!(server.requests().len(), 2);
         assert_eq!(server.requests()[1].0, SPEAKR_FAILED);
@@ -1071,7 +1081,7 @@ mod tests {
         );
         let client = build_client(&params).unwrap();
         let report = poll_now(&client, &spec, &params, &classes, &env).await;
-        assert_eq!(demand(&report), (1, 0));
+        assert_eq!(demand3(&report), (0, 0, 1));
         assert_eq!(server.requests()[1].0, SPEAKR_FAILED);
         // An hour later the window has moved with the clock: the same failure would be
         // listed (or not) by a different query, here unanswered.

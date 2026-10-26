@@ -278,8 +278,8 @@ fn classes(c: &Config, p: &mut Problems) {
             );
         }
         if let Some(r) = &k.recovery {
-            if r.action.trim().is_empty() {
-                p.add(format!("{at}.recovery"), "action must not be empty");
+            for problem in r.problems() {
+                p.add(format!("{at}.recovery"), problem);
             }
             if let Some(src) = &r.source
                 && c.source(src).is_none()
@@ -411,7 +411,7 @@ classes:
     priority: 10
     preemptibility: kill
     demand: { source: s1 }
-    recovery: { action: requeue }
+    recovery: { action: requeue_failed, params: { list: { url: 'http://x/l', items: /i, id: /id }, requeue: { url: 'http://x/{id}' } } }
 sources:
   - { id: s1, kind: http_json, resync: 30s, observe: [demand] }
   - { id: k8s, kind: kubernetes_watch, resync: 10s, observe: [pods, reachability] }
@@ -630,21 +630,47 @@ sources:
     }
 
     #[test]
+    fn rejects_recovery_params_and_actions_this_build_cannot_run() {
+        let bad = VALID.replace(
+            "requeue: { url: 'http://x/{id}' }",
+            "requeue: { url: 'http://x/again' }",
+        );
+        assert_ne!(bad, VALID);
+        let ps = problems(&bad);
+        assert!(
+            has(
+                &ps,
+                "classes[c1].recovery: requeue.url must contain {id} exactly once"
+            ),
+            "{ps:?}"
+        );
+        let unknown = VALID.replace("action: requeue_failed", "action: requeue_faild");
+        let ps = problems(&unknown);
+        assert!(
+            has(
+                &ps,
+                "classes[c1].recovery: unknown action \"requeue_faild\""
+            ),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
     fn rejects_recovery_source_that_dangles() {
         let y = VALID.replace(
-            "recovery: { action: requeue }",
-            "recovery: { action: requeue, source: ghost }",
+            "recovery: { action: requeue_failed, params: { list: { url: 'http://x/l', items: /i, id: /id }, requeue: { url: 'http://x/{id}' } } }",
+            "recovery: { action: requeue_failed, source: ghost, params: { list: { url: 'http://x/l', items: /i, id: /id }, requeue: { url: 'http://x/{id}' } } }",
         );
         assert!(has(
             &problems(&y),
             "classes[c1].recovery: references unknown source \"ghost\""
         ));
         let ok = VALID.replace(
-            "recovery: { action: requeue }",
-            "recovery: { action: requeue, source: s1 }",
+            "recovery: { action: requeue_failed, params: { list: { url: 'http://x/l', items: /i, id: /id }, requeue: { url: 'http://x/{id}' } } }",
+            "recovery: { action: requeue_failed, source: s1, params: { list: { url: 'http://x/l', items: /i, id: /id }, requeue: { url: 'http://x/{id}' } } }",
         );
         assert!(Config::from_yaml(&ok).is_ok());
-        let empty = VALID.replace("{ action: requeue }", "{ action: \"\" }");
+        let empty = VALID.replace("action: requeue_failed, params", "action: \"\", params");
         assert!(has(&problems(&empty), "action must not be empty"));
     }
 

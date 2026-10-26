@@ -94,6 +94,7 @@ pub fn tick(
         }
     }
     let allowed = allowed_set(config, &next, intent);
+    recovery_steps(config, snapshot, &allowed, &mut steps);
     Ok(Decision {
         steps,
         allowed,
@@ -150,6 +151,33 @@ fn resource_tick(
     }
     power::step(cx, &mut st, steps, acted);
     Some(st)
+}
+
+/// `RunRecovery` for every class whose recovery action needs its model up, while the class is
+/// in the allowed set (its model serving and not winding down, its hosts up, no reclaim) and
+/// the snapshot reports failed items for it. Emitted on every such tick: the action is
+/// idempotent and rate-limited by itself, and must re-check the allowed set before it acts.
+/// Never for a class that is not allowed, so recovery never runs for a model that is not.
+fn recovery_steps(
+    config: &Config,
+    snapshot: &Snapshot,
+    allowed: &sched_model::AllowedSet,
+    steps: &mut Vec<Step>,
+) {
+    for class in config.classes() {
+        let needs_model = class
+            .recovery
+            .as_ref()
+            .is_some_and(|r| r.needs_serving_model());
+        if needs_model
+            && allowed.classes.contains(&class.id)
+            && sched_model::class_work(config, snapshot, class).failed > 0
+        {
+            steps.push(Step::RunRecovery {
+                class: class.id.clone(),
+            });
+        }
+    }
 }
 
 /// What KEDA may run, derived from the new state alone.

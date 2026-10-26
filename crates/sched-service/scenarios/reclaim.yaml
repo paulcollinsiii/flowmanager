@@ -1,4 +1,4 @@
-description: "A reclaim stops intake, gives in-flight work its timeout, stops it and withdraws the model (running the class's recovery action in the same tick), then shuts the host down; it is then not woken."
+description: "A reclaim stops intake, gives in-flight work its timeout, stops it and withdraws the model (its recovery action re-queues failed items and needs the model allowed, so it is not run after the cut-off), then shuts the host down; it is then not woken."
 # The power machine as under managed control (M4).
 power_control: managed
 initial_state:
@@ -39,7 +39,7 @@ frames:
   - at: 100600000
     refresh: true
     expect:
-      steps: [{ type: kill_in_flight, class: speakr-transcription }, { type: drain_model, resource: cuda-central, model: whisperx }, { type: run_recovery, class: speakr-transcription }]
+      steps: [{ type: kill_in_flight, class: speakr-transcription }, { type: drain_model, resource: cuda-central, model: whisperx }]
       allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
   # Next tick: the host shuts down, overriding idle grace. Nothing waits for pods: whisperX
   # has left the allowed set and no model is allowed.

@@ -143,6 +143,34 @@ mod tests {
     use crate::test_support::example_config;
 
     #[test]
+    fn failed_items_are_wanted_but_not_busy_and_never_give_an_age() {
+        let config = example_config();
+        let class = config.class(&"speakr-transcription".into()).unwrap();
+        let snap = |failed: u64| Snapshot {
+            now: Millis(1_000_000),
+            observations: vec![Observation {
+                source: "speakr-pending".into(),
+                observed_at: Millis(999_000),
+                fidelity: Fidelity::Polled,
+                value: ObservedValue::Demand {
+                    class: "speakr-transcription".into(),
+                    ready: 0,
+                    in_flight: 0,
+                    failed,
+                    oldest_ready_at: None,
+                },
+            }],
+            ..Snapshot::default()
+        };
+        let w = class_work(&config, &snap(3), class);
+        assert_eq!(w.failed, 3);
+        assert!(w.wanted() && !w.busy() && w.oldest_ready_at.is_none());
+        assert_eq!(w.oldest_age(Millis(1_000_000)), Millis::ZERO);
+        let w = class_work(&config, &snap(0), class);
+        assert!(!w.wanted());
+    }
+
+    #[test]
     fn a_source_that_can_never_report_is_no_demand_until_it_reports() {
         let config = example_config();
         let class = config.class(&"interactive-llm".into()).unwrap();

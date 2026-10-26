@@ -29,7 +29,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bo
     match st.mode.clone() {
         ModePhase::Idle => {
             // Left by a state from before the queue-only change (a drain in progress).
-            recover(st, steps);
+            recover(cx, st, steps);
             match &target {
                 Some(m) => allow(cx, st, steps, m),
                 None => false,
@@ -67,9 +67,18 @@ fn fresh_up(cx: &Cx) -> bool {
 }
 
 /// Runs the recovery actions of classes whose work was stopped, once their model is gone.
-fn recover(st: &mut ResourceState, steps: &mut Vec<Step>) {
+/// An action that needs the model up (it re-queues failed items) is not run here: it runs
+/// while the model serves and items are waiting (see `recovery_steps` in the crate root).
+fn recover(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
     for class in std::mem::take(&mut st.pending_recovery) {
-        steps.push(Step::RunRecovery { class });
+        let after_kill = cx
+            .config
+            .class(&class)
+            .and_then(|c| c.recovery.as_ref())
+            .is_none_or(|r| !r.needs_serving_model());
+        if after_kill {
+            steps.push(Step::RunRecovery { class });
+        }
     }
 }
 
@@ -110,7 +119,7 @@ fn switch(
         model: old.clone(),
     });
     st.mode = ModePhase::Idle;
-    recover(st, steps);
+    recover(cx, st, steps);
     if let Some(m) = next {
         allow(cx, st, steps, m);
     }
@@ -244,7 +253,10 @@ fn serving(
             steps.push(Step::KillInFlight {
                 class: c.id.clone(),
             });
-            if c.recovery.is_some() {
+            if c.recovery
+                .as_ref()
+                .is_some_and(|r| !r.needs_serving_model())
+            {
                 st.pending_recovery.insert(c.id.clone());
             }
             wd.killed.insert(c.id.clone());

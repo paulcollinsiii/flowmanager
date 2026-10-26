@@ -366,7 +366,7 @@ fn typed<T: for<'de> Deserialize<'de>>(
         .map_err(|e| format!("invalid params: {e}"))
 }
 
-fn pointer_problem(p: &str) -> Option<String> {
+pub(crate) fn pointer_problem(p: &str) -> Option<String> {
     (!p.is_empty() && !p.starts_with('/'))
         .then(|| format!("JSON pointer {p:?} must be empty or start with '/'"))
 }
@@ -468,7 +468,7 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
     out
 }
 
-fn timeout_problem(timeout: Millis) -> Option<String> {
+pub(crate) fn timeout_problem(timeout: Millis) -> Option<String> {
     (timeout == Millis::ZERO || timeout > MAX_HTTP_TIMEOUT).then(|| {
         format!("timeout ({timeout}) must be greater than zero and at most {MAX_HTTP_TIMEOUT}")
     })
@@ -482,7 +482,7 @@ fn confirmations_problem(n: u32) -> Option<String> {
     })
 }
 
-fn auth_problems(a: &AuthSpec) -> Vec<String> {
+pub(crate) fn auth_problems(a: &AuthSpec) -> Vec<String> {
     let mut out = Vec::new();
     let token = !a.header.is_empty()
         && a.header
