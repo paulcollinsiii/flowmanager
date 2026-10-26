@@ -147,8 +147,10 @@ What is carried out and what is not:
   workload to 0. Each class is cut off at its own timeout, but the model is withdrawn only
   when no class of it is still blocking: in the same tick if the cut-off class was the last
   one, otherwise the model stays allowed and the other classes' work keeps running until
-  the last of them is cut off or finishes. The step is reported as not executed, with a
-  note saying so (and the reason says which of the two cases it is).
+  the last of them is cut off or finishes. It also stays allowed if the switch itself is
+  waiting (a stale host reading, say). The step is reported as not executed, with a note
+  saying so, and the reason says which of the three cases it is (withdrawn this tick, other
+  classes still blocking, or the switch waiting, naming the wait reason).
   What re-runs the interrupted work is up to the consumer: paperless-gpt reprocesses
   unfinished documents (paperless-ocr, paperless-tagging are `kill` for that reason), immich
   leaves it pending, speakr marks a transcription failed (re-queued by its recovery), and

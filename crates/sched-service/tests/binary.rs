@@ -13,13 +13,14 @@ use sched_keda::proto::external_scaler_client::ExternalScalerClient;
 use sched_model::test_support::EXAMPLE_CONFIG;
 use tonic::Code;
 
-/// The child process, killed when the test ends however it ends.
-struct Running(Child);
+/// The child process and its temp dir, cleaned up when the test ends however it ends.
+struct Running(Child, std::path::PathBuf);
 
 impl Drop for Running {
     fn drop(&mut self) {
         drop(self.0.kill());
         drop(self.0.wait());
+        drop(std::fs::remove_dir_all(&self.1));
     }
 }
 
@@ -45,11 +46,18 @@ async fn the_binary_serves_the_restate_endpoint_metrics_and_the_keda_scaler() {
             .args(["--keda-listen", &keda.to_string()])
             // Nothing listens here: no tick ever completes, so the scaler stays not ready.
             .args(["--restate-ingress", &format!("http://{ingress}")])
+            // The example config has a kubernetes_watch source: make sure it can never find
+            // (and contact) a real cluster from this machine.
+            .env_remove("KUBERNETES_SERVICE_HOST")
+            .env_remove("KUBERNETES_SERVICE_PORT")
+            .env("KUBECONFIG", dir.join("no-such-kubeconfig"))
+            .env("HOME", &dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("start sched-service"),
+        dir.clone(),
     );
 
     // Start-up takes a moment; the deadline covers a slow machine.
@@ -121,5 +129,4 @@ async fn the_binary_serves_the_restate_endpoint_metrics_and_the_keda_scaler() {
         child.0.try_wait().unwrap().is_none(),
         "the binary is still running"
     );
-    drop(std::fs::remove_dir_all(&dir));
 }
