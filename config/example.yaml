@@ -54,6 +54,10 @@ resources:
       # Set per resource: the NFS host boots and stops faster than the GPU host.
       power_on_timeout: 5m
       shutdown_timeout: 10m
+      # Under managed control, how long a shutdown may wait for pods to stop mounting this
+      # host (see the basestar-mounts source) before the scheduler alerts and stops, without
+      # shutting it down and without retrying (default 30m, at most 1d).
+      mounts_timeout: 30m
 
 models:
   - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru] }
@@ -232,6 +236,22 @@ sources:
       timeout: 2s
       # Consecutive agreeing readings before up/down flips (as for cluster-pods).
       reachability_confirmations: 3
+
+  # Before flowmanager powers basestar off, no pod may mount its NFS export: the pods are
+  # read from the Kubernetes API (pods, PersistentVolumeClaims and PersistentVolumes; see
+  # docs/kubernetes_setup.md for the RBAC) and counted when a volume, directly or through a
+  # claim, is an NFS volume of one of `nfs_servers` (the name or address exactly as the pod
+  # specs and PersistentVolumes write it; list both if both are used). One list per resync.
+  # `namespaces` is optional: absent means every namespace, which is what a safety check
+  # wants (a pod in a namespace not listed here would be missed).
+  # A failed read, or a reading older than policy.host_reading_stale_after, is "possibly
+  # mounted", never "no mounts". Required for a managed shared resource.
+  - id: basestar-mounts
+    kind: kubernetes_watch
+    observe: [mounts]
+    resync: 10s
+    params:
+      nfs_servers: { basestar-nfs: [basestar] }
 
   # The `prometheus` kind is also available for reachability: one instant query per resync
   # that must return exactly one series, 1 up and 0 down (anything else is a failed read).

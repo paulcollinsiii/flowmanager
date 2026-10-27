@@ -56,17 +56,30 @@ pub struct PowerSpec {
     /// As `power_on_timeout`, for being observed down after a shutdown. Default 15 minutes.
     #[serde(default)]
     pub shutdown_timeout: Option<Millis>,
+    /// How long a shutdown may wait for pods to stop mounting this host (see the `mounts`
+    /// capability) before the scheduler gives up, raises an alert and stops (it never retries;
+    /// a person acts). Default 30 minutes. Only meaningful under `control: managed`, for a
+    /// resource that a `mounts` source checks.
+    #[serde(default)]
+    pub mounts_timeout: Option<Millis>,
 }
 
 /// Default for [`PowerSpec::power_on_timeout`].
 pub const DEFAULT_POWER_ON_TIMEOUT: Millis = Millis(10 * 60_000);
 /// Default for [`PowerSpec::shutdown_timeout`].
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Millis = Millis(15 * 60_000);
+/// Default for [`PowerSpec::mounts_timeout`].
+pub const DEFAULT_MOUNTS_TIMEOUT: Millis = Millis(30 * 60_000);
 
 impl PowerSpec {
     /// The effective power-on timeout.
     pub fn power_on_timeout(&self) -> Millis {
         self.power_on_timeout.unwrap_or(DEFAULT_POWER_ON_TIMEOUT)
+    }
+
+    /// The effective mounts timeout.
+    pub fn mounts_timeout(&self) -> Millis {
+        self.mounts_timeout.unwrap_or(DEFAULT_MOUNTS_TIMEOUT)
     }
 
     /// The effective shutdown timeout.
@@ -194,7 +207,7 @@ impl SourceKind {
     pub fn can_supply(self, capability: Capability) -> bool {
         use Capability::*;
         match self {
-            SourceKind::KubernetesWatch => matches!(capability, Pods | Reachability),
+            SourceKind::KubernetesWatch => matches!(capability, Pods | Reachability | Mounts),
             SourceKind::HttpJson | SourceKind::Prometheus => {
                 matches!(capability, Reachability | Demand)
             }
@@ -221,6 +234,10 @@ pub enum Capability {
     Reachability,
     /// Queue demand of workload classes (`demand`).
     Demand,
+    /// How many pods mount an NFS host (`resource_mounts`): read from the Kubernetes API
+    /// against the NFS servers configured per resource. Safety-critical: it is the veto before
+    /// that host is powered off, and an unknown or stale reading counts as "possibly mounted".
+    Mounts,
 }
 
 impl std::fmt::Display for Capability {
@@ -229,6 +246,7 @@ impl std::fmt::Display for Capability {
             Capability::Pods => "pods",
             Capability::Reachability => "reachability",
             Capability::Demand => "demand",
+            Capability::Mounts => "mounts",
         })
     }
 }
@@ -403,6 +421,19 @@ impl Config {
         self.resource(id)
             .and_then(|r| r.power.as_ref())
             .is_some_and(|p| p.control == PowerControl::Managed)
+    }
+
+    /// Whether a source declaring the `mounts` capability checks which pods mount `id`:
+    /// its params name NFS servers for the resource. Such a resource is never powered off
+    /// while pods may still mount it.
+    pub fn mounts_checked(&self, id: &ResourceId) -> bool {
+        self.sources.iter().any(|s| {
+            s.observe.contains(&Capability::Mounts)
+                && s.kube_watch_params()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.nfs_servers.get(id).is_some_and(|v| !v.is_empty()))
+        })
     }
 
     pub fn resource(&self, id: &ResourceId) -> Option<&ResourceSpec> {

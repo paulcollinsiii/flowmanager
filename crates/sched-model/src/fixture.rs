@@ -134,6 +134,9 @@ impl Fixture {
                 ObservedValue::Demand { class, .. } => format!("demand:{class}"),
                 ObservedValue::ModelPods { model, .. } => format!("model_pods:{model}"),
                 ObservedValue::ResourceUp { resource, .. } => format!("resource_up:{resource}"),
+                ObservedValue::ResourceMounts { resource, .. } => {
+                    format!("resource_mounts:{resource}")
+                }
             };
             if !seen.insert((&o.source, subject.clone())) {
                 add(
@@ -246,6 +249,20 @@ impl Fixture {
                             ),
                         ),
                         Some(_) => {}
+                    }
+                }
+                ObservedValue::ResourceMounts { resource, .. } => {
+                    if source.is_some() && !config.source_observes(&o.source, Capability::Mounts) {
+                        add(
+                            &at,
+                            format!(
+                                "source {:?} does not declare the mounts capability (the scheduler ignores its readings)",
+                                o.source.as_str()
+                            ),
+                        );
+                    }
+                    if config.resource(resource).is_none() {
+                        add(&at, format!("unknown resource {:?}", resource.as_str()));
                     }
                 }
             }

@@ -74,6 +74,9 @@ pub enum ObservedValue {
     },
     /// Whether a resource's host is reachable and up.
     ResourceUp { resource: ResourceId, up: bool },
+    /// How many pods mount the resource's NFS server (pods that have not finished and have
+    /// a volume on it, directly or through a claim). Read from the Kubernetes API.
+    ResourceMounts { resource: ResourceId, pods: u32 },
 }
 
 impl ObservedValue {
@@ -84,7 +87,9 @@ impl ObservedValue {
     pub fn is_safety_critical(&self) -> bool {
         matches!(
             self,
-            ObservedValue::ModelPods { .. } | ObservedValue::ResourceUp { .. }
+            ObservedValue::ModelPods { .. }
+                | ObservedValue::ResourceUp { .. }
+                | ObservedValue::ResourceMounts { .. }
         )
     }
 }
@@ -217,6 +222,39 @@ impl Snapshot {
         Some(all_up)
     }
 
+    /// How many pods mount `resource`'s NFS server, or `None` when that is unknown, with the
+    /// same source filtering (`mounts` capability), two-level reduction and freshness rule as
+    /// `fresh_model_pods`. Unknown is never zero: a missing, stale or future-dated newest
+    /// reading from any reporting source makes it `None`, and otherwise the highest count of
+    /// any source wins. A caller deciding whether a host may be shut down must treat `None`
+    /// as "possibly mounted".
+    pub fn fresh_resource_mounts(
+        &self,
+        config: &Config,
+        resource: &ResourceId,
+        max_age: Millis,
+    ) -> Option<u32> {
+        let groups = self.newest_per_source(|o| {
+            config.source_observes(&o.source, Capability::Mounts)
+                && matches!(&o.value, ObservedValue::ResourceMounts { resource: r, .. } if r == resource)
+        });
+        if groups.is_empty() {
+            return None;
+        }
+        let mut most = 0;
+        for group in &groups {
+            if !group[0].is_fresh(self.now, max_age) {
+                return None;
+            }
+            for o in group {
+                if let ObservedValue::ResourceMounts { pods, .. } = o.value {
+                    most = most.max(pods);
+                }
+            }
+        }
+        Some(most)
+    }
+
     /// Newest-timestamp demand observations for `class` from `source`, the source its
     /// config says supplies it; everything else is filtered out first.
     pub(crate) fn demand_group(&self, source: &SourceId, class: &ClassId) -> Vec<&Observation> {
@@ -314,6 +352,51 @@ mod tests {
             leases: vec![],
             unobservable: Default::default(),
         }
+    }
+
+    fn mounts(source: &str, at: u64, pods: u32) -> Observation {
+        Observation {
+            source: source.into(),
+            observed_at: Millis(at),
+            fidelity: Fidelity::Polled,
+            value: ObservedValue::ResourceMounts {
+                resource: "basestar-nfs".into(),
+                pods,
+            },
+        }
+    }
+
+    #[test]
+    fn mounts_are_unknown_when_missing_stale_future_dated_or_from_an_undeclared_source() {
+        let (c, nfs) = (cfg(), ResourceId::new("basestar-nfs"));
+        // Nothing reported: unknown, not zero.
+        assert_eq!(
+            snap(vec![]).fresh_resource_mounts(&c, &nfs, Millis(500)),
+            None
+        );
+        let fresh = snap(vec![mounts("basestar-mounts", 900, 0)]);
+        assert_eq!(fresh.fresh_resource_mounts(&c, &nfs, Millis(500)), Some(0));
+        // Older than the bound, and dated after now: unknown.
+        assert_eq!(fresh.fresh_resource_mounts(&c, &nfs, Millis(50)), None);
+        let future = snap(vec![mounts("basestar-mounts", 1001, 0)]);
+        assert_eq!(future.fresh_resource_mounts(&c, &nfs, Millis(500)), None);
+        // A source that does not declare the capability is ignored, so it can neither
+        // make the reading known nor hide a stale one.
+        let stray = snap(vec![mounts("cluster-pods", 900, 0)]);
+        assert_eq!(stray.fresh_resource_mounts(&c, &nfs, Millis(500)), None);
+        // Only the newest reading of a source counts, and the highest count wins.
+        let newest = snap(vec![
+            mounts("basestar-mounts", 800, 3),
+            mounts("basestar-mounts", 900, 1),
+        ]);
+        assert_eq!(newest.fresh_resource_mounts(&c, &nfs, Millis(500)), Some(1));
+        assert!(
+            ObservedValue::ResourceMounts {
+                resource: nfs,
+                pods: 0
+            }
+            .is_safety_critical()
+        );
     }
 
     fn both_orders(a: Observation, b: Observation) -> [Snapshot; 2] {

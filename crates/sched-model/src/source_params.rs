@@ -40,6 +40,14 @@ pub struct KubeWatchParams {
     /// reported. A single flaky reading never flips a host.
     #[serde(default = "default_confirmations")]
     pub reachability_confirmations: u32,
+    /// For the `mounts` capability: per resource, the names or addresses of its NFS server
+    /// as they appear in pod volumes and in PersistentVolumes (`spec.nfs.server`, or the
+    /// `server` attribute of an NFS CSI volume). A pod mounts the resource if one of its
+    /// volumes, directly or through a PersistentVolumeClaim, is an NFS volume of one of
+    /// these servers (compared ignoring case). List both the name and the address if
+    /// volumes use both.
+    #[serde(default)]
+    pub nfs_servers: BTreeMap<ResourceId, Vec<String>>,
 }
 
 fn default_workload_label() -> String {
@@ -618,6 +626,25 @@ fn kube_problems(p: &KubeWatchParams, spec: &SourceSpec) -> Vec<String> {
         out.push("nodes must not contain empty node names".to_string());
     }
     out.extend(confirmations_problem(p.reachability_confirmations));
+    if spec.observe.contains(&Capability::Mounts) && p.nfs_servers.values().all(Vec::is_empty) {
+        out.push(
+            "nfs_servers must name at least one NFS server of a resource when the source observes mounts"
+                .to_string(),
+        );
+    }
+    for (resource, servers) in &p.nfs_servers {
+        if servers.is_empty() {
+            out.push(format!("nfs_servers[{resource}] must not be empty"));
+        }
+        if servers
+            .iter()
+            .any(|s| s.trim().is_empty() || s.contains(char::is_whitespace))
+        {
+            out.push(format!(
+                "nfs_servers[{resource}] must contain host names or addresses without whitespace"
+            ));
+        }
+    }
     out
 }
 

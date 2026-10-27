@@ -126,6 +126,7 @@ impl PowerSpec {
         for (name, value) in [
             ("power_on_timeout", self.power_on_timeout),
             ("shutdown_timeout", self.shutdown_timeout),
+            ("mounts_timeout", self.mounts_timeout),
         ] {
             match value {
                 Some(Millis::ZERO) => out.push(format!("{name} must be greater than zero")),

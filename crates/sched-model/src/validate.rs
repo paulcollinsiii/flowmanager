@@ -222,6 +222,7 @@ fn models(c: &Config, p: &mut Problems) {
             for (name, value) in [
                 ("power_on_timeout", pw.power_on_timeout()),
                 ("shutdown_timeout", pw.shutdown_timeout()),
+                ("mounts_timeout", pw.mounts_timeout()),
             ] {
                 if c.power_managed(&r.id) && value <= stale {
                     p.add(
@@ -402,6 +403,16 @@ fn sources(c: &Config, p: &mut Problems) {
             );
         }
     }
+    // A managed shared host is powered off by the scheduler, and a pod may still be using it:
+    // refuse a config that gives no way to know.
+    for r in c.resources() {
+        if r.kind == ResourceKind::Shared && c.power_managed(&r.id) && !c.mounts_checked(&r.id) {
+            p.add(
+                format!("resources[{}]", r.id),
+                "control is managed but no source declares the mounts capability (observe: [mounts]) with nfs_servers for it, so the scheduler could not tell whether pods still mount it before powering it off",
+            );
+        }
+    }
     for s in c.sources() {
         let at = format!("sources[{}]", s.id);
         if s.resync == Millis::ZERO {
@@ -434,6 +445,20 @@ fn sources(c: &Config, p: &mut Problems) {
                 );
             }
         }
+        for r in s
+            .kube_watch_params()
+            .ok()
+            .flatten()
+            .iter()
+            .flat_map(|k| k.nfs_servers.keys())
+        {
+            if c.resource(r).is_none() {
+                p.add(
+                    format!("{at}.params.nfs_servers"),
+                    format!("unknown resource \"{r}\""),
+                );
+            }
+        }
         let probed = match s.kind {
             SourceKind::Prometheus => s.prometheus_params().ok().flatten().map(|p| p.resource),
             SourceKind::TcpProbe => s.tcp_probe_params().ok().flatten().map(|p| p.resource),
@@ -458,13 +483,15 @@ fn sources(c: &Config, p: &mut Problems) {
                 );
             }
         }
-        if (s.observe.contains(&Capability::Pods) || s.observe.contains(&Capability::Reachability))
+        if (s.observe.contains(&Capability::Pods)
+            || s.observe.contains(&Capability::Reachability)
+            || s.observe.contains(&Capability::Mounts))
             && s.resync > pol.host_reading_stale_after
         {
             p.add(
                 &at,
                 format!(
-                    "resync ({}) exceeds policy.host_reading_stale_after ({}); its pods/reachability observations would always be stale",
+                    "resync ({}) exceeds policy.host_reading_stale_after ({}); its pods/reachability/mounts observations would always be stale",
                     s.resync, pol.host_reading_stale_after
                 ),
             );
@@ -1347,6 +1374,101 @@ sources:
                 .unwrap()
                 .generation(),
             9
+        );
+    }
+
+    /// The managed example, with its `basestar-mounts` source changed by `f`.
+    fn managed_example_with(from: &str, to: &str) -> String {
+        let y = crate::test_support::example_yaml_managed();
+        assert!(y.contains(from), "the example changed: {from}");
+        y.replace(from, to)
+    }
+
+    #[test]
+    fn a_managed_shared_host_needs_a_mounts_source_naming_it() {
+        let c = Config::from_yaml(&crate::test_support::example_yaml_managed()).unwrap();
+        assert!(c.mounts_checked(&"basestar-nfs".into()));
+        assert!(!c.mounts_checked(&"cuda-central".into()));
+        let ps = problems(&managed_example_with(
+            "nfs_servers: { basestar-nfs: [basestar] }",
+            "nfs_servers: { cuda-central: [basestar] }",
+        ));
+        assert!(
+            has(
+                &ps,
+                "resources[basestar-nfs]: control is managed but no source declares the mounts capability"
+            ),
+            "{ps:?}"
+        );
+        // Under manual control nothing is shut down, so nothing is required.
+        let manual = crate::test_support::EXAMPLE_CONFIG.replace(
+            "nfs_servers: { basestar-nfs: [basestar] }",
+            "nfs_servers: { cuda-central: [basestar] }",
+        );
+        assert!(Config::from_yaml(&manual).is_ok());
+    }
+
+    #[test]
+    fn mounts_params_are_checked() {
+        let ps = problems(&managed_example_with(
+            "nfs_servers: { basestar-nfs: [basestar] }",
+            "nfs_servers: { nowhere: [basestar] }",
+        ));
+        assert!(
+            has(
+                &ps,
+                "sources[basestar-mounts].params.nfs_servers: unknown resource \"nowhere\""
+            ),
+            "{ps:?}"
+        );
+        let ps = problems(&managed_example_with(
+            "nfs_servers: { basestar-nfs: [basestar] }",
+            "nfs_servers: { basestar-nfs: [] }",
+        ));
+        assert!(
+            has(&ps, "nfs_servers[basestar-nfs] must not be empty"),
+            "{ps:?}"
+        );
+        let ps = problems(&managed_example_with(
+            "nfs_servers: { basestar-nfs: [basestar] }",
+            "nfs_servers: { basestar-nfs: ['a b'] }",
+        ));
+        assert!(has(&ps, "without whitespace"), "{ps:?}");
+        let ps = problems(&managed_example_with(
+            "    observe: [mounts]\n    resync: 10s",
+            "    observe: [mounts]\n    resync: 1m",
+        ));
+        assert!(
+            has(&ps, "exceeds policy.host_reading_stale_after"),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn the_mounts_timeout_is_bounded_and_longer_than_the_staleness_bound() {
+        let ps = problems(&managed_example_with(
+            "mounts_timeout: 30m",
+            "mounts_timeout: 1s",
+        ));
+        assert!(
+            has(
+                &ps,
+                "mounts_timeout (1000ms) must be greater than policy.host_reading_stale_after"
+            ),
+            "{ps:?}"
+        );
+        let ps = problems(&managed_example_with(
+            "mounts_timeout: 30m",
+            "mounts_timeout: 2d",
+        ));
+        assert!(has(&ps, "mounts_timeout 172800000ms exceeds"), "{ps:?}");
+        let ps = problems(&managed_example_with(
+            "mounts_timeout: 30m",
+            "mounts_timeout: 0",
+        ));
+        assert!(
+            has(&ps, "mounts_timeout must be greater than zero"),
+            "{ps:?}"
         );
     }
 }

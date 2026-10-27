@@ -19,6 +19,7 @@ enum Subject {
     Demand(ClassId),
     Pods(ModelId),
     Up(ResourceId),
+    Mounts(ResourceId),
 }
 
 fn subject(v: &ObservedValue) -> Subject {
@@ -26,6 +27,7 @@ fn subject(v: &ObservedValue) -> Subject {
         ObservedValue::Demand { class, .. } => Subject::Demand(class.clone()),
         ObservedValue::ModelPods { model, .. } => Subject::Pods(model.clone()),
         ObservedValue::ResourceUp { resource, .. } => Subject::Up(resource.clone()),
+        ObservedValue::ResourceMounts { resource, .. } => Subject::Mounts(resource.clone()),
     }
 }
 
@@ -35,6 +37,7 @@ fn capability(v: &ObservedValue) -> Capability {
         ObservedValue::Demand { .. } => Capability::Demand,
         ObservedValue::ModelPods { .. } => Capability::Pods,
         ObservedValue::ResourceUp { .. } => Capability::Reachability,
+        ObservedValue::ResourceMounts { .. } => Capability::Mounts,
     }
 }
 
@@ -53,6 +56,7 @@ fn accepts(config: &Config, source: &SourceId, value: &ObservedValue) -> bool {
             .is_some_and(|d| &d.source == source),
         ObservedValue::ModelPods { model, .. } => config.model(model).is_some(),
         ObservedValue::ResourceUp { resource, .. } => config.resource(resource).is_some(),
+        ObservedValue::ResourceMounts { resource, .. } => config.resource(resource).is_some(),
     }
 }
 
