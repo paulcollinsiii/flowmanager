@@ -11,6 +11,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::kube_jobs::{self, JobTarget};
 use crate::kube_watch::{self, Timing};
+use crate::nudge::{DEFAULT_NUDGE_MIN_INTERVAL, Nudge, Nudges};
 use crate::{ReportTx, http_json, prometheus, tcp_probe};
 
 /// What a running observer was built from. If it is unchanged by a reload, the observer
@@ -30,6 +31,8 @@ struct Fingerprint {
 struct Running {
     fingerprint: Fingerprint,
     handle: JoinHandle<()>,
+    /// Whether the observer takes nudges (its handle is in the registry).
+    nudged: bool,
 }
 
 /// Knobs for starting observers; the defaults suit production.
@@ -42,6 +45,13 @@ pub struct SpawnOptions {
     pub kube_timing: Timing,
     /// The clock adapters date `since` windows from; defaults to the system clock.
     pub now: Option<http_json::NowFn>,
+    /// Where `http_json` sources with a `webhook:` setting get their "poll now" handle. The
+    /// registry outlives the observers, so a restart keeps the handle. Share a clone of it
+    /// with whatever delivers the nudges.
+    pub nudges: Nudges,
+    /// The least time between two polls of a nudged source; defaults to
+    /// [`DEFAULT_NUDGE_MIN_INTERVAL`].
+    pub nudge_min_interval: Option<Duration>,
 }
 
 /// The running observers. Dropping this stops them and everything they started.
@@ -110,17 +120,28 @@ impl Observers {
                     .entry(id.clone())
                     .or_insert_with(|| shared_backoff(opts.restart)),
             );
-            if let Some(handle) = start(&fp, tx, opts, backoff) {
+            if let Some((handle, nudged)) = start(&fp, tx, opts, backoff) {
                 self.running.insert(
                     id.clone(),
                     Running {
                         fingerprint: fp,
                         handle,
+                        nudged,
                     },
                 );
                 started.push(id);
             }
         }
+        // Handles of sources that are gone, or no longer take nudges, are dropped; those of
+        // sources that merely restarted were kept above.
+        opts.nudges.retain_only(
+            &self
+                .running
+                .iter()
+                .filter(|(_, r)| r.nudged)
+                .map(|(id, _)| id.clone())
+                .collect(),
+        );
         started
     }
 }
@@ -160,11 +181,36 @@ fn fingerprint(config: &Config, spec: &SourceSpec) -> Fingerprint {
     }
 }
 
+/// Starts the observer for `fp`; the flag says whether it takes nudges.
 fn start(
     fp: &Fingerprint,
     tx: &ReportTx,
     opts: &SpawnOptions,
     backoff: SharedBackoff,
+) -> Option<(JoinHandle<()>, bool)> {
+    let takes_nudges = fp.spec.kind == SourceKind::HttpJson
+        && fp
+            .spec
+            .http_json_params()
+            .ok()
+            .flatten()
+            .is_some_and(|p| p.webhook.is_some());
+    let nudge = takes_nudges.then(|| Nudge {
+        notify: opts.nudges.handle(&fp.spec.id),
+        min_interval: opts
+            .nudge_min_interval
+            .unwrap_or(DEFAULT_NUDGE_MIN_INTERVAL),
+    });
+    let handle = start_with(fp, tx, opts, backoff, nudge)?;
+    Some((handle, takes_nudges))
+}
+
+fn start_with(
+    fp: &Fingerprint,
+    tx: &ReportTx,
+    opts: &SpawnOptions,
+    backoff: SharedBackoff,
+    nudge: Option<Nudge>,
 ) -> Option<JoinHandle<()>> {
     let spec = &fp.spec;
     match spec.kind {
@@ -183,6 +229,7 @@ fn start(
                             classes.clone(),
                             tx2.clone(),
                             now.clone(),
+                            nudge.clone(),
                         )
                     },
                 )))

@@ -11,6 +11,7 @@ use sched_model::{
 };
 use serde_json::Value;
 
+use crate::nudge::{Nudge, poll_loop};
 use crate::{Report, ReportTx};
 
 /// Looks up an environment variable; injected so tests need not touch the process environment.
@@ -511,13 +512,15 @@ pub fn client_with_timeout(timeout: Millis) -> Result<reqwest::Client, reqwest::
         .build()
 }
 
-/// Polls forever, every `resync`, until the receiver is gone.
+/// Polls forever, every `resync` and, if `nudge` is given, whenever it fires (but no more
+/// often than its minimum interval), until the receiver is gone.
 pub async fn run(
     spec: SourceSpec,
     params: HttpJsonParams,
     classes: Vec<ClassId>,
     tx: ReportTx,
     now: NowFn,
+    nudge: Option<Nudge>,
 ) {
     let client = match build_client(&params) {
         Ok(c) => c,
@@ -532,15 +535,12 @@ pub async fn run(
         }
     };
     let env = |name: &str| std::env::var(name).ok();
-    let mut ticker = tokio::time::interval(Duration::from_millis(spec.resync.as_u64().max(1)));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
+    let resync = Duration::from_millis(spec.resync.as_u64().max(1));
+    poll_loop(resync, nudge, || async {
         let report = poll_at(&client, &spec, &params, &classes, &env, MAX_BODY, now()).await;
-        if tx.send(report).await.is_err() {
-            return;
-        }
-    }
+        tx.send(report).await.is_ok()
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -868,7 +868,7 @@ mod tests {
         let url = "/api/documents/?tags__name__iexact=ocr-pending&page_size=1";
         server.set(url, Reply::status(500));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let task = tokio::spawn(run(spec, params, classes, tx, system_now()));
+        let task = tokio::spawn(run(spec, params, classes, tx, system_now(), None));
         assert!(matches!(rx.recv().await.unwrap(), Report::Failed { .. }));
         server.set(url, Reply::json(r#"{"count": 3}"#));
         loop {

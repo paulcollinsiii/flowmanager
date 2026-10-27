@@ -310,6 +310,7 @@ async fn reloads_do_not_leak_watches_and_unrelated_reloads_keep_observers() {
         },
         kube_timing: FAST,
         now: None,
+        ..SpawnOptions::default()
     };
     let mut observers = Observers::default();
     let first = observers.update(
@@ -647,6 +648,7 @@ async fn restart_throttling_survives_a_restart_caused_by_a_reload() {
         },
         kube_timing: FAST,
         now: None,
+        ..SpawnOptions::default()
     };
     let id = sched_model::SourceId::new("cluster-pods");
     let mut observers = Observers::default();

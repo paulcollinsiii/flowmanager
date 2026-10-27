@@ -9,6 +9,7 @@ pub mod http_json;
 pub mod kube_jobs;
 pub mod kube_mounts;
 pub mod kube_watch;
+mod nudge;
 pub mod prometheus;
 mod report;
 mod supervisor;
@@ -18,6 +19,7 @@ pub mod tcp_probe;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testserver;
 
+pub use nudge::{DEFAULT_NUDGE_MIN_INTERVAL, Nudge, Nudges, poll_loop};
 pub use report::{Report, ReportTx};
 pub use supervisor::{
     ObserverState, Observers, RestartBackoff, RestartPolicy, SharedBackoff, SpawnOptions,
