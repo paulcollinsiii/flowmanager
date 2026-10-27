@@ -62,7 +62,8 @@ ENTRYPOINT ["/usr/local/bin/sched-service"]
 `tzdata` is required, not optional, once any job is configured: jobs are scheduled in a time
 zone (`UTC` by default) and the zone is looked up in the system database, which the Rust
 time library does not bundle on Linux. Verified by hiding `/usr/share/zoneinfo`: the config
-is then rejected at load with "failed to find timezone UTC" (even for `UTC`). An image with
+is then rejected at load with "failed to find timezone UTC" (even for `UTC`). The Dockerfile
+above installs `tzdata`; an image built another way must include it too.
 
 The repository root has a `.dockerignore` (`target/`, `.git/`, scratch and worktree
 directories); keep it when building from the repository, or `COPY . .` sends the whole
