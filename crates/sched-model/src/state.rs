@@ -8,13 +8,50 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{ClassId, ModelId, ResourceId};
 use crate::time::Millis;
 
+/// The power transition a host was in when it timed out (see [`PowerPhase::Failed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerTransition {
+    /// The host was powering on and was not observed up in time.
+    PoweringOn,
+    /// The host was shutting down and was not observed down in time.
+    ShuttingDown,
+}
+
+impl PowerTransition {
+    /// The label used in logs and metrics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PowerTransition::PoweringOn => "powering_on",
+            PowerTransition::ShuttingDown => "shutting_down",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PowerPhase {
     Off,
-    PoweringOn { since: Millis },
-    On { since: Millis },
-    ShuttingDown { since: Millis },
+    PoweringOn {
+        since: Millis,
+    },
+    On {
+        since: Millis,
+    },
+    ShuttingDown {
+        since: Millis,
+    },
+    /// A power transition did not complete within its configured timeout. The scheduler
+    /// stops here: it raises an alert, allows nothing on the host, and never issues another
+    /// power action for it by itself (a host that does not come up or go down is a matter
+    /// for a person, and a retry risks flapping it). `since` is when the timeout expired.
+    /// It clears only when a fresh observation shows the state the transition was after
+    /// (up for `PoweringOn`, down for `ShuttingDown`), including because a person fixed the
+    /// host, or when the resource is set to `control: manual`.
+    Failed {
+        since: Millis,
+        during: PowerTransition,
+    },
 }
 
 /// A serving model that is being switched away from: its classes have left the allowed
@@ -252,5 +289,26 @@ mod tests {
             );
             assert_eq!(mode(&text).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn the_failed_power_phase_reads_and_writes_as_documented() {
+        let p: PowerPhase =
+            serde_yaml_ng::from_str(r#"{"phase":"failed","since":9,"during":"shutting_down"}"#)
+                .unwrap();
+        assert_eq!(
+            p,
+            PowerPhase::Failed {
+                since: Millis(9),
+                during: PowerTransition::ShuttingDown
+            }
+        );
+        assert_eq!(
+            serde_yaml_ng::from_str::<PowerPhase>(&serde_yaml_ng::to_string(&p).unwrap()).unwrap(),
+            p
+        );
+        // Not a resource the sequencer treats as on.
+        assert!(!ResourceState::new(p).is_on());
+        assert!(serde_yaml_ng::from_str::<PowerPhase>(r#"{"phase":"failed","since":9}"#).is_err());
     }
 }

@@ -13,7 +13,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::config::{PowerControl, PowerSpec};
+use crate::config::{MAX_LEASE_DURATION, PowerControl, PowerSpec};
+use crate::time::Millis;
 
 /// A MAC address. Written `aa:bb:cc:dd:ee:ff` (or with `-`), in either case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,18 @@ impl PowerSpec {
                 );
             }
         }
+        for (name, value) in [
+            ("power_on_timeout", self.power_on_timeout),
+            ("shutdown_timeout", self.shutdown_timeout),
+        ] {
+            match value {
+                Some(Millis::ZERO) => out.push(format!("{name} must be greater than zero")),
+                Some(t) if t > MAX_LEASE_DURATION => out.push(format!(
+                    "{name} {t} exceeds the maximum of {MAX_LEASE_DURATION} (1 day)"
+                )),
+                _ => {}
+            }
+        }
         if let Some(w) = &self.wake_on_lan {
             out.extend(router_url_problem(&w.router_url).map(|m| format!("wake_on_lan.{m}")));
             if w.interface.trim().is_empty() {
@@ -159,7 +172,13 @@ fn router_url_problem(url: &str) -> Option<String> {
             "router_url {url:?} must start with https:// (the credentials are sent with it)"
         ));
     };
-    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    // The wake path is appended to the URL, so a query string or fragment would swallow it.
+    if url.contains(['?', '#']) {
+        return Some(format!(
+            "router_url {url:?} must not contain a query string or fragment (the API path is appended to it)"
+        ));
+    }
+    let authority = rest.split('/').next().unwrap_or("");
     if authority.is_empty() {
         return Some(format!("router_url {url:?} has no host"));
     }
@@ -261,6 +280,50 @@ mod tests {
                 Err(e) => assert!(e.to_string().contains(want), "{want}: {e}"),
             }
         }
+    }
+
+    #[test]
+    fn router_url_with_a_query_or_fragment_is_rejected() {
+        for bad in [
+            "https://r.example?x=1",
+            "https://r.example/?x=1",
+            "https://r.example/api#frag",
+            "https://r.example#frag",
+        ] {
+            let yaml = full("managed").replace("https://r.example", bad);
+            let p = spec(&yaml);
+            let m = p.problems().join("; ");
+            assert!(m.contains("query string or fragment"), "{bad}: {m}");
+        }
+        let yaml = full("managed").replace("https://r.example", "https://r.example:8443/base/");
+        assert!(spec(&yaml).problems().is_empty());
+    }
+
+    #[test]
+    fn timeouts_default_and_are_validated() {
+        let p = spec(&full("managed"));
+        assert_eq!(p.power_on_timeout(), Millis(600_000));
+        assert_eq!(p.shutdown_timeout(), Millis(900_000));
+        let p = spec(&format!(
+            "{}power_on_timeout: 3m\nshutdown_timeout: 1h\n",
+            full("managed")
+        ));
+        assert!(p.problems().is_empty(), "{:?}", p.problems());
+        assert_eq!(p.power_on_timeout(), Millis(180_000));
+        assert_eq!(p.shutdown_timeout(), Millis(3_600_000));
+        let p = spec(&format!(
+            "{}power_on_timeout: 0\nshutdown_timeout: 2d\n",
+            full("managed")
+        ));
+        let m = p.problems().join("; ");
+        assert!(
+            m.contains("power_on_timeout must be greater than zero"),
+            "{m}"
+        );
+        assert!(
+            m.contains("shutdown_timeout 172800000ms exceeds the maximum"),
+            "{m}"
+        );
     }
 
     #[test]

@@ -215,6 +215,22 @@ fn models(c: &Config, p: &mut Problems) {
             );
         }
         if let Some(pw) = &r.power {
+            // A timeout no longer than the staleness bound could expire before one fresh
+            // reading can show the host's state.
+            let stale = c.policy().host_reading_stale_after;
+            for (name, value) in [
+                ("power_on_timeout", pw.power_on_timeout()),
+                ("shutdown_timeout", pw.shutdown_timeout()),
+            ] {
+                if value <= stale {
+                    p.add(
+                        format!("resources[{}].power", r.id),
+                        format!(
+                            "{name} ({value}) must be greater than policy.host_reading_stale_after ({stale})"
+                        ),
+                    );
+                }
+            }
             for problem in pw.problems() {
                 p.add(format!("resources[{}].power", r.id), problem);
             }
@@ -1028,6 +1044,45 @@ sources:
     }
 
     const POWER: &str = "wake_on_lan: { router_url: 'https://r.example', mac: 'aa:bb:cc:dd:ee:01' }, shutdown: { host: h1, user: u, host_key: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }";
+
+    #[test]
+    fn power_timeouts_are_bounded_and_longer_than_the_staleness_bound() {
+        let with = |extra: &str| {
+            VALID.replace(
+                "{ id: gpu, kind: exclusive, power: { control: manual } }",
+                &format!(
+                    "{{ id: gpu, kind: exclusive, power: {{ control: managed, {POWER}, {extra} }} }}"
+                ),
+            )
+        };
+        let c = Config::from_yaml(&with("power_on_timeout: 3m, shutdown_timeout: 1h")).unwrap();
+        let pw = c.resource(&"gpu".into()).unwrap().power.as_ref().unwrap();
+        assert_eq!(pw.power_on_timeout(), crate::Millis(180_000));
+        let ps = problems(&with("power_on_timeout: 0"));
+        assert!(
+            has(
+                &ps,
+                "resources[gpu].power: power_on_timeout must be greater than zero"
+            ),
+            "{ps:?}"
+        );
+        let ps = problems(&with("shutdown_timeout: 2d"));
+        assert!(
+            has(
+                &ps,
+                "resources[gpu].power: shutdown_timeout 172800000ms exceeds"
+            ),
+            "{ps:?}"
+        );
+        let ps = problems(&with("power_on_timeout: 1s"));
+        assert!(
+            has(
+                &ps,
+                "power_on_timeout (1000ms) must be greater than policy.host_reading_stale_after"
+            ),
+            "{ps:?}"
+        );
+    }
 
     #[test]
     fn a_managed_resource_needs_its_actuators() {

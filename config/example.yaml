@@ -37,12 +37,23 @@ resources:
       # follows its observed reachability. managed: the scheduler powers it on and off
       # (both sections above are then required) and never retries a failed power action.
       control: manual
+      # Under managed control, how long the host may take to be observed up after a
+      # power-on (default 10m) or down after a shutdown (default 15m). On expiry the
+      # scheduler raises an alert (log event `power_timeout`, metric
+      # `sched_resource_power_failed`), allows nothing on the host and stops: it never
+      # retries by itself, a person acts. Each must be above host_reading_stale_after and
+      # at most 1d.
+      power_on_timeout: 10m
+      shutdown_timeout: 15m
   - id: basestar-nfs
     kind: shared
     power:
       wake_on_lan: { router_url: "https://router.example.internal", interface: lan, mac: "02:00:00:00:00:02" }
       shutdown: { host: basestar, port: 22, user: poweroff, host_key: "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
       control: manual
+      # Set per resource: the NFS host boots and stops faster than the GPU host.
+      power_on_timeout: 5m
+      shutdown_timeout: 10m
 
 models:
   - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru] }

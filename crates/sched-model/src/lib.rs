@@ -40,7 +40,7 @@ pub use source_params::{
     AuthSpec, CountsAs, ElementFilter, ExtraCount, FilterValue, HttpJsonParams, KubeWatchParams,
     PrometheusParams, RequestSpec, ResponseCondition, SinceSpec, TcpProbeParams,
 };
-pub use state::{ModePhase, PowerPhase, ResourceState, SchedState, WindDown};
+pub use state::{ModePhase, PowerPhase, PowerTransition, ResourceState, SchedState, WindDown};
 pub use store::ConfigStore;
 pub use time::Millis;
 pub use validate::Problem;

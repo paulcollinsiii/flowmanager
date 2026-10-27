@@ -48,6 +48,31 @@ pub struct PowerSpec {
     pub wake_on_lan: Option<WakeOnLan>,
     #[serde(default)]
     pub shutdown: Option<SshShutdown>,
+    /// How long the host may take to be observed up after a power-on before the scheduler
+    /// gives up, raises an alert and stops (it never retries). Default 10 minutes. Only
+    /// meaningful under `control: managed`.
+    #[serde(default)]
+    pub power_on_timeout: Option<Millis>,
+    /// As `power_on_timeout`, for being observed down after a shutdown. Default 15 minutes.
+    #[serde(default)]
+    pub shutdown_timeout: Option<Millis>,
+}
+
+/// Default for [`PowerSpec::power_on_timeout`].
+pub const DEFAULT_POWER_ON_TIMEOUT: Millis = Millis(10 * 60_000);
+/// Default for [`PowerSpec::shutdown_timeout`].
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Millis = Millis(15 * 60_000);
+
+impl PowerSpec {
+    /// The effective power-on timeout.
+    pub fn power_on_timeout(&self) -> Millis {
+        self.power_on_timeout.unwrap_or(DEFAULT_POWER_ON_TIMEOUT)
+    }
+
+    /// The effective shutdown timeout.
+    pub fn shutdown_timeout(&self) -> Millis {
+        self.shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

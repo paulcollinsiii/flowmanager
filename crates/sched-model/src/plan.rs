@@ -55,6 +55,10 @@ pub enum WaitReason {
     HostNotUp,
     PoweringOn,
     ShuttingDown,
+    /// The host's power transition (on or off) timed out and the scheduler stopped: it takes
+    /// no further power action for the host by itself and allows nothing on it until a
+    /// reachability observation shows the state the transition was after, or a person acts.
+    PowerFailed,
     /// The allowed model has not been allowed for `min_dwell` yet.
     MinDwell,
     /// The allowed model's active work is not declared preemptible.
