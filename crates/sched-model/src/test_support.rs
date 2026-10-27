@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn resource_up_needs_a_power_section() {
         let yaml = EXAMPLE_CONFIG.replace(
-            "    power:\n      actuator: ssh_power\n      params: { host: basestar }\n      control: manual\n",
+            "    power:\n      wake_on_lan: { router_url: \"https://router.example.internal\", interface: lan, mac: \"02:00:00:00:00:02\" }\n      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n      control: manual\n",
             "",
         );
         let yaml = yaml.replace("    may_change_power: true\n", "");

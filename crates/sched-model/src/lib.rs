@@ -12,6 +12,7 @@ pub mod ids;
 pub mod lease;
 pub mod observation;
 pub mod plan;
+pub mod power_params;
 pub mod recovery_params;
 pub mod source_params;
 pub mod state;
@@ -33,6 +34,7 @@ pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};
 pub use lease::{Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};
 pub use plan::{AllowedSet, Intent, PowerWant, PublishedAllowed, Step, WaitReason};
+pub use power_params::{MacAddr, SshShutdown, WakeOnLan};
 pub use recovery_params::{HttpMethod, ListSpec, REQUEUE_FAILED, RequeueFailedParams, RequeueSpec};
 pub use source_params::{
     AuthSpec, CountsAs, ElementFilter, ExtraCount, FilterValue, HttpJsonParams, KubeWatchParams,

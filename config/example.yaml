@@ -21,16 +21,27 @@ resources:
   - id: cuda-central
     kind: exclusive
     power:
-      actuator: wake_on_lan
-      params: { mac: "00:00:00:00:00:01", shutdown: ssh_forced_command }
+      # Power-on: Wake-on-LAN, sent by the router (flowmanager runs in the cluster and
+      # cannot broadcast on the LAN) through the OPNsense os-wol API. `router_url` must be
+      # https. `interface` is the router interface the packet leaves by (default lan).
+      # The router credentials (a `key:secret` file) and an optional CA bundle are NOT here:
+      # they are files mounted from Kubernetes Secrets (see the service's
+      # --opnsense-credentials-file and --opnsense-ca-file), read on every call.
+      wake_on_lan: { router_url: "https://router.example.internal", interface: lan, mac: "02:00:00:00:00:01" }
+      # Power-off: SSH to a forced-command key, which runs the host's shutdown whatever
+      # command is sent. `host_key` is the host's pinned SHA256 fingerprint (ssh-keygen -lf);
+      # any other key is refused. The private key is a file mounted from a Kubernetes Secret
+      # (--ssh-key-file), read on every call.
+      shutdown: { host: cuda-central, port: 22, user: poweroff, host_key: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
       # manual: a person powers the host; the scheduler never emits power steps for it and
-      # follows its observed reachability. managed (M4): the scheduler powers it on and off.
+      # follows its observed reachability. managed: the scheduler powers it on and off
+      # (both sections above are then required) and never retries a failed power action.
       control: manual
   - id: basestar-nfs
     kind: shared
     power:
-      actuator: ssh_power
-      params: { host: basestar }
+      wake_on_lan: { router_url: "https://router.example.internal", interface: lan, mac: "02:00:00:00:00:02" }
+      shutdown: { host: basestar, port: 22, user: poweroff, host_key: "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
       control: manual
 
 models:

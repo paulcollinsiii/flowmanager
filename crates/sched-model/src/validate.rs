@@ -1,7 +1,7 @@
 //! Whole-config validation. Problems are collected, not short-circuited, so one load
 //! reports everything that is wrong.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::config::{Capability, Config, MAX_LEASE_DURATION, ResourceKind, SourceKind};
@@ -214,12 +214,41 @@ fn models(c: &Config, p: &mut Problems) {
                 "exclusive resource has no models",
             );
         }
-        if let Some(pw) = &r.power
-            && pw.actuator.trim().is_empty()
+        if let Some(pw) = &r.power {
+            for problem in pw.problems() {
+                p.add(format!("resources[{}].power", r.id), problem);
+            }
+        }
+    }
+    // Two resources must not be powered through the same host: one would switch the other.
+    let mut macs = HashMap::new();
+    let mut targets = HashMap::new();
+    for r in c.resources() {
+        let Some(pw) = &r.power else { continue };
+        let at = format!("resources[{}].power", r.id);
+        if let Some(w) = &pw.wake_on_lan
+            && let Some(prev) = macs.insert(w.mac.0, &r.id)
         {
             p.add(
-                format!("resources[{}].power", r.id),
-                "actuator must not be empty",
+                &at,
+                format!(
+                    "wake_on_lan.mac {} is also used by resource {:?}",
+                    w.mac,
+                    prev.as_str()
+                ),
+            );
+        }
+        if let Some(s) = &pw.shutdown
+            && let Some(prev) = targets.insert((s.host.to_ascii_lowercase(), s.port), &r.id)
+        {
+            p.add(
+                &at,
+                format!(
+                    "shutdown host {}:{} is also used by resource {:?}",
+                    s.host,
+                    s.port,
+                    prev.as_str()
+                ),
             );
         }
     }
@@ -442,8 +471,8 @@ policy:
   interactive_ttl: 10m
   drain_timeout: 5m
 resources:
-  - { id: gpu, kind: exclusive, power: { actuator: wol } }
-  - { id: nfs, kind: shared, power: { actuator: ssh } }
+  - { id: gpu, kind: exclusive, power: { control: manual } }
+  - { id: nfs, kind: shared, power: { control: manual } }
   - { id: gpu2, kind: exclusive }
 models:
   - { id: m1, resource: gpu, load_time: 60s, workloads: [w1] }
@@ -511,7 +540,7 @@ sources:
     fn rejects_duplicate_names_in_every_section() {
         let y = VALID
             .replace(
-                "  - { id: nfs, kind: shared, power: { actuator: ssh } }",
+                "  - { id: nfs, kind: shared, power: { control: manual } }",
                 "  - { id: nfs, kind: shared }\n  - { id: nfs, kind: shared }",
             )
             .replace(
@@ -653,11 +682,11 @@ sources:
                 "preemptibility: none\n    may_change_power: true",
             )
             .replace(
-                "{ id: gpu, kind: exclusive, power: { actuator: wol } }",
+                "{ id: gpu, kind: exclusive, power: { control: manual } }",
                 "{ id: gpu, kind: exclusive }",
             )
             .replace(
-                "{ id: nfs, kind: shared, power: { actuator: ssh } }",
+                "{ id: nfs, kind: shared, power: { control: manual } }",
                 "{ id: nfs, kind: shared }",
             );
         let ps = problems(&y);
@@ -987,7 +1016,7 @@ sources:
     }
 
     #[test]
-    fn rejects_zero_load_time_and_empty_actuator() {
+    fn rejects_zero_load_time() {
         let ps = problems(&VALID.replace(
             "load_time: 60s, workloads: [w1]",
             "load_time: 0, workloads: [w1]",
@@ -996,9 +1025,80 @@ sources:
             has(&ps, "models[m1]: load_time must be greater than zero"),
             "{ps:?}"
         );
-        let ps = problems(&VALID.replace("actuator: wol", "actuator: \"\""));
+    }
+
+    const POWER: &str = "wake_on_lan: { router_url: 'https://r.example', mac: 'aa:bb:cc:dd:ee:01' }, shutdown: { host: h1, user: u, host_key: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }";
+
+    #[test]
+    fn a_managed_resource_needs_its_actuators() {
+        let ps = problems(&VALID.replace(
+            "{ id: gpu, kind: exclusive, power: { control: manual } }",
+            "{ id: gpu, kind: exclusive, power: { control: managed } }",
+        ));
         assert!(
-            has(&ps, "resources[gpu].power: actuator must not be empty"),
+            has(
+                &ps,
+                "resources[gpu].power: control is managed but there is no wake_on_lan"
+            ),
+            "{ps:?}"
+        );
+        assert!(
+            has(
+                &ps,
+                "resources[gpu].power: control is managed but there is no shutdown"
+            ),
+            "{ps:?}"
+        );
+        let ok = VALID.replace(
+            "{ id: gpu, kind: exclusive, power: { control: manual } }",
+            &format!("{{ id: gpu, kind: exclusive, power: {{ control: managed, {POWER} }} }}"),
+        );
+        Config::from_yaml(&ok).unwrap();
+        // A malformed section is refused even for a manual resource.
+        let bad = ok
+            .replace("control: managed", "control: manual")
+            .replace("https://r.example", "http://r.example");
+        assert!(
+            has(&problems(&bad), "wake_on_lan.router_url"),
+            "{:?}",
+            problems(&bad)
+        );
+        // The placeholder shape this replaced is refused with a parse error.
+        let old = VALID.replace(
+            "power: { control: manual } }\n  - { id: nfs",
+            "power: { actuator: wol } }\n  - { id: nfs",
+        );
+        assert_ne!(old, VALID);
+        assert!(matches!(
+            Config::from_yaml(&old),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn two_resources_must_not_share_a_power_target() {
+        let both = VALID
+            .replace(
+                "{ id: gpu, kind: exclusive, power: { control: manual } }",
+                &format!("{{ id: gpu, kind: exclusive, power: {{ control: managed, {POWER} }} }}"),
+            )
+            .replace(
+                "{ id: nfs, kind: shared, power: { control: manual } }",
+                &format!("{{ id: nfs, kind: shared, power: {{ control: managed, {POWER} }} }}"),
+            );
+        let ps = problems(&both);
+        assert!(
+            has(
+                &ps,
+                "resources[nfs].power: wake_on_lan.mac aa:bb:cc:dd:ee:01 is also used by resource \"gpu\""
+            ),
+            "{ps:?}"
+        );
+        assert!(
+            has(
+                &ps,
+                "resources[nfs].power: shutdown host h1:22 is also used by resource \"gpu\""
+            ),
             "{ps:?}"
         );
     }

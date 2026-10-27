@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 
 use crate::ids::{ClassId, ModelId, ResourceId, SourceId};
+use crate::power_params::{SshShutdown, WakeOnLan};
 use crate::time::Millis;
 use crate::validate::{self, Problem};
 
@@ -34,16 +35,19 @@ pub enum PowerControl {
     Managed,
 }
 
-/// How a host's power is changed. The actuator kind lives in code; its parameters here.
+/// How a host's power is changed: Wake-on-LAN through the router to power on, SSH with a
+/// forced-command key to power off (see `power_params`). Both are required for
+/// `control: managed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PowerSpec {
-    pub actuator: String,
-    #[serde(default)]
-    pub params: Value,
     /// Defaults to `manual`.
     #[serde(default)]
     pub control: PowerControl,
+    #[serde(default)]
+    pub wake_on_lan: Option<WakeOnLan>,
+    #[serde(default)]
+    pub shutdown: Option<SshShutdown>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
