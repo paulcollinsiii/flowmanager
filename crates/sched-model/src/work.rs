@@ -20,7 +20,7 @@ pub struct ClassWork {
     pub failed: u64,
     pub oldest_ready_at: Option<Millis>,
     /// False when the class has demand but its observation is missing or older than
-    /// `demand_max_age`. Unknown work must be assumed possibly in flight.
+    /// `queue_reading_stale_after`. Unknown work must be assumed possibly in flight.
     pub known: bool,
 }
 
@@ -131,7 +131,7 @@ pub fn host_is_up(
     match state.resource(resource) {
         Some(st) => st.is_on(),
         None => snapshot
-            .fresh_resource_up(config, resource, config.policy().safety_max_age)
+            .fresh_resource_up(config, resource, config.policy().host_reading_stale_after)
             .unwrap_or(false),
     }
 }

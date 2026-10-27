@@ -9,8 +9,8 @@ policy:
   max_dwell: 2h
   idle_grace: 10m
   age_threshold: 30m
-  demand_max_age: 10m
-  safety_max_age: 30s
+  queue_reading_stale_after: 10m
+  host_reading_stale_after: 30s
   interactive_ttl: 15m
   # Once the planner wants another model, in-flight work (whatever its preemptibility,
   # except a busy `none` class) is cut off this long after the wind-down starts, unless a

@@ -679,7 +679,7 @@ mod tests {
         cluster(&s);
         ocr_demand(&s, 3);
         // 31s later nothing was refreshed: the host's reachability is older than
-        // safety_max_age (30s), so no model is allowed on it.
+        // host_reading_stale_after (30s), so no model is allowed on it.
         let r = s.tick(Millis(T0 + 31_000), &mut d);
         assert!(!r.kinds.contains(&"allow_model".to_string()), "{r:?}");
         assert!(

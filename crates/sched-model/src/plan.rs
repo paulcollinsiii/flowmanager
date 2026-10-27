@@ -44,7 +44,7 @@ pub struct Intent {
 #[serde(rename_all = "snake_case")]
 pub enum WaitReason {
     /// A safety-critical observation (host reachability) is missing or older than
-    /// `safety_max_age`.
+    /// `host_reading_stale_after`.
     StaleObservation,
     /// A scheduling observation needed to prove no work is in flight is missing or stale.
     StaleDemand,

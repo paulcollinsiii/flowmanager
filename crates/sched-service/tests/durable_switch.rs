@@ -283,7 +283,7 @@ fn a_switch_is_one_tick_and_resumes_safely_after_a_restart_in_the_middle_of_it()
     world.queues.get_mut("paperless-ocr").unwrap().ready = 3;
     let mut p = start(T0);
     let mut log: Vec<String> = Vec::new();
-    // The cluster watch stalls for longer than safety_max_age when the switch comes due.
+    // The cluster watch stalls for longer than host_reading_stale_after when the switch comes due.
     let stall = 60..75usize;
     let mut stale_holds = 0;
     let mut switched_at: Option<usize> = None;

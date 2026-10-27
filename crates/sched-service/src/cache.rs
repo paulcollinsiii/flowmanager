@@ -402,10 +402,10 @@ mod tests {
                 .errors_total,
             1
         );
-        // Past demand_max_age (10m) the snapshot reading is stale.
+        // Past queue_reading_stale_after (10m) the snapshot reading is stale.
         let snap = c.snapshot(&cfg, Millis(1_000 + 600_001));
         let o = snap.demand(&cfg, &"paperless-ocr".into()).unwrap();
-        assert!(!o.is_fresh(snap.now, cfg.policy().demand_max_age));
+        assert!(!o.is_fresh(snap.now, cfg.policy().queue_reading_stale_after));
         // A source that never reported has no age at all.
         let never = ages
             .iter()

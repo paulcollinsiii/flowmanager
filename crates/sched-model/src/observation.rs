@@ -78,7 +78,7 @@ pub enum ObservedValue {
 
 impl ObservedValue {
     /// Host reachability gates the safety-critical steps (allowing a model, powering a host
-    /// off) and is held to `safety_max_age`. Pod counts gate nothing any more (Kubernetes
+    /// off) and is held to `host_reading_stale_after`. Pod counts gate nothing any more (Kubernetes
     /// enforces GPU exclusivity) but keep the same bound, so their ages read alike.
     /// Everything else is a scheduling input.
     pub fn is_safety_critical(&self) -> bool {

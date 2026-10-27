@@ -13,10 +13,11 @@ pub(crate) fn initial(cx: &Cx, steps: &mut Vec<Step>) -> Option<ResourceState> {
     if cx.res.power.is_none() {
         return Some(ResourceState::new(PowerPhase::On { since: now }));
     }
-    match cx
-        .snapshot
-        .fresh_resource_up(cx.config, &cx.res.id, cx.config.policy().safety_max_age)
-    {
+    match cx.snapshot.fresh_resource_up(
+        cx.config,
+        &cx.res.id,
+        cx.config.policy().host_reading_stale_after,
+    ) {
         Some(true) => Some(ResourceState::new(PowerPhase::On { since: now })),
         Some(false) => Some(ResourceState::new(PowerPhase::Off)),
         None => {
@@ -42,10 +43,11 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         st.host_idle_since = None;
     }
     let now = cx.now();
-    let Some(up) =
-        cx.snapshot
-            .fresh_resource_up(cx.config, &cx.res.id, cx.config.policy().safety_max_age)
-    else {
+    let Some(up) = cx.snapshot.fresh_resource_up(
+        cx.config,
+        &cx.res.id,
+        cx.config.policy().host_reading_stale_after,
+    ) else {
         return;
     };
     st.power = match (st.power, up) {
@@ -210,7 +212,7 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
 /// Shuts the host down, provided a fresh reading shows it up. It is only reached with no
 /// model allowed (mode idle); pod counts are not consulted.
 fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
-    let max_age = cx.config.policy().safety_max_age;
+    let max_age = cx.config.policy().host_reading_stale_after;
     if cx
         .snapshot
         .fresh_resource_up(cx.config, &cx.res.id, max_age)

@@ -124,8 +124,8 @@ fn policy(c: &Config, p: &mut Problems) {
     let positive = [
         ("max_dwell", pol.max_dwell),
         ("age_threshold", pol.age_threshold),
-        ("demand_max_age", pol.demand_max_age),
-        ("safety_max_age", pol.safety_max_age),
+        ("queue_reading_stale_after", pol.queue_reading_stale_after),
+        ("host_reading_stale_after", pol.host_reading_stale_after),
         ("interactive_ttl", pol.interactive_ttl),
         ("drain_timeout", pol.drain_timeout),
     ];
@@ -151,12 +151,12 @@ fn policy(c: &Config, p: &mut Problems) {
             p.add(format!("policy.{name}"), "must be greater than zero");
         }
     }
-    if pol.safety_max_age > pol.demand_max_age {
+    if pol.host_reading_stale_after > pol.queue_reading_stale_after {
         p.add(
             "policy",
             format!(
-                "safety_max_age ({}) is greater than demand_max_age ({}); safety-critical data must be at least as fresh as scheduling inputs",
-                pol.safety_max_age, pol.demand_max_age
+                "host_reading_stale_after ({}) is greater than queue_reading_stale_after ({}); safety-critical data must be at least as fresh as scheduling inputs",
+                pol.host_reading_stale_after, pol.queue_reading_stale_after
             ),
         );
     }
@@ -362,12 +362,12 @@ fn sources(c: &Config, p: &mut Problems) {
             p.add(&at, "resync must be greater than zero");
             continue;
         }
-        if s.resync > pol.demand_max_age {
+        if s.resync > pol.queue_reading_stale_after {
             p.add(
                 &at,
                 format!(
-                    "resync ({}) exceeds policy.demand_max_age ({}); its observations would always be stale",
-                    s.resync, pol.demand_max_age
+                    "resync ({}) exceeds policy.queue_reading_stale_after ({}); its observations would always be stale",
+                    s.resync, pol.queue_reading_stale_after
                 ),
             );
         }
@@ -413,13 +413,13 @@ fn sources(c: &Config, p: &mut Problems) {
             }
         }
         if (s.observe.contains(&Capability::Pods) || s.observe.contains(&Capability::Reachability))
-            && s.resync > pol.safety_max_age
+            && s.resync > pol.host_reading_stale_after
         {
             p.add(
                 &at,
                 format!(
-                    "resync ({}) exceeds policy.safety_max_age ({}); its pods/reachability observations would always be stale",
-                    s.resync, pol.safety_max_age
+                    "resync ({}) exceeds policy.host_reading_stale_after ({}); its pods/reachability observations would always be stale",
+                    s.resync, pol.host_reading_stale_after
                 ),
             );
         }
@@ -437,8 +437,8 @@ policy:
   max_dwell: 1h
   idle_grace: 5m
   age_threshold: 30m
-  demand_max_age: 5m
-  safety_max_age: 30s
+  queue_reading_stale_after: 5m
+  host_reading_stale_after: 30s
   interactive_ttl: 10m
   drain_timeout: 5m
 resources:
@@ -578,7 +578,10 @@ sources:
     fn rejects_inconsistent_policy_and_reports_all() {
         let y = VALID
             .replace("min_dwell: 1m", "min_dwell: 2h")
-            .replace("safety_max_age: 30s", "safety_max_age: 10m")
+            .replace(
+                "host_reading_stale_after: 30s",
+                "host_reading_stale_after: 10m",
+            )
             .replace("drain_timeout: 5m", "drain_timeout: 0");
         let ps = problems(&y);
         assert!(
@@ -588,7 +591,7 @@ sources:
             ),
             "{ps:?}"
         );
-        assert!(has(&ps, "safety_max_age"), "{ps:?}");
+        assert!(has(&ps, "host_reading_stale_after"), "{ps:?}");
         assert!(
             has(&ps, "policy.drain_timeout: must be greater than zero"),
             "{ps:?}"
@@ -672,7 +675,10 @@ sources:
             .replace("resync: 30s }", "resync: 10m }");
         let ps = problems(&y);
         assert!(has(&ps, "is not exclusive"), "{ps:?}");
-        assert!(has(&ps, "exceeds policy.demand_max_age"), "{ps:?}");
+        assert!(
+            has(&ps, "exceeds policy.queue_reading_stale_after"),
+            "{ps:?}"
+        );
     }
 
     #[test]
@@ -838,7 +844,7 @@ sources:
 
     #[test]
     fn the_safety_resync_limit_applies_to_pods_and_to_reachability_sources_alike() {
-        // safety_max_age is 30s in VALID; 45s is within demand_max_age.
+        // host_reading_stale_after is 30s in VALID; 45s is within queue_reading_stale_after.
         let probe = |observe: &str, resync: &str| {
             let kind = if observe == "pods" {
                 "kubernetes_watch"
@@ -857,12 +863,12 @@ sources:
             assert!(
                 has(
                     &ps,
-                    "sources[probe]: resync (45000ms) exceeds policy.safety_max_age"
+                    "sources[probe]: resync (45000ms) exceeds policy.host_reading_stale_after"
                 ),
                 "{observe}: {ps:?}"
             );
         }
-        // A demand-only source is held only to demand_max_age.
+        // A demand-only source is held only to queue_reading_stale_after.
         assert!(Config::from_yaml(&probe("demand", "45s")).is_ok());
     }
 
@@ -1067,7 +1073,10 @@ sources:
             "kind: kubernetes_watch, resync: 10s",
             "kind: kubernetes_watch, resync: 1m",
         ));
-        assert!(has(&ps, "exceeds policy.safety_max_age"), "{ps:?}");
+        assert!(
+            has(&ps, "exceeds policy.host_reading_stale_after"),
+            "{ps:?}"
+        );
     }
 
     #[test]

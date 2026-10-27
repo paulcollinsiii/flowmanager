@@ -1,4 +1,4 @@
-description: "A reachability reading of the GPU host older than safety_max_age blocks allowing a model until a fresh one arrives; pod counts, stale or showing another model, never do."
+description: "A reachability reading of the GPU host older than host_reading_stale_after blocks allowing a model until a fresh one arrives; pod counts, stale or showing another model, never do."
 frames:
   # The GPU host's reading is 60s old, the bound is 30s. Pod counts are fresh and say llm is
   # still running: that does not matter (Kubernetes keeps a new pod pending until the GPU is free).

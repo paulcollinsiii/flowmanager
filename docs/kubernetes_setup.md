@@ -585,7 +585,7 @@ Deployment (`README.md`, *Known blind spots*).
 ## 8. Reachability and power
 
 Which host is up decides what may be allowed: no model is allowed on a host observed off,
-and allowing one needs a fresh "up" reading (`policy.safety_max_age`, 30 s in the example).
+and allowing one needs a fresh "up" reading (`policy.host_reading_stale_after`, 30 s in the example).
 
 - **cuda-central** comes from the Kubernetes node watch (`kubernetes_watch`, `observe:
   [reachability]`): `params.nodes: { cuda-central: <node name> }` maps the resource to the

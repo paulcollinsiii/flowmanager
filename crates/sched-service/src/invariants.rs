@@ -107,7 +107,10 @@ fn failed_items(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<u
         })
         .collect();
     let latest = seen.iter().map(|x| x.0).max()?;
-    let (now, max_age) = (snap.now.as_u64(), config.policy().demand_max_age.as_u64());
+    let (now, max_age) = (
+        snap.now.as_u64(),
+        config.policy().queue_reading_stale_after.as_u64(),
+    );
     if latest > now || now - latest > max_age {
         return None;
     }
@@ -145,7 +148,10 @@ fn demand(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<(bool, 
         // A source that can never report and never has: no demand.
         return snap.unobservable.contains(src).then_some((false, false));
     };
-    let (now, max_age) = (snap.now.as_u64(), config.policy().demand_max_age.as_u64());
+    let (now, max_age) = (
+        snap.now.as_u64(),
+        config.policy().queue_reading_stale_after.as_u64(),
+    );
     if latest > now || now - latest > max_age {
         return None;
     }
@@ -206,7 +212,7 @@ pub fn check(
     let mut out = Vec::new();
     let policy = config.policy();
     let now = snapshot.now;
-    let safety = policy.safety_max_age;
+    let safety = policy.host_reading_stale_after;
     let _ = intent;
 
     // 1. At most one model allowed per exclusive resource.

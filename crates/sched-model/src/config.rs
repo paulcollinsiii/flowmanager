@@ -238,10 +238,10 @@ pub struct PolicyConfig {
     /// Age of the oldest ready item on another queue that forces a switch.
     pub age_threshold: Millis,
     /// Oldest acceptable observation for scheduling inputs such as queue depth.
-    pub demand_max_age: Millis,
+    pub queue_reading_stale_after: Millis,
     /// Oldest acceptable observation for safety-critical checks (host reachability, before
     /// a model is allowed or a host powered off).
-    pub safety_max_age: Millis,
+    pub host_reading_stale_after: Millis,
     /// Lifetime of an interactive lease before it must be renewed.
     pub interactive_ttl: Millis,
     /// How long in-flight jobs may run after a manual model lease cuts batch work short.
@@ -258,12 +258,12 @@ impl PolicyConfig {
     }
 
     /// The oldest an observation of this kind may be and still be used: safety-critical
-    /// kinds are held to `safety_max_age`, scheduling inputs to `demand_max_age`.
+    /// kinds are held to `host_reading_stale_after`, scheduling inputs to `queue_reading_stale_after`.
     pub fn max_age_for(&self, value: &crate::observation::ObservedValue) -> Millis {
         if value.is_safety_critical() {
-            self.safety_max_age
+            self.host_reading_stale_after
         } else {
-            self.demand_max_age
+            self.queue_reading_stale_after
         }
     }
 }

@@ -1202,8 +1202,11 @@ mod tests {
             "    kind: tcp_probe\n    observe: [reachability]\n    resync: 10s\n",
             "    kind: tcp_probe\n    observe: [reachability]\n    resync: 60s\n",
         );
-        // resync 60s exceeds the example's safety_max_age (30s), so raise that as well.
-        let y = y.replace("safety_max_age: 30s", "safety_max_age: 60s");
+        // resync 60s exceeds the example's host_reading_stale_after (30s), so raise that as well.
+        let y = y.replace(
+            "host_reading_stale_after: 30s",
+            "host_reading_stale_after: 60s",
+        );
         assert_eq!(tcp_params(&y).timeout, crate::Millis(60_000));
         let p = tcp_params(&EXAMPLE_CONFIG.replace(
             "      timeout: 2s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",

@@ -57,13 +57,14 @@ fn waiting(cx: &Cx, steps: &mut Vec<Step>, reason: WaitReason) -> bool {
 }
 
 /// Whether the host may be given a new model: a resource without a power section always,
-/// otherwise only on a fresh "up" reading (safety-critical, held to `safety_max_age`).
+/// otherwise only on a fresh "up" reading (safety-critical, held to `host_reading_stale_after`).
 fn fresh_up(cx: &Cx) -> bool {
     cx.res.power.is_none()
-        || cx
-            .snapshot
-            .fresh_resource_up(cx.config, &cx.res.id, cx.config.policy().safety_max_age)
-            == Some(true)
+        || cx.snapshot.fresh_resource_up(
+            cx.config,
+            &cx.res.id,
+            cx.config.policy().host_reading_stale_after,
+        ) == Some(true)
 }
 
 /// Runs the recovery actions of classes whose work was stopped, once their model is gone.
