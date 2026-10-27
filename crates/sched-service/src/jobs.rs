@@ -201,3 +201,6 @@ pub fn summaries(config: &Config, book: &JobBook) -> Vec<JobSummary> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod scenarios;
