@@ -241,6 +241,31 @@ mod tests {
     }
 
     #[test]
+    fn a_job_not_marked_as_made_by_flowmanager_is_ignored_even_if_the_selector_let_it_through() {
+        // The server-side label selector already filters; this is the second line of defence.
+        let mut foreign = job("backup-other", "backups", Some("backup"), &[]);
+        foreign
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_MANAGED_BY.to_string(), "someone-else".to_string());
+        let mut unmarked = job("backup-unmarked", "backups", Some("backup"), &[]);
+        unmarked
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(LABEL_MANAGED_BY);
+        let ours = job("backup-1-a1", "backups", Some("backup"), &[]);
+        let v = job_values(&target(), &[foreign, unmarked, ours]);
+        assert_eq!(
+            runs(&v),
+            vec![("backup-1-a1".to_string(), JobRunState::Active)]
+        );
+    }
+
+    #[test]
     fn the_conditions_decide_the_state_and_only_a_true_condition_counts() {
         assert_eq!(job_state(&job("a", "n", None, &[])), JobRunState::Active);
         assert_eq!(
