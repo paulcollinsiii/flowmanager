@@ -861,6 +861,7 @@ impl Shared {
         let ages: Vec<InputAge> = r.inputs.iter().map(InputReport::to_input_age).collect();
         self.metrics.set_input_ages(&ages);
         self.metrics.set_phases(r.at, &r.state);
+        self.metrics.set_manual_lease_ages(r.at, &r.leases);
         let config = self.config.current();
         self.metrics.set_power_failed(&r.state, |id| {
             config.resource(id).is_some_and(|res| res.power.is_some())

@@ -42,6 +42,10 @@ pub struct Metrics {
     mounts_timeouts: IntCounterVec,
     mounts_veto: GaugeVec,
     min_off_remaining: GaugeVec,
+    toggle_requests: IntCounterVec,
+    manual_lease_age: GaugeVec,
+    /// (kind, target) pairs with `manual_lease_age` series, to drop released leases.
+    manual_lease_labels: Mutex<HashSet<(String, String)>>,
     /// Resources with `min_off_remaining` series, to drop those that leave the set.
     min_off_resources: Mutex<HashSet<String>>,
     /// Resources with `mounts_veto` series, to drop those that leave the checked set.
@@ -269,6 +273,28 @@ impl Metrics {
             .register(Box::new(mounts_timeouts.clone()))
             .unwrap();
         registry.register(Box::new(mounts_veto.clone())).unwrap();
+        let toggle_requests = IntCounterVec::new(
+            Opts::new(
+                "sched_toggle_requests_total",
+                "Requests to the toggle listener (Home Assistant) by endpoint (a fixed set: list, model_get, model_on, model_off, resource_get, resource_on, resource_off, resource_resume, unmatched) and outcome (ok, unauthorized, bad_request, not_found, method_not_allowed, conflict, error); never labelled with a model or resource name",
+            ),
+            &["endpoint", "outcome"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(toggle_requests.clone()))
+            .unwrap();
+        let manual_lease_age = GaugeVec::new(
+            Opts::new(
+                "sched_manual_lease_age_seconds",
+                "Seconds since each manual lease was granted, as of the last tick: kind is model (target = the model) or host (target = the resource). An alert on this finds a lease that was forgotten",
+            ),
+            &["kind", "target"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(manual_lease_age.clone()))
+            .unwrap();
         let min_off_remaining = GaugeVec::new(
             Opts::new(
                 "sched_resource_min_off_remaining_seconds",
@@ -328,6 +354,9 @@ impl Metrics {
             mounts_timeouts,
             mounts_veto,
             min_off_remaining,
+            toggle_requests,
+            manual_lease_age,
+            manual_lease_labels: Mutex::new(HashSet::new()),
             min_off_resources: Mutex::new(HashSet::new()),
             mounts_veto_resources: Mutex::new(HashSet::new()),
             phases: Mutex::new(HashMap::new()),
@@ -622,6 +651,44 @@ impl Metrics {
         *known = now_known;
     }
 
+    /// Counts one toggle-listener request; `endpoint` and `outcome` are from the fixed sets
+    /// in the metric's help.
+    pub fn toggle_request(&self, endpoint: &str, outcome: &str) {
+        self.toggle_requests
+            .with_label_values(&[endpoint, outcome])
+            .inc();
+    }
+
+    /// Sets `sched_manual_lease_age_seconds` from the leases the tick gave the core: one
+    /// series per manual model lease (target the model) and manual host lease (target the
+    /// resource); a released lease loses its series.
+    pub fn set_manual_lease_ages(&self, now: Millis, leases: &[sched_model::Lease]) {
+        use sched_model::LeaseKind;
+        let mut known = self
+            .manual_lease_labels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut now_known = HashSet::new();
+        for l in leases {
+            let (kind, target) = match &l.kind {
+                LeaseKind::ManualModel { model } => ("model", model.to_string()),
+                LeaseKind::ManualHost => ("host", l.resource.to_string()),
+                _ => continue,
+            };
+            let age = now.as_u64().saturating_sub(l.granted_at.as_u64()) as f64 / 1000.0;
+            self.manual_lease_age
+                .with_label_values(&[kind, &target])
+                .set(age);
+            now_known.insert((kind.to_string(), target));
+        }
+        for (kind, target) in known.difference(&now_known) {
+            let _ = self
+                .manual_lease_age
+                .remove_label_values(&[kind.as_str(), target.as_str()]);
+        }
+        *known = now_known;
+    }
+
     /// Counts one power action by outcome (see the metric's help). `resource` must be a
     /// configured resource id.
     pub fn power_request(&self, resource: &str, action: &str, outcome: &str) {
@@ -657,6 +724,49 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_lease_ages_count_up_and_a_released_lease_loses_its_series() {
+        use sched_model::{Lease, LeaseKind};
+        let m = Metrics::new();
+        let lease = |id: &str, resource: &str, kind: LeaseKind| Lease {
+            id: id.into(),
+            resource: resource.into(),
+            kind,
+            granted_at: Millis(1_000),
+        };
+        let leases = vec![
+            lease(
+                "a",
+                "gpu",
+                LeaseKind::ManualModel {
+                    model: "llm".into(),
+                },
+            ),
+            lease("b", "nfs", LeaseKind::ManualHost),
+            lease("c", "gpu", LeaseKind::Reclaim),
+        ];
+        m.set_manual_lease_ages(Millis(61_000), &leases);
+        let text = m.render();
+        assert!(
+            text.contains("sched_manual_lease_age_seconds{kind=\"model\",target=\"llm\"} 60"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sched_manual_lease_age_seconds{kind=\"host\",target=\"nfs\"} 60"),
+            "{text}"
+        );
+        assert!(!text.contains("reclaim"), "{text}");
+        m.set_manual_lease_ages(Millis(62_000), &leases[1..]);
+        let text = m.render();
+        assert!(!text.contains("target=\"llm\""), "{text}");
+        assert!(text.contains("target=\"nfs\"} 61"), "{text}");
+        m.toggle_request("model_on", "ok");
+        assert!(
+            m.render()
+                .contains("sched_toggle_requests_total{endpoint=\"model_on\",outcome=\"ok\"} 1")
+        );
+    }
 
     #[test]
     fn the_min_off_gauge_counts_down_to_zero_and_drops_resources_without_a_minimum() {
