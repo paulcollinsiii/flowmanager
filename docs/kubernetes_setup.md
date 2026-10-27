@@ -59,6 +59,11 @@ EXPOSE 9080 9090 9095
 ENTRYPOINT ["/usr/local/bin/sched-service"]
 ```
 
+`tzdata` is required, not optional, once any job is configured: jobs are scheduled in a time
+zone (`UTC` by default) and the zone is looked up in the system database, which the Rust
+time library does not bundle on Linux. Verified by hiding `/usr/share/zoneinfo`: the config
+is then rejected at load with "failed to find timezone UTC" (even for `UTC`). An image with
+
 The repository root has a `.dockerignore` (`target/`, `.git/`, scratch and worktree
 directories); keep it when building from the repository, or `COPY . .` sends the whole
 `target/` directory into the build context.
@@ -249,7 +254,7 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/resume` | `{"resource": "<id>"}` | After a host was fixed by hand: clears a failed power transition, or a shutdown stopped by mounting pods, for that one resource, which then follows observation (found running means up and not managed). Powers nothing; other resources and the leases are untouched. Not stopped: `409`. | an operator. |
 | `Scheduler/main/jobs` | none | Read only. Every configured scheduled job with its state: next time, the run in progress (phase, attempt, Job name, retry time), the last outcome and the last success, and a Job past its deadline that may still be active. | operators, monitoring. |
 | `Scheduler/main/trigger_job` | `{"id": "<job id>"}` | **Starts a run of a scheduled job now** (it waits for the job's needs, then the Job is created). Refused with `409` while the previous instance is pending or running, never queued; unknown id `404`. | an operator. |
-| `Scheduler/main/discard_state` | `{"key": "scheduler_state"\|"lease_book"\|"job_book", "force": bool}` | **Destructive**: deletes a persisted document so the next tick starts it afresh. Without `force` only a document that cannot be read (`409` otherwise). `lease_book` drops every lease; `scheduler_state` drops the sequencer state. Returns what was stored. | operators only. |
+| `Scheduler/main/discard_state` | `{"key": "scheduler_state"\|"lease_book"\|"job_book", "force": bool}` | **Destructive**: deletes a persisted document so the next tick starts it afresh. Without `force` only a document that cannot be read (`409` otherwise). `lease_book` drops every lease; `scheduler_state` drops the sequencer state; `job_book` forgets every run, lingering mark and next time (a Job still running is then unknown to the next run, which can start beside it). Returns what was stored. | operators only. |
 | `Recovery/{class}/attempts` | none | Read only. The stored attempts document (text, `null` if none). | operators, monitoring. |
 | `Recovery/{class}/discard_attempts` | `{"force": bool}` | Deletes the re-queue attempts of a class (with `force`, a readable document too, which gives every failed recording a fresh set of attempts). | operators only. |
 
@@ -405,7 +410,15 @@ nothing else (no ConfigMaps, no Secrets), with one exception, the scheduled jobs
   by the job (its `spec.jobTemplate` is the template), **creates** Jobs, and **lists** Jobs by
   the label `app.kubernetes.io/managed-by=flowmanager` once per `resync` (no `watch`). It
   never deletes, patches or updates anything: a Job it made stays for the CronJob's or your
-  own cleanup (`ttlSecondsAfterFinished` in the template, say). Creating a Job owned by a
+  own cleanup. If the template sets `ttlSecondsAfterFinished`, make it long: a finished Job
+  that Kubernetes deletes before flowmanager has seen it finish reads as deleted by hand
+  (`job_deleted`: the run fails, no retry, an alert) although it succeeded. flowmanager sees a
+  finish after at most `resync` (10 s in the example) plus the 20 s read timeout plus a
+  backstop interval (30 s), and not at all while it is down, so use at least an hour (and
+  longer than any outage you want to ride out), or no TTL. A TTL shorter than that is not
+  detected; the only sign is that failed event with reason `job_deleted` for a Job that really
+  completed.
+  Creating a Job owned by a
   CronJob also needs no `cronjobs/finalizers` permission here, because flowmanager does not
   set `blockOwnerDeletion`.
 - **pods, volumes and claims for the NFS mount check**: only when a source declares
@@ -475,7 +488,8 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: flowman
 subjects: [{ kind: ServiceAccount, name: flowmanager, namespace: flowmanager }]
 ---
 # Only if jobs are configured. One Role + RoleBinding per namespace that holds a job's
-# CronJob (the example: backups). Least privilege: read the template, make Jobs, list them.
+# CronJob (the example: backups). Least privilege, exactly the calls the code makes: get the
+# template CronJob, create Jobs, list Jobs (no watch, no get of a single Job).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata: { name: flowmanager-jobs, namespace: backups }
@@ -486,7 +500,7 @@ rules:
     # resourceNames: [postgres-backup, actualbudget-backup]   # narrower still
   - apiGroups: [batch]
     resources: [jobs]
-    verbs: [create, get, list, watch]
+    verbs: [create, list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -778,9 +792,9 @@ event):
 - alert: FlowmanagerShutdownStopped      # pods kept mounting a managed NFS host past mounts_timeout; it stays up until a person acts
   expr: sched_resource_mounts_veto{state="stopped"} == 1
 - alert: FlowmanagerJobProblem           # a scheduled job failed for good, was missed, overlapped, started late or could not be created
-  expr: sum by (job, event) (increase(sched_job_events_total{event=~"failed|missed|skipped_overlap|start_late|create_failed"}[30m])) > 0
-- alert: FlowmanagerBackupStale          # no success for a week and a day; tune per job
-  expr: time() - sched_job_last_success_timestamp_seconds{job="backup"} > 8 * 86400
+  expr: sum by (scheduled_job, event) (increase(sched_job_events_total{event=~"failed|missed|skipped_overlap|start_late|create_failed"}[30m])) > 0
+- alert: FlowmanagerBackupStale          # no success for a week and a day (a job that never succeeded has no series: it counts as 0, so this fires at once on a new install; silence it for the first week); tune per job
+  expr: time() - (sched_job_last_success_timestamp_seconds{scheduled_job="backup"} or on() vector(0)) > 8 * 86400
 - alert: FlowmanagerConfigRejected       # the last good config is still active
   expr: increase(sched_config_reloads_total{outcome=~"rejected|unreadable"}[15m]) > 0
 - alert: FlowmanagerRecoveryFailing
@@ -832,6 +846,13 @@ persisted state itself is readable by both builds (version 1). A document writte
 newer build that this one cannot decode makes ticks report an error and publish nothing
 (the scaler keeps what it had); the fix is the build that wrote it, or `discard_state`.
 After a rollback that changes handlers, re-register the deployment (section 2).
+
+A build without scheduled jobs rejects the `jobs:` section of the config (roll the config back
+with it), ignores the `job_book` key and never releases `hold-job-*` leases already in the
+lease book: a run in progress at the moment of the rollback leaves its NFS hold in place and
+the host powered. After rolling back, `POST /Scheduler/main/leases` and release any
+`hold-job-*` with `release_lease` (or roll back between runs). Jobs already created keep
+running under Kubernetes. The README's rollback section has the details.
 
 ### The first tick after a restart
 

@@ -11,7 +11,9 @@
 //! day-of-week`, with `0` or `7` for Sunday, names, ranges, lists and steps) and its
 //! `timezone` an IANA name (default `UTC`). The expression is evaluated by the `cronexpr`
 //! crate with the Vixie rules (day-of-month and day-of-week are a union unless one starts with
-//! `*`). Named zones need the host's time zone database (`/usr/share/zoneinfo`); a zone the
+//! `*`). Every zone, `UTC` included, is looked up in the host's time zone database (`$TZDIR`, else
+//! `/usr/share/zoneinfo`): on Linux jiff does not bundle one (it does only on Windows and wasm),
+//! checked by running the tests with the database hidden. A zone the
 //! database does not know is a config error, so a missing database fails closed at load.
 //!
 //! Daylight saving time follows the crate's wall-clock matching, which the tests below pin

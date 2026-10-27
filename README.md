@@ -330,7 +330,7 @@ The object keeps its state in Restate, under these keys:
 | `scheduler_state` | Versioned document: the sequencer state (per resource the power phase: off, powering on, on, shutting down, failed (a power transition timed out); and mode phase: idle, or serving with its wind-down; with when each began) and which configured sources have ever reported values. |
 | `lease_book` | Versioned document: the leases held and the counter lease ids are drawn from. |
 | `backstop_epoch` | The current backstop chain (a number). |
-| `job_book` | Versioned document: per scheduled job the next scheduled time, the run in progress (phase, attempt), a Job that outran its deadline and may still be active, and the last outcome and success. Unreadable: only the job step is switched off (an error log `job_book_unreadable`, `sched_persisted_state_errors_total{key="job_book"}`); `discard_state` with `"key": "job_book"` clears it. |
+| `job_book` | Versioned document: per scheduled job the next scheduled time, the run in progress (phase, attempt), a Job that outran its deadline or whose creation failed and may still be active (the lingering mark, kept for a removed job too), the namespace its Job was made in, and the last outcome and success. Unreadable: only the job step is switched off (an error log `job_book_unreadable`, `sched_persisted_state_errors_total{key="job_book"}`); `discard_state` with `"key": "job_book"` clears it. |
 
 The `Recovery` virtual object (one instance per class id) keeps its own state:
 
@@ -373,6 +373,19 @@ config (the persisted state is readable by both builds, except while it holds wh
 this build writes: a `failed` power phase, or a `mounts_veto` entry, which is present
 whenever a shutdown is waiting on pods that still mount NFS or has stopped. Until those
 clear, or until `discard_state` is used, the older build cannot read the document).
+
+**Rolling back across scheduled jobs.** A build without scheduled jobs (the one before the
+`jobs:` key) rejects a config that has the `jobs:` section, so roll the config back with it
+(remove `jobs:`). It ignores the `job_book` key and never reads it. It also knows nothing of
+`hold-job-*` leases: any such lease already in the `lease_book` (a run in progress when you
+rolled back) is never released by it, and keeps its resource (the NFS host) held and powered
+until a person releases it: `release_lease` with the lease's id (see `leases`), or `discard_state`
+of `lease_book` (which drops every lease). Check `leases` for `hold-job-*` entries after the
+rollback; better, roll back when no run is in progress (the `jobs` handler shows `run`). A Job
+that flowmanager already created is not touched either way: it runs to its end under
+Kubernetes (the CronJob stays `suspend: true`). Rolling forward again finds `job_book` as it
+was left, which may be stale (a run that ended meanwhile), so a run in it ends from the readings
+as usual; discard it (`job_book`) if you want a clean start.
 
 To recover, either deploy the build that wrote the document, or discard it. Discarding
 `scheduler_state` restarts the sequencer from observation: no model is allowed until the
@@ -757,7 +770,7 @@ hot-reloaded like the rest; the `schedule` source kind is gone):
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `cron`, `timezone` | Five-field crontab and an IANA zone. A time in the hour DST skips does not run that day; one in the hour it repeats runs twice (use `UTC` for a strict once). Named zones need the host's tz database (`tzdata` in the image); `UTC` needs none, and an unknown zone rejects the config. | `UTC` |
+| `cron`, `timezone` | Five-field crontab and an IANA zone. A time in the hour DST skips does not run that day; one in the hour it repeats runs twice (use `UTC` for a strict once). Every zone, `UTC` included, is read from the host's tz database (`tzdata` in the image): jiff bundles none on Linux, so without `/usr/share/zoneinfo` (or `$TZDIR`) every config that has a job is rejected at load ("failed to find timezone"), as is an unknown zone. | `UTC` |
 | `cronjob` | `{namespace, name}` of the template CronJob. | required |
 | `needs` | A list of tagged needs; only `{type: nfs, resource: <shared resource>}` (a hold on it) today, so a model need can be added later without changing existing configs. | none |
 | `retries`, `retry_backoff` | Retries after a failed Job (0: none); the wait doubles from `retry_backoff` up to 1h. Power is never retried: that is not about the Job. | 1, 5m |
@@ -794,8 +807,36 @@ How a run goes (the state machine is pure, `sched_sequencer::jobs`, with a test 
   `deadline` is alerted and failed without deleting it (the job then stays blocked while the
   Job is still active).
 - **Readings.** Job states come from listing Jobs by label every resync. A reading that is
-  stale (older than `host_reading_stale_after`), failed or missing never means "finished", and
-  a Job absent from a reading older than its creation proves nothing.
+  stale (older than `host_reading_stale_after`), failed or missing never means "finished". A Job
+  absent from a reading proves it deleted only if the reading was received more than 20 s
+  (`JOB_READ_SETTLE`, the observer's read timeout) after the creation call *returned* (the time
+  the run is stamped with, not the time the tick decided to make the Job, which the call can
+  trail by up to 15 s), because a read in flight when the Job was made lacks it. A Job that
+  carries a `ttlSecondsAfterFinished` that expires before flowmanager has seen it finish is
+  deleted too, and reads as `job_deleted` (failed, no retry, an alert) although it succeeded:
+  keep the TTL well above `resync` plus the 20 s read plus a backstop interval, and above any
+  outage of flowmanager you want to ride out (the setup guide suggests at least an hour), or
+  leave it off. The machine does not tell the two apart.
+- **Ambiguous creation.** A creation that returned an error may still have made the Job (the
+  call can fail after the API created it). A run that then gives up (its start window ends)
+  is `missed` and leaves the job's `lingering` mark, so the next run does not start beside it;
+  the mark is freed by a reading received after the failed try that does not list the Job as
+  active. The creation failure alert is sent once per attempt.
+- **Overlap memory.** The `lingering` mark (a Job that outran its `deadline`, or may exist
+  after a failed creation) blocks new runs of that job until a reading shows it is not active.
+  A job removed from the config while its Job runs keeps a tombstone with that mark (its
+  hold ends with its place in the config, as holds are derived from the config's jobs), so
+  adding it back does not start a second instance; the mark is freed once the job is back and
+  a reading shows the Job is not active. A tombstone of a job that had no live Job is dropped.
+  The namespace the Job was made in is remembered: if `cronjob.namespace` is changed while
+  it runs, readings (which now come from the new namespace) are ignored for that Job until the
+  namespace is restored, so it is neither finished nor deleted by them; the run ends at its
+  `deadline` and stays `lingering`. `discard_state` of `job_book` deliberately forgets
+  everything (runs, marks, tombstones, `next_due`): a Job still running then is not known to
+  the next run, which can start beside it, so use it only when no Job of flowmanager is active.
+  `start_window` and `deadline` are not checked against the schedule's period: a `skip` run
+  stops waiting at the next scheduled time anyway, and a `deadline` longer than the period
+  means a due run is skipped (alerted) while the Job runs.
 - **Durability.** Per-job state is the `job_book` document in the Scheduler object. The Job's
   name is `<id>-<scheduled epoch seconds>-a<attempt>` and creation runs in a journaled step in
   which `AlreadyExists` is success, so a replay or crash creates it once. A tick (every
@@ -850,12 +891,14 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   on `== 1`), else 0. Only resources named by a `mounts` source have the series.
 - `sched_mounts_timeouts_total{resource}`: shutdown waits that timed out (alert on any
   increase; the host stays up until a person acts).
-- `sched_job_events_total{job,event}`: scheduled-job events by configured job: `started` (a Job
+- `sched_job_events_total{scheduled_job,event}`: scheduled-job events by configured job: `started` (a Job
   was created), `succeeded`, `failed` (after its retries, past its deadline, or deleted;
   alert), `retried`, `missed` (alert), `skipped_overlap` (alert), `caught_up`, `start_late`
-  (alert), `create_failed` (alert) and `triggered`. `sched_job_running{job}` is 1 while a run
-  exists, `sched_job_last_success_timestamp_seconds{job}` the last success (absent until one),
-  `sched_job_next_due_timestamp_seconds{job}` the next scheduled time.
+  (alert), `create_failed` (alert) and `triggered`. The label is `scheduled_job`, not `job`, which
+  Prometheus uses for its own scrape label (a series named `job` would be exported as
+  `exported_job`). `sched_job_running{scheduled_job}` is 1 while a run
+  exists, `sched_job_last_success_timestamp_seconds{scheduled_job}` the last success (absent until one),
+  `sched_job_next_due_timestamp_seconds{scheduled_job}` the next scheduled time.
 - `sched_power_requests_total{resource,action,outcome}`: power actions by `on`/`off` and
   `requested` (accepted by the router or host), `failed` (never retried automatically; alert on
   any increase) or `not_wired` (the active config no longer has the host under managed control).
