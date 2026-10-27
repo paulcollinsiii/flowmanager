@@ -1780,6 +1780,38 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_tick_does_not_count_a_shutdown_wait_timeout_again() {
+        let (s, clock, mut d) = due_nfs();
+        world(&s, Some(2));
+        s.tick(Millis(T0 + 1_000), &mut d);
+        let at = T0 + 1_000 + 30 * 60_000;
+        clock.set(Millis(at));
+        world(&s, Some(2));
+        s.seed_reported(&d.reported);
+        let outcome = s.decide(Millis(at), &d);
+        assert_eq!(
+            outcome.report.mounts_timeouts.len(),
+            1,
+            "{:?}",
+            outcome.report
+        );
+        let counted = || {
+            s.metrics
+                .render()
+                .contains("sched_mounts_timeouts_total{resource=\"basestar-nfs\"}")
+        };
+        // The journal gave the decision back: it is published again, not counted again.
+        s.publish(&outcome, true);
+        assert!(!counted(), "{}", s.metrics.render());
+        s.publish(&outcome, false);
+        assert!(
+            s.metrics
+                .render()
+                .contains("sched_mounts_timeouts_total{resource=\"basestar-nfs\"} 1")
+        );
+    }
+
+    #[test]
     fn a_host_whose_mounts_were_never_read_is_not_shut_down_and_the_reason_says_unknown() {
         let (s, _, mut d) = due_nfs();
         world(&s, None);

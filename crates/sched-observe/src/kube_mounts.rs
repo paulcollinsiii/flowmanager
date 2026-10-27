@@ -346,6 +346,44 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_server_written_in_mixed_case_still_matches_a_pods_server() {
+        // `pod_servers` lowercases what the pod says; the configured name is compared
+        // ignoring case too, so a config that spells the host in capitals matches.
+        let configured = BTreeMap::from([(
+            ResourceId::new("basestar-nfs"),
+            vec!["BaseStar.Local".to_string()],
+        )]);
+        let pods = [
+            pod(
+                "a",
+                "docs",
+                "Running",
+                vec![nfs_volume("v", "basestar.local")],
+            ),
+            pod(
+                "b",
+                "docs",
+                "Running",
+                vec![nfs_volume("v", "BASESTAR.LOCAL")],
+            ),
+            pod(
+                "c",
+                "docs",
+                "Running",
+                vec![nfs_volume("v", "basestar.other")],
+            ),
+        ];
+        let v = mount_values(&configured, &pods, &Cluster::default()).unwrap();
+        assert_eq!(
+            v,
+            vec![ObservedValue::ResourceMounts {
+                resource: ResourceId::new("basestar-nfs"),
+                pods: 2
+            }]
+        );
+    }
+
+    #[test]
     fn a_claim_bound_to_an_nfs_volume_counts_and_one_bound_elsewhere_does_not() {
         let c = Cluster::new(
             &[pv_nfs("pv-docs", "basestar"), pv_local("pv-scratch")],

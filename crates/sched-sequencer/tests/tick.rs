@@ -2563,6 +2563,32 @@ fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retr
 }
 
 #[test]
+fn a_stopped_host_is_never_shut_down_even_if_a_state_says_it_is_managed_and_nothing_mounts_it() {
+    // Normal transitions never leave a host both managed and stopped (giving up clears
+    // `managed`, and a manual request that sets it clears the veto), so the state is built by
+    // hand: the check itself must still refuse, whatever the reading says, rather than rely on
+    // the caller having cleared the flag.
+    let managed_stopped = format!(
+        "{{ power: {}, mode: {}, managed: true, host_idle_since: {}, mounts_veto: {{ phase: stopped, since: 1 }} }}",
+        on(),
+        mode_idle(),
+        T - 20 * MIN
+    );
+    for (name, case) in [
+        ("zero mounts", Case::new().obs(mounts(0, 0))),
+        ("unknown mounts", Case::new().drop_obs("resource_mounts")),
+    ] {
+        let d = case.nfs_state(&managed_stopped).run();
+        assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], name);
+        assert!(matches!(power_of(&d, N), PowerPhase::On { .. }), "{name}");
+        assert!(matches!(
+            veto_of(&d),
+            Some(sched_model::MountsVeto::Stopped { .. })
+        ));
+    }
+}
+
+#[test]
 fn a_new_manual_request_takes_a_stopped_host_over_and_the_next_idle_period_decides_afresh() {
     let stopped = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: false, mounts_veto: { phase: stopped, since: 1 } }";
     let d = Case::new()

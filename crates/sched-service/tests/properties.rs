@@ -28,6 +28,8 @@ struct Raw {
     dt: u64,
     pods: Vec<Option<(u32, u32)>>,
     up: Vec<Option<bool>>,
+    /// How many pods mount the NFS host (`None`: no reading this frame).
+    mounts: Option<u32>,
     /// (ready, in_flight, age of the oldest ready item, failed)
     demand: Vec<Option<(u64, u64, u64, u64)>>,
     leases: Option<Vec<usize>>,
@@ -42,6 +44,7 @@ fn raw() -> impl Strategy<Value = Raw> {
             4,
         ),
         prop::collection::vec(prop::option::weighted(0.8, any::<bool>()), 2),
+        prop::option::weighted(0.6, 0u32..3),
         prop::collection::vec(
             prop::option::weighted(0.7, (0u64..4, 0u64..3, 0u64..4_000_000, 0u64..3)),
             7,
@@ -49,10 +52,11 @@ fn raw() -> impl Strategy<Value = Raw> {
         prop::option::weighted(0.3, prop::collection::vec(0usize..8, 0..4)),
         prop::bool::weighted(0.6),
     )
-        .prop_map(|(dt, pods, up, demand, leases, refresh)| Raw {
+        .prop_map(|(dt, pods, up, mounts, demand, leases, refresh)| Raw {
             dt,
             pods,
             up,
+            mounts,
             demand,
             leases,
             refresh,
@@ -132,6 +136,17 @@ fn scenario(frames: &[Raw]) -> Scenario {
                     },
                 });
             }
+        }
+        if let Some(pods) = r.mounts {
+            observe.push(Observe {
+                source: SourceId::new("basestar-mounts"),
+                observed_at: None,
+                fidelity: Fidelity::Polled,
+                value: ObservedValue::ResourceMounts {
+                    resource: ResourceId::new("basestar-nfs"),
+                    pods,
+                },
+            });
         }
         for ((c, s), d) in CLASSES.iter().zip(&r.demand) {
             if let Some((ready, in_flight, age, failed)) = d {
