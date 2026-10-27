@@ -39,3 +39,6 @@ tools were on `PATH`, whether a hook was blocking.
 **`$?` after a pipeline is the last stage's exit code.** `cmd | tail; echo $?`
 reports `tail`, and has produced false "it passes" reports here more than once.
 Redirect to a file and read `$?` from the bare command.
+
+# General Guidelines
+- Do not use python for file edits.
