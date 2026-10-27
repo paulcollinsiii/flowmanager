@@ -266,14 +266,14 @@ own; protect the admin API separately.
 
 ### Using the lease handlers
 
-A manual model lease is how a person (and, later, Open WebUI) gets the LLM loaded and kept
+A manual model lease is how a person (and Home Assistant, through the toggle listener below) gets the LLM loaded and kept
 loaded: "pin the model `llm` on its GPU until I release it". Rules (`README.md`, *Manual
 model leases*; the error texts below were produced by a live run): the model must exist in
 the config; at most one manual model lease per exclusive resource; lease ids are
 `manual-model-<n>`; a lease whose model later disappears from the config is kept but
 ignored. A lease also asks for its host to be up; under `power.control: manual` that means
 the lease **waits** until a person powers the host on. Nothing releases a lease by time:
-**the release is manual**. Open WebUI will later hold such a lease and a person releases it.
+**the release is manual**. Home Assistant can hold such a lease through the toggle listener below (Open WebUI itself is not integrated), and a person releases it.
 
 ```sh
 INGRESS=http://restate.restate.svc.cluster.local:8080   # the Restate ingress
@@ -396,34 +396,55 @@ derived from the last tick's report and are **left out when they cannot be said*
 
 - model: `active` (in the allowed set), `waiting_for_host` (its host is not up),
   `host_failed`, `draining` (another model of the resource is winding down, its in-flight work
-  awaited), `pending` (the last tick predates the lease, or another model is still allowed and the
-  report gives no more);
+  awaited), `reclaimed` (a reclaim is held on its resource: no model is allowed there until it is
+  released, whatever the host is doing), `pending` (the last tick predates the lease, or another
+  model is still allowed and the report gives no more);
 - host lease (`GET /v1/resources/..`): `power` (the phase as the sequencer holds it, with `since`
   and, when failed, `during`), `wait` (a list: `min_off` with the seconds left, or
   `shutdown_held_by_mounts` with `stopped`), `needs_attention`;
-- reclaim: `host_failed`, `powered_off`, `shutting_down`, `draining`, `pending`, the `power`
+- reclaim: `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_for_person` (the host
+  is up and its power is `control: manual`, so flowmanager never shuts it down: power it off
+  yourself), `pending`, the `power`
   phase, `tick_reason` (the tick's reason in words) and `needs_attention`.
 
 `needs_attention` is true when a person has to act: a resource is in a failed power phase, or
 its shutdown was stopped by mounting pods (`resume` it after fixing the host). It is the same
 condition as the metrics `sched_resource_power_failed == 1` and
-`sched_resource_mounts_veto{state="stopped"} == 1`.
+`sched_resource_mounts_veto{state="stopped"} == 1`; the JSON field is derived from the same state,
+there is no separate metric for it (alert on those two, see the alert list).
 
-Errors are JSON `{"error": "<message>"}` carrying the handler's own message, with the status
-of the handler's refusal: `400` for a resource that cannot be leased (an exclusive resource
-for a host lease, a shared one or one without a power section for a reclaim), `409` for
-another model already leased on the resource (and for `resume` of a resource that is not
-stopped), `404` for a name the config does not have (the message lists what is configured),
-`405`, `401`, `503` (Restate or the token file unreachable) and `502` (an unexpected answer
-from Restate). An exclusive resource's `GET /v1/resources/..` answers `lease_supported: false`.
+Errors are JSON `{"error": "<message>"}`. The handler's own message and status are relayed for
+`400` (a resource that cannot be leased: an exclusive resource for a host lease, a shared one or
+one without a power section for a reclaim) and `409` (another model already leased on the
+resource; `resume` of a resource that is not stopped). `404` is the listener's own answer for a
+name the config does not have (the message lists what is configured) or a path it does not
+serve. A `404` from Restate is never relayed: Restate gives it for a service it does not know
+(the `Scheduler` deployment is not registered), so it is a `502`, like any other unexpected
+answer. `405` carries an `Allow` header, `401` a `WWW-Authenticate`, `503` means Restate or the
+token file is unreachable and `504` that Restate did not answer in 15 seconds. An off request is a
+success only when the lease listing shows the lease gone (or never there); a release that fails is
+checked against a fresh listing and is otherwise the error. An exclusive resource's
+`GET /v1/resources/..` answers `lease_supported: false`.
 
-**Observability.** Every on/off/resume request (authorized or not) logs one structured line
-`event="toggle"` with `kind` (`model`, `host`, `reclaim`), `name`, `action` (`on`, `off`,
-`resume`), `outcome` and `status` (never the token); the acquire and release themselves log as
+**Observability.** Every on/off/resume request, and every refused request of any kind (a
+wrong or missing token, an unknown path, a wrong method, an oversize body), logs one structured
+line `event="toggle"` with `kind` (`model`, `host`, `reclaim`, `list`, `unmatched`), `name`,
+`action` (`get`, `on`, `off`, `resume`, `unknown`), `outcome`, `status` and `suppressed`; never the
+token or a body. `name` is what the caller put in the path, shortened to 64 characters and logged
+escaped (a newline in a path cannot start a log line of its own). At most 30 refused requests are
+logged per 10 seconds; the next line says in `suppressed` how many were left out (every request is
+still counted in the metric, and a successful change is always logged). The acquire and release
+themselves log as
 before. Metrics: `sched_toggle_requests_total{endpoint,outcome}` (counted per endpoint
 label, never per name), `sched_manual_lease_age_seconds{kind,target}` for each held manual
 model lease, host lease and reclaim (`kind` is `model`, `host` or `reclaim`), and the existing
 `sched_resource_power_failed` / `sched_resource_mounts_veto` for needs-attention.
+
+**Limits.** The token is checked before a request's body is read (an oversize or non-UTF-8 body
+of an unauthenticated caller is a `401`, of an authenticated one a `400`; a body is limited to 1024
+bytes and read only by the `POST /v1/<kind>/{name}` form). At most 64 connections are served at
+once; a client has 5 seconds to send its request headers, so idle connections do not hold the slots,
+and no connection lives longer than 30 seconds.
 
 **Network.** Expose the port with a named Service port and let only Home Assistant reach it:
 
@@ -466,11 +487,14 @@ spec:
 ```
 
 and give 9096 an `AuthorizationPolicy` rule with no `from.principals` (a plain-text caller has
-none); the bearer token and the NetworkPolicy are then what protect the port. The 9080 port
+none); the bearer token and the NetworkPolicy are then what protect the port. (Not tested: the
+PeerAuthentication and AuthorizationPolicy behaviour for a caller without a sidecar is described
+from how Istio documents them, not from a run on this cluster.) The 9080 port
 stays as section 3 describes.
 
 **Home Assistant.** Home Assistant resolves cluster DNS names (`hostNetwork: true` with
-`dnsPolicy: ClusterFirstWithHostNet`), and it already talks to an in-cluster service over plain
+`dnsPolicy: ClusterFirstWithHostNet`; this and the plain-HTTP peer are taken from its
+manifests, not tested here), and it already talks to an in-cluster service over plain
 HTTP the same way. Keep the whole header value `Bearer <token>` in an environment variable (or
 `!secret`), because a YAML header cannot concatenate:
 
@@ -571,7 +595,7 @@ named here are guesses of common defaults; use the real ones.
 | Prometheus | flowmanager | 9090, `GET /metrics` | HTTP | Scrape. `/healthz` is for kubelet probes. |
 | flowmanager | Restate ingress | 8080 (Restate default), `POST /Scheduler/main/tick/send` and `POST /Scheduler/main/arm_backstop/send` | HTTP | The only ingress paths the process itself calls. |
 | operators (a person through whatever path is trusted) | Restate ingress | 8080, `POST /Scheduler/main/{leases,last_decision,tick,acquire_model_lease,release_lease,discard_state}`, `POST /Recovery/*/{attempts,discard_attempts}` | HTTP | Section 2's table. Keep the destructive ones (`discard_*`) to operators only. |
-| Open WebUI (later) | Restate ingress | 8080, `POST /Scheduler/main/{acquire_model_lease,release_lease,leases}` | HTTP | Holds a manual model lease. Nothing else. |
+| A client calling the ingress directly (Open WebUI is not integrated) | Restate ingress | 8080, `POST /Scheduler/main/{acquire_model_lease,release_lease,leases}` | HTTP | Holds a manual model lease. Nothing else. |
 | Home Assistant (`hostNetwork`, no sidecar) | flowmanager | 9096 (when `--toggle-listen` is set) | HTTP, bearer token | The toggle listener (see the toggle listener subsection of section 2): needs a PERMISSIVE port exemption under STRICT mTLS and a NetworkPolicy rule for the node network. flowmanager then calls the Restate ingress for the same handlers. |
 | nobody | Restate ingress | `/Scheduler/main/backstop` | | Not for callers. |
 
@@ -1035,14 +1059,14 @@ event):
   for: 5m
 - alert: FlowmanagerSourceErrors
   expr: increase(sched_source_errors_total[15m]) > 5
-- alert: FlowmanagerShutdownStopped      # pods kept mounting a managed NFS host past mounts_timeout; it stays up until a person acts
+- alert: FlowmanagerShutdownStopped      # the mounts-stopped case alone; FlowmanagerNeedsAttention below covers it with the failed power phase
   expr: sched_resource_mounts_veto{state="stopped"} == 1
 - alert: FlowmanagerJobProblem           # a scheduled job failed for good, was missed, overlapped, started late or could not be created
   expr: sum by (scheduled_job, event) (increase(sched_job_events_total{event=~"failed|missed|skipped_overlap|start_late|create_failed"}[30m])) > 0
 - alert: FlowmanagerBackupStale          # no success for a week and a day (a job that never succeeded has no series: it counts as 0, so this fires at once on a new install; silence it for the first week); tune per job
   expr: time() - (sched_job_last_success_timestamp_seconds{scheduled_job="backup"} or on() vector(0)) > 8 * 86400
-- alert: FlowmanagerNeedsAttention       # a host in a failed power phase (resume it after fixing it)
-  expr: sched_resource_power_failed == 1
+- alert: FlowmanagerNeedsAttention       # a host in a failed power phase, or a shutdown stopped by mounting pods: resume it after fixing it (the toggle listener's needs_attention is these two)
+  expr: sched_resource_power_failed == 1 or sched_resource_mounts_veto{state="stopped"} == 1
 - alert: FlowmanagerLeaseHeldTooLong     # a forgotten manual lease or reclaim
   expr: sched_manual_lease_age_seconds > 6 * 3600
   for: 10m

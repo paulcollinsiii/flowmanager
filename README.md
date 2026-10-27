@@ -823,12 +823,16 @@ off are idempotent (off when not held is a success), and nobody sees a lease id.
 goes to the matching `Scheduler` handler through the Restate ingress, so locking and
 journaling are the handlers'; the handler's refusal comes back as `{"error": "<message>"}`
 with its status (`400` unsuitable resource, `409` another model leased or nothing to resume,
-`404` unknown name). A state read has `held` and `state`, and, when the last tick's report
-supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draining`,
-`host_failed`, `pending`), `power`, `wait` and `needs_attention`; a field that cannot be
-derived is left out. Every on/off/resume request logs one `event="toggle"` line, is counted in
+`404` unknown name or path; a `404` from Restate is a `502`, never an answer). The token is checked
+before a body is read. A state read has `held` and `state`, and, when the last tick's report
+supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draining`, `reclaimed`,
+`host_failed`, `pending`; a reclaim also `left_for_person` on a `control: manual` host), `power`,
+`wait` and `needs_attention` (the failed power phase or mounts-stopped shutdown also seen in
+`sched_resource_power_failed` and `sched_resource_mounts_veto`); a field that cannot be derived is
+left out. Every on/off/resume request and every refused request logs one `event="toggle"` line
+(names escaped, refusals rate limited), is counted in
 `sched_toggle_requests_total{endpoint,outcome}`, and a held lease shows in
-`sched_manual_lease_age_seconds{kind,target}`. The flags, the token Secret, the NetworkPolicy and
+`sched_manual_lease_age_seconds{kind,target}`.
 `PeerAuthentication` notes for a `hostNetwork` client, the Home Assistant YAML and an alert
 are in `docs/kubernetes_setup.md` (the toggle listener subsection of section 2).
 

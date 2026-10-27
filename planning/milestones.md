@@ -80,19 +80,19 @@ M0 through M3 ran in sequence, and M3 was rescoped while it ran (see *Scope rese
 
 **Deferred (user decision) to a separate conversation.** That conversation has to separate two things: a *webhook reporting state* (notify-then-fetch: an observer that is told to re-read a source), and a *workflow acting on that* (a webhook that triggers work). Until then sources are polled at their `resync` and `webhook:` settings in source params are accepted and ignored. The previous scope, kept for reference: a generic webhook receiver using notify-then-fetch; paperless-ngx workflow webhooks (including paperless-gpt's tag edits) and speakr webhooks; resync intervals lengthened for sources with webhooks; metrics for event-to-decision latency; exit criteria "a new paperless document leads to a decision within seconds; dropping a webhook still leads to a correct decision at the next resync".
 
-### M6: Open WebUI on a manual lease
+### M6: Manual leases from Home Assistant
 
 (Shrunk during M3; the previous scope was "Interactive sessions".)
 
-**Goal:** Open WebUI can hold the LLM for a person without manually juggling models.
+**Goal:** a person can hold the LLM (or a host) from Home Assistant without manually juggling models. Open WebUI itself is not integrated.
 
-- **In scope:** Open WebUI acquires and holds a **manual model lease** through the existing ingress handlers (`acquire_model_lease`, `release_lease`, `leases`) and the **release is manual** (a person releases it); the lease cuts batch work short with its timeout, as a reclaim does.
+- **In scope:** a client (Home Assistant, through the toggle listener; Open WebUI is not integrated) acquires and holds a **manual model lease** through the existing handlers (`acquire_model_lease`, `release_lease`, `leases`) and the **release is manual** (a person releases it); the lease cuts batch work short with its timeout, as a reclaim does.
 - **Out of scope:** interactive leases with renewal and expiry, a request path for clients to renew, priority over batch work at job boundaries for ordinary interactive requests, a model-routing proxy, demand-driven power.
 - **Decided by the user (Oct 27, 2026), which changes the trigger route above:** the toggle is **Home Assistant**, not Open WebUI. Home Assistant runs inside the cluster with `hostNetwork: true` (mDNS on the 192.168.2.x network).
   - *API:* a small dedicated HTTP listener in flowmanager (its own address, like the metrics and KEDA listeners) that Home Assistant's REST switch can use: plain `GET` for state, `POST` for on and off, idempotent by name so Home Assistant never needs a lease id. A bearer token (read from a secret file) is mandatory.
   - *Scope:* manual **model leases** (one toggle per configured model; **on means a lease is held**, not that the model is loaded) **and host controls** (the manual host lease of a shared host such as NFS, which an exclusive GPU host does not take, plus `resume` for a failed power phase; `reclaim`/`unreclaim` are included too, a user decision of Oct 27, 2026: an exclusive resource with a power section, such as the GPU host, "this GPU is mine"). The read side reports held or not held plus a richer status (waiting for the host, draining batch work, model active) for a sensor.
   - *Acquire:* explicit action only, never automatic. *Release:* manual; the safety net is visibility only (a lease-age metric and an example alert), no automatic expiry.
-- **Exit criteria:** a manual LLM lease preempts batch work within its timeout and holds the LLM until released; releasing it lets batch draining resume. Through the HTTP listener, a request without the token is refused; on and off are idempotent; the state read agrees with `leases` and the sequencer's reasons; a host toggle brings a managed host up (or waits under `control: manual`) and releases it again.
+- **Exit criteria:** a manual LLM lease preempts batch work within its timeout and holds the LLM until released; releasing it lets batch draining resume. Through the HTTP listener, a request without the token is refused; on and off are idempotent; the state read agrees with `leases`, and its richer status is derived from the last tick (a model lease on a reclaimed resource reads `reclaimed`, a status that cannot be said is left out); a host toggle brings a managed host up (or waits under `control: manual`) and releases it again.
 
 ### M7: Remaining immich and preemption items
 
