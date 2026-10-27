@@ -19,7 +19,7 @@ use sched_service::config_source::{ConfigHolder, watch_file};
 use sched_service::metrics::Metrics;
 use sched_service::scheduler::{Power, Recovery, Scheduler};
 use sched_service::tick::Shared;
-use sched_service::{keda_scaler, metrics_server, recovery, runtime};
+use sched_service::{keda_scaler, metrics_server, recovery, runtime, toggle};
 
 fn duration(text: &str) -> Result<Duration, String> {
     Millis::parse(text).map(|m| Duration::from_millis(m.as_u64()))
@@ -52,6 +52,17 @@ struct Args {
     /// Address of the KEDA external scaler (plaintext gRPC; in the cluster Istio adds mTLS).
     #[arg(long, env = "SCHED_KEDA_LISTEN", default_value = "0.0.0.0:9095")]
     keda_listen: SocketAddr,
+    /// Address of the toggle listener (plain HTTP; Home Assistant's REST switch uses it to
+    /// hold and release manual model and host leases). Off when not given. Needs
+    /// `--toggle-token-file`. Suggested: 0.0.0.0:9096, like the other listeners, because
+    /// the client is another pod or a hostNetwork pod, not a process on this host.
+    #[arg(long, env = "SCHED_TOGGLE_LISTEN", requires = "toggle_token_file")]
+    toggle_listen: Option<SocketAddr>,
+    /// Bearer token the toggle listener requires (a mounted Kubernetes Secret, one line),
+    /// read on every request. Needs `--toggle-listen`; the listener refuses to start when
+    /// the file is missing or empty.
+    #[arg(long, env = "SCHED_TOGGLE_TOKEN_FILE", requires = "toggle_listen")]
+    toggle_token_file: Option<PathBuf>,
     /// Restate ingress, used to ask for a tick when observations change and to arm the backstop.
     #[arg(
         long,
@@ -179,6 +190,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keda = keda_scaler::spawn(&shared, args.keda_listen).await?;
     tracing::info!(addr = %keda, "serving the KEDA external scaler (gRPC)");
 
+    if let (Some(addr), Some(token_file)) = (args.toggle_listen, args.toggle_token_file.clone()) {
+        let toggle = toggle::Toggle::new(
+            Arc::clone(&shared),
+            Arc::new(toggle::RestateIngress::new(&args.restate_ingress)),
+            token_file,
+        );
+        let bound = toggle::spawn(toggle, addr).await?;
+        tracing::info!(addr = %bound, "serving the toggle listener (HTTP, bearer token)");
+    }
     tracing::info!(addr = %args.listen, "serving the Restate endpoint");
     HttpServer::new(
         Endpoint::builder()
@@ -215,6 +235,27 @@ mod tests {
             assert!(parse(&[flag, "1s"]).is_ok());
         }
         assert_eq!(parse(&[]).unwrap().backstop, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_toggle_listener_is_off_unless_given_with_its_token_file() {
+        let a = parse(&[]).unwrap();
+        assert!(a.toggle_listen.is_none() && a.toggle_token_file.is_none());
+        let a = parse(&[
+            "--toggle-listen",
+            "127.0.0.1:9096",
+            "--toggle-token-file",
+            "/t",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.toggle_listen,
+            Some("127.0.0.1:9096".parse::<SocketAddr>().unwrap())
+        );
+        // Each needs the other: no unauthenticated listener, no token without a listener.
+        assert!(parse(&["--toggle-listen", "127.0.0.1:9096"]).is_err());
+        assert!(parse(&["--toggle-token-file", "/t"]).is_err());
+        assert!(parse(&["--toggle-listen", "nope", "--toggle-token-file", "/t"]).is_err());
     }
 
     #[test]

@@ -31,3 +31,4 @@ pub mod resume;
 pub mod runtime;
 pub mod scheduler;
 pub mod tick;
+pub mod toggle;

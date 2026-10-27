@@ -20,6 +20,12 @@ use crate::metrics::Metrics;
 /// A response body made of one chunk.
 pub struct OneShot(Option<Bytes>);
 
+impl OneShot {
+    pub fn new(body: Bytes) -> OneShot {
+        OneShot(Some(body))
+    }
+}
+
 impl Body for OneShot {
     type Data = Bytes;
     type Error = Infallible;

@@ -276,7 +276,7 @@ impl Metrics {
         let toggle_requests = IntCounterVec::new(
             Opts::new(
                 "sched_toggle_requests_total",
-                "Requests to the toggle listener (Home Assistant) by endpoint (a fixed set: list, model_get, model_on, model_off, resource_get, resource_on, resource_off, resource_resume, unmatched) and outcome (ok, unauthorized, bad_request, not_found, method_not_allowed, conflict, error); never labelled with a model or resource name",
+                "Requests to the toggle listener (Home Assistant) by endpoint (a fixed set: list, model_get, model_on, model_off, model_set, resource_get, resource_on, resource_off, resource_set, resource_resume, reclaim_get, reclaim_on, reclaim_off, reclaim_set, unmatched) and outcome (ok, unauthorized, bad_request, not_found, method_not_allowed, conflict, error); never labelled with a model or resource name",
             ),
             &["endpoint", "outcome"],
         )
@@ -287,7 +287,7 @@ impl Metrics {
         let manual_lease_age = GaugeVec::new(
             Opts::new(
                 "sched_manual_lease_age_seconds",
-                "Seconds since each manual lease was granted, as of the last tick: kind is model (target = the model) or host (target = the resource). An alert on this finds a lease that was forgotten",
+                "Seconds since each manual lease or reclaim was granted, as of the last tick: kind is model (target = the model), host (the manual host lease) or reclaim (target = the resource). An alert on this finds a lease that was forgotten",
             ),
             &["kind", "target"],
         )
@@ -673,6 +673,7 @@ impl Metrics {
             let (kind, target) = match &l.kind {
                 LeaseKind::ManualModel { model } => ("model", model.to_string()),
                 LeaseKind::ManualHost => ("host", l.resource.to_string()),
+                LeaseKind::Reclaim => ("reclaim", l.resource.to_string()),
                 _ => continue,
             };
             let age = now.as_u64().saturating_sub(l.granted_at.as_u64()) as f64 / 1000.0;
@@ -756,7 +757,10 @@ mod tests {
             text.contains("sched_manual_lease_age_seconds{kind=\"host\",target=\"nfs\"} 60"),
             "{text}"
         );
-        assert!(!text.contains("reclaim"), "{text}");
+        assert!(
+            text.contains("sched_manual_lease_age_seconds{kind=\"reclaim\",target=\"gpu\"} 60"),
+            "{text}"
+        );
         m.set_manual_lease_ages(Millis(62_000), &leases[1..]);
         let text = m.render();
         assert!(!text.contains("target=\"llm\""), "{text}");
