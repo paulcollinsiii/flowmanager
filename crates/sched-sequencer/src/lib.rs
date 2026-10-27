@@ -39,6 +39,10 @@
 //!    and forced switches still give in-flight work its timeout. In-flight work is stopped
 //!    only on a forced switch (reclaim or manual model lease), class by class, each when
 //!    its own timeout has run out. In-flight work is what the queues report, not pods.
+//! 9. After a shutdown flowmanager started and saw confirmed (the host observed down), an
+//!    automatic power-on (a workload, a scheduled job's hold) waits for `power.min_off`
+//!    (default 0: no wait); a manual lease does not wait. A host found down, or gone down by
+//!    itself, is not penalised. The wait only delays a fresh decision; it is never a retry.
 
 mod exclusive;
 pub mod jobs;

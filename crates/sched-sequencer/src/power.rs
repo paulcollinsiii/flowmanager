@@ -2,8 +2,8 @@
 //! them up. Resources without a power section are always on.
 
 use sched_model::{
-    ClassSpec, ModePhase, MountsVeto, PowerPhase, PowerTransition, PowerWant, ResourceState, Step,
-    WaitReason, class_work,
+    ClassSpec, Millis, ModePhase, MountsVeto, PowerPhase, PowerTransition, PowerWant,
+    ResourceState, Step, WaitReason, class_work,
 };
 
 use crate::Cx;
@@ -46,6 +46,7 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         st.mounts_veto = None;
     }
     let now = cx.now();
+    let before = st.power;
     let observed = cx.snapshot.fresh_resource_up(
         cx.config,
         &cx.res.id,
@@ -104,6 +105,28 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
             p => p,
         };
     }
+    // The stamp of a confirmed shutdown: the instant the phase reached `off` from a shutdown
+    // flowmanager started (also a failed one: the host was observed down after it). A host
+    // found down, gone down by itself, or under manual control has none, and the stamp ends
+    // with the phase `off`. A stamp from the future (the clock went back) is made again at
+    // now, so the wait is never longer than `min_off`.
+    st.shutdown_confirmed_at = match (st.power, st.shutdown_confirmed_at) {
+        _ if manual => None,
+        (PowerPhase::Off, _)
+            if matches!(
+                before,
+                PowerPhase::ShuttingDown { .. }
+                    | PowerPhase::Failed {
+                        during: PowerTransition::ShuttingDown,
+                        ..
+                    }
+            ) =>
+        {
+            Some(now)
+        }
+        (PowerPhase::Off, Some(at)) => Some(at.min(now)),
+        _ => None,
+    };
     // A failed transition leaves the host not managed by an earlier action of ours: whatever
     // brings it back (a person, a slow boot) is treated like a host found running, so no
     // automatic power-off follows until a new want powers it on through the normal path.
@@ -182,11 +205,23 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
             }
             if cx.reclaimed() {
                 wait(cx, steps, WaitReason::Reclaimed);
+            } else if want.is_some()
+                && want != Some(PowerWant::Manual)
+                && st.min_off_remaining(
+                    cx.res.power.as_ref().map_or(Millis::ZERO, |p| p.min_off()),
+                    now,
+                ) > Millis::ZERO
+            {
+                // flowmanager shut this host down a moment ago. A person who asked for it
+                // (a manual lease) does not wait; anything else does, and decides afresh
+                // when the time has passed (a delay, never a retry).
+                wait(cx, steps, WaitReason::MinOff);
             } else if want.is_some() {
                 steps.push(Step::PowerOn {
                     resource: cx.res.id.clone(),
                 });
                 st.power = PowerPhase::PoweringOn { since: now };
+                st.shutdown_confirmed_at = None;
                 st.managed = true;
                 st.host_idle_since = None;
             } else if cx

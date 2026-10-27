@@ -2726,3 +2726,267 @@ fn a_reclaim_gives_in_flight_work_its_timeout_before_the_managed_gpu_host_is_shu
     // host is shut down on the tick after.
     assert_eq!(powered_off_at, Some(11));
 }
+
+// The minimum off time (`power.min_off`): after a shutdown flowmanager started and saw
+// confirmed, an automatic power-on waits; a manual lease does not.
+
+const MIN_OFF: u64 = 10 * MIN;
+
+/// The managed example with `min_off: 10m` on both powered resources.
+fn with_min_off(c: Case) -> Case {
+    let y = example_yaml_managed();
+    assert!(y.contains("mounts_timeout: 30m"), "the example changed");
+    let y = y.replacen(
+        "power_on_timeout:",
+        "min_off: 10m\n      power_on_timeout:",
+        2,
+    );
+    Case {
+        config: Config::from_yaml(&y).unwrap(),
+        ..c
+    }
+}
+
+fn nfs_off(confirmed_ago: Option<u64>) -> String {
+    let stamp = confirmed_ago
+        .map(|a| format!(", shutdown_confirmed_at: {}", T - a))
+        .unwrap_or_default();
+    format!("{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}{stamp} }}")
+}
+
+fn nfs_down(c: Case) -> Case {
+    c.obs(up(N, false, 0))
+}
+
+fn stamp_of(d: &Decision, r: &str) -> Option<sched_model::Millis> {
+    d.state.resource(&rid(r)).unwrap().shutdown_confirmed_at
+}
+
+fn powers_on(d: &Decision, r: &str) -> bool {
+    d.steps
+        .iter()
+        .any(|s| matches!(s, Step::PowerOn { resource } if *resource == rid(r)))
+}
+
+#[test]
+fn a_confirmed_shutdown_is_stamped_and_a_host_found_down_is_not() {
+    let sd = |ago: u64| {
+        format!(
+            "{{ power: {{ phase: shutting_down, since: {} }}, mode: {{ phase: idle }} }}",
+            T - ago
+        )
+    };
+    // Observed down while shutting down: the stamp is now.
+    let d = nfs_down(with_min_off(Case::new()).nfs_state(&sd(MIN))).run();
+    assert!(matches!(power_of(&d, N), PowerPhase::Off));
+    assert_eq!(stamp_of(&d, N), Some(sched_model::Millis(T)));
+    // Still shutting down (observed up): no stamp.
+    let d = with_min_off(Case::new()).nfs_state(&sd(MIN)).run();
+    assert!(matches!(power_of(&d, N), PowerPhase::ShuttingDown { .. }));
+    assert_eq!(stamp_of(&d, N), None);
+    // A host that was up and went down by itself, or was found down: no stamp.
+    let d = nfs_down(with_min_off(Case::new())).run();
+    assert!(matches!(power_of(&d, N), PowerPhase::Off));
+    assert_eq!(stamp_of(&d, N), None, "went down by itself");
+    let d = nfs_down(with_min_off(Case::new()).nfs_state(&nfs_off(None))).run();
+    assert_eq!(stamp_of(&d, N), None, "found down");
+    // A shutdown that timed out and is later seen down: stamped when it is seen down.
+    let d = with_min_off(Case::new()).nfs_state(&sd(15 * MIN)).run();
+    assert!(matches!(power_of(&d, N), PowerPhase::Failed { .. }));
+    assert_eq!(stamp_of(&d, N), None);
+    let d2 = nfs_down(with_min_off(Case::new())).run_at(&d.state, T);
+    assert!(matches!(power_of(&d2, N), PowerPhase::Off));
+    assert_eq!(stamp_of(&d2, N), Some(sched_model::Millis(T)));
+    // The stamp is kept while the host stays off, and dropped when it comes up.
+    let kept = nfs_down(with_min_off(Case::new()).nfs_state(&nfs_off(Some(3 * MIN)))).run();
+    assert_eq!(stamp_of(&kept, N), Some(sched_model::Millis(T - 3 * MIN)));
+    let back = with_min_off(Case::new())
+        .nfs_state(&nfs_off(Some(3 * MIN)))
+        .run();
+    assert!(matches!(power_of(&back, N), PowerPhase::On { .. }));
+    assert_eq!(stamp_of(&back, N), None);
+}
+
+#[test]
+fn an_automatic_want_waits_for_min_off_after_our_shutdown_and_then_powers_on() {
+    let c = |ago: u64, w: PowerWant| {
+        nfs_down(with_min_off(Case::new()).nfs_state(&nfs_off(Some(ago)))).want(N, w)
+    };
+    let w = PowerWant::Workload;
+    {
+        let d = c(MIN_OFF - 1, w).run();
+        assert_steps(&d, vec![wait(N, WaitReason::MinOff)], "one ms short");
+        assert!(matches!(power_of(&d, N), PowerPhase::Off));
+        assert_eq!(
+            stamp_of(&d, N),
+            Some(sched_model::Millis(T - (MIN_OFF - 1)))
+        );
+        let d = c(MIN_OFF, w).run();
+        assert_steps(&d, vec![Step::PowerOn { resource: rid(N) }], "at min_off");
+        assert!(matches!(power_of(&d, N), PowerPhase::PoweringOn { .. }));
+        assert_eq!(stamp_of(&d, N), None, "the stamp ends with the phase off");
+    }
+    // Nobody wants it: nothing is said about min_off.
+    let d = nfs_down(with_min_off(Case::new()).nfs_state(&nfs_off(Some(MIN)))).run();
+    assert_steps(&d, vec![], "no want, no wait");
+}
+
+#[test]
+fn a_manual_lease_overrides_min_off() {
+    let d = nfs_down(with_min_off(Case::new()).nfs_state(&nfs_off(Some(1000))))
+        .want(N, PowerWant::Manual)
+        .run();
+    assert_steps(&d, vec![Step::PowerOn { resource: rid(N) }], "manual");
+    assert!(d.state.resource(&rid(N)).unwrap().managed);
+    assert_eq!(stamp_of(&d, N), None);
+}
+
+#[test]
+fn a_host_found_down_or_gone_down_by_itself_is_powered_on_at_once() {
+    let d = nfs_down(with_min_off(Case::new()).nfs_state(&nfs_off(None)))
+        .want(N, PowerWant::Workload)
+        .run();
+    assert_steps(&d, vec![Step::PowerOn { resource: rid(N) }], "found down");
+    // Up one tick, down the next, wanted: it went down on its own.
+    let first = with_min_off(Case::new()).run();
+    let d = nfs_down(with_min_off(Case::new()))
+        .want(N, PowerWant::Workload)
+        .run_at(&first.state, T);
+    assert_steps(&d, vec![Step::PowerOn { resource: rid(N) }], "went down");
+}
+
+#[test]
+fn the_default_of_zero_changes_nothing() {
+    // The stamp is written (it is state), but nothing waits on it.
+    let d = nfs_down(Case::new().nfs_state(&nfs_off(Some(1))))
+        .want(N, PowerWant::Workload)
+        .run();
+    assert_steps(&d, vec![Step::PowerOn { resource: rid(N) }], "no min_off");
+    let sd = format!(
+        "{{ power: {{ phase: shutting_down, since: {} }}, mode: {{ phase: idle }} }}",
+        T - MIN
+    );
+    let d = nfs_down(Case::new().nfs_state(&sd))
+        .want(N, PowerWant::Workload)
+        .run();
+    assert_steps(
+        &d,
+        vec![Step::PowerOn { resource: rid(N) }],
+        "as before: at once",
+    );
+    assert_eq!(stamp_of(&d, N), None);
+    // With a minimum the same tick waits instead.
+    let d = nfs_down(with_min_off(Case::new()).nfs_state(&sd))
+        .want(N, PowerWant::Workload)
+        .run();
+    assert_steps(
+        &d,
+        vec![wait(N, WaitReason::MinOff)],
+        "min_off from the first tick",
+    );
+}
+
+#[test]
+fn a_clock_that_goes_back_never_lengthens_the_wait_beyond_min_off() {
+    // The stamp is five minutes in the future.
+    let future = format!(
+        "{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, shutdown_confirmed_at: {} }}",
+        T + 5 * MIN
+    );
+    let c = nfs_down(with_min_off(Case::new()).nfs_state(&future)).want(N, PowerWant::Workload);
+    let d = c.run();
+    assert_steps(&d, vec![wait(N, WaitReason::MinOff)], "waits");
+    assert_eq!(
+        stamp_of(&d, N),
+        Some(sched_model::Millis(T)),
+        "made again at now"
+    );
+    let d = c.run_fresh_at(&d.state, T + MIN_OFF - 1);
+    assert_steps(&d, vec![wait(N, WaitReason::MinOff)], "still short");
+    let d = c.run_fresh_at(&d.state, T + MIN_OFF);
+    assert_steps(&d, vec![Step::PowerOn { resource: rid(N) }], "due");
+}
+
+#[test]
+fn the_wait_is_a_delay_of_a_fresh_decision_never_a_retry() {
+    // Many ticks inside the wait: only waits, and exactly one power-on once it is over.
+    let c = nfs_down(with_min_off(Case::new()).nfs_state(&nfs_off(Some(0))))
+        .want(N, PowerWant::Workload);
+    let mut state = c.state();
+    let mut power_ons = 0;
+    for tick_no in 0..=(MIN_OFF / 30_000 + 4) {
+        let now = T + tick_no * 30_000;
+        let d = c.run_fresh_at(&state, now);
+        if powers_on(&d, N) {
+            power_ons += 1;
+            assert!(now >= T + MIN_OFF, "powered on early at +{}", now - T);
+        } else if now < T + MIN_OFF {
+            assert_steps(&d, vec![wait(N, WaitReason::MinOff)], "inside the wait");
+        }
+        state = d.state;
+    }
+    assert_eq!(power_ons, 1);
+    assert!(matches!(
+        state.resource(&rid(N)).unwrap().power,
+        PowerPhase::PoweringOn { .. } | PowerPhase::On { .. } | PowerPhase::Failed { .. }
+    ));
+}
+
+#[test]
+fn min_off_also_holds_back_an_exclusive_host_and_a_reclaim_is_not_delayed() {
+    let off = format!(
+        "{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, shutdown_confirmed_at: {} }}",
+        T - MIN
+    );
+    let c = with_min_off(Case::new())
+        .gpu_state(&off)
+        .obs(up(G, false, 0))
+        .target(Some("llm"))
+        .want(G, PowerWant::Workload);
+    let d = c.run();
+    assert!(!powers_on(&d, G), "{:?}", d.steps);
+    assert!(
+        d.steps.contains(&wait(G, WaitReason::MinOff)),
+        "{:?}",
+        d.steps
+    );
+    assert!(d.allowed.models.is_empty());
+    // A reclaim removes the want and the wait says reclaimed, as before.
+    let d = with_min_off(Case::new())
+        .gpu_state(&off)
+        .obs(up(G, false, 0))
+        .reclaim()
+        .run();
+    assert!(
+        !d.steps.contains(&wait(G, WaitReason::MinOff)),
+        "{:?}",
+        d.steps
+    );
+}
+
+#[test]
+fn the_stamp_is_state_that_survives_a_restart() {
+    let sd = format!(
+        "{{ power: {{ phase: shutting_down, since: {} }}, mode: {{ phase: idle }} }}",
+        T - MIN
+    );
+    let c = nfs_down(with_min_off(Case::new()).nfs_state(&sd)).want(N, PowerWant::Workload);
+    let d = c.run();
+    assert_eq!(stamp_of(&d, N), Some(sched_model::Millis(T)));
+    // Written and read back, as the service does between ticks.
+    let restored: SchedState =
+        serde_json::from_str(&serde_json::to_string(&d.state).unwrap()).unwrap();
+    assert_eq!(restored, d.state);
+    let d2 = c.run_fresh_at(&restored, T + MIN_OFF - 1);
+    assert_steps(
+        &d2,
+        vec![wait(N, WaitReason::MinOff)],
+        "still waits after a restart",
+    );
+    let d3 = c.run_fresh_at(&restored, T + MIN_OFF);
+    assert_steps(
+        &d3,
+        vec![Step::PowerOn { resource: rid(N) }],
+        "due after a restart",
+    );
+}
