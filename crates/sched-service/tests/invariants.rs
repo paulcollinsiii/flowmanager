@@ -723,3 +723,95 @@ fn a_power_step_or_a_silent_exit_from_the_failed_power_state_is_a_violation() {
     let v = check_with(&up, &failed, &d);
     assert!(!v.iter().any(|m| m.contains("invariant 11")), "{v:?}");
 }
+
+// Invariant 4b: no automatic power-on within `min_off` of a confirmed shutdown.
+
+fn min_off_config() -> sched_model::Config {
+    let y = sched_model::test_support::example_yaml_managed().replacen(
+        "power_on_timeout:",
+        "min_off: 10m\n      power_on_timeout:",
+        2,
+    );
+    sched_model::Config::from_yaml(&y).unwrap()
+}
+
+fn power_on(res: &str) -> Step {
+    Step::PowerOn {
+        resource: ResourceId::new(res),
+    }
+}
+
+fn nfs_down() -> Vec<sched_model::Observation> {
+    use sched_model::{Fidelity, Observation, ObservedValue};
+    vec![Observation {
+        source: "cluster-pods".into(),
+        observed_at: Millis(NOW),
+        fidelity: Fidelity::Event,
+        value: ObservedValue::ResourceUp {
+            resource: "basestar-nfs".into(),
+            up: false,
+        },
+    }]
+}
+
+fn job_hold() -> Vec<Lease> {
+    vec![lease(
+        "h",
+        "basestar-nfs",
+        LeaseKind::SharedHold {
+            holder: "job:backup".into(),
+        },
+    )]
+}
+
+fn off_since(ago: u64) -> SchedState {
+    prev(&format!(
+        "    basestar-nfs: {{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, shutdown_confirmed_at: {} }}\n",
+        NOW - ago
+    ))
+}
+
+fn run_min_off(snap: &Snapshot, prev: &SchedState, steps: Vec<Step>) -> Vec<String> {
+    check(
+        &min_off_config(),
+        snap,
+        prev,
+        &Intent::default(),
+        &decision(steps),
+    )
+}
+
+#[test]
+fn powering_on_within_min_off_of_a_confirmed_shutdown_is_a_violation() {
+    let s = snap(nfs_down(), job_hold());
+    let v = run_min_off(&s, &off_since(9 * MIN), vec![power_on("basestar-nfs")]);
+    assert!(v.iter().any(|m| m.contains("invariant 4b")), "{v:?}");
+    // The same tick that sees the shutdown finish counts as confirmed now.
+    let shutting = prev(
+        "    basestar-nfs: { power: { phase: shutting_down, since: 1 }, mode: { phase: idle } }\n",
+    );
+    let v = run_min_off(&s, &shutting, vec![power_on("basestar-nfs")]);
+    assert!(v.iter().any(|m| m.contains("invariant 4b")), "{v:?}");
+    // A stamp in the future is within the wait too.
+    let v = run_min_off(&s, &off_since(0), vec![power_on("basestar-nfs")]);
+    assert!(v.iter().any(|m| m.contains("invariant 4b")), "{v:?}");
+}
+
+#[test]
+fn powering_on_after_min_off_with_a_manual_lease_or_without_a_stamp_is_fine() {
+    let s = snap(nfs_down(), job_hold());
+    let v = run_min_off(&s, &off_since(10 * MIN), vec![power_on("basestar-nfs")]);
+    assert!(v.is_empty(), "{v:?}");
+    let manual = snap(
+        nfs_down(),
+        vec![lease("m", "basestar-nfs", LeaseKind::ManualHost)],
+    );
+    let v = run_min_off(&manual, &off_since(MIN), vec![power_on("basestar-nfs")]);
+    assert!(v.is_empty(), "{v:?}");
+    let found = prev("    basestar-nfs: { power: { phase: \"off\" }, mode: { phase: idle } }\n");
+    let v = run_min_off(&s, &found, vec![power_on("basestar-nfs")]);
+    assert!(v.is_empty(), "{v:?}");
+    // The default of 0 never fires.
+    let v = run(&s, &off_since(1), vec![power_on("basestar-nfs")]);
+    assert!(v.is_empty(), "{v:?}");
+}

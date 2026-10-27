@@ -1,0 +1,72 @@
+description: "min_off (10m in this scenario): after flowmanager shuts the NFS host down and sees it down, a scheduled job's hold arriving two minutes later is not served by a power-on until min_off has passed since the host was seen down. Until then the tick says wait min_off (the job's start window keeps running). At exactly min_off the host is powered on, once."
+power_control: managed
+min_off: 10m
+initial_state:
+  resources:
+    basestar-nfs: { power: { phase: "on", since: 0 }, mode: { phase: idle }, managed: true }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      # No pod mounts the NFS host (the veto before a shutdown reads this).
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
+  # Idle for idle_grace (10m): shut down.
+  - at: 100600000
+    refresh: true
+    expect:
+      steps: [{ type: power_off, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  # Seen down: the minimum off time starts here (100630000).
+  - at: 100630000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [] }
+  # A job's hold arrives: the host is wanted but min_off has not passed.
+  - at: 100750000
+    refresh: true
+    leases:
+      - { id: hold-1, resource: basestar-nfs, granted_at: 100750000, kind: { type: shared_hold, holder: "job:backup" } }
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: min_off }]
+      allowed: { models: [], classes: [] }
+  # One millisecond short of min_off after the host was seen down.
+  - at: 101229999
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: min_off }]
+      allowed: { models: [], classes: [] }
+  # min_off has passed: the host is powered on, once.
+  - at: 101230000
+    refresh: true
+    expect:
+      steps: [{ type: power_on, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 101260000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: powering_on }]
+      allowed: { models: [], classes: [] }
+  - at: 101290000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }

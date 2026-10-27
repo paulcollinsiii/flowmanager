@@ -27,6 +27,10 @@ pub struct Scenario {
     /// replayed against (scenarios of the power machine use `managed`).
     #[serde(default)]
     pub power_control: Option<sched_model::PowerControl>,
+    /// Sets `power.min_off` of every powered resource of the config the scenario is
+    /// replayed against (the config's own value is zero: disabled).
+    #[serde(default)]
+    pub min_off: Option<Millis>,
     pub frames: Vec<Frame>,
 }
 

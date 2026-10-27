@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{
-    AllowedSet, Capability, ClassId, CreateJob, JobBook, JobEvent, Lease, LeaseId, Millis, ModelId,
-    MountsVeto, PowerPhase, PowerTransition, PublishedAllowed, ResourceId, SchedState, SourceId,
-    Step, class_work,
+    AllowedSet, Capability, ClassId, Config, CreateJob, JobBook, JobEvent, Lease, LeaseId, Millis,
+    ModelId, MountsVeto, PowerPhase, PowerTransition, PublishedAllowed, ResourceId, SchedState,
+    SourceId, Step, WaitReason, class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
@@ -216,6 +216,48 @@ fn mounts_report(prev: &SchedState, next: &SchedState) -> (Vec<MountsHeld>, Vec<
     (held, timeouts)
 }
 
+/// A resource whose automatic power-on waits for `min_off`, in a [`TickReport`]: flowmanager
+/// shut the host down and saw it down, and a want arrived before the minimum off time passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinOffWait {
+    pub resource: ResourceId,
+    /// When the host was seen down after flowmanager shut it down.
+    pub since: Millis,
+    /// The instant the wait ends (the earliest a power-on can be decided).
+    pub until: Millis,
+    /// How long is left at the tick's time.
+    pub remaining: Millis,
+}
+
+/// The `min_off` waits of a decision: one per resource whose step is that wait.
+fn min_off_report(
+    config: &Config,
+    state: &SchedState,
+    steps: &[Step],
+    now: Millis,
+) -> Vec<MinOffWait> {
+    steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Wait {
+                resource,
+                reason: WaitReason::MinOff,
+            } => {
+                let st = state.resource(resource)?;
+                let min_off = config.resource(resource)?.power.as_ref()?.min_off();
+                let remaining = st.min_off_remaining(min_off, now);
+                Some(MinOffWait {
+                    resource: resource.clone(),
+                    since: st.shutdown_confirmed_at?,
+                    until: now.saturating_add(remaining),
+                    remaining,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// What a tick decided, for logs and for the `last_decision` handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TickReport {
@@ -283,6 +325,10 @@ pub struct TickReport {
     /// resource stays in `mounts_held` as stopped).
     #[serde(default)]
     pub mounts_timeouts: Vec<MountsTimeout>,
+    /// Resources whose automatic power-on is held back for `min_off` after a shutdown
+    /// flowmanager started: the time left per resource. A manual lease never waits.
+    #[serde(default)]
+    pub min_off_waits: Vec<MinOffWait>,
     /// What the scheduled jobs did in this tick (alerts among them).
     #[serde(default)]
     pub job_events: Vec<JobEvent>,
@@ -527,6 +573,7 @@ impl Shared {
             power_request_failures: vec![],
             mounts_held: vec![],
             mounts_timeouts: vec![],
+            min_off_waits: vec![],
             job_events: vec![],
             jobs: vec![],
             inputs: vec![],
@@ -741,6 +788,16 @@ impl Shared {
         } else {
             (kinds, reason)
         };
+        let min_off_waits = if error.is_none() {
+            min_off_report(&config, &state, &steps, now)
+        } else {
+            Vec::new()
+        };
+        let reason = if min_off_waits.is_empty() {
+            reason
+        } else {
+            reason::with_min_off(reason, &min_off_waits)
+        };
         let report = TickReport {
             config_generation: config.generation(),
             at: now,
@@ -766,6 +823,7 @@ impl Shared {
             power_request_failures,
             mounts_held,
             mounts_timeouts,
+            min_off_waits,
             inputs: ages.iter().map(InputReport::from).collect(),
             job_events,
             jobs: crate::jobs::summaries(&config, &jobs),
@@ -809,6 +867,14 @@ impl Shared {
         });
         self.metrics
             .set_mounts_veto(&r.state, |id| config.mounts_checked(id));
+        self.metrics.set_min_off_remaining(&r.state, r.at, |id| {
+            config
+                .resource(id)
+                .filter(|_| config.power_managed(id))
+                .and_then(|res| res.power.as_ref())
+                .map(|p| p.min_off())
+                .filter(|m| *m > Millis::ZERO)
+        });
         if !replayed {
             for t in &r.mounts_timeouts {
                 self.metrics.mounts_timeout(t.resource.as_str());

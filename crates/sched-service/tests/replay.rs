@@ -17,6 +17,18 @@ fn replay(name: &str) {
         Some(PowerControl::Managed) => example_config_managed(),
         Some(PowerControl::Manual) | None => example_config(),
     };
+    let config = match scenario.min_off {
+        Some(m) => {
+            // The example text, not a Config, carries the key: set it on both powered hosts.
+            let y = sched_model::test_support::example_yaml_managed().replacen(
+                "power_on_timeout:",
+                &format!("min_off: {}ms\n      power_on_timeout:", m.as_u64()),
+                2,
+            );
+            sched_model::Config::from_yaml(&y).unwrap()
+        }
+        None => config,
+    };
     if let Err(problems) = run_checked(&config, &scenario) {
         panic!("{name}: {}\n{}", scenario.description, problems.join("\n"));
     }
@@ -47,11 +59,13 @@ scenarios! {
     nfs_lease_mount_check => "nfs-lease-mount-check.yaml",
     nfs_two_holders => "nfs-two-holders.yaml",
     nfs_unmount_timeout => "nfs-unmount-timeout.yaml",
+    min_off_wait => "min-off-wait.yaml",
+    min_off_manual_lease => "min-off-manual-lease.yaml",
 }
 
 #[test]
 fn every_scenario_file_has_a_test() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
     let count = std::fs::read_dir(dir).unwrap().count();
-    assert_eq!(count, 18, "add new scenario files to the scenarios! list");
+    assert_eq!(count, 20, "add new scenario files to the scenarios! list");
 }

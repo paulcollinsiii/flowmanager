@@ -41,6 +41,9 @@ pub struct Metrics {
     power_failed_resources: Mutex<HashSet<String>>,
     mounts_timeouts: IntCounterVec,
     mounts_veto: GaugeVec,
+    min_off_remaining: GaugeVec,
+    /// Resources with `min_off_remaining` series, to drop those that leave the set.
+    min_off_resources: Mutex<HashSet<String>>,
     /// Resources with `mounts_veto` series, to drop those that leave the checked set.
     mounts_veto_resources: Mutex<HashSet<String>>,
     job_events: IntCounterVec,
@@ -266,6 +269,17 @@ impl Metrics {
             .register(Box::new(mounts_timeouts.clone()))
             .unwrap();
         registry.register(Box::new(mounts_veto.clone())).unwrap();
+        let min_off_remaining = GaugeVec::new(
+            Opts::new(
+                "sched_resource_min_off_remaining_seconds",
+                "Seconds left of the resource's min_off, the minimum time flowmanager keeps a host off after a shutdown it started before it powers the host on again by itself; 0 when it is not in that window (the host is up, was found down, or the time has passed). A want that arrives while this is above 0 waits (wait reason min_off); a manual lease does not. Only managed resources with min_off above zero have a series",
+            ),
+            &["resource"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(min_off_remaining.clone()))
+            .unwrap();
         registry.register(Box::new(recovery_runs.clone())).unwrap();
         registry
             .register(Box::new(recovery_requeues.clone()))
@@ -313,6 +327,8 @@ impl Metrics {
             power_failed_resources: Mutex::new(HashSet::new()),
             mounts_timeouts,
             mounts_veto,
+            min_off_remaining,
+            min_off_resources: Mutex::new(HashSet::new()),
             mounts_veto_resources: Mutex::new(HashSet::new()),
             phases: Mutex::new(HashMap::new()),
             job_events,
@@ -578,6 +594,34 @@ impl Metrics {
         );
     }
 
+    /// Sets `sched_resource_min_off_remaining_seconds` from the state at `now`: per resource
+    /// for which `min_off` gives a minimum (managed, above zero), the seconds left of it;
+    /// resources without one lose their series.
+    pub fn set_min_off_remaining(
+        &self,
+        state: &SchedState,
+        now: Millis,
+        min_off: impl Fn(&ResourceId) -> Option<Millis>,
+    ) {
+        let mut known = self
+            .min_off_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut now_known = HashSet::new();
+        for (id, st) in &state.resources {
+            let Some(m) = min_off(id) else { continue };
+            let left = st.min_off_remaining(m, now);
+            self.min_off_remaining
+                .with_label_values(&[id.as_str()])
+                .set(left.as_u64() as f64 / 1000.0);
+            now_known.insert(id.to_string());
+        }
+        for gone in known.difference(&now_known) {
+            let _ = self.min_off_remaining.remove_label_values(&[gone.as_str()]);
+        }
+        *known = now_known;
+    }
+
     /// Counts one power action by outcome (see the metric's help). `resource` must be a
     /// configured resource id.
     pub fn power_request(&self, resource: &str, action: &str, outcome: &str) {
@@ -613,6 +657,40 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_min_off_gauge_counts_down_to_zero_and_drops_resources_without_a_minimum() {
+        use sched_model::{PowerPhase, ResourceState};
+        let m = Metrics::new();
+        let mut off = ResourceState::new(PowerPhase::Off);
+        off.shutdown_confirmed_at = Some(Millis(1_000));
+        let mut s = SchedState::default();
+        s.resources.insert("a".into(), off);
+        s.resources
+            .insert("b".into(), ResourceState::new(PowerPhase::Off));
+        let min = |id: &ResourceId| (id.as_str() != "c").then_some(Millis(61_000));
+        m.set_min_off_remaining(&s, Millis(11_000), min);
+        let text = m.render();
+        assert!(
+            text.contains("sched_resource_min_off_remaining_seconds{resource=\"a\"} 51"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sched_resource_min_off_remaining_seconds{resource=\"b\"} 0"),
+            "{text}"
+        );
+        m.set_min_off_remaining(&s, Millis(70_000), min);
+        assert!(
+            m.render()
+                .contains("sched_resource_min_off_remaining_seconds{resource=\"a\"} 0")
+        );
+        // Without a minimum (disabled, or no longer managed) the series goes away.
+        m.set_min_off_remaining(&s, Millis(70_000), |_| None);
+        assert!(
+            !m.render()
+                .contains("sched_resource_min_off_remaining_seconds{")
+        );
+    }
 
     #[test]
     fn renders_every_metric_family_and_replaces_ages() {

@@ -435,6 +435,38 @@ pub fn check(
                         "invariant 4: powered on {resource} without a manual or workload reason"
                     ));
                 }
+                // 4b. No automatic power-on within `min_off` of a shutdown flowmanager
+                // started and saw confirmed; a manual lease is the only exception. The
+                // confirmation is the stamp the previous state carries, or a shutdown that
+                // this snapshot shows complete (the host freshly read down).
+                let min_off = config
+                    .resource(resource)
+                    .and_then(|r| r.power.as_ref())
+                    .and_then(|p| p.min_off)
+                    .unwrap_or(Millis::ZERO);
+                if !manual && min_off > Millis::ZERO {
+                    let before = prev.resource(resource);
+                    let confirmed = match before.map(|s| (s.power, s.shutdown_confirmed_at)) {
+                        Some((PowerPhase::Off, Some(at))) => Some(at),
+                        Some((
+                            PowerPhase::ShuttingDown { .. }
+                            | PowerPhase::Failed {
+                                during: PowerTransition::ShuttingDown,
+                                ..
+                            },
+                            _,
+                        )) if host_seen_down(config, snapshot, resource, safety) => Some(now),
+                        _ => None,
+                    };
+                    if let Some(at) = confirmed
+                        && now.saturating_sub(at) < min_off
+                    {
+                        out.push(format!(
+                            "invariant 4b: powered on {resource} {}ms after a confirmed shutdown, within its min_off of {min_off}, with no manual lease",
+                            now.saturating_sub(at).as_u64()
+                        ));
+                    }
+                }
                 if reclaimed(config, snapshot, resource) {
                     out.push(format!("powered on reclaimed {resource}"));
                 }

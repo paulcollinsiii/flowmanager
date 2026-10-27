@@ -855,3 +855,121 @@ async fn an_unreadable_job_book_keeps_the_hold_in_the_planners_view_and_starts_n
         "no shutdown was requested"
     );
 }
+
+/// A managed host that flowmanager is shutting down (the stored state says so), with
+/// `min_off` of 45 minutes, and a job (`backup`, start window 30m) that is due a minute after
+/// the host is seen down. `missed_run` is the job's policy.
+async fn min_off_world(missed_run: &str) -> World {
+    let yaml = example_yaml_managed()
+        .replacen(
+            "power_on_timeout:",
+            "min_off: 45m\n      power_on_timeout:",
+            2,
+        )
+        .replace("missed_run: catch_up", &format!("missed_run: {missed_run}"));
+    let w = World::new(&yaml);
+    let mut state = sched_model::SchedState::default();
+    state.resources.insert(
+        "basestar-nfs".into(),
+        sched_model::ResourceState::new(sched_model::PowerPhase::ShuttingDown {
+            since: Millis(DUE - 5 * MIN),
+        }),
+    );
+    let core = persist::CoreState {
+        state,
+        ..Default::default()
+    };
+    w.ctx.put(persist::STATE_KEY, &persist::encode_state(&core));
+    w
+}
+
+fn power_ons(w: &World) -> usize {
+    w.ctx
+        .powers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(r, a)| r == "basestar-nfs" && *a == PowerAction::On)
+        .count()
+}
+
+#[tokio::test]
+async fn a_job_hold_during_min_off_waits_and_a_catch_up_run_alerts_at_the_window_and_starts_late() {
+    let w = min_off_world("catch_up").await;
+    // The host is seen down a minute before the job is due: the minimum off time starts.
+    let r = w.tick(DUE - MIN, false, false).await;
+    let st = r.state.resource(&"basestar-nfs".into()).unwrap();
+    assert_eq!(st.shutdown_confirmed_at, Some(Millis(DUE - MIN)));
+    // Due: the hold exists, the host is wanted, and it is reported waiting, not silent.
+    let r = w.tick(DUE, false, false).await;
+    assert_eq!(w.holds(), vec![hold()]);
+    assert!(
+        r.steps.contains(&sched_model::Step::Wait {
+            resource: "basestar-nfs".into(),
+            reason: sched_model::WaitReason::MinOff
+        }),
+        "{:?}",
+        r.steps
+    );
+    assert_eq!(r.min_off_waits.len(), 1, "{r:?}");
+    assert_eq!(r.min_off_waits[0].remaining, Millis(44 * MIN));
+    assert!(
+        r.reason.contains("waiting for min_off, 2640s left"),
+        "{}",
+        r.reason
+    );
+    assert!(
+        w.shared
+            .metrics
+            .render()
+            .contains("sched_resource_min_off_remaining_seconds{resource=\"basestar-nfs\"} 2640"),
+        "{}",
+        w.shared.metrics.render()
+    );
+    assert_eq!(power_ons(&w), 0);
+    // Through the start window (30m) and beyond: no power-on; catch_up alerts once at the
+    // window's end and keeps waiting.
+    let mut seen = vec![];
+    for k in 1..44 {
+        let r = w.tick(DUE + k * MIN, false, false).await;
+        seen.extend(kinds(&r));
+        assert_eq!(power_ons(&w), 0, "powered on early at +{k}m");
+        assert_eq!(w.holds(), vec![hold()]);
+    }
+    assert_eq!(seen, vec!["backup:start_late"], "{seen:?}");
+    // min_off after the host was seen down: powered on, once.
+    w.tick(DUE + 44 * MIN, false, false).await;
+    assert_eq!(power_ons(&w), 1);
+    for k in 45..48 {
+        w.tick(DUE + k * MIN, false, false).await;
+    }
+    assert_eq!(power_ons(&w), 1, "never retried");
+    // It comes up; the late run goes ahead, once.
+    w.tick(DUE + 50 * MIN, true, false).await;
+    let r = w.tick(DUE + 51 * MIN, true, false).await;
+    assert!(
+        r.job_events.iter().any(|e| e.kind.counter() == "started"),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_skip_run_that_waits_out_its_window_for_min_off_is_missed_and_the_host_stays_off() {
+    let w = min_off_world("skip").await;
+    w.tick(DUE - MIN, false, false).await;
+    let r = w.tick(DUE, false, false).await;
+    assert_eq!(w.holds(), vec![hold()]);
+    assert_eq!(r.min_off_waits.len(), 1, "{r:?}");
+    // The window (30m) ends inside the wait (45m): dropped as missed, the hold released.
+    let r = w.tick(DUE + 30 * MIN, false, false).await;
+    assert_eq!(kinds(&r), vec!["backup:missed"], "{r:?}");
+    assert!(w.holds().is_empty());
+    // Nothing wants the host any more: no wait is reported and it is not powered on.
+    let r = w.tick(DUE + 31 * MIN, false, false).await;
+    assert!(r.min_off_waits.is_empty(), "{r:?}");
+    let r = w.tick(DUE + 50 * MIN, false, false).await;
+    assert!(r.min_off_waits.is_empty(), "{r:?}");
+    assert_eq!(power_ons(&w), 0);
+    assert_eq!(w.counter("backup", "missed"), "1");
+    assert!(w.kube.calls.lock().unwrap().is_empty());
+}

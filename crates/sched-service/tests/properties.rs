@@ -181,6 +181,7 @@ fn scenario(frames: &[Raw]) -> Scenario {
         description: "random".into(),
         initial_state: Default::default(),
         power_control: None,
+        min_off: None,
         frames: out,
     }
 }

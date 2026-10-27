@@ -1,0 +1,34 @@
+description: "min_off (10m in this scenario) does not delay a manual request: a person's lease that arrives right after flowmanager shut the NFS host down powers it on at once."
+power_control: managed
+min_off: 10m
+initial_state:
+  resources:
+    basestar-nfs: { power: { phase: shutting_down, since: 99900000 }, mode: { phase: idle } }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      # No pod mounts the NFS host (the veto before a shutdown reads this).
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [] }
+  - at: 100030000
+    refresh: true
+    leases:
+      - { id: manual-1, resource: basestar-nfs, granted_at: 100030000, kind: { type: manual_host } }
+    expect:
+      steps: [{ type: power_on, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }

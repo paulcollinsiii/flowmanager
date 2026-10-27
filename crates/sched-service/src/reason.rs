@@ -8,7 +8,9 @@ use sched_model::{
 use sched_observe::ObserverState;
 
 use crate::cache::InputAge;
-use crate::tick::{MountsHeld, MountsTimeout, PowerFailed, PowerRequestFailure, PowerTimeout};
+use crate::tick::{
+    MinOffWait, MountsHeld, MountsTimeout, PowerFailed, PowerRequestFailure, PowerTimeout,
+};
 
 /// The metric label of a step. A fixed set, so label cardinality is bounded.
 pub fn step_kind(step: &Step) -> &'static str {
@@ -139,6 +141,20 @@ pub fn with_mounts(
         }
     }
     (kinds, reason)
+}
+
+/// Adds the power-ons held back by `min_off` to a decision's reason: how long each has left.
+pub fn with_min_off(mut reason: String, waits: &[MinOffWait]) -> String {
+    for w in waits {
+        reason.push_str(&format!(
+            "; {} is wanted but was shut down by flowmanager and seen down at {}ms: waiting for min_off, {}s left (power-on decided again at {}ms; a manual lease would not wait)",
+            w.resource,
+            w.since.as_u64(),
+            w.remaining.as_u64().div_ceil(1000),
+            w.until.as_u64()
+        ));
+    }
+    reason
 }
 
 /// Classes whose demand is unknown, by why. None of them is "zero demand".
