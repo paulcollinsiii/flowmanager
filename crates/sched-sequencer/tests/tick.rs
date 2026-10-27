@@ -1954,7 +1954,8 @@ fn manual_control_converges_transitional_phases_to_what_is_observed() {
     assert!(d.allowed.models.is_empty());
     // Under managed control a host observed up stays shutting down (the managed machine
     // waits for it to go down).
-    let mut m = Case::new().gpu_state(&host_state(shutting, "{ phase: idle }", true));
+    let recent = format!("{{ phase: shutting_down, since: {} }}", T - 1000);
+    let mut m = Case::new().gpu_state(&host_state(&recent, "{ phase: idle }", true));
     m.config = example_config_managed();
     assert!(matches!(
         power_of(&m.run(), G),
@@ -2131,4 +2132,214 @@ fn a_killed_class_whose_action_needs_its_model_records_no_recovery() {
             .pending_recovery
             .is_empty()
     );
+}
+
+// ---- power transition timeouts: alert and stop, never retry --------------------------
+
+const POWER_ON_TIMEOUT: u64 = 10 * MIN;
+const SHUTDOWN_TIMEOUT: u64 = 15 * MIN;
+
+fn powering_on_since(ago: u64) -> String {
+    format!(
+        "{{ power: {{ phase: powering_on, since: {} }}, mode: {{ phase: idle }}, managed: true }}",
+        T - ago
+    )
+}
+
+fn shutting_down_since(ago: u64) -> String {
+    format!(
+        "{{ power: {{ phase: shutting_down, since: {} }}, mode: {{ phase: idle }} }}",
+        T - ago
+    )
+}
+
+fn power_failed(during: &str) -> String {
+    format!(
+        "{{ power: {{ phase: failed, since: {}, during: {during} }}, mode: {{ phase: idle }} }}",
+        T - 1000
+    )
+}
+
+fn no_power_step(d: &Decision) -> bool {
+    !d.steps
+        .iter()
+        .any(|s| matches!(s, Step::PowerOn { .. } | Step::PowerOff { .. }))
+}
+
+#[test]
+fn a_host_that_never_comes_up_fails_at_the_timeout_and_is_never_woken_again() {
+    let c = |ago: u64| {
+        Case::new()
+            .gpu_state(&powering_on_since(ago))
+            .obs(up(G, false, 0))
+            .target(Some("llm"))
+            .want(G, PowerWant::Workload)
+    };
+    // One millisecond short: still powering on.
+    let d = c(POWER_ON_TIMEOUT - 1).run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::PoweringOn)],
+        "before the timeout",
+    );
+    assert!(matches!(power_of(&d, G), PowerPhase::PoweringOn { .. }));
+
+    // At the timeout: the failed state, a visible wait, and no power step.
+    let d = c(POWER_ON_TIMEOUT).run();
+    assert_eq!(
+        power_of(&d, G),
+        PowerPhase::Failed {
+            since: sched_model::Millis(T),
+            during: sched_model::PowerTransition::PoweringOn
+        }
+    );
+    assert_steps(&d, vec![wait(G, WaitReason::PowerFailed)], "at the timeout");
+    assert!(d.allowed.models.is_empty());
+    assert!(!uses_gpu(&d));
+
+    // Hours later, still wanted, still down, observations fresh: failed, no power step.
+    let mut state = d.state.clone();
+    for hours in 1..=6u64 {
+        let d = c(0).run_fresh_at(&state, T + hours * 60 * MIN);
+        assert!(
+            matches!(power_of(&d, G), PowerPhase::Failed { .. }),
+            "{hours}h"
+        );
+        assert!(no_power_step(&d), "{hours}h: {:?}", d.steps);
+        assert_steps(&d, vec![wait(G, WaitReason::PowerFailed)], "stays failed");
+        assert!(d.allowed.models.is_empty());
+        state = d.state;
+    }
+}
+
+#[test]
+fn the_power_on_timeout_needs_no_fresh_reading() {
+    let d = Case::new()
+        .gpu_state(&powering_on_since(POWER_ON_TIMEOUT + 5))
+        .obs(up(G, false, 3_600_000))
+        .run();
+    assert!(matches!(power_of(&d, G), PowerPhase::Failed { .. }));
+}
+
+#[test]
+fn a_host_that_never_goes_down_fails_at_the_timeout_and_is_never_shut_down_again() {
+    let c = |ago: u64| {
+        Case::new()
+            .gpu_state(&shutting_down_since(ago))
+            .obs(up(G, true, 0))
+    };
+    let d = c(SHUTDOWN_TIMEOUT - 1).run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::ShuttingDown)],
+        "before the timeout",
+    );
+    assert!(matches!(power_of(&d, G), PowerPhase::ShuttingDown { .. }));
+
+    let d = c(SHUTDOWN_TIMEOUT).run();
+    assert_eq!(
+        power_of(&d, G),
+        PowerPhase::Failed {
+            since: sched_model::Millis(T),
+            during: sched_model::PowerTransition::ShuttingDown
+        }
+    );
+    assert_steps(&d, vec![wait(G, WaitReason::PowerFailed)], "at the timeout");
+    // The host is observed up, but nothing is allowed on it.
+    assert!(d.allowed.models.is_empty());
+    assert!(!uses_gpu(&d));
+
+    let mut state = d.state.clone();
+    for hours in 1..=6u64 {
+        let d = c(0)
+            .target(Some("llm"))
+            .want(G, PowerWant::Manual)
+            .run_fresh_at(&state, T + hours * 60 * MIN);
+        assert!(
+            matches!(power_of(&d, G), PowerPhase::Failed { .. }),
+            "{hours}h"
+        );
+        assert!(no_power_step(&d), "{hours}h: {:?}", d.steps);
+        assert!(d.allowed.models.is_empty(), "{hours}h");
+        state = d.state;
+    }
+}
+
+#[test]
+fn the_failed_state_clears_only_on_the_state_that_was_wanted() {
+    // Failed while powering on: a host observed down stays failed; observed up it is on.
+    let c = Case::new().gpu_state(&power_failed("powering_on"));
+    let d = c.clone().obs(up(G, false, 0)).run();
+    assert!(matches!(power_of(&d, G), PowerPhase::Failed { .. }));
+    let d = c.clone().obs(up(G, true, 31_000)).run();
+    assert!(
+        matches!(power_of(&d, G), PowerPhase::Failed { .. }),
+        "a stale reading does not clear it"
+    );
+    let d = c.obs(up(G, true, 0)).run();
+    assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+
+    // Failed while shutting down: observed up stays failed; observed down it is off.
+    let c = Case::new().gpu_state(&power_failed("shutting_down"));
+    let d = c.clone().obs(up(G, true, 0)).run();
+    assert!(matches!(power_of(&d, G), PowerPhase::Failed { .. }));
+    let d = c.obs(up(G, false, 0)).run();
+    assert!(matches!(power_of(&d, G), PowerPhase::Off));
+    assert!(no_power_step(&d), "{:?}", d.steps);
+}
+
+#[test]
+fn manual_control_has_no_transition_to_time_out_and_clears_a_failed_state() {
+    let mut c = Case::new().gpu_state(&powering_on_since(POWER_ON_TIMEOUT * 3));
+    c.config = example_config();
+    let d = c.obs(up(G, false, 0)).run();
+    assert!(
+        matches!(power_of(&d, G), PowerPhase::Off),
+        "{:?}",
+        power_of(&d, G)
+    );
+    let mut c = Case::new().gpu_state(&power_failed("shutting_down"));
+    c.config = example_config();
+    let d = c.obs(up(G, true, 0)).run();
+    assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+}
+
+#[test]
+fn timeouts_are_per_resource_and_configurable() {
+    // The example gives basestar-nfs 5m / 10m and cuda-central 10m / 15m.
+    let d = Case::new()
+        .gpu_state(&powering_on_since(6 * MIN))
+        .nfs_state(&format!(
+            "{{ power: {{ phase: powering_on, since: {} }}, mode: {{ phase: idle }}, managed: true }}",
+            T - 6 * MIN
+        ))
+        .obs(up(G, false, 0))
+        .obs(up(N, false, 0))
+        .run();
+    assert!(matches!(power_of(&d, G), PowerPhase::PoweringOn { .. }));
+    assert!(matches!(power_of(&d, N), PowerPhase::Failed { .. }));
+
+    let mut c = Case::new()
+        .gpu_state(&shutting_down_since(2 * MIN))
+        .obs(up(G, true, 0));
+    c.config = Config::from_yaml(
+        &example_yaml_managed().replace("shutdown_timeout: 15m", "shutdown_timeout: 90s"),
+    )
+    .unwrap();
+    let d = c.run();
+    assert!(matches!(power_of(&d, G), PowerPhase::Failed { .. }));
+}
+
+#[test]
+fn other_resources_keep_scheduling_while_one_is_failed() {
+    // The GPU host failed; the NFS host is up and its backup runs on.
+    let d = Case::new()
+        .gpu_state(&power_failed("powering_on"))
+        .obs(up(G, false, 0))
+        .obs(demand("backup", "backup-schedule", 0, 1, 0))
+        .run();
+    assert!(matches!(power_of(&d, G), PowerPhase::Failed { .. }));
+    assert!(d.allowed.classes.contains(&cid("backup")));
+    assert!(d.allowed.classes.contains(&cid("paperless-ngx")));
+    assert!(!d.allowed.classes.contains(&cid("paperless-gpt")));
 }

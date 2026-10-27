@@ -24,6 +24,11 @@
 //!    other resource it is ignored and reported as a wait.
 //! 5. Safety-critical steps (allowing a model, powering a host off) need a fresh "up"
 //!    reading of the host; otherwise the sequencer waits.
+//! 6. A power transition (powering on, shutting down) is bounded by the resource's
+//!    `power_on_timeout` / `shutdown_timeout`. On expiry the resource enters the failed phase:
+//!    nothing is allowed on it, no power step is ever emitted for it again, and it leaves that
+//!    phase only when a fresh reading shows the state the transition was after (or its
+//!    control is manual). Other resources are unaffected.
 //! 8. Early switching happens only away from classes that declare it safe, or when forced,
 //!    and forced switches still give in-flight work its timeout. In-flight work is stopped
 //!    only on a forced switch (reclaim or manual model lease), class by class, each when

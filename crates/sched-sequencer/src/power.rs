@@ -2,7 +2,8 @@
 //! them up. Resources without a power section are always on.
 
 use sched_model::{
-    ClassSpec, ModePhase, PowerPhase, PowerWant, ResourceState, Step, WaitReason, class_work,
+    ClassSpec, ModePhase, PowerPhase, PowerTransition, PowerWant, ResourceState, Step, WaitReason,
+    class_work,
 };
 
 use crate::Cx;
@@ -43,22 +44,64 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         st.host_idle_since = None;
     }
     let now = cx.now();
-    let Some(up) = cx.snapshot.fresh_resource_up(
+    let observed = cx.snapshot.fresh_resource_up(
         cx.config,
         &cx.res.id,
         cx.config.policy().host_reading_stale_after,
-    ) else {
-        return;
-    };
-    st.power = match (st.power, up) {
-        (PowerPhase::On { since }, true) => PowerPhase::On { since },
-        (_, true) if manual => PowerPhase::On { since: now },
-        (_, false) if manual => PowerPhase::Off,
-        (PowerPhase::Off | PowerPhase::PoweringOn { .. }, true) => PowerPhase::On { since: now },
-        (PowerPhase::On { .. }, false) => PowerPhase::Off,
-        (PowerPhase::ShuttingDown { .. }, false) => PowerPhase::Off,
-        (p, _) => p,
-    };
+    );
+    if let Some(up) = observed {
+        st.power = match (st.power, up) {
+            (PowerPhase::On { since }, true) => PowerPhase::On { since },
+            (_, true) if manual => PowerPhase::On { since: now },
+            (_, false) if manual => PowerPhase::Off,
+            (PowerPhase::Off | PowerPhase::PoweringOn { .. }, true) => {
+                PowerPhase::On { since: now }
+            }
+            (PowerPhase::On { .. }, false) => PowerPhase::Off,
+            (PowerPhase::ShuttingDown { .. }, false) => PowerPhase::Off,
+            // The failed state clears only on the state the transition was after.
+            (
+                PowerPhase::Failed {
+                    during: PowerTransition::PoweringOn,
+                    ..
+                },
+                true,
+            ) => PowerPhase::On { since: now },
+            (
+                PowerPhase::Failed {
+                    during: PowerTransition::ShuttingDown,
+                    ..
+                },
+                false,
+            ) => PowerPhase::Off,
+            (p, _) => p,
+        };
+    }
+    // A transition that outlasts its timeout is not retried: the resource enters the failed
+    // state, which only the observation (or a person, or manual control) leaves. The check
+    // does not need a fresh reading: it is about elapsed time. Manual control has no
+    // transitions to time out.
+    if !manual && let Some(power) = &cx.res.power {
+        st.power = match st.power {
+            PowerPhase::PoweringOn { since }
+                if now.saturating_sub(since) >= power.power_on_timeout() =>
+            {
+                PowerPhase::Failed {
+                    since: now,
+                    during: PowerTransition::PoweringOn,
+                }
+            }
+            PowerPhase::ShuttingDown { since }
+                if now.saturating_sub(since) >= power.shutdown_timeout() =>
+            {
+                PowerPhase::Failed {
+                    since: now,
+                    during: PowerTransition::ShuttingDown,
+                }
+            }
+            p => p,
+        };
+    }
     if !st.is_on() {
         st.mode = ModePhase::Idle;
         st.host_idle_since = None;
@@ -155,6 +198,12 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 wait(cx, steps, WaitReason::ShuttingDown);
             }
         }
+        // Stopped: no power step is ever emitted from here (see `PowerPhase::Failed`).
+        PowerPhase::Failed { .. } => {
+            if !acted {
+                wait(cx, steps, WaitReason::PowerFailed);
+            }
+        }
         PowerPhase::On { .. } => {
             if acted {
                 return;
@@ -204,6 +253,7 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
         // Only left from managed control while reachability is not fresh.
         PowerPhase::PoweringOn { .. } => wait(cx, steps, WaitReason::PoweringOn),
         PowerPhase::ShuttingDown { .. } => wait(cx, steps, WaitReason::ShuttingDown),
+        PowerPhase::Failed { .. } => wait(cx, steps, WaitReason::PowerFailed),
         PowerPhase::Off if needed => wait(cx, steps, WaitReason::HostNotUp),
         PowerPhase::Off => {}
     }
