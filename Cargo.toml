@@ -8,6 +8,9 @@ unsafe_code = "forbid"
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml_ng = "0.10"
+# Cron expressions for scheduled jobs: pure computation (it needs only jiff, which kube already
+# pulls in), used by sched-model to validate and evaluate a job's schedule in its own timezone.
+cronexpr = "1.7.0"
 thiserror = "2"
 proptest = "1"
 # I/O dependencies: only the I/O crates (sched-observe, sched-service) may use these.

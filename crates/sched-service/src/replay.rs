@@ -97,6 +97,7 @@ fn subject(v: &ObservedValue) -> String {
         ObservedValue::ModelPods { model, .. } => format!("model_pods:{model}"),
         ObservedValue::ResourceUp { resource, .. } => format!("resource_up:{resource}"),
         ObservedValue::ResourceMounts { resource, .. } => format!("resource_mounts:{resource}"),
+        ObservedValue::JobRuns { job, .. } => format!("job_runs:{job}"),
     }
 }
 

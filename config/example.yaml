@@ -245,6 +245,17 @@ sources:
     params:
       nfs_servers: { basestar-nfs: [basestar] }
 
+  # The state of the Kubernetes Jobs flowmanager creates for its scheduled jobs (see `jobs`
+  # below): one list per resync of the Jobs it labelled `app.kubernetes.io/managed-by:
+  # flowmanager`, in `job_namespaces`, which must include each job's CronJob namespace. A
+  # reading that is stale or failed is never taken as "the Job finished": the hold stays.
+  - id: scheduled-jobs
+    kind: kubernetes_watch
+    observe: [jobs]
+    resync: 10s
+    params:
+      job_namespaces: [backups]
+
   # The `prometheus` kind is also available for reachability: one instant query per resync
   # that must return exactly one series, 1 up and 0 down (anything else is a failed read).
   # Not used here, as no blackbox exporter probes basestar. For a probed host it would be:
@@ -420,3 +431,37 @@ sources:
     kind: session
     observe: [demand]
     resync: 30s
+
+# Scheduled jobs: flowmanager starts a Kubernetes Job from a CronJob on a cron schedule, after
+# taking what the job needs. The CronJob is only the template: keep it `suspend: true` (its
+# own schedule never fires) and manage it in your own manifests; flowmanager copies its
+# `spec.jobTemplate` the way `kubectl create job --from=cronjob/<name>` does and adds the
+# labels `app.kubernetes.io/managed-by: flowmanager` and `flowmanager/job: <id>` and the
+# annotations `invoked-by: flowmanager` and `flowmanager/scheduled-at` (RFC3339 UTC). It never
+# deletes a Job. The backup Jobs check their own preconditions in init containers.
+jobs:
+  - id: backup
+    # Five-field crontab, evaluated in `timezone` (an IANA name, default UTC). Here: Sundays
+    # at 03:00. Daylight saving: a time inside the skipped spring hour does not run that day,
+    # a time inside the repeated autumn hour runs twice; use UTC for a strict once.
+    cron: "0 3 * * 0"
+    timezone: UTC
+    cronjob: { namespace: backups, name: postgres-backup }
+    # A hold on a shared resource, taken when the run is due (it wakes basestar if its power
+    # is managed; under `manual` a person powers it on) and released when the run ends, fails
+    # for good, is missed, or the Job is gone. More kinds of need can be added later.
+    needs:
+      - { type: nfs, resource: basestar-nfs }
+    # Retries after a failed Job (default 1; 0 for none), the first after `retry_backoff`
+    # (default 5m), then doubling up to 1h. A job whose needs never came up is a missed run,
+    # not a failed attempt: it uses no retries.
+    retries: 1
+    retry_backoff: 5m
+    # skip (default): a run that could not start within `start_window` of its time is dropped,
+    # logged and alerted. catch_up: it keeps waiting for its needs and runs late, at most once,
+    # as long as the next scheduled time has not arrived; then it is dropped. Backups: catch_up.
+    missed_run: catch_up
+    start_window: 30m
+    # A started run that takes longer is alerted and counted as failed (the Job is not
+    # deleted, and no new run starts while it is still active). Default 6h.
+    deadline: 6h

@@ -9,6 +9,7 @@
 pub mod config;
 pub mod fixture;
 pub mod ids;
+pub mod jobs;
 pub mod lease;
 pub mod observation;
 pub mod plan;
@@ -30,7 +31,8 @@ pub use config::{
     SourceSpec,
 };
 pub use fixture::{Fixture, FixtureError};
-pub use ids::{ClassId, HolderId, LeaseId, ModelId, ResourceId, SourceId};
+pub use ids::{ClassId, HolderId, JobId, LeaseId, ModelId, ResourceId, SourceId};
+pub use jobs::{CronJobRef, JobNeed, JobSpec, MissedRun};
 pub use lease::{Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, Observation, ObservedValue, Snapshot};
 pub use plan::{AllowedSet, Intent, PowerWant, PublishedAllowed, Step, WaitReason};

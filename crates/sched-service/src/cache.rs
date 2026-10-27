@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use sched_model::{
-    Capability, ClassId, Config, Fidelity, Millis, ModelId, Observation, ObservedValue, ResourceId,
+    Capability, ClassId, Config, Fidelity, JobId, Millis, ModelId, Observation, ObservedValue, ResourceId,
     Snapshot, SourceId,
 };
 use sched_observe::{ObserverState, Report, observer_state};
@@ -20,6 +20,7 @@ enum Subject {
     Pods(ModelId),
     Up(ResourceId),
     Mounts(ResourceId),
+    Jobs(JobId),
 }
 
 fn subject(v: &ObservedValue) -> Subject {
@@ -28,6 +29,7 @@ fn subject(v: &ObservedValue) -> Subject {
         ObservedValue::ModelPods { model, .. } => Subject::Pods(model.clone()),
         ObservedValue::ResourceUp { resource, .. } => Subject::Up(resource.clone()),
         ObservedValue::ResourceMounts { resource, .. } => Subject::Mounts(resource.clone()),
+        ObservedValue::JobRuns { job, .. } => Subject::Jobs(job.clone()),
     }
 }
 
@@ -38,6 +40,7 @@ fn capability(v: &ObservedValue) -> Capability {
         ObservedValue::ModelPods { .. } => Capability::Pods,
         ObservedValue::ResourceUp { .. } => Capability::Reachability,
         ObservedValue::ResourceMounts { .. } => Capability::Mounts,
+        ObservedValue::JobRuns { .. } => Capability::Jobs,
     }
 }
 
@@ -57,6 +60,7 @@ fn accepts(config: &Config, source: &SourceId, value: &ObservedValue) -> bool {
         ObservedValue::ModelPods { model, .. } => config.model(model).is_some(),
         ObservedValue::ResourceUp { resource, .. } => config.resource(resource).is_some(),
         ObservedValue::ResourceMounts { resource, .. } => config.resource(resource).is_some(),
+        ObservedValue::JobRuns { job, .. } => config.job(job).is_some(),
     }
 }
 

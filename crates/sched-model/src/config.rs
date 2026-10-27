@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 
-use crate::ids::{ClassId, ModelId, ResourceId, SourceId};
+use crate::ids::{ClassId, JobId, ModelId, ResourceId, SourceId};
+use crate::jobs::JobSpec;
 use crate::power_params::{SshShutdown, WakeOnLan};
 use crate::time::Millis;
 use crate::validate::{self, Problem};
@@ -206,7 +207,9 @@ impl SourceKind {
     pub fn can_supply(self, capability: Capability) -> bool {
         use Capability::*;
         match self {
-            SourceKind::KubernetesWatch => matches!(capability, Pods | Reachability | Mounts),
+            SourceKind::KubernetesWatch => {
+                matches!(capability, Pods | Reachability | Mounts | Jobs)
+            }
             SourceKind::HttpJson | SourceKind::Prometheus => {
                 matches!(capability, Reachability | Demand)
             }
@@ -237,6 +240,10 @@ pub enum Capability {
     /// against the NFS servers configured per resource. Safety-critical: it is the veto before
     /// that host is powered off, and an unknown or stale reading counts as "possibly mounted".
     Mounts,
+    /// The state of the Jobs flowmanager created for its scheduled jobs (`job_runs`): read
+    /// from the Kubernetes API. Whether a job is complete, failed or gone; a reading that is
+    /// stale or unavailable is never read as "finished".
+    Jobs,
 }
 
 impl std::fmt::Display for Capability {
@@ -246,6 +253,7 @@ impl std::fmt::Display for Capability {
             Capability::Reachability => "reachability",
             Capability::Demand => "demand",
             Capability::Mounts => "mounts",
+            Capability::Jobs => "jobs",
         })
     }
 }
@@ -327,6 +335,8 @@ struct RawConfig {
     classes: Vec<ClassSpec>,
     #[serde(default)]
     sources: Vec<SourceSpec>,
+    #[serde(default)]
+    jobs: Vec<JobSpec>,
 }
 
 /// A validated configuration.
@@ -338,6 +348,7 @@ pub struct Config {
     models: Vec<ModelSpec>,
     classes: Vec<ClassSpec>,
     sources: Vec<SourceSpec>,
+    jobs: Vec<JobSpec>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -373,6 +384,7 @@ impl Config {
             models: raw.models,
             classes: raw.classes,
             sources: raw.sources,
+            jobs: raw.jobs,
         };
         let problems = validate::validate(&config);
         if problems.is_empty() {
@@ -405,6 +417,22 @@ impl Config {
 
     pub fn sources(&self) -> &[SourceSpec] {
         &self.sources
+    }
+
+    pub fn jobs(&self) -> &[JobSpec] {
+        &self.jobs
+    }
+
+    pub fn job(&self, id: &JobId) -> Option<&JobSpec> {
+        self.jobs.iter().find(|j| &j.id == id)
+    }
+
+    /// The source that reads the state of the scheduled jobs' Kubernetes Jobs: the one that
+    /// declares the `jobs` capability (validation allows at most one).
+    pub fn jobs_source(&self) -> Option<&SourceSpec> {
+        self.sources
+            .iter()
+            .find(|s| s.observe.contains(&Capability::Jobs))
     }
 
     /// Whether a reclaim lease means anything for `id`: only an exclusive resource with a

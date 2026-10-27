@@ -137,6 +137,7 @@ impl Fixture {
                 ObservedValue::ResourceMounts { resource, .. } => {
                     format!("resource_mounts:{resource}")
                 }
+                ObservedValue::JobRuns { job, .. } => format!("job_runs:{job}"),
             };
             if !seen.insert((&o.source, subject.clone())) {
                 add(
@@ -263,6 +264,20 @@ impl Fixture {
                     }
                     if config.resource(resource).is_none() {
                         add(&at, format!("unknown resource {:?}", resource.as_str()));
+                    }
+                }
+                ObservedValue::JobRuns { job, .. } => {
+                    if source.is_some() && !config.source_observes(&o.source, Capability::Jobs) {
+                        add(
+                            &at,
+                            format!(
+                                "source {:?} does not declare the jobs capability (the scheduler ignores its readings)",
+                                o.source.as_str()
+                            ),
+                        );
+                    }
+                    if config.job(job).is_none() {
+                        add(&at, format!("unknown job {:?}", job.as_str()));
                     }
                 }
             }

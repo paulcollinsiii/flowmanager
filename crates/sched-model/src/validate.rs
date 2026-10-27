@@ -104,7 +104,154 @@ pub(crate) fn validate(c: &Config) -> Vec<Problem> {
     models(c, &mut p);
     classes(c, &mut p);
     sources(c, &mut p);
+    jobs(c, &mut p);
     p.0
+}
+
+/// Why `id` cannot name a scheduled job, or `None` if it can: lowercase letters, digits and
+/// `-`, starting and ending with a letter or digit, at most [`MAX_JOB_ID_LEN`] characters. It
+/// becomes part of a Kubernetes Job name and a label value.
+fn job_id_problem(id: &str) -> Option<String> {
+    use crate::jobs::MAX_JOB_ID_LEN;
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let rule = format!(
+        "a job id may use only lowercase letters, digits and '-', must start and end with a letter or digit, and be at most {MAX_JOB_ID_LEN} characters (it becomes part of the Job's name)"
+    );
+    if id.is_empty() || id != id.trim() {
+        return None; // reported by check_ids
+    }
+    if let Some(bad) = id.chars().find(|c| !alnum(*c) && *c != '-') {
+        return Some(format!("id {id:?} has the character {bad:?}; {rule}"));
+    }
+    if !id.starts_with(alnum) || !id.ends_with(alnum) {
+        return Some(format!(
+            "id {id:?} must start and end with a letter or digit; {rule}"
+        ));
+    }
+    if id.chars().count() > MAX_JOB_ID_LEN {
+        return Some(format!(
+            "id {id:?} is {} characters, more than {MAX_JOB_ID_LEN}; {rule}",
+            id.chars().count()
+        ));
+    }
+    None
+}
+
+/// Why `name` cannot be a Kubernetes namespace or CronJob name (a DNS-1123 subdomain: at most
+/// 253 characters of lowercase letters, digits, '-' and '.', starting and ending with a
+/// letter or digit), or `None`.
+fn kube_name_problem(what: &str, name: &str) -> Option<String> {
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let ok = !name.is_empty()
+        && name.len() <= 253
+        && name.chars().all(|c| alnum(c) || c == '-' || c == '.')
+        && name.starts_with(alnum)
+        && name.ends_with(alnum);
+    (!ok).then(|| {
+        format!("{what} {name:?} must be a Kubernetes name: lowercase letters, digits, '-' and '.', starting and ending with a letter or digit")
+    })
+}
+
+fn jobs(c: &Config, p: &mut Problems) {
+    use crate::jobs::{JobNeed, MAX_JOB_DURATION, MAX_JOB_RETRIES};
+    check_ids(p, "jobs", c.jobs().iter().map(|j| j.id.as_str()));
+    let sources_with_jobs: Vec<_> = c
+        .sources()
+        .iter()
+        .filter(|s| s.observe.contains(&Capability::Jobs))
+        .collect();
+    if sources_with_jobs.len() > 1 {
+        p.add(
+            "sources",
+            format!(
+                "more than one source declares the jobs capability ({}); one reads the state of every scheduled job's Kubernetes Jobs",
+                sources_with_jobs
+                    .iter()
+                    .map(|s| s.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    // The namespaces the jobs source lists; a job whose CronJob is elsewhere could never be
+    // observed, so its hold would never be released on completion.
+    let listed: Option<Vec<String>> = sources_with_jobs
+        .first()
+        .and_then(|s| s.kube_watch_params().ok().flatten())
+        .map(|k| k.job_namespaces);
+    if !c.jobs().is_empty() && sources_with_jobs.is_empty() {
+        p.add(
+            "jobs",
+            "scheduled jobs are configured but no source declares the jobs capability (observe: [jobs] on the kubernetes_watch source, with job_namespaces), so their Jobs could never be observed",
+        );
+    }
+    for j in c.jobs() {
+        let at = format!("jobs[{}]", j.id);
+        if let Some(why) = job_id_problem(j.id.as_str()) {
+            p.add(&at, why);
+        }
+        if let Some(why) = j.schedule_problem() {
+            p.add(format!("{at}.cron"), why);
+        }
+        for (what, value) in [
+            ("namespace", &j.cronjob.namespace),
+            ("name", &j.cronjob.name),
+        ] {
+            if let Some(why) = kube_name_problem(&format!("cronjob {what}"), value) {
+                p.add(format!("{at}.cronjob.{what}"), why);
+            }
+        }
+        if let Some(listed) = &listed
+            && !listed.contains(&j.cronjob.namespace)
+        {
+            p.add(
+                format!("{at}.cronjob.namespace"),
+                format!(
+                    "namespace {:?} is not in the jobs source's job_namespaces, so its Jobs would never be listed",
+                    j.cronjob.namespace
+                ),
+            );
+        }
+        let mut seen = HashSet::new();
+        for (i, need) in j.needs.iter().enumerate() {
+            let at = format!("{at}.needs[{i}]");
+            let JobNeed::Nfs { resource } = need;
+            match c.resource(resource) {
+                None => p.add(&at, format!("unknown resource \"{resource}\"")),
+                Some(r) if r.kind != ResourceKind::Shared => p.add(
+                    &at,
+                    format!(
+                        "resource \"{resource}\" is not a shared resource; an nfs need is a hold on a shared resource"
+                    ),
+                ),
+                Some(_) => {}
+            }
+            if !seen.insert(resource) {
+                p.add(&at, format!("resource \"{resource}\" is needed twice"));
+            }
+        }
+        if j.retries() > MAX_JOB_RETRIES {
+            p.add(
+                format!("{at}.retries"),
+                format!(
+                    "{} is more than the largest allowed, {MAX_JOB_RETRIES}",
+                    j.retries()
+                ),
+            );
+        }
+        for (name, value) in [
+            ("retry_backoff", j.retry_backoff()),
+            ("start_window", j.start_window()),
+            ("deadline", j.deadline()),
+        ] {
+            if value == Millis::ZERO || value > MAX_JOB_DURATION {
+                p.add(
+                    format!("{at}.{name}"),
+                    format!("{value} must be above zero and at most {MAX_JOB_DURATION} (7 days)"),
+                );
+            }
+        }
+    }
 }
 
 fn policy(c: &Config, p: &mut Problems) {
@@ -485,13 +632,14 @@ fn sources(c: &Config, p: &mut Problems) {
         }
         if (s.observe.contains(&Capability::Pods)
             || s.observe.contains(&Capability::Reachability)
-            || s.observe.contains(&Capability::Mounts))
+            || s.observe.contains(&Capability::Mounts)
+            || s.observe.contains(&Capability::Jobs))
             && s.resync > pol.host_reading_stale_after
         {
             p.add(
                 &at,
                 format!(
-                    "resync ({}) exceeds policy.host_reading_stale_after ({}); its pods/reachability/mounts observations would always be stale",
+                    "resync ({}) exceeds policy.host_reading_stale_after ({}); its pods/reachability/mounts/jobs observations would always be stale",
                     s.resync, pol.host_reading_stale_after
                 ),
             );
@@ -1469,5 +1617,175 @@ sources:
             has(&ps, "mounts_timeout must be greater than zero"),
             "{ps:?}"
         );
+    }
+
+    // Scheduled jobs.
+
+    fn example_with(from: &str, to: &str) -> String {
+        let text = crate::test_support::EXAMPLE_CONFIG;
+        assert!(text.contains(from), "the example has no {from:?}");
+        text.replacen(from, to, 1)
+    }
+
+    #[test]
+    fn the_example_job_is_valid_and_typed() {
+        let c = Config::from_yaml(crate::test_support::EXAMPLE_CONFIG).unwrap();
+        let j = c.job(&"backup".into()).unwrap();
+        assert_eq!(j.missed_run, crate::jobs::MissedRun::CatchUp);
+        assert_eq!(j.retries(), 1);
+        assert_eq!(j.needs.len(), 1);
+        assert_eq!(j.needs[0].resource().as_str(), "basestar-nfs");
+        assert_eq!(c.jobs_source().unwrap().id.as_str(), "scheduled-jobs");
+        // Omitted keys take the documented defaults, and a config without jobs is valid.
+        let bare = example_with("    retries: 1\n    retry_backoff: 5m\n", "");
+        let c = Config::from_yaml(&bare).unwrap();
+        assert_eq!(c.jobs()[0].retries(), 1);
+        assert_eq!(
+            c.jobs()[0].retry_backoff(),
+            crate::jobs::DEFAULT_RETRY_BACKOFF
+        );
+    }
+
+    #[test]
+    fn a_job_that_is_malformed_is_refused_with_the_path_and_the_reason() {
+        let ps = problems(&example_with(
+            "  - id: backup\n    # Five-field",
+            "  - id: Back_up\n    # Five-field",
+        ));
+        assert!(has(&ps, "jobs[Back_up]"), "{ps:?}");
+        assert!(has(&ps, "lowercase letters"), "{ps:?}");
+        let long = "a".repeat(41);
+        let ps = problems(&example_with(
+            "  - id: backup\n    # Five-field",
+            &format!("  - id: {long}\n    # Five-field"),
+        ));
+        assert!(has(&ps, "more than 40"), "{ps:?}");
+        for (cron, why) in [
+            ("0 3 * *", "five fields"),
+            ("0 3 * * 0 UTC", "five fields"),
+            ("61 3 * * 0", "cron"),
+            ("0 0 30 2 *", "cron"),
+        ] {
+            let ps = problems(&example_with(
+                "cron: \"0 3 * * 0\"",
+                &format!("cron: \"{cron}\""),
+            ));
+            assert!(has(&ps, "jobs[backup].cron"), "{cron}: {ps:?}");
+            assert!(has(&ps, why), "{cron}: {ps:?}");
+        }
+        let ps = problems(&example_with("timezone: UTC", "timezone: Nowhere/City"));
+        assert!(has(&ps, "jobs[backup].cron"), "{ps:?}");
+        assert!(has(&ps, "Nowhere/City"), "{ps:?}");
+    }
+
+    #[test]
+    fn a_jobs_needs_cronjob_and_numbers_are_checked() {
+        let ps = problems(&example_with(
+            "{ type: nfs, resource: basestar-nfs }",
+            "{ type: nfs, resource: nowhere }",
+        ));
+        assert!(
+            has(&ps, "jobs[backup].needs[0]") && has(&ps, "unknown resource \"nowhere\""),
+            "{ps:?}"
+        );
+        let ps = problems(&example_with(
+            "{ type: nfs, resource: basestar-nfs }",
+            "{ type: nfs, resource: cuda-central }",
+        ));
+        assert!(has(&ps, "is not a shared resource"), "{ps:?}");
+        let ps = problems(&example_with(
+            "      - { type: nfs, resource: basestar-nfs }\n    # Retries",
+            "      - { type: nfs, resource: basestar-nfs }\n      - { type: nfs, resource: basestar-nfs }\n    # Retries",
+        ));
+        assert!(has(&ps, "needed twice"), "{ps:?}");
+        let e = Config::from_yaml(&example_with(
+            "{ type: nfs, resource: basestar-nfs }",
+            "{ type: gpu, model: llm }",
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("unknown variant `gpu`"), "{e}");
+        let ps = problems(&example_with(
+            "cronjob: { namespace: backups, name: postgres-backup }",
+            "cronjob: { namespace: Backups, name: pg_backup }",
+        ));
+        assert!(
+            has(&ps, "jobs[backup].cronjob.namespace") && has(&ps, "jobs[backup].cronjob.name"),
+            "{ps:?}"
+        );
+        let ps = problems(&example_with("retries: 1\n", "retries: 11\n"));
+        assert!(has(&ps, "jobs[backup].retries"), "{ps:?}");
+        for key in ["retry_backoff: 5m", "start_window: 30m", "deadline: 6h"] {
+            let name = key.split(':').next().unwrap();
+            for bad in ["0", "8d"] {
+                let ps = problems(&example_with(key, &format!("{name}: {bad}")));
+                assert!(
+                    has(&ps, &format!("jobs[backup].{name}")),
+                    "{key} {bad}: {ps:?}"
+                );
+            }
+        }
+        let e = Config::from_yaml(&example_with("missed_run: catch_up", "missed_run: later"))
+            .unwrap_err();
+        assert!(e.to_string().contains("unknown variant `later`"), "{e}");
+    }
+
+    #[test]
+    fn jobs_need_a_source_that_lists_their_jobs() {
+        // No source declares the capability.
+        let ps = problems(&example_with(
+            "    observe: [jobs]\n",
+            "    observe: [mounts]\n",
+        ));
+        assert!(has(&ps, "no source declares the jobs capability"), "{ps:?}");
+        // The CronJob's namespace is not listed.
+        let ps = problems(&example_with(
+            "job_namespaces: [backups]",
+            "job_namespaces: [other]",
+        ));
+        assert!(
+            has(&ps, "not in the jobs source's job_namespaces"),
+            "{ps:?}"
+        );
+        // A jobs source must name namespaces.
+        let ps = problems(&example_with(
+            "job_namespaces: [backups]",
+            "job_namespaces: []",
+        ));
+        assert!(
+            has(&ps, "job_namespaces must name at least one namespace"),
+            "{ps:?}"
+        );
+        // Only one source may declare it.
+        let two = example_with(
+            "  - id: scheduled-jobs\n",
+            "  - id: more-jobs\n    kind: kubernetes_watch\n    observe: [jobs]\n    resync: 10s\n    params:\n      job_namespaces: [backups]\n\n  - id: scheduled-jobs\n",
+        );
+        let ps = problems(&two);
+        assert!(
+            has(&ps, "more than one source declares the jobs capability"),
+            "{ps:?}"
+        );
+        // Its resync is held to the host-reading bound: a stale reading would block the hold.
+        let ps = problems(&example_with(
+            "    observe: [jobs]\n    resync: 10s\n",
+            "    observe: [jobs]\n    resync: 5m\n",
+        ));
+        assert!(
+            has(&ps, "exceeds policy.host_reading_stale_after"),
+            "{ps:?}"
+        );
+        // A kind that cannot supply it.
+        let ps = problems(&example_with(
+            "  - id: scheduled-jobs\n    kind: kubernetes_watch\n",
+            "  - id: scheduled-jobs\n    kind: tcp_probe\n",
+        ));
+        assert!(has(&ps, "cannot supply the jobs capability"), "{ps:?}");
+        // No jobs at all needs no source.
+        let none = example_with(
+            "  - id: scheduled-jobs\n    kind: kubernetes_watch\n    observe: [jobs]\n    resync: 10s\n    params:\n      job_namespaces: [backups]\n",
+            "",
+        );
+        let none = none.split("\n# Scheduled jobs").next().unwrap().to_string();
+        assert!(Config::from_yaml(&none).unwrap().jobs().is_empty());
     }
 }

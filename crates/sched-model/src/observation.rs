@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Capability, Config};
-use crate::ids::{ClassId, ModelId, ResourceId, SourceId};
+use crate::ids::{ClassId, JobId, ModelId, ResourceId, SourceId};
 use crate::lease::Lease;
 use crate::time::Millis;
 
@@ -77,6 +77,33 @@ pub enum ObservedValue {
     /// How many pods mount the resource's NFS server (pods that have not finished and have
     /// a volume on it, directly or through a claim). Read from the Kubernetes API.
     ResourceMounts { resource: ResourceId, pods: u32 },
+    /// The state of the Kubernetes Jobs flowmanager created for scheduled job `job`, as read
+    /// from the API: one entry per Job still listed (the newest few). An empty list is a
+    /// fresh reading that found none; a reading that is stale or missing is unknown.
+    JobRuns {
+        job: JobId,
+        runs: Vec<JobRunReading>,
+    },
+}
+
+/// What a Job's status says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobRunState {
+    /// Neither complete nor failed (pending or running).
+    Active,
+    /// The `Complete` condition is true.
+    Complete,
+    /// The `Failed` condition is true.
+    Failed,
+}
+
+/// One Job of a scheduled job as listed from the Kubernetes API.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobRunReading {
+    pub name: String,
+    pub state: JobRunState,
 }
 
 impl ObservedValue {
@@ -90,6 +117,7 @@ impl ObservedValue {
             ObservedValue::ModelPods { .. }
                 | ObservedValue::ResourceUp { .. }
                 | ObservedValue::ResourceMounts { .. }
+                | ObservedValue::JobRuns { .. }
         )
     }
 }
@@ -253,6 +281,39 @@ impl Snapshot {
             }
         }
         Some(most)
+    }
+
+    /// The state of the Jobs of scheduled job `job` and when that reading was taken, or
+    /// `None` when it is unknown, with the same source filtering (`jobs` capability) and
+    /// freshness rule as `fresh_resource_mounts`. Unknown is never "no Jobs": a missing, stale
+    /// or future-dated reading makes it `None`, and a caller must not read `None` as the Job
+    /// having finished or vanished.
+    pub fn fresh_job_runs(
+        &self,
+        config: &Config,
+        job: &JobId,
+        max_age: Millis,
+    ) -> Option<(Millis, Vec<JobRunReading>)> {
+        let groups = self.newest_per_source(|o| {
+            config.source_observes(&o.source, Capability::Jobs)
+                && matches!(&o.value, ObservedValue::JobRuns { job: j, .. } if j == job)
+        });
+        let mut found: Option<(Millis, Vec<JobRunReading>)> = None;
+        for group in &groups {
+            if !group[0].is_fresh(self.now, max_age) {
+                return None;
+            }
+            // One source per job is the rule (validation); with more, the older reading wins
+            // (the less recent view is the safer one to act on).
+            if let ObservedValue::JobRuns { runs, .. } = &group[0].value
+                && found
+                    .as_ref()
+                    .is_none_or(|(at, _)| group[0].observed_at < *at)
+            {
+                found = Some((group[0].observed_at, runs.clone()));
+            }
+        }
+        found
     }
 
     /// Newest-timestamp demand observations for `class` from `source`, the source its

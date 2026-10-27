@@ -59,3 +59,7 @@ id_type!(
     /// Whoever holds a shared reference-counted lease.
     HolderId
 );
+id_type!(
+    /// A scheduled job.
+    JobId
+);

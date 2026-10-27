@@ -48,6 +48,11 @@ pub struct KubeWatchParams {
     /// volumes use both.
     #[serde(default)]
     pub nfs_servers: BTreeMap<ResourceId, Vec<String>>,
+    /// For the `jobs` capability: the namespaces whose Jobs are listed (those flowmanager
+    /// created for its scheduled jobs, found by label). Each scheduled job's CronJob must be
+    /// in one of them.
+    #[serde(default)]
+    pub job_namespaces: Vec<String>,
 }
 
 fn default_workload_label() -> String {
@@ -626,6 +631,15 @@ fn kube_problems(p: &KubeWatchParams, spec: &SourceSpec) -> Vec<String> {
         out.push("nodes must not contain empty node names".to_string());
     }
     out.extend(confirmations_problem(p.reachability_confirmations));
+    if spec.observe.contains(&Capability::Jobs) && p.job_namespaces.is_empty() {
+        out.push(
+            "job_namespaces must name at least one namespace when the source observes jobs"
+                .to_string(),
+        );
+    }
+    if p.job_namespaces.iter().any(|n| n.trim().is_empty()) {
+        out.push("job_namespaces must not contain empty names".to_string());
+    }
     if spec.observe.contains(&Capability::Mounts) && p.nfs_servers.values().all(Vec::is_empty) {
         out.push(
             "nfs_servers must name at least one NFS server of a resource when the source observes mounts"
