@@ -15,7 +15,6 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     leases:
       - { id: manual-host-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: manual_host } }
@@ -29,7 +28,7 @@ frames:
       - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # The shared hold ends first: the manual lease alone keeps it up, however long.
   - at: 100060000
     refresh: true
@@ -37,12 +36,12 @@ frames:
       - { id: manual-host-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: manual_host } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   - at: 101860000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # A new hold arrives, then the manual lease is released: the hold alone keeps it up.
   - at: 101870000
     refresh: true
@@ -50,24 +49,24 @@ frames:
       - { id: hold-2, resource: basestar-nfs, granted_at: 101870000, kind: { type: shared_hold, holder: backup-run } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   - at: 103670000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Both gone: the idle clock starts now.
   - at: 103680000
     refresh: true
     leases: []
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   - at: 104279000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Idle grace over and no pod mounts it (fresh reading): shut down.
   - at: 104280000
     refresh: true

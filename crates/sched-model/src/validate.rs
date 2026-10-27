@@ -874,7 +874,6 @@ sources:
             (Prometheus, [false, true, true]),
             (TcpProbe, [false, true, false]),
             (Sql, [false, false, true]),
-            (Schedule, [false, false, true]),
             (Session, [false, false, true]),
             (Webhook, [false, false, false]),
         ];
@@ -1013,7 +1012,7 @@ sources:
                 "{ps:?}"
             );
         }
-        for kind in ["sql", "prometheus", "schedule", "session"] {
+        for kind in ["sql", "prometheus", "session"] {
             let y = VALID.replace(
                 "{ id: s1, kind: http_json",
                 &format!("{{ id: s1, kind: {kind}"),

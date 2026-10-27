@@ -79,7 +79,6 @@ const CLASSES: &[(&str, &str)] = &[
     ("speakr-transcription", "speakr-pending"),
     ("speakr-summarization", "speakr-summaries"),
     ("immich-ml", "immich-queues"),
-    ("backup", "backup-schedule"),
     ("interactive-llm", "llm-sessions"),
 ];
 
@@ -1092,7 +1091,7 @@ fn power_down_rules() {
     assert_steps(&d, vec![], "a live interactive lease holds the host");
 
     let d = c(T - 99 * MIN)
-        .obs(demand("backup", "backup-schedule", 1, 0, 0))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 1, 0, 0))
         .run();
     assert_steps(&d, vec![], "queued work holds");
     let d = c(T - 99 * MIN)
@@ -1178,7 +1177,7 @@ fn unseen_resources_are_initialised_from_observation() {
 #[test]
 fn allowed_set_requires_every_requirement() {
     // The NFS-only classes, and the gate class that needs the GPU host and NFS up.
-    let all_nfs: Vec<ClassId> = ["backup", "paperless-ngx", "immich-server", "paperless-gpt"]
+    let all_nfs: Vec<ClassId> = ["paperless-ngx", "immich-server", "paperless-gpt"]
         .iter()
         .map(|c| cid(c))
         .collect();
@@ -1206,7 +1205,6 @@ fn allowed_set_requires_every_requirement() {
         "paperless-tagging",
         "speakr-summarization",
         "interactive-llm",
-        "backup",
     ] {
         assert!(d.allowed.classes.contains(&cid(c)), "{c}");
     }
@@ -2370,14 +2368,13 @@ fn timeouts_are_per_resource_and_configurable() {
 
 #[test]
 fn other_resources_keep_scheduling_while_one_is_failed() {
-    // The GPU host failed; the NFS host is up and its backup runs on.
+    // The GPU host failed; the NFS host is up and what needs it runs on.
     let d = Case::new()
         .gpu_state(&power_failed("powering_on"))
         .obs(up(G, false, 0))
-        .obs(demand("backup", "backup-schedule", 0, 1, 0))
+        .obs(demand("immich-ml", "immich-queues", 0, 1, 0))
         .run();
     assert!(matches!(power_of(&d, G), PowerPhase::Failed { .. }));
-    assert!(d.allowed.classes.contains(&cid("backup")));
     assert!(d.allowed.classes.contains(&cid("paperless-ngx")));
     assert!(!d.allowed.classes.contains(&cid("paperless-gpt")));
 }

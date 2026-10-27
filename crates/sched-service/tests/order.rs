@@ -216,7 +216,6 @@ fn equal_timestamp_reachability_reads_as_not_up_in_either_order() {
         ("speakr-transcription", "speakr-pending"),
         ("speakr-summarization", "speakr-summaries"),
         ("immich-ml", "immich-queues"),
-        ("backup", "backup-schedule"),
         ("interactive-llm", "llm-sessions"),
     ] {
         fixed.push(demand(c, s, NOW, 0, 0, None));

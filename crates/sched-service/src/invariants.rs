@@ -403,7 +403,7 @@ pub fn check(
                     ));
                 }
             }
-            // 4. Power-on needs a manual request or a power-changing class with work.
+            // 4. Power-on needs a manual request, a power-changing class with work or a job's hold.
             Step::PowerOn { resource } => {
                 if !managed_power(config, resource) {
                     out.push(format!(
@@ -423,7 +423,14 @@ pub fn check(
                         && needs(c, resource)
                         && demand(config, snapshot, c).is_some_and(|d| d.0)
                 });
-                if !manual && !workload {
+                // A shared hold is a scheduled job's: jobs are workloads allowed to change
+                // power (a hold only ever exists for a running or waiting job).
+                let held = snapshot.leases.iter().any(|l| {
+                    &l.resource == resource
+                        && matches!(l.kind, LeaseKind::SharedHold { .. })
+                        && active(&l.kind, now)
+                });
+                if !manual && !workload && !held {
                     out.push(format!(
                         "invariant 4: powered on {resource} without a manual or workload reason"
                     ));

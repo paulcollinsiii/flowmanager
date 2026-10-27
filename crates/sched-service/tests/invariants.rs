@@ -310,7 +310,6 @@ fn idle_demand() -> Vec<sched_model::Observation> {
         ("speakr-transcription", "speakr-pending"),
         ("speakr-summarization", "speakr-summaries"),
         ("immich-ml", "immich-queues"),
-        ("backup", "backup-schedule"),
         ("interactive-llm", "llm-sessions"),
     ]
     .iter()

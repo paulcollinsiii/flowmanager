@@ -154,14 +154,6 @@ classes:
     preemptibility: kill
     demand: { source: immich-queues }
 
-  - id: backup
-    requires:
-      - { resource: basestar-nfs }
-    priority: 70
-    preemptibility: none
-    may_change_power: true
-    demand: { source: backup-schedule }
-
   - id: interactive-llm
     requires:
       - { resource: cuda-central, model: llm }
@@ -423,12 +415,6 @@ sources:
           also:
             - { count: /statistics/delayed, counts_as: ready }
             - { count: /statistics/active, counts_as: in_flight }
-
-  - id: backup-schedule
-    kind: schedule
-    observe: [demand]
-    resync: 60s
-    params: { cron: "0 3 * * 0" }
 
   - id: llm-sessions
     kind: session

@@ -14,11 +14,10 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   # The GPU host goes down (a person powered it off): no model, and the gate closes.
   - at: 100010000
     refresh: true
@@ -26,7 +25,7 @@ frames:
       - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: false } }
     expect:
       steps: [{ type: wait, resource: cuda-central, reason: host_not_up }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server] }
   # Back up: the waiting OCR work brings mineru in again and the gate reopens.
   - at: 100020000
     refresh: true
@@ -34,4 +33,4 @@ frames:
       - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
     expect:
       steps: [{ type: allow_model, resource: cuda-central, model: mineru }]
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }

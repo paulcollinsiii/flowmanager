@@ -32,13 +32,12 @@ const TICK: u64 = 10_000;
 const SAFETY_MAX_AGE: u64 = 30_000;
 const GPU: &str = "cuda-central";
 const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
-const CLASSES: [(&str, &str); 7] = [
+const CLASSES: [(&str, &str); 6] = [
     ("paperless-ocr", "paperless-ocr-pending"),
     ("paperless-tagging", "paperless-post-ocr"),
     ("speakr-transcription", "speakr-pending"),
     ("speakr-summarization", "speakr-summaries"),
     ("immich-ml", "immich-queues"),
-    ("backup", "backup-schedule"),
     ("interactive-llm", "llm-sessions"),
 ];
 

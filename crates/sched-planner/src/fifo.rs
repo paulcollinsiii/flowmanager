@@ -70,6 +70,21 @@ impl Strategy for FifoExhaustive {
                     .insert(l.resource.clone(), PowerWant::Manual);
             }
         }
+        // A shared hold (a scheduled job's NFS hold, say) wants its host up like a workload
+        // does: a managed host that is off is woken for it. It never takes the host over
+        // (only a manual request does), so a host found running stays not ours to shut down.
+        for l in snapshot.leases.iter().filter(active) {
+            if matches!(l.kind, LeaseKind::SharedHold { .. })
+                && config
+                    .resource(&l.resource)
+                    .is_some_and(|r| r.power.is_some())
+            {
+                intent
+                    .power_up
+                    .entry(l.resource.clone())
+                    .or_insert(PowerWant::Workload);
+            }
+        }
         for class in config.classes().iter().filter(|c| c.may_change_power) {
             if !class_work(config, snapshot, class).busy() {
                 continue;

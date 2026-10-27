@@ -72,13 +72,12 @@ const MANAGED_NFS: &str = "    cuda-central: { power: { phase: \"on\", since: 0 
 const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
 const GPU_AND_NFS: [&str; 2] = ["cuda-central", "basestar-nfs"];
 /// Every demand class and the source that supplies it.
-const CLASSES: [(&str, &str); 7] = [
+const CLASSES: [(&str, &str); 6] = [
     ("paperless-ocr", "paperless-ocr-pending"),
     ("paperless-tagging", "paperless-post-ocr"),
     ("speakr-transcription", "speakr-pending"),
     ("speakr-summarization", "speakr-summaries"),
     ("immich-ml", "immich-queues"),
-    ("backup", "backup-schedule"),
     ("interactive-llm", "llm-sessions"),
 ];
 
@@ -281,8 +280,8 @@ fn the_checker_does_not_accept_stray_readings_as_proof_of_safety() {
 
     // A newer "no work" reading of the class from another source does not hide the work the
     // configured source reports.
-    let mut o = authoritative(Some(("backup", 2)));
-    o.push(demand("speakr-pending", "backup", NOW, 0, None));
+    let mut o = authoritative(Some(("paperless-ocr", 2)));
+    o.push(demand("speakr-pending", "paperless-ocr", NOW, 0, None));
     let v = run_check(
         &snapshot(o),
         &state(MANAGED_NFS),
@@ -347,7 +346,10 @@ fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
     assert!(!has_wait(&d, WaitReason::StaleObservation), "{:?}", d.steps);
     // NFS is up, so its classes are allowed rather than waiting on an unknown host.
     assert!(
-        d.allowed.classes.iter().any(|c| c.as_str() == "backup"),
+        d.allowed
+            .classes
+            .iter()
+            .any(|c| c.as_str() == "paperless-ngx"),
         "{:?}",
         d.allowed
     );

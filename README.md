@@ -185,7 +185,7 @@ What is carried out and what is not:
   - a window shorter than `idle_grace` plus load time means a model may come and go without
     ever serving a re-queue, which is harmless.
 - **Demand that can never be observed counts as none.** A class whose demand source has no
-  observer in this build (a `schedule` or `session` source, for example) or is an
+  observer in this build (a `session` source, for example) or is an
   observable kind configured without `params`, and that has never reported, counts as
   having **no demand**: it does not keep a model loaded or a host held. Since `observe` is
   ingress-private, nothing outside Restate can push to such a source, so its demand could
@@ -799,7 +799,7 @@ Notes:
   manual model lease pins a model; such a tick is never `idle`, even with no step), and
   `demand_unknown` (something should be reporting the demand, an observer runs or the source
   has reported before, and it is silent or stale), `demand_unsupported` (the source kind has
-  no observer in this build, e.g. schedule and session sources, and nothing has ever pushed
+  no observer in this build, e.g. session sources, and nothing has ever pushed
   to it) and `demand_unpolled` (an observable kind configured without `params`: nothing polls
   it and nothing has pushed to it). `sched_source_has_observer{source}` is 0 for the last two.
   `demand_unknown` means "not idle"; `demand_unsupported` and `demand_unpolled` count as no
@@ -873,9 +873,10 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
   (see the top of this section). If a GPU workload is deployed without
   `nvidia.com/gpu: 1`, or the node exposes more than one GPU, two models can run at once
   and nothing here notices.
-- **Demand that cannot be observed is treated as none.** A `schedule` or `session` source
-  (backup, interactive LLM) that never reported counts as no demand, so the scheduler will
-  not keep the LLM loaded for interactive use or NFS up for a backup it cannot see.
+- **Demand that cannot be observed is treated as none.** A `session` source
+  (interactive LLM) that never reported counts as no demand, so the scheduler will
+  not keep the LLM loaded for an interactive session it cannot see (scheduled jobs such as the
+  backup are not demand: they hold NFS through leases, see *Scheduled jobs*).
 - **Failed speakr transcriptions are `failed` demand for 15 minutes.** `speakr-pending` lists
   FAILED recordings updated in the last 15m and counts those with `has_summary: false` in
   the `failed` bucket of `speakr-transcription` (speakr stores a failed summary's error in

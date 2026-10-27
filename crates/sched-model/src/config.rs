@@ -196,7 +196,6 @@ pub enum SourceKind {
     /// A TCP connect to one host and port, for the reachability of one resource.
     TcpProbe,
     Webhook,
-    Schedule,
     Session,
 }
 
@@ -212,7 +211,7 @@ impl SourceKind {
                 matches!(capability, Reachability | Demand)
             }
             SourceKind::TcpProbe => matches!(capability, Reachability),
-            SourceKind::Sql | SourceKind::Schedule | SourceKind::Session => {
+            SourceKind::Sql | SourceKind::Session => {
                 matches!(capability, Demand)
             }
             SourceKind::Webhook => false,

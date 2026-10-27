@@ -1,6 +1,6 @@
 //! Table-driven tests for the fifo-exhaustive strategy against the example config.
 
-use sched_model::test_support::{EXAMPLE_CONFIG, example_config};
+use sched_model::test_support::{EXAMPLE_CONFIG, example_config, example_config_with_nfs_batch};
 use sched_model::{Config, Fixture, Intent, ModelId, PowerWant, ResourceId};
 use sched_planner::{PlanError, plan, strategy_names};
 
@@ -105,6 +105,22 @@ fn fixture_yaml(
 
 fn run(f: &Fixture) -> Intent {
     plan(&example_config(), &f.snapshot, &f.state).unwrap()
+}
+
+/// Demand of the test-only NFS batch class (see `example_config_with_nfs_batch`).
+fn batch(ready: u64) -> String {
+    demand("nfs-batch", "nfs-batch-queue", ready, 0, None)
+}
+
+/// As `fixture`, checked against the example plus the NFS batch class.
+fn batch_fixture(obs: &[String], leases: &[&str]) -> Fixture {
+    let y = fixture_yaml(obs, leases, None);
+    Fixture::from_yaml_checked(&y, &example_config_with_nfs_batch())
+        .unwrap_or_else(|e| panic!("{e}\n{y}"))
+}
+
+fn run_batch(f: &Fixture) -> Intent {
+    plan(&example_config_with_nfs_batch(), &f.snapshot, &f.state).unwrap()
 }
 
 fn target(f: &Fixture) -> Option<String> {
@@ -424,19 +440,29 @@ fn power_wants() {
     let f = fixture(&[], &[host], None);
     assert_eq!(run(&f).power_up.get(&nfs), Some(&PowerWant::Manual));
 
-    let backup = demand("backup", "backup-schedule", 1, 0, None);
-    let f = fixture(std::slice::from_ref(&backup), &[], None);
-    assert_eq!(run(&f).power_up.get(&nfs), Some(&PowerWant::Workload));
+    let backup = batch(1);
+    let f = batch_fixture(std::slice::from_ref(&backup), &[]);
+    assert_eq!(run_batch(&f).power_up.get(&nfs), Some(&PowerWant::Workload));
 
-    let f = fixture(&[backup], &[host], None);
+    let f = batch_fixture(&[backup], &[host]);
     assert_eq!(
-        run(&f).power_up.get(&nfs),
+        run_batch(&f).power_up.get(&nfs),
         Some(&PowerWant::Manual),
         "manual wins over workload"
     );
 
-    let idle_backup = demand("backup", "backup-schedule", 0, 0, None);
-    let f = fixture(&[idle_backup], &[], None);
+    let idle_backup = batch(0);
+    let f = batch_fixture(&[idle_backup], &[]);
+    assert!(run_batch(&f).power_up.is_empty());
+
+    // A shared hold (a scheduled job's) wants the host up like a workload, never as a
+    // manual request, so it does not take a host over.
+    let hold = "{ id: s, resource: basestar-nfs, granted_at: 0, kind: { type: shared_hold, holder: \"job:x\" } }";
+    let f = fixture(&[], &[hold], None);
+    assert_eq!(run(&f).power_up.get(&nfs), Some(&PowerWant::Workload));
+    let f = fixture(&[], &[hold, host], None);
+    assert_eq!(run(&f).power_up.get(&nfs), Some(&PowerWant::Manual));
+    let f = fixture(&[], &[], None);
     assert!(run(&f).power_up.is_empty());
 
     // Gpu demand alone never powers anything on in v1.
@@ -600,7 +626,7 @@ fn a_reclaim_removes_the_power_wants_of_the_reclaimed_host_only() {
     );
     let nfs_host = "{ id: n, resource: basestar-nfs, granted_at: 0, kind: { type: manual_host } }";
     let reclaim = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: reclaim }} }}");
-    let backup = demand("backup", "backup-schedule", 1, 0, None);
+    let backup = batch(1);
 
     // Without the reclaim, both manual leases want the host powered.
     let f = fixture(&[], &[&manual_host, &manual_model], None);
@@ -608,12 +634,11 @@ fn a_reclaim_removes_the_power_wants_of_the_reclaimed_host_only() {
 
     // With it, intake stops and no want to power the reclaimed host survives, whatever
     // leases ask for it.
-    let f = fixture(
+    let f = batch_fixture(
         std::slice::from_ref(&backup),
         &[&manual_host, &manual_model, &reclaim, nfs_host],
-        None,
     );
-    let i = run(&f);
+    let i = run_batch(&f);
     assert!(i.reclaim.contains(&host));
     assert!(
         !i.power_up.contains_key(&host),

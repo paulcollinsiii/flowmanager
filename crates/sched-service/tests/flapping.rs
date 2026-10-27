@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use sched_model::test_support::example_config_managed as example_config;
+use sched_model::test_support::{example_yaml_managed, with_nfs_batch};
 // The power machine is exercised as under managed control (M4).
 use sched_model::{
     AllowedSet, ClassId, Config, Fidelity, Millis, ModelId, Observation, ObservedValue, ResourceId,
@@ -26,7 +26,7 @@ const CLASSES: [(&str, &str); 7] = [
     ("speakr-transcription", "speakr-pending"),
     ("speakr-summarization", "speakr-summaries"),
     ("immich-ml", "immich-queues"),
-    ("backup", "backup-schedule"),
+    ("nfs-batch", "nfs-batch-queue"),
     ("interactive-llm", "llm-sessions"),
 ];
 const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
@@ -411,7 +411,7 @@ fn the_simulated_world_exercises_switching_and_power() {
 }
 
 #[test]
-fn a_lone_backup_cycles_nfs_without_flapping() {
+fn a_lone_nfs_batch_cycles_nfs_without_flapping() {
     let config = example_config();
     let bytes: Vec<u8> = (0..512u32)
         .map(|i| (i.wrapping_mul(1103515245).wrapping_add(12345) >> 16) as u8)
@@ -429,4 +429,10 @@ fn a_lone_backup_cycles_nfs_without_flapping() {
         "{ons} power-ons, {} power-offs",
         sum.power_offs
     );
+}
+
+/// The managed example plus the power-changing NFS batch class that these simulations drive
+/// (the shipped example has none: its scheduled jobs hold the share through leases).
+fn example_config() -> Config {
+    Config::from_yaml(&with_nfs_batch(&example_yaml_managed())).expect("valid")
 }

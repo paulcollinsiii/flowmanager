@@ -17,7 +17,6 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     leases:
       - { id: user-nfs, resource: basestar-nfs, granted_at: 100000000, kind: { type: manual_host } }
@@ -36,7 +35,7 @@ frames:
       - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Manual lease swapped for a shared hold: still held.
   - at: 100060000
     refresh: true
@@ -44,26 +43,26 @@ frames:
       - { id: hold-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: shared_hold, holder: backup-run } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # A long time later the hold still keeps the host up.
   - at: 101260000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Released: the idle clock starts.
   - at: 101270000
     refresh: true
     leases: []
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # One second short of idle_grace.
   - at: 101869000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Idle grace over: power down.
   - at: 101870000
     refresh: true

@@ -1,4 +1,4 @@
-description: "The backup class may change power: it wakes NFS when due and NFS goes down again after it finishes and idle grace passes."
+description: "A scheduled job's hold on NFS wakes the managed host; it goes down again once the hold is released and idle grace passes."
 # The power machine as under managed control (M4).
 power_control: managed
 frames:
@@ -17,9 +17,9 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 1, in_flight: 0 } }
+    leases:
+      - { id: hold-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: shared_hold, holder: "job:backup" } }
     expect:
       steps: [{ type: power_on, resource: basestar-nfs }]
       allowed: { models: [], classes: [] }
@@ -27,18 +27,16 @@ frames:
     refresh: true
     observe:
       - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 1 } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
-  # Backup finished: the idle clock starts.
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
+  # The job finished and released its hold: the idle clock starts.
   - at: 100600000
     refresh: true
-    observe:
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+    leases: []
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   - at: 101200000
     refresh: true
     expect:

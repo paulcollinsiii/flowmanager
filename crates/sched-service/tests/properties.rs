@@ -12,13 +12,12 @@ use sched_model::{
 use sched_service::replay::{Frame, Observe, Scenario, run};
 
 const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
-const CLASSES: [(&str, &str); 7] = [
+const CLASSES: [(&str, &str); 6] = [
     ("paperless-ocr", "paperless-ocr-pending"),
     ("paperless-tagging", "paperless-post-ocr"),
     ("speakr-transcription", "speakr-pending"),
     ("speakr-summarization", "speakr-summaries"),
     ("immich-ml", "immich-queues"),
-    ("backup", "backup-schedule"),
     ("interactive-llm", "llm-sessions"),
 ];
 const HOSTS: [&str; 2] = ["cuda-central", "basestar-nfs"];
@@ -47,7 +46,7 @@ fn raw() -> impl Strategy<Value = Raw> {
         prop::option::weighted(0.6, 0u32..3),
         prop::collection::vec(
             prop::option::weighted(0.7, (0u64..4, 0u64..3, 0u64..4_000_000, 0u64..3)),
-            7,
+            6,
         ),
         prop::option::weighted(0.3, prop::collection::vec(0usize..8, 0..4)),
         prop::bool::weighted(0.6),

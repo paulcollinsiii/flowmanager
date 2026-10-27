@@ -16,7 +16,6 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     leases:
       - { id: manual-host-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: manual_host } }
@@ -35,7 +34,7 @@ frames:
       - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # An hour later, pods mount it and the lease still holds it up: nothing happens.
   - at: 103600000
     refresh: true
@@ -43,32 +42,32 @@ frames:
       - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 3 } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Released: the idle clock starts.
   - at: 103660000
     refresh: true
     leases: []
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # One second short of idle_grace (10m).
   - at: 104259000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Idle grace over, but three pods mount basestar: no shutdown, the reason says so, the
   # host stays up and everything that needs it stays allowed.
   - at: 104260000
     refresh: true
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   - at: 104560000
     refresh: true
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # The pods are gone: the very next decision shuts the host down.
   - at: 104570000
     refresh: true

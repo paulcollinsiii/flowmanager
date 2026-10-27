@@ -13,20 +13,19 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 1, in_flight: 0, oldest_ready_at: 99999000 } }
       - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
     expect:
       steps: [{ type: allow_model, resource: cuda-central, model: mineru }]
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   - at: 100005000
     refresh: true
     observe:
       - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 1, ready_pods: 1 } }
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   # OCR is done and tagging is now ready, but mineru is only just idle.
   - at: 100700000
     refresh: true
@@ -35,17 +34,17 @@ frames:
       - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 1, in_flight: 0, oldest_ready_at: 100690000 } }
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   # Idle for idle_grace: switch to the LLM, withdrawing mineru in the same tick.
   - at: 101300000
     refresh: true
     expect:
       steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: llm }]
-      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-tagging, speakr-summarization, interactive-llm] }
+      allowed: { models: [llm], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-tagging, speakr-summarization, interactive-llm] }
   - at: 101305000
     refresh: true
     observe:
       - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
     expect:
       steps: []
-      allowed: { models: [llm], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-tagging, speakr-summarization, interactive-llm] }
+      allowed: { models: [llm], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-tagging, speakr-summarization, interactive-llm] }

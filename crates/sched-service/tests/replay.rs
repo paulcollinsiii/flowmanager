@@ -32,7 +32,7 @@ scenarios! {
     lifecycle_ocr_to_transcription => "lifecycle-ocr-to-transcription.yaml",
     stale_reachability_blocks_allow => "stale-reachability-blocks-allow.yaml",
     manual_nfs_lease => "manual-nfs-lease.yaml",
-    backup_power_cycle => "backup-power-cycle.yaml",
+    job_hold_power_cycle => "job-hold-power-cycle.yaml",
     reclaim => "reclaim.yaml",
     manual_llm_lease => "manual-llm-lease.yaml",
     interactive_pin => "interactive-pin.yaml",

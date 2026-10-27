@@ -1091,7 +1091,6 @@ mod tests {
             ("speakr-pending", "speakr-transcription"),
             ("speakr-summaries", "speakr-summarization"),
             ("immich-queues", "immich-ml"),
-            ("backup-schedule", "backup"),
             ("llm-sessions", "interactive-llm"),
         ] {
             push(
@@ -1225,39 +1224,50 @@ mod tests {
         let (s, _) = shared();
         let mut d = Durable::default();
         cluster(&s);
-        // backup-schedule has no observer in this build, but something pushed to it.
+        // llm-sessions has no observer in this build, but something pushed to it.
         push(
             &s,
-            "backup-schedule",
+            "llm-sessions",
             vec![ObservedValue::Demand {
                 failed: 0,
-                class: "backup".into(),
+                class: "interactive-llm".into(),
                 ready: 0,
                 in_flight: 0,
                 oldest_ready_at: None,
             }],
         );
         s.tick(Millis(T0 + 1_000), &mut d);
-        assert!(d.reported.contains(&SourceId::from("backup-schedule")));
+        assert!(d.reported.contains(&SourceId::from("llm-sessions")));
         assert!(d.reported.contains(&SourceId::from("cluster-pods")));
-        assert!(!d.reported.contains(&SourceId::from("llm-sessions")));
+        assert!(
+            !d.reported
+                .contains(&SourceId::from("paperless-ocr-pending"))
+        );
         // After a restart the pusher is dead: nothing arrives.
         let (s2, mut d2) = restart(&d);
         let r = s2.tick(Millis(T0 + 2_000), &mut d2);
         assert!(
-            r.unknown_demand.iter().any(|c| c.as_str() == "backup"),
+            r.unknown_demand
+                .iter()
+                .any(|c| c.as_str() == "interactive-llm"),
             "{r:?}"
         );
         assert!(
-            !r.unsupported_demand.iter().any(|c| c.as_str() == "backup"),
+            !r.unsupported_demand
+                .iter()
+                .any(|c| c.as_str() == "interactive-llm"),
             "{r:?}"
         );
         // The memory is kept across further ticks and restarts.
-        assert!(d2.reported.contains(&SourceId::from("backup-schedule")));
+        assert!(d2.reported.contains(&SourceId::from("llm-sessions")));
         // Without the durable memory it would read as never reported.
         let (s3, _) = shared();
         let r = s3.tick(Millis(T0 + 2_000), &mut Durable::default());
-        assert!(r.unsupported_demand.iter().any(|c| c.as_str() == "backup"));
+        assert!(
+            r.unsupported_demand
+                .iter()
+                .any(|c| c.as_str() == "interactive-llm")
+        );
     }
 
     #[test]
@@ -1474,14 +1484,11 @@ mod tests {
                 }],
             );
         }
-        // Everything that has an observer reports; only schedule and session sources are
-        // silent, and nothing is built to observe them.
+        // Everything that has an observer reports; only the session source is
+        // silent, and nothing is built to observe it.
         let r = s.tick(Millis(T0 + 1_000), &mut d);
         assert!(r.unknown_demand.is_empty(), "{:?}", r.unknown_demand);
-        assert_eq!(
-            r.unsupported_demand,
-            vec![ClassId::from("backup"), ClassId::from("interactive-llm")]
-        );
+        assert_eq!(r.unsupported_demand, vec![ClassId::from("interactive-llm")]);
         // Nothing can ever report it, so it is no demand: the tick is idle.
         assert_eq!(
             r.kinds,
@@ -1491,7 +1498,7 @@ mod tests {
         assert!(r.reason.contains("counted as no demand"), "{}", r.reason);
         let text = s.metrics.render();
         assert!(
-            text.contains("sched_source_has_observer{source=\"backup-schedule\"} 0"),
+            text.contains("sched_source_has_observer{source=\"llm-sessions\"} 0"),
             "{text}"
         );
         assert!(
@@ -1562,13 +1569,13 @@ mod tests {
         let (s, _) = shared();
         let mut d = Durable::default();
         cluster(&s);
-        // backup-schedule has no observer in this build, but something pushed to it.
+        // llm-sessions has no observer in this build, but something pushed to it.
         push(
             &s,
-            "backup-schedule",
+            "llm-sessions",
             vec![ObservedValue::Demand {
                 failed: 0,
-                class: "backup".into(),
+                class: "interactive-llm".into(),
                 ready: 0,
                 in_flight: 0,
                 oldest_ready_at: None,
@@ -1579,21 +1586,29 @@ mod tests {
             !fresh
                 .unsupported_demand
                 .iter()
-                .any(|c| c.as_str() == "backup")
+                .any(|c| c.as_str() == "interactive-llm")
         );
-        assert!(!fresh.unknown_demand.iter().any(|c| c.as_str() == "backup"));
+        assert!(
+            !fresh
+                .unknown_demand
+                .iter()
+                .any(|c| c.as_str() == "interactive-llm")
+        );
         // Ten minutes later it has gone stale: a source that reported before and has gone
         // quiet is a real problem, not the expected "nothing observes this".
         let stale = s.tick(Millis(T0 + 1_000 + 600_001), &mut d);
         assert!(
-            stale.unknown_demand.iter().any(|c| c.as_str() == "backup"),
+            stale
+                .unknown_demand
+                .iter()
+                .any(|c| c.as_str() == "interactive-llm"),
             "{stale:?}"
         );
         assert!(
             !stale
                 .unsupported_demand
                 .iter()
-                .any(|c| c.as_str() == "backup")
+                .any(|c| c.as_str() == "interactive-llm")
         );
     }
 

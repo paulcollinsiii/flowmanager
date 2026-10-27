@@ -19,11 +19,10 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Idle for idle_grace (10m): shut down.
   - at: 100600000
     refresh: true
@@ -47,11 +46,11 @@ frames:
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
       allowed: { models: [], classes: [] }
-  # Work arrives and an hour passes: still failed, still no power step, nothing allowed.
+  # A job takes a hold and an hour passes: still failed, still no power step, nothing allowed.
   - at: 104800000
     refresh: true
-    observe:
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 1, in_flight: 0 } }
+    leases:
+      - { id: hold-1, resource: basestar-nfs, granted_at: 104800000, kind: { type: shared_hold, holder: "job:backup" } }
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
       allowed: { models: [], classes: [] }
@@ -60,13 +59,12 @@ frames:
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
       allowed: { models: [], classes: [] }
-  # A person took the host down: observed down, the failed state clears (work is
-  # queued, so a fresh power-on follows from the new Off state).
+  # A person took the host down: observed down, the failed state clears (a job still holds
+  # it, so a fresh power-on follows at once from the new Off state).
   - at: 122830000
     refresh: true
     observe:
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
     expect:
-      steps: []
+      steps: [{ type: power_on, resource: basestar-nfs }]
       allowed: { models: [], classes: [] }

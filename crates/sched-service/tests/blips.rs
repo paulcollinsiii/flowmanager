@@ -20,13 +20,12 @@ const START: u64 = 50_000_000;
 const TICK: u64 = 30_000;
 const MIN: u64 = 60_000;
 
-const CLASSES: [(&str, &str); 7] = [
+const CLASSES: [(&str, &str); 6] = [
     ("paperless-ocr", "paperless-ocr-pending"),
     ("paperless-tagging", "paperless-post-ocr"),
     ("speakr-transcription", "speakr-pending"),
     ("speakr-summarization", "speakr-summaries"),
     ("immich-ml", "immich-queues"),
-    ("backup", "backup-schedule"),
     ("interactive-llm", "llm-sessions"),
 ];
 

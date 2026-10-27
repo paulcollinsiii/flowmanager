@@ -18,22 +18,21 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
       - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 1, ready_pods: 1 } }
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   - at: 100599000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   - at: 100600000
     refresh: true
     expect:
       steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Nothing is wanted and the GPU host was not powered by the scheduler, so it stays up.
   - at: 100605000
     refresh: true
@@ -41,4 +40,4 @@ frames:
       - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
     expect:
       steps: []
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }

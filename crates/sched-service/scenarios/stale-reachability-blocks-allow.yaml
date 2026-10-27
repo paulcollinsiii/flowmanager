@@ -13,12 +13,11 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 1, in_flight: 0, oldest_ready_at: 99999000 } }
     expect:
       steps: [{ type: wait, resource: cuda-central, reason: stale_observation }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server] }
   # A fresh reading arrives; the pod counts are now a minute old as well: mineru is allowed.
   - at: 100060000
     observe:
@@ -26,4 +25,4 @@ frames:
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 1, in_flight: 0, oldest_ready_at: 99999000 } }
     expect:
       steps: [{ type: allow_model, resource: cuda-central, model: mineru }]
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }

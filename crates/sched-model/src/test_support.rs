@@ -51,6 +51,36 @@ pub fn example_config() -> Config {
     Config::from_yaml(EXAMPLE_CONFIG).expect("bundled example config is valid")
 }
 
+/// A class on the NFS share that may change power and the source that feeds its demand, for
+/// tests of workload-driven power. The shipped example has no such class (its scheduled jobs
+/// hold the share instead), but the planner and the sequencer still honour `may_change_power`.
+pub const NFS_BATCH_CLASS: &str = "  - id: nfs-batch\n    requires:\n      - { resource: basestar-nfs }\n    priority: 70\n    preemptibility: none\n    may_change_power: true\n    demand: { source: nfs-batch-queue }\n\n";
+
+/// The source of [`NFS_BATCH_CLASS`]: an observable kind without params, so only pushes feed it.
+pub const NFS_BATCH_SOURCE: &str =
+    "  - id: nfs-batch-queue\n    kind: http_json\n    observe: [demand]\n    resync: 60s\n\n";
+
+/// `yaml` (the example, possibly edited) with [`NFS_BATCH_CLASS`] and [`NFS_BATCH_SOURCE`]
+/// added before the `interactive-llm` class and the `llm-sessions` source.
+pub fn with_nfs_batch(yaml: &str) -> String {
+    let (class_anchor, source_anchor) = ("  - id: interactive-llm\n", "  - id: llm-sessions\n");
+    assert!(
+        yaml.contains(class_anchor) && yaml.contains(source_anchor),
+        "the example's interactive-llm class or llm-sessions source changed; update with_nfs_batch"
+    );
+    yaml.replacen(class_anchor, &format!("{NFS_BATCH_CLASS}{class_anchor}"), 1)
+        .replacen(
+            source_anchor,
+            &format!("{NFS_BATCH_SOURCE}{source_anchor}"),
+            1,
+        )
+}
+
+/// The example configuration with the power-changing NFS batch class (see [`with_nfs_batch`]).
+pub fn example_config_with_nfs_batch() -> Config {
+    Config::from_yaml(&with_nfs_batch(EXAMPLE_CONFIG)).expect("example with nfs batch is valid")
+}
+
 /// `yaml` with every `control: manual` power section switched to `control: managed`: the
 /// scheduler powers hosts on and off (M4). Tests of the power machine use it.
 pub fn managed_power(yaml: &str) -> String {
@@ -100,7 +130,6 @@ pub fn recovery_spec(yaml: &str) -> crate::RecoverySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Preemptibility;
 
     #[test]
     fn example_config_describes_every_workload() {
@@ -111,7 +140,6 @@ mod tests {
             "speakr-transcription",
             "speakr-summarization",
             "immich-ml",
-            "backup",
             "interactive-llm",
             "paperless-ngx",
             "immich-server",
@@ -120,9 +148,6 @@ mod tests {
         }
         assert_eq!(c.resources().len(), 2);
         assert_eq!(c.models().len(), 4);
-        let backup = c.class(&"backup".into()).unwrap();
-        assert!(backup.may_change_power);
-        assert_eq!(backup.preemptibility, Preemptibility::None);
         assert!(c.class(&"paperless-ngx".into()).unwrap().demand.is_none());
     }
 

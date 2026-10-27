@@ -18,11 +18,10 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0, failed: 3 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   # 40 and 80 minutes later (past age_threshold 30m, below max_dwell): the failed items have
   # no age, so whisperx is not starved and mineru keeps the GPU. Nothing is emitted for a
   # class that is not allowed.
@@ -30,12 +29,12 @@ frames:
     refresh: true
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   - at: 104800000
     refresh: true
     expect:
       steps: []
-      allowed: { models: [mineru], classes: [backup, paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
+      allowed: { models: [mineru], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-ocr] }
   # The ocr queue empties: mineru is idle from here.
   - at: 105000000
     observe:
@@ -51,4 +50,4 @@ frames:
     refresh: true
     expect:
       steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }, { type: run_recovery, class: speakr-transcription }]
-      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+      allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }

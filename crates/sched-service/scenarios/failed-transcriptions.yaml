@@ -18,17 +18,16 @@ frames:
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0, failed: 2 } }
       - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
-      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     expect:
       steps: [{ type: allow_model, resource: cuda-central, model: whisperx }, { type: run_recovery, class: speakr-transcription }]
-      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+      allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   # Still failed a minute later (the re-queue is paced by the action itself): emitted again.
   - at: 100060000
     refresh: true
     expect:
       steps: [{ type: run_recovery, class: speakr-transcription }]
-      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+      allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   # Re-queued: the work shows as ready (stats), nothing failed.
   - at: 100120000
     observe:
@@ -36,7 +35,7 @@ frames:
     refresh: true
     expect:
       steps: []
-      allowed: { models: [whisperx], classes: [backup, paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+      allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   # Done. Idle clock starts here; grace is not over a minute before 10m.
   - at: 100180000
     observe:
@@ -52,4 +51,4 @@ frames:
     refresh: true
     expect:
       steps: [{ type: pause_intake, class: speakr-transcription }, { type: drain_model, resource: cuda-central, model: whisperx }]
-      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
