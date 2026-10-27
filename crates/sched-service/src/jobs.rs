@@ -78,7 +78,29 @@ pub fn step(
         leases: leases.to_vec(),
         ..Default::default()
     };
-    out.book.jobs.retain(|id, _| config.job(id).is_some());
+    // A job removed from the config while its Job may still be active leaves a tombstone: the
+    // lingering mark, so that adding the job back (a reload that dropped it for a moment, a
+    // renamed file) does not start a second instance beside it. The run and its hold end with
+    // the job's place in the config (the holds are derived from the config's jobs); nothing
+    // reads the Jobs of a removed job, so the mark is freed when the job is back in the
+    // config and a reading shows the Job is not active (or when the job book is discarded).
+    out.book.jobs.retain(|id, rec| {
+        if config.job(id).is_some() {
+            return true;
+        }
+        if let Some(Run {
+            phase: RunPhase::Running { name, .. },
+            ..
+        }) = rec.run.take()
+        {
+            rec.lingering = Some(name);
+            rec.lingering_after = None;
+        }
+        // Back in the config, it starts from the then current time, not from a stale due.
+        rec.next_due = None;
+        rec.schedule.clear();
+        rec.lingering.is_some()
+    });
     let max_age = config.policy().host_reading_stale_after;
     for spec in config.jobs() {
         let reading = snapshot.fresh_job_runs(config, &spec.id, max_age);
@@ -204,3 +226,30 @@ pub fn summaries(config: &Config, book: &JobBook) -> Vec<JobSummary> {
 
 #[cfg(test)]
 mod scenarios;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sched_model::test_support::example_config;
+    use sched_model::{PowerPhase, ResourceState};
+
+    #[test]
+    fn a_host_that_is_on_but_whose_shutdown_flowmanager_gave_up_on_is_not_up_for_a_job() {
+        let config = example_config();
+        let spec = config.jobs()[0].clone();
+        let nfs = spec.needs[0].resource().clone();
+        let snapshot = Snapshot::default();
+        let mut st = ResourceState::new(PowerPhase::On { since: Millis(1) });
+        let mut state = SchedState::default();
+        state.resources.insert(nfs.clone(), st.clone());
+        assert!(needs_up(&config, &snapshot, &state, &spec), "on: up");
+        // Waiting for the mounts to go away is still up (a shutdown is merely held back).
+        st.mounts_veto = Some(MountsVeto::Waiting { since: Millis(2) });
+        state.resources.insert(nfs.clone(), st.clone());
+        assert!(needs_up(&config, &snapshot, &state, &spec));
+        // Stopped: the host is On, but flowmanager stopped managing it; a job does not start.
+        st.mounts_veto = Some(MountsVeto::Stopped { since: Millis(3) });
+        state.resources.insert(nfs, st);
+        assert!(!needs_up(&config, &snapshot, &state, &spec));
+    }
+}

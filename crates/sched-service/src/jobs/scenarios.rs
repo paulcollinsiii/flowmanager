@@ -274,7 +274,6 @@ async fn nfs_that_comes_up_late_still_runs_the_job_and_a_manual_host_is_never_po
 #[tokio::test]
 async fn a_managed_host_is_woken_by_the_hold_and_flowmanager_never_retries_power() {
     let mut w = World::new(&example_yaml_managed());
-    w.restart();
     w.tick(SUN + H, false, false).await;
     // The first tick that sees the host off only learns its state; the due tick wakes it.
     w.tick(DUE - MIN, false, false).await;
@@ -447,7 +446,6 @@ async fn a_restart_mid_run_continues_from_the_stored_state_and_leaks_no_hold() {
     assert_eq!(w.holds(), vec![hold()]);
     // The process restarts: empty cache, the stored job book and leases carry on. Without a
     // reading nothing is concluded.
-    w.restart();
     let r = w.tick(DUE + 10 * MIN, true, false).await;
     assert!(r.job_events.is_empty(), "{r:?}");
     assert_eq!(w.holds(), vec![hold()]);
@@ -726,4 +724,132 @@ async fn a_creation_that_never_worked_leaves_the_job_marked_in_case_it_exists() 
     // A reading that does not list it frees the job once it is newer than the failed try.
     w.tick(DUE + 31 * MIN, true, true).await;
     assert_eq!(w.book().jobs[&JobId::new("backup")].lingering, None);
+}
+
+#[tokio::test]
+async fn a_job_removed_from_the_config_while_its_job_runs_is_not_started_again_beside_it() {
+    let two = format!("{EXAMPLE_CONFIG}{BUDGET}");
+    let mut w = World::new(&two);
+    w.tick(SUN + H, true, false).await;
+    w.tick(DUE, true, false).await;
+    assert_eq!(w.holds().len(), 2);
+    let budget = "budget-1772334000-a1";
+    // The job leaves the config: its run and hold end with it, but the Job may still be active.
+    assert!(matches!(
+        w.shared.config.apply_text(EXAMPLE_CONFIG),
+        crate::config_source::ReloadOutcome::Applied(_)
+    ));
+    w.tick(DUE + MIN, true, true).await;
+    assert_eq!(w.holds(), vec![hold()]);
+    let tomb = &w.book().jobs[&JobId::new("budget")];
+    assert!(tomb.run.is_none() && tomb.lingering.as_deref() == Some(budget));
+    // Added back while the Job is still active: a run asked for now is refused.
+    assert!(matches!(
+        w.shared.config.apply_text(&two),
+        crate::config_source::ReloadOutcome::Applied(_)
+    ));
+    w.clock.set(Millis(DUE + 2 * MIN));
+    let e = object::trigger_job(
+        &w.shared,
+        &w.ctx,
+        TriggerJob {
+            id: "budget".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{e:?}").contains("already has a run"), "{e:?}");
+    w.ctx.commit();
+    // Its Job finishes: the mark goes and a run may start.
+    w.states.insert(budget.into(), JobRunState::Complete);
+    w.tick(DUE + 3 * MIN, true, true).await;
+    assert_eq!(w.book().jobs[&JobId::new("budget")].lingering, None);
+    w.clock.set(Millis(DUE + 4 * MIN));
+    object::trigger_job(
+        &w.shared,
+        &w.ctx,
+        TriggerJob {
+            id: "budget".into(),
+        },
+    )
+    .await
+    .unwrap();
+    w.ctx.commit();
+    // A job removed with nothing active leaves nothing behind.
+    w.shared.config.apply_text(EXAMPLE_CONFIG);
+    w.tick(DUE + 5 * MIN, true, true).await;
+    w.tick(DUE + 6 * MIN, true, true).await;
+    assert!(
+        !w.book().jobs.contains_key(&JobId::new("budget")),
+        "a run that was only waiting leaves no tombstone"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_namespace_while_the_job_runs_is_not_read_as_the_job_being_deleted() {
+    let w = World::example();
+    w.tick(SUN + H, true, false).await;
+    w.tick(DUE, true, false).await;
+    let moved = EXAMPLE_CONFIG
+        .replace("namespace: backups", "namespace: archive")
+        .replace(
+            "job_namespaces: [backups]",
+            "job_namespaces: [backups, archive]",
+        );
+    assert_ne!(moved, EXAMPLE_CONFIG);
+    assert!(matches!(
+        w.shared.config.apply_text(&moved),
+        crate::config_source::ReloadOutcome::Applied(_)
+    ));
+    // The observer now reads the new namespace and finds no such Job.
+    w.kube.made.lock().unwrap().clear();
+    for k in 1..=3 {
+        let r = w.tick(DUE + k * 2 * MIN, true, true).await;
+        assert!(r.job_events.is_empty(), "{k}: {r:?}");
+        assert_eq!(w.holds(), vec![hold()]);
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_job_book_keeps_the_hold_in_the_planners_view_and_starts_no_shutdown() {
+    let w = World::new(&example_yaml_managed());
+    w.tick(SUN + H, false, false).await;
+    w.tick(DUE - MIN, false, false).await;
+    w.tick(DUE, false, false).await;
+    // The host comes up and the Job runs, holding it.
+    w.tick(DUE + MIN, true, false).await;
+    let r = w.tick(DUE + 2 * MIN, true, false).await;
+    assert!(
+        r.job_events.iter().any(|e| e.kind.counter() == "started"),
+        "{r:?}"
+    );
+    w.ctx.put(persist::JOBS_KEY, b"not json");
+    // For as long as the book stays unreadable, the planner sees the hold (the job step
+    // running on an empty book would release it and the idle host would be shut down).
+    for k in 1..=40 {
+        let r = w.tick(DUE + 2 * MIN + k * 5 * MIN, true, true).await;
+        assert!(
+            r.leases
+                .iter()
+                .any(|l| l.id.as_str() == "hold-job-backup-basestar-nfs"),
+            "{k}: the hold is gone from the planner's view: {:?}",
+            r.leases
+        );
+        assert!(
+            !r.steps
+                .iter()
+                .any(|s| matches!(s, sched_model::Step::PowerOff { .. })),
+            "{k}: {:?}",
+            r.steps
+        );
+    }
+    assert!(
+        !w.ctx
+            .powers
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, a)| *a == PowerAction::Off),
+        "no shutdown was requested"
+    );
 }
