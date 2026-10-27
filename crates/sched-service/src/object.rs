@@ -19,7 +19,7 @@ use crate::leases::{LeaseBook, LeaseError, LeaseGrant};
 use crate::persist::{self, CoreState, LEASES_KEY, STATE_KEY, StateError};
 use crate::power::PowerAction;
 use crate::resume::{self, Resume, ResumeAck};
-use crate::tick::{Durable, Shared, TickReport};
+use crate::tick::{Durable, Shared, TickOutcome, TickReport};
 
 /// A boxed, `Send` future: what the context's methods return. Boxed rather than `impl
 /// Future`, which runs into the compiler's higher-ranked `Send` limits with Restate's
@@ -178,10 +178,27 @@ pub async fn tick<C: ObjectCtx>(shared: &Arc<Shared>, ctx: &C) -> Result<TickRep
     };
     // Deterministic from the stored state, so it is done on a replay too.
     shared.seed_reported(&core.reported);
+    // The jobs' state is read apart: an unreadable document switches the job step off for
+    // this tick (loudly) instead of stopping the GPU and NFS scheduling with it.
+    let jobs_raw = ctx.get_raw(persist::JOBS_KEY).await?;
+    let (jobs, jobs_off) = match persist::decode_jobs(jobs_raw.as_deref()) {
+        Ok(b) => (b, false),
+        Err(e) => {
+            shared.metrics.persisted_state_error(&e.key);
+            tracing::error!(
+                event = "job_book_unreadable",
+                "ALERT: the scheduled jobs' state cannot be read ({e}); jobs and their holds are left as they are until it is discarded (the discard_state handler)"
+            );
+            (Default::default(), true)
+        }
+    };
+    let next_lease = book.next;
     let durable = Durable {
         state: core.state,
         leases: book.leases,
         reported: core.reported,
+        jobs,
+        jobs_off,
     };
     let ran = Arc::new(AtomicBool::new(false));
     let (s, r) = (Arc::clone(shared), Arc::clone(&ran));
@@ -192,6 +209,7 @@ pub async fn tick<C: ObjectCtx>(shared: &Arc<Shared>, ctx: &C) -> Result<TickRep
             s.decide(now, &durable)
         })
         .await?;
+    let mut outcome = outcome;
     ctx.set_raw(
         STATE_KEY,
         persist::encode_state(&CoreState {
@@ -199,6 +217,17 @@ pub async fn tick<C: ObjectCtx>(shared: &Arc<Shared>, ctx: &C) -> Result<TickRep
             reported: outcome.reported.clone(),
         }),
     );
+    if !jobs_off {
+        ctx.set_raw(
+            LEASES_KEY,
+            persist::encode_leases(&LeaseBook {
+                next: next_lease,
+                leases: outcome.leases.clone(),
+            }),
+        );
+        ctx.set_raw(persist::JOBS_KEY, persist::encode_jobs(&outcome.jobs));
+        create_jobs(shared, ctx, &mut outcome).await?;
+    }
     shared.publish(&outcome, !ran.load(Ordering::SeqCst));
     // Recovery runs in its own object, after the allowed set is published (it re-checks it).
     // Asked for on every tick that emits the step: the action is idempotent and gates itself.
@@ -217,6 +246,59 @@ pub async fn tick<C: ObjectCtx>(shared: &Arc<Shared>, ctx: &C) -> Result<TickRep
         }
     }
     Ok(outcome.report)
+}
+
+/// Creates the Jobs the job step asked for, each in its own journaled step (the call is made
+/// once; a retried invocation gets the recorded result). The name is deterministic and a Job
+/// that exists counts as made, so even a crash between the call and its journal entry is
+/// safe. The results go back through the state machine, and the new state is stored.
+async fn create_jobs<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    outcome: &mut TickOutcome,
+) -> Result<(), HandlerError> {
+    if outcome.creates.is_empty() {
+        return Ok(());
+    }
+    let config = shared.config.current();
+    let backend = shared.job_backend();
+    let at = outcome.report.at;
+    for c in outcome.creates.clone() {
+        let Some(spec) = config.job(&c.job).cloned() else {
+            continue;
+        };
+        let (b, cronjob, job, name, scheduled_at) = (
+            backend.clone(),
+            spec.cronjob.clone(),
+            c.job.clone(),
+            c.name.clone(),
+            c.scheduled_at,
+        );
+        let result: Result<(), String> = ctx
+            .run_journaled_async("create_job", move || {
+                Box::pin(async move {
+                    match b {
+                        Some(b) => b.create(cronjob, job, name, scheduled_at).await.map(|_| ()),
+                        None => Err("no Kubernetes client is configured for jobs".to_string()),
+                    }
+                })
+            })
+            .await?;
+        let rec = outcome.jobs.jobs.entry(c.job.clone()).or_default();
+        let events = sched_sequencer::jobs::created(
+            rec,
+            &spec,
+            at,
+            match result {
+                Ok(()) => sched_sequencer::jobs::Created::Made,
+                Err(e) => sched_sequencer::jobs::Created::Failed(e),
+            },
+        );
+        outcome.report.job_events.extend(events);
+    }
+    outcome.report.jobs = crate::jobs::summaries(&config, &outcome.jobs);
+    ctx.set_raw(persist::JOBS_KEY, persist::encode_jobs(&outcome.jobs));
+    Ok(())
 }
 
 /// Acquires a manual model lease (see `leases`). The config and the clock are read inside
@@ -402,6 +484,111 @@ pub async fn release_lease<C: ObjectCtx>(
     Ok(lease)
 }
 
+/// `trigger_job` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerJob {
+    pub id: sched_model::JobId,
+}
+
+/// What the journaled step of `trigger_job` decided.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum Triggered {
+    Unknown(Vec<sched_model::JobId>),
+    Refused(sched_model::JobEvent),
+    Started(sched_model::JobBook, sched_model::JobEvent),
+}
+
+/// Starts a run of a job now, on a person's request: the same machine as a scheduled run
+/// (it waits for the needs, then the Job is created), subject to the overlap rule: while the
+/// previous instance is pending or running (or may still be) the request is refused with 409
+/// and nothing is queued. The config and the clock are read inside the journaled step.
+pub async fn trigger_job<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: TriggerJob,
+) -> Result<crate::jobs::JobSummary, HandlerError> {
+    let book = persist::decode_jobs(ctx.get_raw(persist::JOBS_KEY).await?.as_deref())
+        .map_err(|e| unreadable(shared, &e))?;
+    let s = Arc::clone(shared);
+    let ran = Arc::new(AtomicBool::new(false));
+    let r = Arc::clone(&ran);
+    let id = req.id.clone();
+    let result = ctx
+        .run_journaled("trigger_job", move || {
+            r.store(true, Ordering::SeqCst);
+            let config = s.config.current();
+            let now = s.clock.now();
+            let Some(spec) = config.job(&id) else {
+                return Triggered::Unknown(config.jobs().iter().map(|j| j.id.clone()).collect());
+            };
+            let mut book = book;
+            let rec = book.jobs.entry(id.clone()).or_default();
+            match sched_sequencer::jobs::trigger(rec, spec, now) {
+                Ok(e) => Triggered::Started(book, e),
+                Err(e) => Triggered::Refused(e),
+            }
+        })
+        .await?;
+    let fresh = ran.load(Ordering::SeqCst);
+    let count = |e: &sched_model::JobEvent| {
+        if fresh {
+            shared.metrics.job_event(e.job.as_str(), e.kind.counter());
+        }
+    };
+    match result {
+        Triggered::Unknown(known) => {
+            let known: Vec<&str> = known.iter().map(|j| j.as_str()).collect();
+            Err(TerminalError::new_with_code(
+                404,
+                format!(
+                    "unknown job {:?} (configured: {})",
+                    req.id.as_str(),
+                    known.join(", ")
+                ),
+            )
+            .into())
+        }
+        Triggered::Refused(e) => {
+            count(&e);
+            tracing::error!(
+                event = "job_skipped_overlap",
+                job = %e.job,
+                "ALERT: a person asked for a run of scheduled job {} while the previous instance is pending or running; refused, not queued",
+                e.job
+            );
+            Err(TerminalError::new_with_code(
+                409,
+                format!(
+                    "job {:?} already has a run pending or running (or a Job past its deadline that may still be active); it is not queued",
+                    req.id.as_str()
+                ),
+            )
+            .into())
+        }
+        Triggered::Started(book, e) => {
+            count(&e);
+            ctx.set_raw(persist::JOBS_KEY, persist::encode_jobs(&book));
+            ctx.request_tick();
+            tracing::info!(event = "job_triggered", job = %e.job, "a person started a run of scheduled job {}", e.job);
+            let config = shared.config.current();
+            Ok(crate::jobs::summaries(&config, &book)
+                .into_iter()
+                .find(|j| j.id == req.id)
+                .expect("a configured job has a summary"))
+        }
+    }
+}
+
+/// Every configured job with its state, from the stored job book.
+pub fn list_jobs(
+    shared: &Shared,
+    raw: Option<&[u8]>,
+) -> Result<Vec<crate::jobs::JobSummary>, HandlerError> {
+    let book = persist::decode_jobs(raw).map_err(|e| unreadable(shared, &e))?;
+    Ok(crate::jobs::summaries(&shared.config.current(), &book))
+}
+
 /// Every lease held, from the stored lease book.
 pub fn list_leases(shared: &Shared, raw: Option<&[u8]>) -> Result<Vec<Lease>, HandlerError> {
     persist::decode_leases(raw)
@@ -427,10 +614,10 @@ pub async fn discard_state<C: ObjectCtx>(
         .into());
     }
     let raw = ctx.get_raw(&req.key).await?;
-    let readable = if req.key == STATE_KEY {
-        persist::decode_state(raw.as_deref()).is_ok()
-    } else {
-        persist::decode_leases(raw.as_deref()).is_ok()
+    let readable = match req.key.as_str() {
+        STATE_KEY => persist::decode_state(raw.as_deref()).is_ok(),
+        persist::JOBS_KEY => persist::decode_jobs(raw.as_deref()).is_ok(),
+        _ => persist::decode_leases(raw.as_deref()).is_ok(),
     };
     if readable && !req.force {
         return Err(TerminalError::new_with_code(

@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 
 use sched_actuate::AttemptBook;
-use sched_model::{SchedState, SourceId};
+use sched_model::{JobBook, SchedState, SourceId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,8 @@ pub const RECOVERY_KEY: &str = "recovery_attempts";
 /// The last power action of a resource, kept by the `Power` object under the key of each
 /// resource ([`crate::power::PowerLog`]). Informational: nothing reads it back to decide.
 pub const POWER_KEY: &str = "power_last_action";
+/// The scheduled jobs' state ([`JobBook`]).
+pub const JOBS_KEY: &str = "job_book";
 /// The backstop chain's epoch (a plain number, not versioned).
 pub const EPOCH_KEY: &str = "backstop_epoch";
 
@@ -49,8 +51,11 @@ pub const RECOVERY_VERSION: u32 = 1;
 /// Version of the [`crate::power::PowerLog`] document this build reads and writes.
 pub const POWER_VERSION: u32 = 1;
 
+/// Version of the [`JobBook`] document this build reads and writes.
+pub const JOBS_VERSION: u32 = 1;
+
 /// The keys a tick or a lease request may fail to read, and the recovery handler may clear.
-pub const DOCUMENT_KEYS: [&str; 2] = [STATE_KEY, LEASES_KEY];
+pub const DOCUMENT_KEYS: [&str; 3] = [STATE_KEY, LEASES_KEY, JOBS_KEY];
 
 /// The scheduler's own durable state, besides the leases.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +154,14 @@ pub fn encode_state(s: &CoreState) -> Vec<u8> {
 
 pub fn encode_leases(b: &LeaseBook) -> Vec<u8> {
     encode(LEASES_VERSION, b)
+}
+
+pub fn decode_jobs(raw: Option<&[u8]>) -> Result<JobBook, StateError> {
+    decode(JOBS_KEY, JOBS_VERSION, raw)
+}
+
+pub fn encode_jobs(b: &JobBook) -> Vec<u8> {
+    encode(JOBS_VERSION, b)
 }
 
 #[cfg(test)]

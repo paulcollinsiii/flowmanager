@@ -26,5 +26,6 @@ pub mod ssh;
 pub mod wol;
 
 pub use attempts::{AttemptBook, Attempts, Plan};
+pub use kube_jobs::{JobBackend, KubeJobs};
 pub use power::{BoxFut, HostPower, PowerBackend, SecretFiles};
 pub use requeue::{Listed, PostOutcome, client, list, requeue};

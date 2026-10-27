@@ -86,6 +86,42 @@ pub fn build_job(
     Ok(j)
 }
 
+/// The Kubernetes call behind a run, behind a trait seam so the service can be tested without
+/// a cluster. [`KubeJobs`] is the real one.
+pub trait JobBackend: Send + Sync {
+    /// Creates (or finds) the Job `name` of scheduled job `job` from `cronjob`'s template.
+    fn create(
+        &self,
+        cronjob: CronJobRef,
+        job: JobId,
+        name: String,
+        scheduled_at: Millis,
+    ) -> crate::power::BoxFut<'static, Result<Created, String>>;
+}
+
+/// The real backend. A creation is rare (a few a week), so it makes its cluster client from
+/// the environment each time: nothing is cached that could go stale, and a cluster that was
+/// unreachable at the last try is simply tried again.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KubeJobs;
+
+impl JobBackend for KubeJobs {
+    fn create(
+        &self,
+        cronjob: CronJobRef,
+        job: JobId,
+        name: String,
+        scheduled_at: Millis,
+    ) -> crate::power::BoxFut<'static, Result<Created, String>> {
+        Box::pin(async move {
+            let client = kube::Client::try_default()
+                .await
+                .map_err(|e| format!("cannot create the Kubernetes client: {e}"))?;
+            create_from_cronjob(&client, &cronjob, &job, &name, scheduled_at).await
+        })
+    }
+}
+
 async fn create_inner(
     client: &kube::Client,
     cronjob: &CronJobRef,

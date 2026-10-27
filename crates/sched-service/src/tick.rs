@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{
-    AllowedSet, Capability, ClassId, Lease, LeaseId, Millis, ModelId, MountsVeto, PowerPhase,
-    PowerTransition, PublishedAllowed, ResourceId, SchedState, SourceId, Step, class_work,
+    AllowedSet, Capability, ClassId, CreateJob, JobBook, JobEvent, Lease, LeaseId, Millis, ModelId,
+    MountsVeto, PowerPhase, PowerTransition, PublishedAllowed, ResourceId, SchedState, SourceId,
+    Step, class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
@@ -282,6 +283,12 @@ pub struct TickReport {
     /// resource stays in `mounts_held` as stopped).
     #[serde(default)]
     pub mounts_timeouts: Vec<MountsTimeout>,
+    /// What the scheduled jobs did in this tick (alerts among them).
+    #[serde(default)]
+    pub job_events: Vec<JobEvent>,
+    /// Every configured job and its state after this tick.
+    #[serde(default)]
+    pub jobs: Vec<crate::jobs::JobSummary>,
     pub inputs: Vec<InputReport>,
     /// Whether observations changed since the previous tick of this process.
     pub input_changed: bool,
@@ -302,6 +309,13 @@ pub struct Durable {
     /// earlier one.
     #[serde(default)]
     pub reported: BTreeSet<SourceId>,
+    /// The scheduled jobs' state.
+    #[serde(default)]
+    pub jobs: JobBook,
+    /// The stored job book could not be read: the job step is skipped (jobs and their holds
+    /// stay as they are) while scheduling the GPU and NFS goes on.
+    #[serde(default)]
+    pub jobs_off: bool,
 }
 
 impl Durable {
@@ -309,6 +323,10 @@ impl Durable {
     pub fn apply(&mut self, outcome: &TickOutcome) {
         self.state = outcome.report.state.clone();
         self.reported = outcome.reported.clone();
+        if !self.jobs_off {
+            self.jobs = outcome.jobs.clone();
+            self.leases = outcome.leases.clone();
+        }
     }
 }
 
@@ -319,6 +337,12 @@ pub struct TickOutcome {
     pub report: TickReport,
     /// Sources that have ever reported, to persist (configured sources only).
     pub reported: BTreeSet<SourceId>,
+    /// The scheduled jobs' state after this tick, to persist.
+    pub jobs: JobBook,
+    /// The lease book after this tick: the stored leases with the jobs' holds reconciled.
+    pub leases: Vec<Lease>,
+    /// Jobs to create now (the object does it, journaled, after storing this outcome).
+    pub creates: Vec<CreateJob>,
     /// How long deciding took, in microseconds.
     pub duration_us: u64,
 }
@@ -359,6 +383,9 @@ pub struct Shared {
     /// The latest failed power request per resource, as the `Power` object reported it. In
     /// memory: the durable record is the `Power` object's `last_action`.
     power_failures: Mutex<BTreeMap<ResourceId, PowerRequestFailure>>,
+    /// Creates the Jobs of scheduled jobs; `None` until the binary sets one (jobs then fail to
+    /// start, visibly, rather than being skipped).
+    job_backend: std::sync::RwLock<Option<Arc<dyn sched_actuate::JobBackend>>>,
 }
 
 impl Shared {
@@ -375,7 +402,21 @@ impl Shared {
             allowed: watch::channel(None).0,
             last_report: Mutex::new(None),
             power_failures: Mutex::new(BTreeMap::new()),
+            job_backend: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Sets the backend that creates scheduled jobs' Jobs.
+    pub fn set_job_backend(&self, backend: Arc<dyn sched_actuate::JobBackend>) {
+        *self.job_backend.write().unwrap_or_else(|e| e.into_inner()) = Some(backend);
+    }
+
+    /// The backend that creates scheduled jobs' Jobs, if one was set.
+    pub fn job_backend(&self) -> Option<Arc<dyn sched_actuate::JobBackend>> {
+        self.job_backend
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The latest tick report this process published, if any.
@@ -486,6 +527,8 @@ impl Shared {
             power_request_failures: vec![],
             mounts_held: vec![],
             mounts_timeouts: vec![],
+            job_events: vec![],
+            jobs: vec![],
             inputs: vec![],
             input_changed: false,
             error: Some(format!("persisted state cannot be read: {text}")),
@@ -580,7 +623,6 @@ impl Shared {
         let started = Instant::now();
         let config = self.config.current();
         after_pin();
-        let (leases, ignored_leases) = leases::effective(&config, &durable.leases);
         let (mut snapshot, ages, changed, now, reported) = {
             let mut cache = self.cache();
             // Which sources reported before is durable and was seeded into the cache before
@@ -603,6 +645,28 @@ impl Shared {
                     .collect::<BTreeSet<_>>(),
             )
         };
+        // The scheduled jobs move first: their holds enter the lease book before the planner
+        // looks at it, so a job that comes due is seen by the very tick that notices it. If
+        // the stored job book was unreadable the step is skipped and nothing about jobs moves.
+        let (jobs, all_leases, job_events, creates) = if durable.jobs_off {
+            (
+                durable.jobs.clone(),
+                durable.leases.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let s = crate::jobs::step(
+                &config,
+                &snapshot,
+                &durable.state,
+                &durable.jobs,
+                &durable.leases,
+                now,
+            );
+            (s.book, s.leases, s.events, s.creates)
+        };
+        let (leases, ignored_leases) = leases::effective(&config, &all_leases);
         snapshot.leases = leases.clone();
         // Sources that can never report: nothing observes them in this build and, `observe`
         // being ingress-private, nothing outside Restate can push to them. If they have
@@ -703,12 +767,17 @@ impl Shared {
             mounts_held,
             mounts_timeouts,
             inputs: ages.iter().map(InputReport::from).collect(),
+            job_events,
+            jobs: crate::jobs::summaries(&config, &jobs),
             input_changed: changed,
             error,
         };
         TickOutcome {
             report,
             reported,
+            jobs,
+            leases: all_leases,
+            creates,
             duration_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         }
     }
@@ -751,6 +820,12 @@ impl Shared {
                     .power_timeout(t.resource.as_str(), t.during.as_str());
             }
         }
+        self.metrics.set_jobs(&r.jobs);
+        if !replayed {
+            for e in &r.job_events {
+                self.metrics.job_event(e.job.as_str(), e.kind.counter());
+            }
+        }
         self.metrics.tick_finished_at(r.at);
         log_tick(r, &reason::format_inputs(&ages), replayed);
         *self.last_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
@@ -770,6 +845,23 @@ impl Shared {
     /// Records that the backstop ran at `now`.
     pub fn note_backstop(&self, now: Millis) {
         self.last_backstop.store(now.as_u64(), Ordering::SeqCst);
+    }
+}
+
+/// Logs one scheduled-job event. The alert-grade ones are errors under a stable `event` name
+/// (`job_failed`, `job_missed`, `job_skipped_overlap`, `job_start_late`, `job_create_failed`)
+/// for the tick that decided them; a replay logs the same fact at info level under the name
+/// plus `_replayed`, so a log-based alert fires once. The others are info.
+fn log_job_event(e: &sched_model::JobEvent, replayed: bool) {
+    let name = format!("job_{}", e.kind.counter());
+    let detail = serde_json::to_string(&e.kind).unwrap_or_default();
+    let (job, at, scheduled) = (e.job.as_str(), e.at.as_u64(), e.scheduled_at.as_u64());
+    if !e.kind.is_alert() {
+        tracing::info!(event = %name, job, at_ms = at, scheduled_at_ms = scheduled, detail = %detail, "scheduled job {job}: {name}");
+    } else if replayed {
+        tracing::info!(event = %format!("{name}_replayed"), job, at_ms = at, scheduled_at_ms = scheduled, detail = %detail, "replayed tick: scheduled job {job}: {name} (alerted when first decided)");
+    } else {
+        tracing::error!(event = %name, job, at_ms = at, scheduled_at_ms = scheduled, detail = %detail, "ALERT: scheduled job {job}: {name}: {detail}");
     }
 }
 
@@ -862,6 +954,9 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
                 t.resource,
             );
         }
+    }
+    for e in &r.job_events {
+        log_job_event(e, replayed);
     }
     for step in &r.not_executed {
         tracing::warn!(

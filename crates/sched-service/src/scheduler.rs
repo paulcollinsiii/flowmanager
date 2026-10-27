@@ -50,12 +50,13 @@ use sched_observe::Report;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::jobs::JobSummary;
 use crate::leases::LeaseGrant;
 use crate::object::{
     self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseLease,
-    ResourceRequest, TickAck,
+    ResourceRequest, TickAck, TriggerJob,
 };
-use crate::persist::{EPOCH_KEY, LEASES_KEY, POWER_KEY, RECOVERY_KEY};
+use crate::persist::{EPOCH_KEY, JOBS_KEY, LEASES_KEY, POWER_KEY, RECOVERY_KEY};
 use crate::power::{self, PowerAck, PowerAction, PowerRecord, PowerRequest};
 use crate::recovery::{self, DiscardAttempts, Env, RunAck};
 use crate::resume::{Resume, ResumeAck};
@@ -394,6 +395,31 @@ impl Scheduler {
         Ok(Json(object::list_leases(&self.shared, raw.as_deref())?))
     }
 
+    /// Starts a run of a scheduled job now (`{"id": "backup"}`): it waits for the job's needs
+    /// and then the Job is created, like a scheduled run. Refused (409) while the previous
+    /// instance is pending or running; an unknown job is 404.
+    #[handler]
+    async fn trigger_job(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<TriggerJob>,
+    ) -> Result<Json<JobSummary>, HandlerError> {
+        Ok(Json(
+            object::trigger_job(&self.shared, &Rctx(&ctx), req).await?,
+        ))
+    }
+
+    /// Every configured scheduled job with its state: next time, the run in progress, the
+    /// last outcome and the last success.
+    #[handler]
+    async fn jobs(
+        &self,
+        ctx: SharedObjectContext<'_>,
+    ) -> Result<Json<Vec<JobSummary>>, HandlerError> {
+        let raw = ctx.get::<Vec<u8>>(JOBS_KEY).await?;
+        Ok(Json(object::list_jobs(&self.shared, raw.as_deref())?))
+    }
+
     /// Discards a persisted document (`scheduler_state` or `lease_book`) that cannot be
     /// read, so the next tick starts it afresh; a readable one only with `force`. Returns
     /// what was stored.
@@ -582,6 +608,7 @@ mod tests {
                 ("arm_backstop".to_string(), None),
                 ("backstop".to_string(), None),
                 ("discard_state".to_string(), None),
+                ("jobs".to_string(), None),
                 ("last_decision".to_string(), None),
                 ("leases".to_string(), None),
                 ("observe".to_string(), Some(true)),
@@ -590,6 +617,7 @@ mod tests {
                 ("release_lease".to_string(), None),
                 ("resume".to_string(), None),
                 ("tick".to_string(), None),
+                ("trigger_job".to_string(), None),
                 ("unreclaim".to_string(), None),
             ]
         );

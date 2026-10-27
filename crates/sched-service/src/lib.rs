@@ -16,6 +16,7 @@ pub mod clock;
 pub mod config_source;
 pub mod core;
 pub mod invariants;
+pub mod jobs;
 pub mod keda_scaler;
 pub mod leases;
 pub mod metrics;

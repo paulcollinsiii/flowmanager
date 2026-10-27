@@ -142,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&metrics),
         Arc::new(SystemClock),
     ));
+    shared.set_job_backend(Arc::new(sched_actuate::KubeJobs));
     tracing::info!(
         generation = holder.current().generation(),
         path = %args.config.display(),

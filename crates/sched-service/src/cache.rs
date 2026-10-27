@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use sched_model::{
-    Capability, ClassId, Config, Fidelity, JobId, Millis, ModelId, Observation, ObservedValue, ResourceId,
-    Snapshot, SourceId,
+    Capability, ClassId, Config, Fidelity, JobId, Millis, ModelId, Observation, ObservedValue,
+    ResourceId, Snapshot, SourceId,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 

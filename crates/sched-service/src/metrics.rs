@@ -43,6 +43,12 @@ pub struct Metrics {
     mounts_veto: GaugeVec,
     /// Resources with `mounts_veto` series, to drop those that leave the checked set.
     mounts_veto_resources: Mutex<HashSet<String>>,
+    job_events: IntCounterVec,
+    job_running: IntGaugeVec,
+    job_last_success: GaugeVec,
+    job_next_due: GaugeVec,
+    /// Jobs with series, to drop those that leave the config.
+    job_labels: Mutex<HashSet<String>>,
     /// Per (resource, axis), the phase whose series is set and when it began.
     phases: Mutex<HashMap<PhaseKey, (&'static str, Millis)>>,
 }
@@ -218,6 +224,44 @@ impl Metrics {
             &["resource", "state"],
         )
         .unwrap();
+        let job_events = IntCounterVec::new(
+            Opts::new(
+                "sched_job_events_total",
+                "Scheduled-job events by job and event: started (a Job was created), succeeded, failed (after its retries, past its deadline or deleted; an alert), retried, missed (a run that never started, or runs dropped during downtime; an alert), skipped_overlap (a run came due or was asked for while the previous instance was pending or running; an alert), caught_up (a late run started), start_late (a catch_up run still waiting for its needs after its start window; an alert), create_failed (the Job could not be created; an alert), triggered (a person started a run)",
+            ),
+            &["job", "event"],
+        )
+        .unwrap();
+        let job_running = IntGaugeVec::new(
+            Opts::new(
+                "sched_job_running",
+                "1 while the job has a run in progress (waiting for its needs, creating, running or in retry backoff), else 0, by configured job",
+            ),
+            &["job"],
+        )
+        .unwrap();
+        let job_last_success = GaugeVec::new(
+            Opts::new(
+                "sched_job_last_success_timestamp_seconds",
+                "Unix time the job last succeeded, by configured job; absent until it has. Alert on time() minus this exceeding the schedule interval plus slack",
+            ),
+            &["job"],
+        )
+        .unwrap();
+        let job_next_due = GaugeVec::new(
+            Opts::new(
+                "sched_job_next_due_timestamp_seconds",
+                "Unix time of the job's next scheduled run, by configured job",
+            ),
+            &["job"],
+        )
+        .unwrap();
+        registry.register(Box::new(job_events.clone())).unwrap();
+        registry.register(Box::new(job_running.clone())).unwrap();
+        registry
+            .register(Box::new(job_last_success.clone()))
+            .unwrap();
+        registry.register(Box::new(job_next_due.clone())).unwrap();
         registry
             .register(Box::new(mounts_timeouts.clone()))
             .unwrap();
@@ -271,6 +315,11 @@ impl Metrics {
             mounts_veto,
             mounts_veto_resources: Mutex::new(HashSet::new()),
             phases: Mutex::new(HashMap::new()),
+            job_events,
+            job_running,
+            job_last_success,
+            job_next_due,
+            job_labels: Mutex::new(HashSet::new()),
         }
     }
 
@@ -314,6 +363,48 @@ impl Metrics {
             }
             keep
         });
+    }
+
+    /// Counts one scheduled-job event (`event` is `JobEventKind::counter`). Labels are the
+    /// configured job ids and a fixed set of events.
+    pub fn job_event(&self, job: &str, event: &str) {
+        self.job_events.with_label_values(&[job, event]).inc();
+    }
+
+    /// Sets the per-job gauges from the summaries; jobs that left the config lose their series.
+    pub fn set_jobs(&self, jobs: &[crate::jobs::JobSummary]) {
+        let mut known = self.job_labels.lock().unwrap_or_else(|e| e.into_inner());
+        let now: HashSet<String> = jobs.iter().map(|j| j.id.to_string()).collect();
+        for gone in known.difference(&now) {
+            let _ = self.job_running.remove_label_values(&[gone.as_str()]);
+            let _ = self.job_last_success.remove_label_values(&[gone.as_str()]);
+            let _ = self.job_next_due.remove_label_values(&[gone.as_str()]);
+        }
+        for j in jobs {
+            let id = j.id.as_str();
+            self.job_running
+                .with_label_values(&[id])
+                .set(i64::from(j.run.is_some()));
+            match j.last_success_at {
+                Some(t) => self
+                    .job_last_success
+                    .with_label_values(&[id])
+                    .set(t.as_u64() as f64 / 1000.0),
+                None => {
+                    let _ = self.job_last_success.remove_label_values(&[id]);
+                }
+            }
+            match j.next_due {
+                Some(t) => self
+                    .job_next_due
+                    .with_label_values(&[id])
+                    .set(t.as_u64() as f64 / 1000.0),
+                None => {
+                    let _ = self.job_next_due.remove_label_values(&[id]);
+                }
+            }
+        }
+        *known = now;
     }
 
     pub fn decision(&self, kind: &str) {
