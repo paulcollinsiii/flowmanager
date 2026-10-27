@@ -30,6 +30,7 @@
 //! control, together with the network (NetworkPolicy, mesh) around the port.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ use std::time::Duration;
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use sched_model::{
     Config, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, PowerPhase, ResourceId,
     ResourceKind,
@@ -98,9 +99,14 @@ pub struct RestateIngress {
 
 impl RestateIngress {
     pub fn new(ingress: &str) -> RestateIngress {
+        Self::with_timeout(ingress, Duration::from_secs(15))
+    }
+
+    /// As [`RestateIngress::new`], with the time one call may take (tests use a short one).
+    pub fn with_timeout(ingress: &str, timeout: Duration) -> RestateIngress {
         RestateIngress {
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
+                .timeout(timeout)
                 .build()
                 .expect("client builds"),
             base: ingress.trim_end_matches('/').to_string(),
@@ -118,10 +124,14 @@ impl RestateIngress {
             req = req.json(b);
         }
         let resp = req.send().await.map_err(|e| {
-            ApiError::new(
-                503,
-                format!("the scheduler could not be reached: {}", e.without_url()),
-            )
+            if e.is_timeout() {
+                ApiError::new(504, "the scheduler did not answer in time")
+            } else {
+                ApiError::new(
+                    503,
+                    format!("the scheduler could not be reached: {}", e.without_url()),
+                )
+            }
         })?;
         let status = resp.status();
         if status.is_success() {
@@ -138,8 +148,12 @@ impl RestateIngress {
             .ok()
             .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
             .unwrap_or(text);
+        // Only a handler's 400 and 409 are relayed. A 404 is not: the handlers answer it only
+        // for a release with nothing to release (the callers list first and never rely on
+        // it), while Restate answers it for a service or handler it does not know, which
+        // must not read as "unknown name" or as "nothing held".
         Err(match status.as_u16() {
-            s @ (400 | 404 | 409) => ApiError::new(s, message),
+            s @ (400 | 409) => ApiError::new(s, message),
             s => ApiError::new(502, format!("the scheduler answered HTTP {s}: {message}")),
         })
     }
@@ -192,7 +206,8 @@ pub enum Route {
     List,
     Switch(Kind, String, Act),
     NotFound,
-    MethodNotAllowed,
+    /// Carries the methods the path does allow, for the `Allow` header.
+    MethodNotAllowed(&'static str),
 }
 
 /// What a switch is on: a model lease, a manual host lease or a reclaim.
@@ -219,6 +234,10 @@ fn percent_decode(s: &str) -> Option<String> {
     while i < b.len() {
         if b[i] == b'%' {
             let hex = s.get(i + 1..i + 3)?;
+            // Exactly two hex digits: `from_str_radix` would also take a leading `+`.
+            if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
             out.push(u8::from_str_radix(hex, 16).ok()?);
             i += 3;
         } else {
@@ -237,7 +256,7 @@ pub fn route(method: &Method, path: &str) -> Route {
             return if method == Method::GET {
                 Route::List
             } else {
-                Route::MethodNotAllowed
+                Route::MethodNotAllowed("GET")
             };
         }
         ["", "v1", k @ ("models" | "resources" | "reclaims"), n] => (*k, *n, None),
@@ -265,7 +284,9 @@ pub fn route(method: &Method, path: &str) -> Route {
         (Some("off"), m) if m == Method::POST => Act::Set(Some(false)),
         (Some("resume"), m) if m == Method::POST && kind == Kind::Host => Act::Resume,
         (Some("resume"), _) if kind != Kind::Host => return Route::NotFound,
-        _ => return Route::MethodNotAllowed,
+        _ => {
+            return Route::MethodNotAllowed(if tail.is_none() { "GET, POST" } else { "POST" });
+        }
     };
     Route::Switch(kind, name, act)
 }
@@ -312,50 +333,109 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
     }
 }
 
-/// The fields of the `toggle` log line of a change request (an on/off or a resume).
+/// The fields of the `toggle` log line: one per change request (an on/off or a resume) and
+/// one per refused request of any kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToggleLog {
     pub kind: &'static str,
+    /// What the caller named, or for an unknown path the path: caller-controlled text,
+    /// shortened here and only ever logged with its `Debug` form (escaped).
     pub name: String,
     pub action: &'static str,
     pub outcome: &'static str,
     pub status: u16,
 }
 
+/// The longest name or path kept in a log line.
+const LOG_NAME_MAX: usize = 64;
+
 impl ToggleLog {
-    /// `None` for a request that is not a change (a read, a listing, an unknown path).
+    /// `None` for a request that succeeded and changed nothing (a read, a listing).
     /// `want` is the resolved wish of a set (`None` before the caller was authorized).
     pub fn of(
         route: &Route,
+        path: &str,
         want: Option<Option<bool>>,
         outcome: &'static str,
         status: u16,
     ) -> Option<ToggleLog> {
-        let Route::Switch(kind, name, act @ (Act::Set(_) | Act::Resume)) = route else {
+        let short = |s: &str| s.chars().take(LOG_NAME_MAX).collect::<String>();
+        let (kind, name, action, change) = match route {
+            Route::Switch(kind, name, act) => {
+                let wish = match act {
+                    Act::Set(Some(w)) => Some(*w),
+                    _ => want.flatten(),
+                };
+                let action = match (act, wish) {
+                    (Act::Get, _) => "get",
+                    (Act::Resume, _) => "resume",
+                    (_, Some(true)) => "on",
+                    (_, Some(false)) => "off",
+                    _ => "unknown",
+                };
+                let kind = match kind {
+                    Kind::Model => "model",
+                    Kind::Host => "host",
+                    Kind::Reclaim => "reclaim",
+                };
+                (kind, short(name), action, *act != Act::Get)
+            }
+            Route::List => ("list", String::new(), "get", false),
+            Route::NotFound | Route::MethodNotAllowed(_) => {
+                ("unmatched", short(path), "unknown", false)
+            }
+        };
+        if !change && status == 200 {
             return None;
-        };
-        let wish = match act {
-            Act::Set(Some(w)) => Some(*w),
-            _ => want.flatten(),
-        };
-        let action = match (act, wish) {
-            (Act::Resume, _) => "resume",
-            (_, Some(true)) => "on",
-            (_, Some(false)) => "off",
-            _ => "unknown",
-        };
-        let kind = match kind {
-            Kind::Model => "model",
-            Kind::Host => "host",
-            Kind::Reclaim => "reclaim",
-        };
+        }
         Some(ToggleLog {
             kind,
-            name: name.clone(),
+            name,
             action,
             outcome,
             status,
         })
+    }
+
+    fn emit(&self, suppressed: u32) {
+        if self.status == 200 {
+            tracing::info!(event = "toggle", kind = self.kind, name = ?self.name, action = self.action, outcome = self.outcome, status = self.status, suppressed, "toggle request");
+        } else {
+            tracing::warn!(event = "toggle", kind = self.kind, name = ?self.name, action = self.action, outcome = self.outcome, status = self.status, suppressed, "toggle request refused");
+        }
+    }
+}
+
+/// Keeps a burst of refused requests (a scan, a wrong token tried in a loop) from flooding
+/// the log: at most `LOG_BURST` refusals are logged per `LOG_WINDOW`, and the next line
+/// that is logged says how many were left out. Changes that succeed are always logged.
+struct LogLimiter(std::sync::Mutex<(std::time::Instant, u32, u32)>);
+
+const LOG_BURST: u32 = 30;
+const LOG_WINDOW: Duration = Duration::from_secs(10);
+
+impl LogLimiter {
+    fn new(now: std::time::Instant) -> LogLimiter {
+        LogLimiter(std::sync::Mutex::new((now, 0, 0)))
+    }
+
+    /// `Some(left_out)` if the line is to be logged.
+    fn admit(&self, now: std::time::Instant, refused: bool) -> Option<u32> {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !refused {
+            return Some(0);
+        }
+        if now.duration_since(s.0) >= LOG_WINDOW {
+            s.0 = now;
+            s.1 = 0;
+        }
+        if s.1 < LOG_BURST {
+            s.1 += 1;
+            Some(std::mem::take(&mut s.2))
+        } else {
+            s.2 += 1;
+            None
+        }
     }
 }
 
@@ -421,6 +501,8 @@ pub struct Reply {
     pub body: String,
     /// Sent with a 401 so a client knows what is wanted.
     pub challenge: bool,
+    /// The methods a 405 allows (its `Allow` header).
+    pub allow: Option<&'static str>,
 }
 
 impl Reply {
@@ -429,6 +511,7 @@ impl Reply {
             status,
             body: v.to_string(),
             challenge: false,
+            allow: None,
         }
     }
 
@@ -442,6 +525,7 @@ pub struct Toggle {
     shared: Arc<Shared>,
     backend: Arc<dyn Backend>,
     token_file: PathBuf,
+    limiter: LogLimiter,
 }
 
 impl Toggle {
@@ -450,6 +534,7 @@ impl Toggle {
             shared,
             backend,
             token_file,
+            limiter: LogLimiter::new(std::time::Instant::now()),
         }
     }
 
@@ -469,7 +554,7 @@ impl Toggle {
         }
     }
 
-    /// Answers one request. `authorization` is the header value, `body` the (bounded) body.
+    /// Answers one request whose body is already in hand.
     pub async fn handle(
         &self,
         method: &Method,
@@ -477,30 +562,59 @@ impl Toggle {
         authorization: Option<&str>,
         body: &str,
     ) -> Reply {
+        self.handle_with(method, path, authorization, async {
+            Some(body.to_string())
+        })
+        .await
+    }
+
+    /// Answers one request. `authorization` is the header value. `read_body` is not polled
+    /// until the caller is authenticated, and only for a request that takes its wish from
+    /// the body; it yields `None` for a body that is too large or unreadable.
+    pub async fn handle_with(
+        &self,
+        method: &Method,
+        path: &str,
+        authorization: Option<&str>,
+        read_body: impl Future<Output = Option<String>>,
+    ) -> Reply {
         let route = route(method, path);
         let mut want = None;
         let reply = match self.authorize(authorization).await {
             Err(reply) => reply,
-            Ok(()) => {
-                if let Route::Switch(_, _, Act::Set(w)) = &route {
-                    want = Some(match w {
-                        Some(w) => Some(*w),
-                        None => parse_wish(body),
-                    });
+            Ok(()) => match &route {
+                Route::Switch(_, _, Act::Set(None)) => match read_body.await {
+                    Some(body) => {
+                        want = Some(parse_wish(&body));
+                        self.dispatch(&route, want).await
+                    }
+                    None => {
+                        want = Some(None);
+                        Reply::error(ApiError::new(
+                            400,
+                            format!(
+                                "the request body is larger than {MAX_BODY} bytes or unreadable"
+                            ),
+                        ))
+                    }
+                },
+                Route::Switch(_, _, Act::Set(Some(w))) => {
+                    want = Some(Some(*w));
+                    self.dispatch(&route, want).await
                 }
-                self.dispatch(&route, want).await
-            }
+                _ => self.dispatch(&route, None).await,
+            },
         };
-        let endpoint = endpoint_label(&route, want);
         let outcome = outcome_label(reply.status);
-        self.shared.metrics.toggle_request(endpoint, outcome);
-        // One structured line per change request, authorized or not; never the token.
-        if let Some(l) = ToggleLog::of(&route, want, outcome, reply.status) {
-            if reply.status == 200 {
-                tracing::info!(event = "toggle", kind = l.kind, name = %l.name, action = l.action, outcome = l.outcome, status = l.status, "toggle request");
-            } else {
-                tracing::warn!(event = "toggle", kind = l.kind, name = %l.name, action = l.action, outcome = l.outcome, status = l.status, "toggle request refused");
-            }
+        self.shared
+            .metrics
+            .toggle_request(endpoint_label(&route, want), outcome);
+        if let Some(l) = ToggleLog::of(&route, path, want, outcome, reply.status)
+            && let Some(left_out) = self
+                .limiter
+                .admit(std::time::Instant::now(), reply.status != 200)
+        {
+            l.emit(left_out);
         }
         reply
     }
@@ -513,6 +627,7 @@ impl Toggle {
                 status: 401,
                 body: json!({ "error": "a valid bearer token is required" }).to_string(),
                 challenge: true,
+                allow: None,
             }),
         }
     }
@@ -520,7 +635,11 @@ impl Toggle {
     async fn dispatch(&self, route: &Route, want: Option<Option<bool>>) -> Reply {
         let result = match route {
             Route::NotFound => Err(ApiError::new(404, "not found")),
-            Route::MethodNotAllowed => Err(ApiError::new(405, "method not allowed")),
+            Route::MethodNotAllowed(allow) => {
+                let mut r = Reply::error(ApiError::new(405, "method not allowed"));
+                r.allow = Some(allow);
+                return r;
+            }
             Route::List => self.list().await,
             Route::Switch(kind, name, Act::Get) => self.switch(*kind, name, None).await,
             Route::Switch(kind, name, Act::Set(_)) => match want.flatten() {
@@ -550,7 +669,11 @@ impl Toggle {
         let models: Vec<Value> = config
             .models()
             .iter()
-            .map(|m| model_state(&m.id, &m.resource, find_model(&leases, &m.id), &report, now))
+            .map(|m| {
+                let reclaimed = Some(find_reclaim(&leases, &m.resource).is_some());
+                let held = find_model(&leases, &m.id);
+                model_state(&m.id, &m.resource, held, reclaimed, &report, now)
+            })
             .collect();
         let resources: Vec<Value> = config
             .resources()
@@ -564,13 +687,26 @@ impl Toggle {
             .filter(|r| config.supports_reclaim(&r.id))
             .map(|r| reclaim_state(&config, &r.id, find_reclaim(&leases, &r.id), &report, now))
             .collect();
-        let attention = resources.iter().any(|r| r["needs_attention"] == true);
+        let attention = resources
+            .iter()
+            .chain(&reclaims)
+            .any(|r| r["needs_attention"] == true);
         Ok(json!({
             "needs_attention": attention,
             "models": models,
             "resources": resources,
             "reclaims": reclaims,
         }))
+    }
+
+    /// A release that failed counts as done only if the lease book, read again, no longer
+    /// holds the lease; otherwise the failure is the answer. (Never "nothing to release"
+    /// from a status code alone: Restate answers 404 for a service it does not know.)
+    async fn gone_after(&self, e: ApiError, id: &LeaseId) -> Result<Vec<Lease>, ApiError> {
+        match self.backend.leases().await {
+            Ok(l) if !l.iter().any(|x| &x.id == id) => Ok(l),
+            _ => Err(e),
+        }
     }
 
     /// One model's state, after setting it first if `set` says so.
@@ -584,20 +720,35 @@ impl Toggle {
                 format!("unknown model {name:?} (configured: {})", known.join(", ")),
             )
         })?;
-        let held = match set {
-            None => find_model(&self.backend.leases().await?, &id).cloned(),
-            Some(true) => Some(self.backend.acquire_model(&id).await?.lease),
+        let (held, leases) = match set {
+            None => {
+                let l = self.backend.leases().await?;
+                (find_model(&l, &id).cloned(), Some(l))
+            }
+            Some(true) => {
+                let lease = self.backend.acquire_model(&id).await?.lease;
+                (Some(lease), self.backend.leases().await.ok())
+            }
             Some(false) => {
-                if let Some(lease) = find_model(&self.backend.leases().await?, &id) {
-                    release_if_held(self.backend.release_lease(&lease.id).await)?;
-                }
-                None
+                let l = self.backend.leases().await?;
+                let l = match find_model(&l, &id).cloned() {
+                    None => l,
+                    Some(lease) => match self.backend.release_lease(&lease.id).await {
+                        Ok(_) => l.into_iter().filter(|x| x.id != lease.id).collect(),
+                        Err(e) => self.gone_after(e, &lease.id).await?,
+                    },
+                };
+                (None, Some(l))
             }
         };
+        let reclaimed = leases
+            .as_ref()
+            .map(|l| find_reclaim(l, &spec.resource).is_some());
         Ok(model_state(
             &id,
             &spec.resource,
             held.as_ref(),
+            reclaimed,
             &self.shared.last_report(),
             self.shared.clock.now(),
         ))
@@ -610,9 +761,12 @@ impl Toggle {
             None => find_host(&self.backend.leases().await?, &id).cloned(),
             Some(true) => Some(self.backend.acquire_host(&id).await?.lease),
             Some(false) => {
-                // Idempotent: a host lease that is not held is already off. (The handler
-                // answers 404 for that; an exclusive resource cannot hold one either.)
-                release_if_held(self.backend.release_host(&id).await)?;
+                let l = self.backend.leases().await?;
+                if let Some(lease) = find_host(&l, &id).cloned()
+                    && let Err(e) = self.backend.release_host(&id).await
+                {
+                    self.gone_after(e, &lease.id).await?;
+                }
                 None
             }
         };
@@ -632,7 +786,12 @@ impl Toggle {
             None => find_reclaim(&self.backend.leases().await?, &id).cloned(),
             Some(true) => Some(self.backend.reclaim(&id).await?.lease),
             Some(false) => {
-                release_if_held(self.backend.unreclaim(&id).await)?;
+                let l = self.backend.leases().await?;
+                if let Some(lease) = find_reclaim(&l, &id).cloned()
+                    && let Err(e) = self.backend.unreclaim(&id).await
+                {
+                    self.gone_after(e, &lease.id).await?;
+                }
                 None
             }
         };
@@ -673,15 +832,6 @@ fn known_resource(config: &Config, name: &str) -> Result<ResourceId, ApiError> {
             known.join(", ")
         ),
     ))
-}
-
-/// A release that finds nothing to release (404) has done its job.
-fn release_if_held(result: Result<Lease, ApiError>) -> Result<(), ApiError> {
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) if e.status == 404 => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 fn find_model<'a>(leases: &'a [Lease], model: &ModelId) -> Option<&'a Lease> {
@@ -726,20 +876,43 @@ fn switch(
 /// up), `host_failed` (its host's power transition failed), `draining` (another model of
 /// the resource is being wound down, its in-flight work awaited), or `pending` (the
 /// scheduler has not yet acted on the lease, or is serving another model for a reason the
-/// report does not give). Absent while the process has not ticked.
+/// report does not give). Absent while the process has not ticked. While a reclaim is held
+/// on the model's resource the status is `reclaimed` whatever the report says: the planner
+/// gives a reclaimed resource no model, so the lease cannot become active until the reclaim
+/// is released. `reclaimed` is whether the lease book holds one; `None` (the book could not
+/// be read just now) leaves the status out.
 pub fn model_state(
     model: &ModelId,
     resource: &ResourceId,
     held: Option<&Lease>,
+    reclaimed: Option<bool>,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
     let mut m = switch("model", model.as_str(), held, now);
     m.insert("resource".into(), json!(resource));
-    if let (Some(lease), Some(r)) = (held, report) {
-        let (status, detail) = model_status(r, lease, model, resource);
-        m.insert("status".into(), json!(status));
-        m.insert("detail".into(), json!(detail));
+    if let (Some(lease), Some(reclaimed)) = (held, reclaimed) {
+        let status = if reclaimed {
+            let power = report
+                .as_ref()
+                .and_then(|r| r.state.resource(resource))
+                .map(|st| format!(" (power: {})", power_name(&st.power)))
+                .unwrap_or_default();
+            Some((
+                "reclaimed",
+                format!(
+                    "{resource} is reclaimed{power}: no model is allowed on it until the reclaim is released"
+                ),
+            ))
+        } else {
+            report
+                .as_ref()
+                .map(|r| model_status(r, lease, model, resource))
+        };
+        if let Some((status, detail)) = status {
+            m.insert("status".into(), json!(status));
+            m.insert("detail".into(), json!(detail));
+        }
     }
     Value::Object(m)
 }
@@ -819,7 +992,8 @@ fn find_reclaim<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Le
 /// A reclaim switch ("this GPU is mine") on an exclusive resource with a power section.
 /// `supported` is false for any other resource, which cannot be reclaimed. While held and
 /// seen by the last tick, `status` is `host_failed` (a power transition failed),
-/// `powered_off` (the host is down and is not woken), `shutting_down`, `draining` (its work
+/// `powered_off` (the host is down and is not woken), `left_for_person` (up, with `control:
+/// manual`: flowmanager never shuts it down), `shutting_down`, `draining` (its work
 /// is awaited for at most the reclaim timeout, then cut off) or `pending` (the tick has
 /// not acted on it yet, or the report does not say more); `tick_reason` is that tick's
 /// reason as the sequencer gave it. `needs_attention` is as for a host.
@@ -844,7 +1018,8 @@ pub fn reclaim_state(
             );
         }
         if let Some(lease) = held {
-            let (status, detail) = reclaim_status(r, lease, resource);
+            let managed = config.power_managed(resource);
+            let (status, detail) = reclaim_status(r, lease, resource, managed);
             m.insert("status".into(), json!(status));
             m.insert("detail".into(), json!(detail));
             m.insert("tick_reason".into(), json!(r.reason));
@@ -862,7 +1037,12 @@ fn attention(r: &TickReport, resource: &ResourceId, power: &PowerPhase) -> bool 
             .any(|h| &h.resource == resource && h.stopped)
 }
 
-fn reclaim_status(r: &TickReport, lease: &Lease, resource: &ResourceId) -> (&'static str, String) {
+fn reclaim_status(
+    r: &TickReport,
+    lease: &Lease,
+    resource: &ResourceId,
+    managed: bool,
+) -> (&'static str, String) {
     if !r.leases.iter().any(|l| l.id == lease.id) {
         return (
             "pending",
@@ -898,6 +1078,12 @@ fn reclaim_status(r: &TickReport, lease: &Lease, resource: &ResourceId) -> (&'st
                 "draining",
                 format!(
                     "{model} is winding down on {resource}; its work is cut off after the reclaim timeout"
+                ),
+            ),
+            _ if !managed => (
+                "left_for_person",
+                format!(
+                    "{resource} is up; its power is control: manual, so flowmanager does not shut it down: power it off yourself"
                 ),
             ),
             _ => (
@@ -966,6 +1152,9 @@ pub fn resource_state(
 pub struct Limits {
     pub max_connections: usize,
     pub connection_timeout: Duration,
+    /// How long a client may take to send the headers of a request. Short, and apart from
+    /// `connection_timeout`, so that connections that say nothing cannot hold the slots.
+    pub header_read_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -973,8 +1162,9 @@ impl Default for Limits {
         // A request may wait on a tick holding the object's lock, so it gets longer than
         // a metrics scrape.
         Limits {
-            max_connections: 16,
+            max_connections: 64,
             connection_timeout: Duration::from_secs(30),
+            header_read_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -999,6 +1189,9 @@ fn response(reply: Reply) -> Response<OneShot> {
         .status(reply.status)
         .header("content-type", "application/json")
         .header("cache-control", "no-store");
+    if let Some(allow) = reply.allow {
+        b = b.header("allow", allow);
+    }
     if reply.challenge {
         b = b.header("www-authenticate", "Bearer");
     }
@@ -1039,17 +1232,19 @@ pub async fn serve(listener: TcpListener, toggle: Arc<Toggle>, limits: Limits) {
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
-                    let reply = match read_body(req.into_body()).await {
-                        Some(body) => toggle.handle(&method, &path, auth.as_deref(), &body).await,
-                        None => Reply::error(ApiError::new(
-                            400,
-                            "the request body is too large or unreadable",
-                        )),
-                    };
+                    // The body is read only once the caller has been authenticated.
+                    let body = read_body(req.into_body());
+                    let reply = toggle
+                        .handle_with(&method, &path, auth.as_deref(), body)
+                        .await;
                     Ok::<_, Infallible>(response(reply))
                 }
             });
+            // A client that does not finish its request headers promptly is dropped long
+            // before the whole-connection limit, so idle connections cannot hold the slots.
             let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
                 .serve_connection(TokioIo::new(stream), svc);
             let _ = tokio::time::timeout(limits.connection_timeout, conn).await;
         });
@@ -1297,7 +1492,7 @@ mod tests {
         let g = Method::GET;
         let p = Method::POST;
         assert_eq!(route(&g, "/v1/leases"), Route::List);
-        assert_eq!(route(&p, "/v1/leases"), Route::MethodNotAllowed);
+        assert_eq!(route(&p, "/v1/leases"), Route::MethodNotAllowed("GET"));
         assert_eq!(
             route(&g, "/v1/models/llm"),
             Route::Switch(Kind::Model, "llm".into(), Act::Get)
@@ -1328,10 +1523,13 @@ mod tests {
             Route::Switch(Kind::Reclaim, "gpu".into(), Act::Get)
         );
         assert_eq!(route(&p, "/v1/reclaims/gpu/resume"), Route::NotFound);
-        assert_eq!(route(&g, "/v1/resources/nfs/on"), Route::MethodNotAllowed);
+        assert_eq!(
+            route(&g, "/v1/resources/nfs/on"),
+            Route::MethodNotAllowed("POST")
+        );
         assert_eq!(
             route(&Method::DELETE, "/v1/models/llm"),
-            Route::MethodNotAllowed
+            Route::MethodNotAllowed("GET, POST")
         );
         for gone in [
             "/v1/resources/nfs/reclaim",
@@ -1366,6 +1564,9 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"abc"));
+        // Only the length differs (the shorter one reads as zero bytes past its end).
+        assert!(!constant_time_eq(b"abc", b"abc\0"));
+        assert!(!constant_time_eq(b"abc\0\0", b"abc"));
         assert_eq!(bearer(Some("Bearer  x ")), Some("x"));
         assert_eq!(bearer(Some("bearer x")), Some("x"));
         assert_eq!(bearer(Some("Basic x")), None);
@@ -1766,7 +1967,12 @@ mod tests {
         assert!(grant.created && grant.lease.id.as_str() == "manual-model-1");
         assert_eq!(ingress.leases().await.unwrap().len(), 1);
         let e = ingress.release_lease(&"x".into()).await.unwrap_err();
-        assert_eq!((e.status, e.message.as_str()), (404, "no lease with id"));
+        // A 404 is never relayed as a handler answer (Restate gives it for unknown services).
+        assert_eq!(e.status, 502);
+        assert!(
+            e.message.contains("404") && e.message.contains("no lease with id"),
+            "{e:?}"
+        );
         let e = ingress.acquire_host(&"nfs".into()).await.unwrap_err();
         assert_eq!((e.status, e.message.as_str()), (409, "held by another"));
         let e = ingress.release_host(&"nfs".into()).await.unwrap_err();
@@ -1929,9 +2135,9 @@ mod tests {
     }
 
     #[test]
-    fn every_change_request_has_one_log_record_and_reads_have_none() {
+    fn every_change_request_and_every_refusal_has_one_log_record_and_ok_reads_none() {
         let l = |m: &str, p: &str, want, outcome, status| {
-            ToggleLog::of(&route(&m.parse().unwrap(), p), want, outcome, status)
+            ToggleLog::of(&route(&m.parse().unwrap(), p), p, want, outcome, status)
         };
         let got = l("POST", "/v1/models/llm/on", None, "ok", 200).unwrap();
         assert_eq!(
@@ -1960,12 +2166,442 @@ mod tests {
         // Refused before authorization: the wish is not read, the path's own is kept.
         let got = l("POST", "/v1/models/llm/off", None, "unauthorized", 401).unwrap();
         assert_eq!((got.action, got.outcome), ("off", "unauthorized"));
-        for (m, p) in [
-            ("GET", "/v1/models/llm"),
-            ("GET", "/v1/leases"),
-            ("POST", "/x"),
-        ] {
+        // Refused reads, listings and unknown paths are logged too; the path is shortened.
+        let got = l("GET", "/v1/models/llm", None, "unauthorized", 401).unwrap();
+        assert_eq!((got.kind, got.action), ("model", "get"));
+        let got = l("GET", "/v1/leases", None, "unauthorized", 401).unwrap();
+        assert_eq!(got.kind, "list");
+        let long = format!("/{}", "x".repeat(500));
+        let got = l("GET", &long, None, "not_found", 404).unwrap();
+        assert_eq!((got.kind, got.name.chars().count()), ("unmatched", 64));
+        let got = l("PUT", "/v1/leases", None, "method_not_allowed", 405).unwrap();
+        assert_eq!(got.status, 405);
+        // Only a read or listing that went well is silent.
+        for (m, p) in [("GET", "/v1/models/llm"), ("GET", "/v1/leases")] {
             assert!(l(m, p, None, "ok", 200).is_none(), "{m} {p}");
+        }
+    }
+
+    #[test]
+    fn a_burst_of_refusals_is_limited_and_the_next_line_counts_what_was_left_out() {
+        let t0 = std::time::Instant::now();
+        let l = LogLimiter::new(t0);
+        for i in 0..LOG_BURST {
+            assert_eq!(l.admit(t0, true), Some(0), "{i}");
+        }
+        assert_eq!(l.admit(t0, true), None);
+        assert_eq!(l.admit(t0, true), None);
+        // A change that went well is always logged and does not disturb the count.
+        assert_eq!(l.admit(t0, false), Some(0));
+        assert_eq!(l.admit(t0 + LOG_WINDOW, true), Some(2));
+        assert_eq!(l.admit(t0 + LOG_WINDOW, true), Some(0));
+    }
+
+    #[test]
+    fn a_percent_escape_is_exactly_two_hex_digits() {
+        assert_eq!(percent_decode("a%41b").as_deref(), Some("aAb"));
+        for bad in ["%+1", "%-1", "%1", "%", "%zz", "% 1", "%ff"] {
+            assert_eq!(percent_decode(bad), None, "{bad}");
+        }
+        assert_eq!(route(&Method::POST, "/v1/models/%+1/on"), Route::NotFound);
+    }
+
+    fn over(r: &Rig, backend: Arc<dyn Backend>) -> Toggle {
+        Toggle::new(Arc::clone(&r.shared), backend, r.token_file.clone())
+    }
+
+    async fn ask(t: &Toggle, method: Method, path: &str) -> (u16, Value) {
+        let auth = format!("Bearer {TOKEN}");
+        let r = t.handle(&method, path, Some(&auth), "ON").await;
+        (r.status, serde_json::from_str(&r.body).unwrap())
+    }
+
+    const NFS_LEASE: &str = r#"{"id":"manual-host-1","resource":"basestar-nfs","kind":{"type":"manual_host"},"granted_at":5}"#;
+
+    #[tokio::test]
+    async fn a_scheduler_that_is_not_registered_is_an_error_never_an_answer() {
+        let r = rig(&example_yaml_managed());
+        let server = TestServer::start().await;
+        for h in [
+            "leases",
+            "acquire_model_lease",
+            "release_lease",
+            "acquire_host_lease",
+            "release_host_lease",
+            "reclaim",
+            "unreclaim",
+            "resume",
+        ] {
+            server.set(
+                &format!("/Scheduler/main/{h}"),
+                ingress_reply(
+                    404,
+                    r#"{"code":404,"message":"Service 'Scheduler' not found"}"#,
+                ),
+            );
+        }
+        let t = over(&r, Arc::new(RestateIngress::new(&server.url(""))));
+        for (m, p) in [
+            (Method::GET, "/v1/models/llm"),
+            (Method::GET, "/v1/leases"),
+            (Method::GET, "/v1/resources/basestar-nfs"),
+            (Method::GET, "/v1/reclaims/cuda-central"),
+            (Method::POST, "/v1/models/llm/on"),
+            (Method::POST, "/v1/models/llm/off"),
+            (Method::POST, "/v1/resources/basestar-nfs/on"),
+            (Method::POST, "/v1/resources/basestar-nfs/off"),
+            (Method::POST, "/v1/resources/basestar-nfs/resume"),
+            (Method::POST, "/v1/reclaims/cuda-central/on"),
+            (Method::POST, "/v1/reclaims/cuda-central/off"),
+        ] {
+            let (s, v) = ask(&t, m.clone(), p).await;
+            assert_eq!(s, 502, "{m} {p}: {v}");
+            assert!(v["error"].as_str().unwrap().contains("404"), "{v}");
+            assert!(v.get("held").is_none(), "{m} {p}: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_counts_only_when_the_lease_is_gone_afterwards() {
+        let r = rig(&example_yaml_managed());
+        let server = TestServer::start().await;
+        let still_listed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = Arc::clone(&still_listed);
+        let lease = NFS_LEASE.to_string();
+        server.set_dynamic("/Scheduler/main/leases", move |_| {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                TestReply::json(&format!("[{lease}]"))
+            } else {
+                TestReply::json("[]")
+            }
+        });
+        // The release answers 404, but only because someone else released it just before.
+        let flag = Arc::clone(&still_listed);
+        server.set_dynamic("/Scheduler/main/release_host_lease", move |_| {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            ingress_reply(
+                404,
+                r#"{"code":404,"message":"holds no manual host lease"}"#,
+            )
+        });
+        let t = over(&r, Arc::new(RestateIngress::new(&server.url(""))));
+        let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/off").await;
+        assert_eq!((s, &v["held"]), (200, &json!(false)), "{v}");
+
+        // A release that fails while the lease is still listed is the answer.
+        still_listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.set_dynamic("/Scheduler/main/release_host_lease", |_| {
+            ingress_reply(500, "boom")
+        });
+        let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/off").await;
+        assert_eq!(s, 502, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn the_body_is_read_only_after_authentication_and_only_when_it_is_needed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let r = rig(EXAMPLE_CONFIG);
+        let polled = Arc::new(AtomicBool::new(false));
+        let reader = |p: &Arc<AtomicBool>, out: Option<String>| {
+            let p = Arc::clone(p);
+            async move {
+                p.store(true, Ordering::SeqCst);
+                out
+            }
+        };
+        let auth = format!("Bearer {TOKEN}");
+        // Not authenticated: refused, and the (oversize) body is never touched.
+        let reply = r
+            .toggle
+            .handle_with(&Method::POST, "/v1/models/llm", None, reader(&polled, None))
+            .await;
+        assert_eq!(reply.status, 401);
+        assert!(!polled.load(Ordering::SeqCst));
+        // Authenticated, body too large or unreadable: 400, counted, nothing done.
+        let reply = r
+            .toggle
+            .handle_with(
+                &Method::POST,
+                "/v1/models/llm",
+                Some(&auth),
+                reader(&polled, None),
+            )
+            .await;
+        assert_eq!(reply.status, 400);
+        assert!(
+            reply.body.contains("larger than 1024 bytes"),
+            "{}",
+            reply.body
+        );
+        assert!(polled.load(Ordering::SeqCst));
+        assert_eq!(r.lease_count(), 0);
+        let text = r.shared.metrics.render();
+        assert!(
+            text.contains(
+                "sched_toggle_requests_total{endpoint=\"model_set\",outcome=\"bad_request\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "sched_toggle_requests_total{endpoint=\"model_set\",outcome=\"unauthorized\"} 1"
+            ),
+            "{text}"
+        );
+        // A path that carries its wish never reads the body.
+        polled.store(false, Ordering::SeqCst);
+        let reply = r
+            .toggle
+            .handle_with(
+                &Method::POST,
+                "/v1/models/llm/on",
+                Some(&auth),
+                reader(&polled, None),
+            )
+            .await;
+        assert_eq!(reply.status, 200);
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_body_cap_is_exact_and_a_405_names_the_methods_it_allows() {
+        let r = rig(EXAMPLE_CONFIG);
+        let toggle = Arc::new(over(&r, Arc::clone(&r.backend) as Arc<dyn Backend>));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve(listener, toggle, Limits::default()));
+        let url = format!("http://{addr}/v1/models/llm");
+        let client = reqwest::Client::new();
+        let post = |body: Vec<u8>, token: bool| {
+            let mut req = client.post(&url).body(body);
+            if token {
+                req = req.bearer_auth(TOKEN);
+            }
+            async move { req.send().await.unwrap().status().as_u16() }
+        };
+        let padded = |n: usize| {
+            let mut b = b"ON".to_vec();
+            b.resize(n, b' ');
+            b
+        };
+        assert_eq!(post(padded(MAX_BODY), true).await, 200);
+        assert_eq!(post(padded(MAX_BODY + 1), true).await, 400);
+        assert_eq!(post(padded(MAX_BODY + 1), false).await, 401);
+        assert_eq!(post(vec![0xff, 0xfe], true).await, 400);
+        assert_eq!(post(vec![0xff, 0xfe], false).await, 401);
+        assert_eq!(r.lease_count(), 1);
+
+        for (method, path, allow) in [
+            (Method::DELETE, "/v1/models/llm", "GET, POST"),
+            (Method::GET, "/v1/models/llm/on", "POST"),
+            (Method::POST, "/v1/leases", "GET"),
+        ] {
+            let resp = client
+                .request(method, format!("http://{addr}{path}"))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 405, "{path}");
+            assert_eq!(resp.headers()["allow"], allow, "{path}");
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_connections_are_dropped_by_the_header_timeout_and_do_not_starve_the_listener() {
+        use tokio::io::AsyncReadExt;
+        let r = rig(EXAMPLE_CONFIG);
+        let toggle = Arc::new(over(&r, Arc::clone(&r.backend) as Arc<dyn Backend>));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limits = Limits {
+            max_connections: 2,
+            connection_timeout: Duration::from_secs(30),
+            header_read_timeout: Duration::from_millis(300),
+        };
+        let task = tokio::spawn(serve(listener, toggle, limits));
+        let mut idle = vec![];
+        for _ in 0..2 {
+            idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        let started = std::time::Instant::now();
+        let served = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/leases"))
+            .bearer_auth(TOKEN)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("served once the idle connections are cut off")
+            .status();
+        assert_eq!(served, 200);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        for mut s in idle {
+            let mut buf = [0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+                .await
+                .expect("closed by the server");
+            assert!(matches!(n, Ok(_) | Err(_)));
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_closed_at_the_connection_timeout_even_if_it_keeps_talking() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let r = rig(EXAMPLE_CONFIG);
+        let toggle = Arc::new(over(&r, Arc::clone(&r.backend) as Arc<dyn Backend>));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limits = Limits {
+            max_connections: 4,
+            connection_timeout: Duration::from_millis(400),
+            header_read_timeout: Duration::from_secs(5),
+        };
+        let task = tokio::spawn(serve(listener, toggle, limits));
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req =
+            format!("GET /v1/leases HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {TOKEN}\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = s.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        // Keep-alive: nothing more is sent; the server ends the connection at its limit.
+        let started = std::time::Instant::now();
+        let end = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf))
+            .await
+            .expect("closed at the connection timeout");
+        assert!(matches!(end, Ok(0) | Err(_)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "{:?}",
+            started.elapsed()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ingress_call_gives_up_at_its_timeout() {
+        let server = TestServer::start().await;
+        server.set(
+            "/Scheduler/main/leases",
+            TestReply::json("[]").delayed(Duration::from_millis(800)),
+        );
+        let slow = RestateIngress::with_timeout(&server.url(""), Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let e = slow.leases().await.unwrap_err();
+        assert_eq!(e.status, 504, "{e:?}");
+        assert!(started.elapsed() < Duration::from_millis(700));
+        let patient = RestateIngress::with_timeout(&server.url(""), Duration::from_secs(5));
+        assert!(patient.leases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_lease_on_a_reclaimed_resource_says_it_is_reclaimed() {
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        assert_eq!(r.post("/v1/models/llm/on", "").await.0, 200);
+        assert_eq!(r.post("/v1/reclaims/cuda-central/on", "").await.0, 200);
+        let check = |v: &Value| {
+            assert_eq!(v["status"], "reclaimed", "{v}");
+            assert!(v["detail"].as_str().unwrap().contains("reclaimed"));
+        };
+        check(&r.get("/v1/models/llm").await.1);
+        check(&r.post("/v1/models/llm/on", "").await.1);
+        r.tick().await;
+        let (_, v) = r.get("/v1/models/llm").await;
+        check(&v);
+        assert!(v["detail"].as_str().unwrap().contains("power:"), "{v}");
+        let (_, list) = r.get("/v1/leases").await;
+        check(&list["models"][1]);
+        // Other models on it hold no lease, so no status.
+        assert!(list["models"][0].get("status").is_none());
+        // Released, the reclaim no longer answers for the model.
+        assert_eq!(r.post("/v1/reclaims/cuda-central/off", "").await.0, 200);
+        let (_, v) = r.get("/v1/models/llm").await;
+        assert_ne!(v["status"], "reclaimed", "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_reclaim_on_a_manual_host_is_left_for_a_person_to_power_off() {
+        let r = rig(EXAMPLE_CONFIG);
+        r.hosts_up(true);
+        assert_eq!(r.post("/v1/reclaims/cuda-central/on", "").await.0, 200);
+        r.tick().await;
+        let (_, v) = r.get("/v1/reclaims/cuda-central").await;
+        assert_eq!(v["status"], "left_for_person", "{v}");
+        assert!(
+            v["detail"]
+                .as_str()
+                .unwrap()
+                .contains("power it off yourself")
+        );
+
+        // Under managed control the same state is not that: flowmanager does the shutdown.
+        let m = rig(&example_yaml_managed());
+        m.hosts_up(true);
+        assert_eq!(m.post("/v1/reclaims/cuda-central/on", "").await.0, 200);
+        m.tick().await;
+        let (_, v) = m.get("/v1/reclaims/cuda-central").await;
+        assert_ne!(v["status"], "left_for_person", "{v}");
+        assert!(v.get("status").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_tick_sets_the_lease_age_gauge_and_a_release_removes_the_series() {
+        let r = rig(EXAMPLE_CONFIG);
+        r.hosts_up(true);
+        r.post("/v1/models/llm/on", "").await;
+        r.post("/v1/resources/basestar-nfs/on", "").await;
+        r.post("/v1/reclaims/cuda-central/on", "").await;
+        assert!(
+            !r.shared
+                .metrics
+                .render()
+                .contains("sched_manual_lease_age_seconds{")
+        );
+        r.tick().await;
+        let text = r.shared.metrics.render();
+        for series in [
+            "kind=\"model\",target=\"llm\"",
+            "kind=\"host\",target=\"basestar-nfs\"",
+            "kind=\"reclaim\",target=\"cuda-central\"",
+        ] {
+            assert!(
+                text.contains(&format!("sched_manual_lease_age_seconds{{{series}}}")),
+                "{series}: {text}"
+            );
+        }
+        r.post("/v1/models/llm/off", "").await;
+        r.tick().await;
+        let text = r.shared.metrics.render();
+        assert!(!text.contains("target=\"llm\""), "{text}");
+        assert!(text.contains("target=\"basestar-nfs\""));
+    }
+
+    #[tokio::test]
+    async fn the_resume_and_conflict_labels_are_counted() {
+        let r = rig(&example_yaml_managed());
+        assert_eq!(r.post("/v1/resources/basestar-nfs/resume", "").await.0, 409);
+        r.post("/v1/models/llm/on", "").await;
+        assert_eq!(r.post("/v1/models/mineru/on", "").await.0, 409);
+        assert_eq!(r.get("/v1/models/nope").await.0, 404);
+        let text = r.shared.metrics.render();
+        for series in [
+            "endpoint=\"resource_resume\",outcome=\"conflict\"",
+            "endpoint=\"model_on\",outcome=\"conflict\"",
+            "endpoint=\"model_on\",outcome=\"ok\"",
+            "endpoint=\"model_get\",outcome=\"not_found\"",
+        ] {
+            assert!(
+                text.contains(&format!("sched_toggle_requests_total{{{series}}} 1")),
+                "{series}: {text}"
+            );
         }
     }
 }
