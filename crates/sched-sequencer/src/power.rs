@@ -39,6 +39,7 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         return;
     }
     let manual = !cx.config.power_managed(&cx.res.id);
+    let was_failed = matches!(st.power, PowerPhase::Failed { .. });
     if manual {
         st.managed = false;
         st.host_idle_since = None;
@@ -101,6 +102,13 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
             }
             p => p,
         };
+    }
+    // A failed transition leaves the host not managed by an earlier action of ours: whatever
+    // brings it back (a person, a slow boot) is treated like a host found running, so no
+    // automatic power-off follows until a new want powers it on through the normal path.
+    if was_failed || matches!(st.power, PowerPhase::Failed { .. }) {
+        st.managed = false;
+        st.host_idle_since = None;
     }
     if !st.is_on() {
         st.mode = ModePhase::Idle;

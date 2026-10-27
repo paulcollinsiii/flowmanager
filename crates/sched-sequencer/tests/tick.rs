@@ -2289,6 +2289,34 @@ fn the_failed_state_clears_only_on_the_state_that_was_wanted() {
 }
 
 #[test]
+fn a_host_that_recovers_from_a_failed_power_on_is_not_powered_off_by_us() {
+    // Entering the failed state drops the flag the PowerOn step set.
+    let d = Case::new()
+        .gpu_state(&powering_on_since(POWER_ON_TIMEOUT))
+        .obs(up(G, false, 0))
+        .run();
+    assert!(matches!(power_of(&d, G), PowerPhase::Failed { .. }));
+    assert!(!d.state.resource(&rid(G)).unwrap().managed);
+
+    // State persisted with the flag still set (an earlier build) is cleared on recovery too.
+    let persisted = format!(
+        "{{ power: {{ phase: failed, since: {}, during: powering_on }}, mode: {{ phase: idle }}, managed: true }}",
+        T - 1000
+    );
+    let c = Case::new().gpu_state(&persisted).obs(up(G, true, 0));
+    let d = c.run();
+    assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+    assert!(!d.state.resource(&rid(G)).unwrap().managed);
+    // No demand, no leases: far past idle_grace, never a power step.
+    let mut state = d.state;
+    for hours in 1..=6u64 {
+        let d = c.run_fresh_at(&state, T + hours * 60 * MIN);
+        assert!(no_power_step(&d), "{hours}h: {:?}", d.steps);
+        assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+        state = d.state;
+    }
+}
+#[test]
 fn manual_control_has_no_transition_to_time_out_and_clears_a_failed_state() {
     let mut c = Case::new().gpu_state(&powering_on_since(POWER_ON_TIMEOUT * 3));
     c.config = example_config();
