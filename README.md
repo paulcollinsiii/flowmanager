@@ -555,8 +555,10 @@ harmless to repeat).
   reclaim clears it. A host that comes back down to `off` while work is queued is then
   treated like any off host (a manual lease or a power-changing class may wake it, as before).
   A host that comes back up out of a failed power-on is treated like a host found running,
-  not as one flowmanager powered on: it is never powered off automatically afterwards unless
-  a new want powers it on through the normal path.
+  not as one flowmanager powered on: the recovery itself never powers it off. Afterwards it is
+  powered off only by what would power off any found-running host: an explicit reclaim, or a
+  manual lease that is held and then released (the lease takes responsibility for the host, so
+  its release plus the idle grace powers it off).
   The timeouts are measured on the wall clock only, with no fresh reading required, so a
   scheduler restart or a long outage can raise the alert before a fresh reading could show
   the host in the state wanted (a known trade-off; the failed phase then clears on that
