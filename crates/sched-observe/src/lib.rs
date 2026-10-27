@@ -6,6 +6,7 @@
 //! reported as [`Report::Failed`], never as a reused old value.
 
 pub mod http_json;
+pub mod kube_jobs;
 pub mod kube_mounts;
 pub mod kube_watch;
 pub mod prometheus;

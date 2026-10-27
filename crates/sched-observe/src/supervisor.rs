@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use sched_model::{ClassId, Config, ModelId, SourceId, SourceKind, SourceSpec};
 use tokio::task::{AbortHandle, JoinHandle};
 
+use crate::kube_jobs::{self, JobTarget};
 use crate::kube_watch::{self, Timing};
 use crate::{ReportTx, http_json, prometheus, tcp_probe};
 
@@ -22,6 +23,8 @@ struct Fingerprint {
     /// Which workloads make up each model (Kubernetes): the only thing about a model the
     /// pod observer uses, so other model changes (load time and the like) do not restart it.
     models: Vec<(ModelId, Vec<String>)>,
+    /// The scheduled jobs and their namespaces (a source that observes `jobs` only).
+    jobs: Vec<JobTarget>,
 }
 
 struct Running {
@@ -149,6 +152,11 @@ fn fingerprint(config: &Config, spec: &SourceSpec) -> Fingerprint {
         } else {
             Vec::new()
         },
+        jobs: if spec.observe.contains(&sched_model::Capability::Jobs) {
+            kube_jobs::job_targets(config)
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -189,6 +197,28 @@ fn start(
             }
         },
         SourceKind::KubernetesWatch => match spec.kube_watch_params() {
+            Ok(Some(params)) if spec.observe.contains(&sched_model::Capability::Jobs) => {
+                let (spec, targets, tx2) = (spec.clone(), fp.jobs.clone(), tx.clone());
+                let (client, timing) = (opts.kube_client.clone(), opts.kube_timing);
+                Some(tokio::spawn(supervised(
+                    spec.id.clone(),
+                    tx.clone(),
+                    backoff,
+                    move || {
+                        let (spec, params, targets, tx) =
+                            (spec.clone(), params.clone(), targets.clone(), tx2.clone());
+                        let client = client.clone();
+                        async move {
+                            match client {
+                                Some(c) => {
+                                    kube_jobs::run_with_client(spec, params, targets, c, tx).await
+                                }
+                                None => kube_jobs::run(spec, params, targets, tx, timing).await,
+                            }
+                        }
+                    },
+                )))
+            }
             Ok(Some(params)) => {
                 let (spec, models, tx2) = (spec.clone(), fp.models.clone(), tx.clone());
                 let (client, timing) = (opts.kube_client.clone(), opts.kube_timing);

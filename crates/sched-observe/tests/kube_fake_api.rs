@@ -881,3 +881,81 @@ async fn configured_namespaces_are_listed_one_by_one() {
     assert_eq!(server.count("/api/v1/pods"), 0, "no cluster-wide pod list");
     task.abort();
 }
+
+fn kube_job(name: &str, id: &str, condition: Option<&str>) -> String {
+    let status = condition.map_or(String::new(), |c| {
+        format!(r#","status":{{"conditions":[{{"type":"{c}","status":"True"}}]}}"#)
+    });
+    format!(
+        r#"{{"apiVersion":"batch/v1","kind":"Job","metadata":{{"name":"{name}","namespace":"backups","uid":"{name}","labels":{{"app.kubernetes.io/managed-by":"flowmanager","flowmanager/job":"{id}"}}}},"spec":{{"template":{{"spec":{{"containers":[]}}}}}}{status}}}"#
+    )
+}
+
+fn runs_of(report: &Report) -> Option<Vec<(String, sched_model::JobRunState)>> {
+    match report {
+        Report::Observed { values, .. } => values.iter().find_map(|v| match v {
+            ObservedValue::JobRuns { job, runs } if job.as_str() == "backup" => {
+                Some(runs.iter().map(|r| (r.name.clone(), r.state)).collect())
+            }
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn job_states_are_read_by_label_and_a_failed_list_is_a_failed_read_never_an_empty_one() {
+    let server = TestServer::start().await;
+    let jobs = Arc::new(Mutex::new(vec![kube_job("backup-1-a1", "backup", None)]));
+    let fail = Arc::new(AtomicBool::new(false));
+    let (j, f, selectors) = (jobs.clone(), fail.clone(), Arc::new(Mutex::new(Vec::new())));
+    let sel = selectors.clone();
+    server.set_dynamic("/apis/batch/v1/namespaces/backups/jobs", move |query| {
+        sel.lock().unwrap().push(query.to_string());
+        if f.load(Ordering::SeqCst) {
+            return Reply::status(500);
+        }
+        list("Job", &j.lock().unwrap())
+    });
+    let config = kube::Config::new(server.url("").parse().unwrap());
+    let client = kube::Client::try_from(config).expect("client builds");
+    let cfg = example_config();
+    let mut spec = cfg.source(&"scheduled-jobs".into()).unwrap().clone();
+    spec.resync = Millis(50);
+    let params = spec.kube_watch_params().unwrap().unwrap();
+    let targets = sched_observe::kube_jobs::job_targets(&cfg);
+    let (tx, mut rx) = mpsc::channel(256);
+    let task = tokio::spawn(sched_observe::kube_jobs::run_with_client(
+        spec, params, targets, client, tx,
+    ));
+    use sched_model::JobRunState::*;
+    assert_eq!(
+        until(&mut rx, runs_of).await,
+        vec![("backup-1-a1".to_string(), Active)]
+    );
+    assert!(
+        selectors.lock().unwrap()[0]
+            .contains("labelSelector=app.kubernetes.io%2Fmanaged-by%3Dflowmanager"),
+        "{:?}",
+        selectors.lock().unwrap()
+    );
+    *jobs.lock().unwrap() = vec![kube_job("backup-1-a1", "backup", Some("Complete"))];
+    assert_eq!(
+        until(&mut rx, |r| runs_of(r).filter(|v| v[0].1 == Complete)).await,
+        vec![("backup-1-a1".to_string(), Complete)]
+    );
+    // Deleted: a complete list without it is an empty reading.
+    jobs.lock().unwrap().clear();
+    assert!(
+        until(&mut rx, |r| runs_of(r).filter(Vec::is_empty))
+            .await
+            .is_empty()
+    );
+    // A failing API is a failed read.
+    fail.store(true, Ordering::SeqCst);
+    until(&mut rx, |r| {
+        matches!(r, Report::Failed { error, .. } if error.contains("jobs")).then_some(())
+    })
+    .await;
+    task.abort();
+}

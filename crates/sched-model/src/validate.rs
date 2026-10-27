@@ -173,6 +173,14 @@ fn jobs(c: &Config, p: &mut Problems) {
             ),
         );
     }
+    for s in &sources_with_jobs {
+        if s.observe.len() > 1 {
+            p.add(
+                format!("sources[{}]", s.id),
+                "a source that observes jobs must observe nothing else (give pods, reachability and mounts their own source)",
+            );
+        }
+    }
     // The namespaces the jobs source lists; a job whose CronJob is elsewhere could never be
     // observed, so its hold would never be released on completion.
     let listed: Option<Vec<String>> = sources_with_jobs
