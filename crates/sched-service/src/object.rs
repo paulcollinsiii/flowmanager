@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use restate_sdk::errors::{HandlerError, TerminalError};
-use sched_model::{Lease, LeaseId, Millis, ModelId};
+use sched_model::{Config, Lease, LeaseId, Millis, ModelId, ResourceId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::leases::{LeaseBook, LeaseError, LeaseGrant};
 use crate::persist::{self, CoreState, LEASES_KEY, STATE_KEY, StateError};
 use crate::power::PowerAction;
+use crate::resume::{self, Resume, ResumeAck};
 use crate::tick::{Durable, Shared, TickReport};
 
 /// A boxed, `Send` future: what the context's methods return. Boxed rather than `impl
@@ -81,6 +82,14 @@ pub struct AcquireModelLease {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseLease {
     pub id: LeaseId,
+}
+
+/// A request about one resource: `acquire_host_lease`, `release_host_lease`, `reclaim`,
+/// `unreclaim`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceRequest {
+    pub resource: ResourceId,
 }
 
 /// `discard_state` request: the recovery path for a persisted document that cannot be read.
@@ -237,6 +246,144 @@ pub async fn acquire_model_lease<C: ObjectCtx>(
         tracing::info!(lease = %grant.lease.id, resource = %grant.lease.resource, "manual model lease acquired");
     }
     Ok(grant)
+}
+
+/// Acquires a lease on a resource with `grant` (see `leases`). As for a model lease, the
+/// config and the clock are read inside the journaled step, so a replay gets the same answer
+/// even if the config was reloaded, and an existing lease is returned without a write.
+async fn acquire_resource_lease<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    step: &'static str,
+    what: &'static str,
+    req: ResourceRequest,
+    grant: fn(&mut LeaseBook, &Config, &ResourceId, Millis) -> Result<LeaseGrant, LeaseError>,
+) -> Result<LeaseGrant, HandlerError> {
+    let book = read_leases(ctx)
+        .await?
+        .map_err(|e| unreadable(shared, &e))?;
+    let s = Arc::clone(shared);
+    let result = ctx
+        .run_journaled(step, move || {
+            let mut book = book;
+            let config = s.config.current();
+            let now = s.clock.now();
+            grant(&mut book, &config, &req.resource, now).map(|grant| (grant, book))
+        })
+        .await?;
+    let (grant, book) = result.map_err(|e| lease_refused(&e))?;
+    if grant.created {
+        ctx.set_raw(LEASES_KEY, persist::encode_leases(&book));
+        ctx.request_tick();
+        tracing::info!(lease = %grant.lease.id, resource = %grant.lease.resource, "{what} lease acquired");
+    }
+    Ok(grant)
+}
+
+/// Acquires a manual lease on a shared host (see `LeaseBook::acquire_manual_host`).
+pub async fn acquire_host_lease<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: ResourceRequest,
+) -> Result<LeaseGrant, HandlerError> {
+    acquire_resource_lease(
+        shared,
+        ctx,
+        "acquire_host_lease",
+        "manual host",
+        req,
+        LeaseBook::acquire_manual_host,
+    )
+    .await
+}
+
+/// Reclaims an exclusive resource (see `LeaseBook::acquire_reclaim`).
+pub async fn reclaim<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: ResourceRequest,
+) -> Result<LeaseGrant, HandlerError> {
+    acquire_resource_lease(
+        shared,
+        ctx,
+        "reclaim",
+        "reclaim",
+        req,
+        LeaseBook::acquire_reclaim,
+    )
+    .await
+}
+
+/// Releases the lease of one kind a resource holds, the way `release_lease` does by id.
+async fn release_resource_lease<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: ResourceRequest,
+    release: fn(&mut LeaseBook, &ResourceId) -> Result<Lease, LeaseError>,
+) -> Result<Lease, HandlerError> {
+    let mut book = read_leases(ctx)
+        .await?
+        .map_err(|e| unreadable(shared, &e))?;
+    let lease = release(&mut book, &req.resource).map_err(|e| lease_refused(&e))?;
+    ctx.set_raw(LEASES_KEY, persist::encode_leases(&book));
+    ctx.request_tick();
+    tracing::info!(lease = %lease.id, resource = %lease.resource, "lease released");
+    Ok(lease)
+}
+
+/// Releases the manual host lease on a resource.
+pub async fn release_host_lease<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: ResourceRequest,
+) -> Result<Lease, HandlerError> {
+    release_resource_lease(shared, ctx, req, LeaseBook::release_manual_host).await
+}
+
+/// Releases the reclaim on a resource.
+pub async fn unreclaim<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: ResourceRequest,
+) -> Result<Lease, HandlerError> {
+    release_resource_lease(shared, ctx, req, LeaseBook::release_reclaim).await
+}
+
+/// Clears what flowmanager stopped at on one resource (see `resume`): its failed power
+/// transition, or its shutdown stopped by mounting pods. The state is read, the rule and the
+/// config are applied inside a journaled step (a replay gets the same answer even if the
+/// config was reloaded), and the new state is stored; other resources' state and the lease
+/// book are left as they are.
+pub async fn resume<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: Resume,
+) -> Result<ResumeAck, HandlerError> {
+    let core = persist::decode_state(ctx.get_raw(STATE_KEY).await?.as_deref())
+        .map_err(|e| unreadable(shared, &e))?;
+    let s = Arc::clone(shared);
+    let result = ctx
+        .run_journaled("resume", move || {
+            let mut core = core;
+            let config = s.config.current();
+            resume::resume(&mut core, &config, &req.resource).map(|ack| (ack, core))
+        })
+        .await?;
+    let (ack, core) = result.map_err(|e| {
+        tracing::warn!("resume refused: {e}");
+        HandlerError::from(TerminalError::new_with_code(e.status(), e.to_string()))
+    })?;
+    ctx.set_raw(STATE_KEY, persist::encode_state(&core));
+    ctx.request_tick();
+    tracing::warn!(
+        event = "power_resumed",
+        resource = %ack.resource,
+        cleared = %ack.cleared,
+        "a person resumed {}: its state ({}) is cleared and it follows observation again",
+        ack.resource,
+        ack.cleared
+    );
+    Ok(ack)
 }
 
 /// Releases a lease by id.
@@ -946,6 +1093,298 @@ mod tests {
         );
     }
 
+    fn process_managed() -> (Arc<Shared>, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(Millis(T0)));
+        let holder = Arc::new(
+            ConfigHolder::new(&sched_model::test_support::example_yaml_managed()).unwrap(),
+        );
+        let s = Arc::new(Shared::new(holder, Arc::new(Metrics::new()), clock.clone()));
+        (s, clock)
+    }
+
+    fn req(resource: &str) -> ResourceRequest {
+        ResourceRequest {
+            resource: resource.into(),
+        }
+    }
+
+    fn refused(e: &HandlerError) -> String {
+        format!("{e:?}")
+    }
+
+    #[tokio::test]
+    async fn a_manual_host_lease_is_stored_idempotent_and_wakes_a_managed_host() {
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        // basestar is observed down: the lease asks for it to be powered on.
+        push(
+            &s,
+            "basestar-probe",
+            vec![ObservedValue::ResourceUp {
+                resource: "basestar-nfs".into(),
+                up: false,
+            }],
+        );
+        let g = acquire_host_lease(&s, &ctx, req("basestar-nfs"))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert!(g.created);
+        assert_eq!(g.lease.id.as_str(), "manual-host-1");
+        assert_eq!(g.lease.kind, sched_model::LeaseKind::ManualHost);
+        assert_eq!(ctx.ticks(), 1);
+        let listed = list_leases(&s, ctx.stored(LEASES_KEY).as_deref()).unwrap();
+        assert_eq!(listed, vec![g.lease.clone()]);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert!(r.kinds.contains(&"power_on".to_string()), "{r:?}");
+        assert_eq!(
+            *ctx.powers.lock().unwrap(),
+            [("basestar-nfs".to_string(), PowerAction::On)]
+        );
+        // Again: the same lease, nothing written, no tick asked for.
+        let again = acquire_host_lease(&s, &ctx, req("basestar-nfs"))
+            .await
+            .unwrap();
+        assert!(!again.created && again.lease == g.lease);
+        assert_eq!(ctx.ticks(), 1);
+        // Released by resource: stored, a tick asked for, and a second release is a 404.
+        let released = release_host_lease(&s, &ctx, req("basestar-nfs"))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert_eq!(released, g.lease);
+        assert!(
+            list_leases(&s, ctx.stored(LEASES_KEY).as_deref())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(ctx.ticks(), 2);
+        let e = release_host_lease(&s, &ctx, req("basestar-nfs"))
+            .await
+            .unwrap_err();
+        assert!(
+            refused(&e).contains("holds no manual host lease"),
+            "{}",
+            refused(&e)
+        );
+    }
+
+    #[tokio::test]
+    async fn host_lease_and_reclaim_requests_are_validated_against_the_active_config() {
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        for (resource, text) in [
+            ("nowhere", "unknown resource"),
+            ("cuda-central", "not a shared resource"),
+        ] {
+            let e = acquire_host_lease(&s, &ctx, req(resource))
+                .await
+                .unwrap_err();
+            assert!(refused(&e).contains(text), "{resource}: {}", refused(&e));
+        }
+        for (resource, text) in [
+            ("nowhere", "unknown resource"),
+            ("basestar-nfs", "cannot be reclaimed"),
+        ] {
+            let e = reclaim(&s, &ctx, req(resource)).await.unwrap_err();
+            assert!(refused(&e).contains(text), "{resource}: {}", refused(&e));
+        }
+        ctx.commit();
+        assert_eq!(ctx.stored(LEASES_KEY), None, "nothing was stored");
+        assert_eq!(ctx.ticks(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reclaim_is_stored_stops_intake_and_is_released_by_resource() {
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        world(&s, 3);
+        let g = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        ctx.commit();
+        assert!(g.created);
+        assert_eq!(g.lease.id.as_str(), "reclaim-1");
+        assert_eq!(g.lease.kind, sched_model::LeaseKind::Reclaim);
+        let again = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        assert!(!again.created && again.lease == g.lease);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.leases, vec![g.lease.clone()]);
+        // Work is waiting (3 OCR items) but the reclaimed resource allows no model, and a
+        // managed host is shut down (the one power request of the tick).
+        assert!(r.allowed_models.is_empty(), "{r:?}");
+        assert_eq!(
+            *ctx.powers.lock().unwrap(),
+            [("cuda-central".to_string(), PowerAction::Off)]
+        );
+        let released = unreclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        ctx.commit();
+        assert_eq!(released, g.lease);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        // The lease is gone; the host is still going down, so nothing is allowed on it yet.
+        assert!(r.leases.is_empty() && r.allowed_models.is_empty(), "{r:?}");
+        let e = unreclaim(&s, &ctx, req("cuda-central")).await.unwrap_err();
+        assert!(
+            refused(&e).contains("holds no reclaim lease"),
+            "{}",
+            refused(&e)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retried_host_lease_request_reuses_the_journaled_grant() {
+        let (s, clock) = process_managed();
+        let ctx = FakeCtx::default();
+        let g = acquire_host_lease(&s, &ctx, req("basestar-nfs"))
+            .await
+            .unwrap();
+        ctx.crash_and_retry();
+        clock.set(Millis(T0 + 5_000));
+        let again = acquire_host_lease(&s, &ctx, req("basestar-nfs"))
+            .await
+            .unwrap();
+        assert!(ctx.ran().is_empty());
+        assert_eq!(again, g);
+        ctx.commit();
+        assert_eq!(
+            list_leases(&s, ctx.stored(LEASES_KEY).as_deref()).unwrap(),
+            vec![g.lease]
+        );
+        // The same for a reclaim.
+        let ctx = FakeCtx::default();
+        let g = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        ctx.crash_and_retry();
+        let again = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        assert!(ctx.ran().is_empty());
+        assert_eq!(again, g);
+    }
+
+    /// cuda-central failed in a shutdown, basestar up and managed: what a person finds after
+    /// a shutdown that never completed and a host fixed by hand.
+    fn failed_gpu_state() -> Vec<u8> {
+        br#"{"version":1,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"failed","since":5,"during":"shutting_down"},"mode":{"phase":"idle"}},"basestar-nfs":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"host_idle_since":null}}},"reported":["cluster-pods"]}}"#.to_vec()
+    }
+
+    #[tokio::test]
+    async fn resume_clears_one_resource_and_it_then_follows_observation() {
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        ctx.put(STATE_KEY, &failed_gpu_state());
+        world(&s, 0);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(
+            r.power_failed.len(),
+            1,
+            "stays failed while the host is up: {r:?}"
+        );
+        let before = stored_state(&ctx);
+        let ack = resume(
+            &s,
+            &ctx,
+            Resume {
+                resource: "cuda-central".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.commit();
+        assert_eq!(ack.cleared, "shutdown_failed");
+        assert_eq!(ctx.ticks(), 1);
+        let after = stored_state(&ctx);
+        assert!(after.state.resource(&"cuda-central".into()).is_none());
+        assert_eq!(
+            after.state.resource(&"basestar-nfs".into()),
+            before.state.resource(&"basestar-nfs".into()),
+            "another resource's state is untouched"
+        );
+        assert_eq!(after.reported, before.reported);
+        // The next tick finds it running: up, and not ours to power off.
+        world(&s, 0);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert!(r.power_failed.is_empty(), "{r:?}");
+        let gpu = r.state.resource(&"cuda-central".into()).unwrap();
+        assert!(gpu.is_on() && !gpu.managed, "{gpu:?}");
+        assert!(
+            ctx.powers.lock().unwrap().is_empty(),
+            "resuming powers nothing by itself"
+        );
+        // Nothing left to resume now.
+        let e = resume(
+            &s,
+            &ctx,
+            Resume {
+                resource: "cuda-central".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(refused(&e).contains("is not stopped"), "{}", refused(&e));
+    }
+
+    #[tokio::test]
+    async fn a_retried_resume_reuses_the_journaled_answer_and_writes_the_same_state() {
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        ctx.put(STATE_KEY, &failed_gpu_state());
+        let ack = resume(
+            &s,
+            &ctx,
+            Resume {
+                resource: "cuda-central".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.crash_and_retry();
+        // The retry reads the state the first attempt read (not what it wrote) and gets the
+        // journaled answer without applying the rule again.
+        let again = resume(
+            &s,
+            &ctx,
+            Resume {
+                resource: "cuda-central".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ctx.ran().is_empty());
+        assert_eq!(again, ack);
+        ctx.commit();
+        assert!(
+            stored_state(&ctx)
+                .state
+                .resource(&"cuda-central".into())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_what_is_not_stopped_and_writes_nothing() {
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        ctx.put(STATE_KEY, &failed_gpu_state());
+        for (resource, status) in [("basestar-nfs", "409"), ("nowhere", "400")] {
+            let e = resume(
+                &s,
+                &ctx,
+                Resume {
+                    resource: resource.into(),
+                },
+            )
+            .await
+            .unwrap_err();
+            let text = refused(&e);
+            assert!(text.contains(status), "{resource}: {text}");
+        }
+        let before = ctx.stored(STATE_KEY);
+        ctx.commit();
+        assert_eq!(ctx.stored(STATE_KEY), before);
+        assert_eq!(ctx.ticks(), 0);
+    }
     #[tokio::test]
     async fn an_unreadable_state_makes_an_error_tick_that_stores_and_publishes_nothing() {
         let (s, _) = process();

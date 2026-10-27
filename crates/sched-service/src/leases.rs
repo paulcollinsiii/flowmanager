@@ -1,4 +1,5 @@
-//! Manual model leases as the user requests them: acquired for a model, released by id,
+//! Manual leases as the user requests them: on a model, on a shared host, a reclaim of an
+//! exclusive resource; released by id (or by resource for a host lease and a reclaim),
 //! listed. The book is plain data that the `Scheduler` object keeps in its Restate state;
 //! the rules here are pure, so they can be tested without Restate.
 //!
@@ -7,6 +8,9 @@
 //! - At most one manual model lease is held per exclusive resource. Asking again for the
 //!   model already leased returns that lease; asking for another model of the same
 //!   resource is refused until the first is released.
+//! - A manual host lease is for a shared resource with a power section, a reclaim for an
+//!   exclusive resource with a power section (`Config::supports_reclaim`); each is held at
+//!   most once per resource, and asking again returns the lease held.
 //! - Lease ids come from a counter kept in the book, so they are deterministic under
 //!   Restate's replay.
 //!
@@ -15,11 +19,15 @@
 
 use std::fmt;
 
-use sched_model::{Config, Lease, LeaseId, LeaseKind, Millis, ModelId, ResourceKind};
+use sched_model::{Config, Lease, LeaseId, LeaseKind, Millis, ModelId, ResourceId, ResourceKind};
 use serde::{Deserialize, Serialize};
 
 /// Prefix of the ids of manual model leases.
 pub const MANUAL_MODEL_PREFIX: &str = "manual-model-";
+/// Prefix of the ids of manual host leases.
+pub const MANUAL_HOST_PREFIX: &str = "manual-host-";
+/// Prefix of the ids of reclaim leases.
+pub const RECLAIM_PREFIX: &str = "reclaim-";
 
 /// Every lease the scheduler holds, and the counter its ids are drawn from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +58,21 @@ pub enum LeaseError {
     NotExclusive { model: ModelId },
     /// Another model of the same resource already has a manual lease.
     Conflict { requested: ModelId, held: Lease },
+    /// The resource is not in the active config.
+    UnknownResource {
+        resource: ResourceId,
+        known: Vec<ResourceId>,
+    },
+    /// A manual host lease is for a shared resource; an exclusive one is leased through its
+    /// models.
+    NotShared { resource: ResourceId },
+    /// The resource has no power section: it is always on, so a lease on it would do nothing.
+    NoPowerSection { resource: ResourceId },
+    /// A reclaim names a resource that cannot be reclaimed: only an exclusive resource with a
+    /// power section can be taken back and shut down.
+    NotReclaimable { resource: ResourceId },
+    /// The resource holds no lease of the kind that was asked to be released.
+    NoLeaseOnResource { resource: ResourceId, kind: String },
     /// No lease has this id.
     UnknownLease { id: LeaseId },
 }
@@ -58,9 +81,14 @@ impl LeaseError {
     /// The HTTP status the ingress answers with.
     pub fn status(&self) -> u16 {
         match self {
-            LeaseError::UnknownModel { .. } | LeaseError::NotExclusive { .. } => 400,
+            LeaseError::UnknownModel { .. }
+            | LeaseError::NotExclusive { .. }
+            | LeaseError::UnknownResource { .. }
+            | LeaseError::NotShared { .. }
+            | LeaseError::NoPowerSection { .. }
+            | LeaseError::NotReclaimable { .. } => 400,
             LeaseError::Conflict { .. } => 409,
-            LeaseError::UnknownLease { .. } => 404,
+            LeaseError::UnknownLease { .. } | LeaseError::NoLeaseOnResource { .. } => 404,
         }
     }
 }
@@ -95,6 +123,33 @@ impl fmt::Display for LeaseError {
                     held.id.as_str(),
                     held_model
                 )
+            }
+            LeaseError::UnknownResource { resource, known } => {
+                let known: Vec<&str> = known.iter().map(ResourceId::as_str).collect();
+                write!(
+                    f,
+                    "unknown resource {:?}: the active config has no such resource (configured: {})",
+                    resource.as_str(),
+                    known.join(", ")
+                )
+            }
+            LeaseError::NotShared { resource } => write!(
+                f,
+                "resource {:?} is not a shared resource; a manual host lease is for shared hosts such as an NFS server (an exclusive resource is leased through one of its models)",
+                resource.as_str()
+            ),
+            LeaseError::NoPowerSection { resource } => write!(
+                f,
+                "resource {:?} has no power section: it is always on, so a lease on it would do nothing",
+                resource.as_str()
+            ),
+            LeaseError::NotReclaimable { resource } => write!(
+                f,
+                "resource {:?} cannot be reclaimed: only an exclusive resource with a power section can be taken back and shut down",
+                resource.as_str()
+            ),
+            LeaseError::NoLeaseOnResource { resource, kind } => {
+                write!(f, "resource {:?} holds no {kind} lease", resource.as_str())
             }
             LeaseError::UnknownLease { id } => {
                 write!(f, "no lease with id {:?}", id.as_str())
@@ -158,6 +213,110 @@ impl LeaseBook {
         })
     }
 
+    /// Acquires a manual lease on a shared host (an NFS server, say): the host is powered on
+    /// if it is off (when its power is managed) and kept up until the lease is released.
+    /// Asking again returns the lease already held.
+    pub fn acquire_manual_host(
+        &mut self,
+        config: &Config,
+        resource: &ResourceId,
+        now: Millis,
+    ) -> Result<LeaseGrant, LeaseError> {
+        let spec = known_resource(config, resource)?;
+        if spec.kind != ResourceKind::Shared {
+            return Err(LeaseError::NotShared {
+                resource: resource.clone(),
+            });
+        }
+        if spec.power.is_none() {
+            return Err(LeaseError::NoPowerSection {
+                resource: resource.clone(),
+            });
+        }
+        Ok(self.acquire_unique(resource, LeaseKind::ManualHost, MANUAL_HOST_PREFIX, now))
+    }
+
+    /// Reclaims an exclusive resource with a power section: the user takes the host back
+    /// despite pending work (see [`LeaseKind::Reclaim`]). Asking again returns the lease
+    /// already held.
+    pub fn acquire_reclaim(
+        &mut self,
+        config: &Config,
+        resource: &ResourceId,
+        now: Millis,
+    ) -> Result<LeaseGrant, LeaseError> {
+        known_resource(config, resource)?;
+        if !config.supports_reclaim(resource) {
+            return Err(LeaseError::NotReclaimable {
+                resource: resource.clone(),
+            });
+        }
+        Ok(self.acquire_unique(resource, LeaseKind::Reclaim, RECLAIM_PREFIX, now))
+    }
+
+    /// The lease of `kind` on `resource`, if one is held, else a new one from the counter.
+    fn acquire_unique(
+        &mut self,
+        resource: &ResourceId,
+        kind: LeaseKind,
+        prefix: &str,
+        now: Millis,
+    ) -> LeaseGrant {
+        if let Some(held) = self
+            .leases
+            .iter()
+            .find(|l| &l.resource == resource && l.kind == kind)
+        {
+            return LeaseGrant {
+                lease: held.clone(),
+                created: false,
+            };
+        }
+        self.next += 1;
+        let lease = Lease {
+            id: LeaseId::new(format!("{prefix}{}", self.next)),
+            resource: resource.clone(),
+            kind,
+            granted_at: now,
+        };
+        self.leases.push(lease.clone());
+        LeaseGrant {
+            lease,
+            created: true,
+        }
+    }
+
+    /// Releases the manual host lease on `resource` and returns it.
+    pub fn release_manual_host(&mut self, resource: &ResourceId) -> Result<Lease, LeaseError> {
+        self.release_kind(resource, "manual host", |k| {
+            matches!(k, LeaseKind::ManualHost)
+        })
+    }
+
+    /// Releases the reclaim on `resource` and returns it.
+    pub fn release_reclaim(&mut self, resource: &ResourceId) -> Result<Lease, LeaseError> {
+        self.release_kind(resource, "reclaim", |k| matches!(k, LeaseKind::Reclaim))
+    }
+
+    fn release_kind(
+        &mut self,
+        resource: &ResourceId,
+        what: &str,
+        is: impl Fn(&LeaseKind) -> bool,
+    ) -> Result<Lease, LeaseError> {
+        let Some(at) = self
+            .leases
+            .iter()
+            .position(|l| &l.resource == resource && is(&l.kind))
+        else {
+            return Err(LeaseError::NoLeaseOnResource {
+                resource: resource.clone(),
+                kind: what.to_string(),
+            });
+        };
+        Ok(self.leases.remove(at))
+    }
+
     /// Releases the lease with `id` and returns it.
     pub fn release(&mut self, id: &LeaseId) -> Result<Lease, LeaseError> {
         let Some(at) = self.leases.iter().position(|l| &l.id == id) else {
@@ -165,6 +324,19 @@ impl LeaseBook {
         };
         Ok(self.leases.remove(at))
     }
+}
+
+/// The resource `id` in the active config, or the error listing what is configured.
+fn known_resource<'a>(
+    config: &'a Config,
+    id: &ResourceId,
+) -> Result<&'a sched_model::ResourceSpec, LeaseError> {
+    config
+        .resource(id)
+        .ok_or_else(|| LeaseError::UnknownResource {
+            resource: id.clone(),
+            known: config.resources().iter().map(|r| r.id.clone()).collect(),
+        })
 }
 
 /// Splits `leases` into those the core is given under `config` and the ids of those it
@@ -306,6 +478,104 @@ mod tests {
         assert_eq!(ignored, vec![LeaseId::new("manual-model-1")]);
     }
 
+    #[test]
+    fn a_host_lease_is_for_a_shared_powered_resource_and_is_unique_per_resource() {
+        let c = example_config();
+        let mut b = LeaseBook::default();
+        let g = b
+            .acquire_manual_host(&c, &"basestar-nfs".into(), Millis(3))
+            .unwrap();
+        assert!(g.created);
+        assert_eq!(g.lease.id.as_str(), "manual-host-1");
+        assert_eq!(g.lease.kind, LeaseKind::ManualHost);
+        let again = b
+            .acquire_manual_host(&c, &"basestar-nfs".into(), Millis(9))
+            .unwrap();
+        assert!(!again.created);
+        assert_eq!(
+            (again.lease, b.next, b.leases.len()),
+            (g.lease.clone(), 1, 1)
+        );
+        // The counter is shared with the other kinds, so ids stay unique.
+        let m = b
+            .acquire_manual_model(&c, &"llm".into(), Millis(4))
+            .unwrap();
+        assert_eq!(m.lease.id.as_str(), "manual-model-2");
+        let e = b
+            .acquire_manual_host(&c, &"cuda-central".into(), Millis(1))
+            .unwrap_err();
+        assert_eq!(e.status(), 400);
+        assert!(e.to_string().contains("not a shared resource"), "{e}");
+        let e = b
+            .acquire_manual_host(&c, &"nowhere".into(), Millis(1))
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("unknown resource \"nowhere\"")
+                && e.to_string().contains("cuda-central, basestar-nfs"),
+            "{e}"
+        );
+        assert_eq!(
+            b.release_manual_host(&"basestar-nfs".into()).unwrap(),
+            g.lease
+        );
+        let e = b.release_manual_host(&"basestar-nfs".into()).unwrap_err();
+        assert_eq!(e.status(), 404);
+        assert_eq!(
+            e.to_string(),
+            "resource \"basestar-nfs\" holds no manual host lease"
+        );
+    }
+
+    #[test]
+    fn a_shared_resource_without_a_power_section_cannot_be_leased() {
+        let y = EXAMPLE_CONFIG
+            .replace(
+                "    power:\n      wake_on_lan: { router_url: \"https://router.example.internal\", interface: lan, mac: \"02:00:00:00:00:02\" }\n      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n      control: manual\n      # Set per resource: the NFS host boots and stops faster than the GPU host.\n      power_on_timeout: 5m\n      shutdown_timeout: 10m\n      # Under managed control, how long a shutdown may wait for pods to stop mounting this\n      # host (see the basestar-mounts source) before the scheduler alerts and stops, without\n      # shutting it down and without retrying (default 30m, at most 1d).\n      mounts_timeout: 30m\n",
+                "",
+            )
+            .replace("    may_change_power: true\n", "");
+        let c = Config::from_yaml(&y).unwrap();
+        let e = LeaseBook::default()
+            .acquire_manual_host(&c, &"basestar-nfs".into(), Millis(1))
+            .unwrap_err();
+        assert_eq!(e.status(), 400);
+        assert!(e.to_string().contains("no power section"), "{e}");
+    }
+
+    #[test]
+    fn a_reclaim_is_for_an_exclusive_powered_resource_and_is_unique_per_resource() {
+        let c = example_config();
+        let mut b = LeaseBook::default();
+        let g = b
+            .acquire_reclaim(&c, &"cuda-central".into(), Millis(3))
+            .unwrap();
+        assert!(g.created);
+        assert_eq!(g.lease.id.as_str(), "reclaim-1");
+        assert_eq!(g.lease.kind, LeaseKind::Reclaim);
+        assert!(
+            !b.acquire_reclaim(&c, &"cuda-central".into(), Millis(4))
+                .unwrap()
+                .created
+        );
+        let e = b
+            .acquire_reclaim(&c, &"basestar-nfs".into(), Millis(1))
+            .unwrap_err();
+        assert_eq!(e.status(), 400);
+        assert!(e.to_string().contains("cannot be reclaimed"), "{e}");
+        assert_eq!(b.leases.len(), 1);
+        // It does not disturb a model lease on the same resource, and each is released alone.
+        let m = b
+            .acquire_manual_model(&c, &"llm".into(), Millis(5))
+            .unwrap();
+        assert_eq!(b.release_reclaim(&"cuda-central".into()).unwrap(), g.lease);
+        assert_eq!(b.leases, vec![m.lease]);
+        assert_eq!(
+            b.release_reclaim(&"cuda-central".into())
+                .unwrap_err()
+                .status(),
+            404
+        );
+    }
     #[test]
     fn the_book_round_trips_through_json_as_restate_stores_it() {
         let c = example_config();

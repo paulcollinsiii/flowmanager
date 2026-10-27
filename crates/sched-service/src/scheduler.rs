@@ -16,6 +16,13 @@
 //!   re-schedules itself with a delayed send to itself; `arm_backstop` starts a new chain
 //!   and bumps an epoch kept in the object's state, so a chain started earlier (before a
 //!   restart, say) sees a stale epoch and ends instead of doubling the ticks.
+//! - `acquire_host_lease` / `release_host_lease`: a manual lease on a shared host (an NFS
+//!   server): it powers a managed host on and keeps it up. `reclaim` / `unreclaim`: take an
+//!   exclusive resource with a power section back, and give it up again. `resume`: for a
+//!   person who fixed a host by hand, clears what flowmanager stopped at on one resource (a
+//!   failed power transition, or a shutdown stopped by mounting pods) so it follows
+//!   observation again. Like the lease handlers they are reachable through the ingress, which
+//!   is trusted-network only.
 //! - `acquire_model_lease` / `release_lease` / `leases`: manual model leases (see
 //!   [`crate::leases`]). A change asks for a tick.
 //! - `discard_state`: the recovery path for a persisted document that cannot be read.
@@ -45,11 +52,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::leases::LeaseGrant;
 use crate::object::{
-    self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseLease, TickAck,
+    self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseLease,
+    ResourceRequest, TickAck,
 };
 use crate::persist::{EPOCH_KEY, LEASES_KEY, POWER_KEY, RECOVERY_KEY};
 use crate::power::{self, PowerAck, PowerAction, PowerRecord, PowerRequest};
 use crate::recovery::{self, DiscardAttempts, Env, RunAck};
+use crate::resume::{Resume, ResumeAck};
 use crate::tick::{Shared, TickReport};
 
 /// The key of the single scheduler instance.
@@ -297,6 +306,75 @@ impl Scheduler {
         ))
     }
 
+    /// Acquires a manual lease on a shared host (an NFS server): a managed host that is off
+    /// is powered on and everything gated on it is allowed once it is up; the host is kept up
+    /// until the lease is released. Asking again returns the same lease; an exclusive
+    /// resource, one without a power section or an unknown one is refused (400).
+    #[handler]
+    async fn acquire_host_lease(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<ResourceRequest>,
+    ) -> Result<Json<LeaseGrant>, HandlerError> {
+        Ok(Json(
+            object::acquire_host_lease(&self.shared, &Rctx(&ctx), req).await?,
+        ))
+    }
+
+    /// Releases the manual host lease on a resource and returns it; none held is refused
+    /// (404). The host is then shut down only once nothing holds it, idle grace has passed and
+    /// no pod mounts it.
+    #[handler]
+    async fn release_host_lease(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<ResourceRequest>,
+    ) -> Result<Json<Lease>, HandlerError> {
+        Ok(Json(
+            object::release_host_lease(&self.shared, &Rctx(&ctx), req).await?,
+        ))
+    }
+
+    /// Reclaims an exclusive resource with a power section: intake stops, its work is cut
+    /// off after the reclaim timeout, the host is shut down (if its power is managed) and it
+    /// is not woken until `unreclaim`. Asking again returns the same lease; a resource that
+    /// cannot be reclaimed (shared, or without a power section) or an unknown one is refused
+    /// (400).
+    #[handler]
+    async fn reclaim(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<ResourceRequest>,
+    ) -> Result<Json<LeaseGrant>, HandlerError> {
+        Ok(Json(object::reclaim(&self.shared, &Rctx(&ctx), req).await?))
+    }
+
+    /// Releases the reclaim on a resource and returns it; none held is refused (404).
+    #[handler]
+    async fn unreclaim(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<ResourceRequest>,
+    ) -> Result<Json<Lease>, HandlerError> {
+        Ok(Json(
+            object::unreclaim(&self.shared, &Rctx(&ctx), req).await?,
+        ))
+    }
+
+    /// For a person who has fixed a host by hand: clears the failed power transition (or the
+    /// shutdown stopped by mounting pods) of one resource, so it follows observation again
+    /// (found running means up and not managed). Other resources' state is untouched. A
+    /// resource that is not stopped is refused (409), an unknown one or one without a power
+    /// section (400).
+    #[handler]
+    async fn resume(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<Resume>,
+    ) -> Result<Json<ResumeAck>, HandlerError> {
+        Ok(Json(object::resume(&self.shared, &Rctx(&ctx), req).await?))
+    }
+
     /// Releases a lease by id and returns it; an unknown id is refused (404).
     #[handler]
     async fn release_lease(
@@ -499,6 +577,7 @@ mod tests {
         assert_eq!(
             seen,
             vec![
+                ("acquire_host_lease".to_string(), None),
                 ("acquire_model_lease".to_string(), None),
                 ("arm_backstop".to_string(), None),
                 ("backstop".to_string(), None),
@@ -506,8 +585,12 @@ mod tests {
                 ("last_decision".to_string(), None),
                 ("leases".to_string(), None),
                 ("observe".to_string(), Some(true)),
+                ("reclaim".to_string(), None),
+                ("release_host_lease".to_string(), None),
                 ("release_lease".to_string(), None),
+                ("resume".to_string(), None),
                 ("tick".to_string(), None),
+                ("unreclaim".to_string(), None),
             ]
         );
         assert_eq!(d.ingress_private, None);

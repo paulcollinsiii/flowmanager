@@ -26,6 +26,7 @@ pub mod power;
 pub mod reason;
 pub mod recovery;
 pub mod replay;
+pub mod resume;
 pub mod runtime;
 pub mod scheduler;
 pub mod tick;
