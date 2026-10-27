@@ -789,4 +789,46 @@ mod tests {
         );
         assert_eq!(ctx.powers.lock().unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn a_later_successful_request_clears_the_failed_request_line() {
+        let (s, clock) = process(&example_yaml_managed());
+        let ctx = FakeCtx::default();
+        object::acquire_model_lease(
+            &s,
+            &ctx,
+            object::AcquireModelLease {
+                model: "llm".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.commit();
+        down_with_lease(&s);
+        object::tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+
+        let (fake, backend) = backend();
+        *fake.fail.lock().unwrap() = Some("router answered HTTP 503".to_string());
+        run(&s, &backend, &FakeCtx::default(), "cuda-central", on())
+            .await
+            .unwrap();
+        clock.advance(Millis(60_000));
+        down_with_lease(&s);
+        let r = object::tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.power_request_failures.len(), 1, "{r:?}");
+
+        // The same transition's request is made again and accepted: the line goes.
+        *fake.fail.lock().unwrap() = None;
+        run(&s, &backend, &FakeCtx::default(), "cuda-central", on())
+            .await
+            .unwrap();
+        clock.advance(Millis(60_000));
+        down_with_lease(&s);
+        let r = object::tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert!(r.power_request_failures.is_empty(), "{r:?}");
+        assert!(!r.reason.contains("FAILED"), "{}", r.reason);
+    }
 }

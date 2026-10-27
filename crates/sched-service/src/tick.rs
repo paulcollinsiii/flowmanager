@@ -350,21 +350,28 @@ impl Shared {
         }
     }
 
-    /// The failed power requests that still matter for `state`: those of resources powering
-    /// on, shutting down or failed. Entries of resources that left those phases are dropped.
+    /// The failed power requests that still matter for `state`: one that belongs to the
+    /// transition the resource is in now (the same action, and made at or after the current
+    /// transition began; a failed resource has no start to compare, so only the action). An
+    /// entry of another action or an earlier cycle is dropped, so a line never shows against
+    /// a different transition than the one that produced it.
     fn power_request_failures(&self, state: &SchedState) -> Vec<PowerRequestFailure> {
         let mut m = self
             .power_failures
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        m.retain(|id, _| {
-            state.resource(id).is_some_and(|st| {
-                matches!(
-                    st.power,
-                    PowerPhase::PoweringOn { .. }
-                        | PowerPhase::ShuttingDown { .. }
-                        | PowerPhase::Failed { .. }
-                )
+        m.retain(|id, f| {
+            state.resource(id).is_some_and(|st| match st.power {
+                PowerPhase::PoweringOn { since } => f.action == PowerAction::On && f.at >= since,
+                PowerPhase::ShuttingDown { since } => f.action == PowerAction::Off && f.at >= since,
+                PowerPhase::Failed { during, .. } => {
+                    f.action
+                        == match during {
+                            PowerTransition::PoweringOn => PowerAction::On,
+                            PowerTransition::ShuttingDown => PowerAction::Off,
+                        }
+                }
+                _ => false,
             })
         });
         m.values().cloned().collect()
@@ -650,7 +657,10 @@ impl Shared {
         let ages: Vec<InputAge> = r.inputs.iter().map(InputReport::to_input_age).collect();
         self.metrics.set_input_ages(&ages);
         self.metrics.set_phases(r.at, &r.state);
-        self.metrics.set_power_failed(&r.state);
+        let config = self.config.current();
+        self.metrics.set_power_failed(&r.state, |id| {
+            config.resource(id).is_some_and(|res| res.power.is_some())
+        });
         if !replayed {
             for t in &r.power_timeouts {
                 self.metrics
@@ -714,21 +724,37 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
         "tick"
     );
     for t in &r.power_timeouts {
-        tracing::error!(
-            event = "power_timeout",
-            resource = %t.resource,
-            during = t.during.as_str(),
-            started_at_ms = ?t.started_at.map(Millis::as_u64),
-            at_ms = t.at.as_u64(),
-            replayed,
-            "ALERT: {} of {} did not complete in time; flowmanager stops here and will not retry any power action for it: nothing is allowed on it until it is observed {} or a person acts",
-            t.during.as_str(),
-            t.resource,
-            match t.during {
-                PowerTransition::PoweringOn => "up",
-                PowerTransition::ShuttingDown => "down",
-            },
-        );
+        let wanted = match t.during {
+            PowerTransition::PoweringOn => "up",
+            PowerTransition::ShuttingDown => "down",
+        };
+        // The alert-grade event is for the tick that decided it. A replay (the decision came
+        // back from the journal) logs the same fact at info level under another event name,
+        // so a log-based alert fires once.
+        if replayed {
+            tracing::info!(
+                event = "power_timeout_replayed",
+                resource = %t.resource,
+                during = t.during.as_str(),
+                started_at_ms = ?t.started_at.map(Millis::as_u64),
+                at_ms = t.at.as_u64(),
+                "replayed tick: {} of {} timed out (alerted when first decided); it is not retried",
+                t.during.as_str(),
+                t.resource,
+            );
+        } else {
+            tracing::error!(
+                event = "power_timeout",
+                resource = %t.resource,
+                during = t.during.as_str(),
+                started_at_ms = ?t.started_at.map(Millis::as_u64),
+                at_ms = t.at.as_u64(),
+                "ALERT: {} of {} did not complete in time; flowmanager stops here and will not retry any power action for it: nothing is allowed on it until it is observed {} or a person acts",
+                t.during.as_str(),
+                t.resource,
+                wanted,
+            );
+        }
     }
     for step in &r.not_executed {
         tracing::warn!(
@@ -1507,6 +1533,92 @@ mod tests {
             s.tick(Millis(T0 + 2_000), &mut d)
                 .unpolled_demand
                 .is_empty()
+        );
+    }
+
+    fn state_in(id: &str, power: PowerPhase) -> SchedState {
+        let mut st = SchedState::default();
+        st.resources
+            .insert(ResourceId::new(id), sched_model::ResourceState::new(power));
+        st
+    }
+
+    #[test]
+    fn a_failed_request_shows_only_against_the_transition_that_produced_it() {
+        let (s, _) = shared();
+        let id = ResourceId::new("cuda-central");
+        let shown =
+            |s: &Shared, p: PowerPhase| s.power_request_failures(&state_in("cuda-central", p));
+        let fail = |action, at| {
+            s.note_power_request(&id, action, Millis(at), Some("refused"));
+        };
+
+        // A failed shutdown request, then the host is observed down and a power-on starts in
+        // the same tick: the old line is dropped, not shown against the new transition.
+        fail(PowerAction::Off, 1_000);
+        assert_eq!(
+            shown(
+                &s,
+                PowerPhase::Failed {
+                    since: Millis(5_000),
+                    during: PowerTransition::ShuttingDown
+                }
+            )
+            .len(),
+            1
+        );
+        assert!(
+            shown(
+                &s,
+                PowerPhase::PoweringOn {
+                    since: Millis(9_000)
+                }
+            )
+            .is_empty()
+        );
+        // And it does not come back if the resource later shuts down again.
+        assert!(
+            shown(
+                &s,
+                PowerPhase::ShuttingDown {
+                    since: Millis(9_500)
+                }
+            )
+            .is_empty()
+        );
+
+        // The same action from an earlier cycle is dropped too; one from this cycle is kept.
+        fail(PowerAction::On, 8_000);
+        assert!(
+            shown(
+                &s,
+                PowerPhase::PoweringOn {
+                    since: Millis(9_000)
+                }
+            )
+            .is_empty()
+        );
+        fail(PowerAction::On, 9_000);
+        assert_eq!(
+            shown(
+                &s,
+                PowerPhase::PoweringOn {
+                    since: Millis(9_000)
+                }
+            )
+            .len(),
+            1
+        );
+        // A failed power-on does not show against a failed shutdown.
+        assert!(
+            shown(
+                &s,
+                PowerPhase::Failed {
+                    since: Millis(20_000),
+                    during: PowerTransition::ShuttingDown
+                }
+            )
+            .is_empty()
         );
     }
 }

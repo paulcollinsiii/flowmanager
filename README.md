@@ -521,7 +521,8 @@ harmless to repeat).
   invocation still succeeds, so Restate does not retry it either. The next ticks also say
   so: the `TickReport` (`last_decision`) lists it in `power_request_failures` and the
   `reason` carries `power on of <resource> FAILED at <t>ms: <error>` for as long as the
-  resource is powering on, shutting down or failed. (This is in memory of the process that
+  resource is in the transition that request belongs to (a request of an earlier cycle or of
+  the other action is dropped, a later accepted request clears it). (This is in memory of the process that
   ran the request: after a restart only the log, the metric and `last_action` have it. A
   request that failed is never reported as success: the sequencer's `powering on` /
   `shutting down` phase means a request was decided, not that it was accepted.) The
@@ -532,7 +533,7 @@ harmless to repeat).
   `shutdown_timeout` (default 15m), moves the resource to the **failed** power phase
   (`{phase: failed, since, during: powering_on|shutting_down}` in `scheduler_state`). Both
   are set per resource under `resources[].power`, must be above 0, above
-  `policy.host_reading_stale_after` and at most 1d, and only matter under `managed` (a
+  `policy.host_reading_stale_after` (checked under `managed` only) and at most 1d, and only matter under `managed` (a
   `manual` host has no such phase). In the failed phase flowmanager:
   - raises the alert once: an error log line with `event="power_timeout"`, a count in
     `sched_power_timeouts_total{resource,during}` and a `power_timeouts` entry in that
@@ -553,6 +554,13 @@ harmless to repeat).
   `control: manual` in the config (the phase then simply follows observation). No lease or
   reclaim clears it. A host that comes back down to `off` while work is queued is then
   treated like any off host (a manual lease or a power-changing class may wake it, as before).
+  A host that comes back up out of a failed power-on is treated like a host found running,
+  not as one flowmanager powered on: it is never powered off automatically afterwards unless
+  a new want powers it on through the normal path.
+  The timeouts are measured on the wall clock only, with no fresh reading required, so a
+  scheduler restart or a long outage can raise the alert before a fresh reading could show
+  the host in the state wanted (a known trade-off; the failed phase then clears on that
+  reading, but the alert has fired).
 - `Power/{resource}/run` is ingress-private; `Power/{resource}/last_action` returns the
   last action (`{action, at, outcome: requested|failed, error}`, `null` if none).
 
@@ -652,7 +660,8 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
 - `sched_recovery_runs_total{class,outcome}` and `sched_recovery_requeues_total{class,outcome}`:
   runs and items of a class's recovery action (see *Recovery actions* for the outcomes).
 - `sched_resource_power_failed{resource,during}`: 1 while the resource is in the failed power
-  phase (a power-on or shutdown timed out; alert on `== 1`), else 0.
+  phase (a power-on or shutdown timed out; alert on `== 1`), else 0. Only resources with a
+  `power` section have the series.
 - `sched_power_timeouts_total{resource,during}`: power transitions that timed out (alert on
   any increase; the resource then stays failed until a person acts).
 - `sched_power_requests_total{resource,action,outcome}`: power actions by `on`/`off` and

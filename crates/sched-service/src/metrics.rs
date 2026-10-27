@@ -8,7 +8,7 @@ use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Opts, Registry, TextEncoder,
 };
-use sched_model::{Millis, ModePhase, PowerPhase, PowerTransition, SchedState};
+use sched_model::{Millis, ModePhase, PowerPhase, PowerTransition, ResourceId, SchedState};
 
 use sched_observe::ObserverState;
 
@@ -369,8 +369,6 @@ impl Metrics {
         }
     }
 
-    /// Counts one power action by outcome (see the metric's help). `resource` must be a
-    /// configured resource id.
     /// Counts a power transition that timed out (see the metric's help).
     pub fn power_timeout(&self, resource: &str, during: &str) {
         self.power_timeouts
@@ -379,13 +377,14 @@ impl Metrics {
     }
 
     /// Sets `sched_resource_power_failed` from the state: 1 for the transition a resource
-    /// is failed in, 0 for the other; resources that left the state lose their series.
-    pub fn set_power_failed(&self, state: &SchedState) {
+    /// is failed in, 0 for the other; resources that left the state lose their series. Only
+    /// resources for which `can_fail` holds (those with a power section) get a series.
+    pub fn set_power_failed(&self, state: &SchedState, can_fail: impl Fn(&ResourceId) -> bool) {
         let mut known = self
             .power_failed_resources
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for (id, st) in &state.resources {
+        for (id, st) in state.resources.iter().filter(|(id, _)| can_fail(id)) {
             for t in [PowerTransition::PoweringOn, PowerTransition::ShuttingDown] {
                 let failed = matches!(st.power, PowerPhase::Failed { during, .. } if during == t);
                 self.power_failed
@@ -394,7 +393,10 @@ impl Metrics {
             }
         }
         known.retain(|id| {
-            let keep = state.resources.keys().any(|k| k.as_str() == id);
+            let keep = state
+                .resources
+                .keys()
+                .any(|k| k.as_str() == id && can_fail(k));
             if !keep {
                 for t in [PowerTransition::PoweringOn, PowerTransition::ShuttingDown] {
                     let _ = self
@@ -404,9 +406,17 @@ impl Metrics {
             }
             keep
         });
-        known.extend(state.resources.keys().map(|k| k.to_string()));
+        known.extend(
+            state
+                .resources
+                .keys()
+                .filter(|k| can_fail(k))
+                .map(|k| k.to_string()),
+        );
     }
 
+    /// Counts one power action by outcome (see the metric's help). `resource` must be a
+    /// configured resource id.
     pub fn power_request(&self, resource: &str, action: &str, outcome: &str) {
         self.power_requests
             .with_label_values(&[resource, action, outcome])
@@ -580,5 +590,29 @@ mod tests {
             );
         }
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn the_power_failed_gauge_covers_only_resources_that_can_fail() {
+        let m = Metrics::new();
+        let mut st = SchedState::default();
+        for id in ["host", "plain"] {
+            st.resources.insert(
+                ResourceId::new(id),
+                sched_model::ResourceState::new(PowerPhase::On { since: Millis(0) }),
+            );
+        }
+        m.set_power_failed(&st, |id| id.as_str() == "host");
+        let text = m.render();
+        let lines = |r: &str| {
+            text.lines()
+                .filter(|l| {
+                    l.starts_with("sched_resource_power_failed{")
+                        && l.contains(&format!("resource=\"{r}\""))
+                })
+                .count()
+        };
+        assert_eq!(lines("host"), 2, "{text}");
+        assert_eq!(lines("plain"), 0, "{text}");
     }
 }
