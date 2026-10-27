@@ -7,7 +7,8 @@
 //! The scheduler's state (the sequencer's state, leases, which sources have reported) is
 //! durable in Restate, and each tick's allowed set is published for the KEDA external scaler,
 //! which this process serves (`keda_scaler`). The recovery action `requeue_failed` runs in
-//! its own Restate object (`recovery`); power and kill steps have no actuator yet and are
+//! its own Restate object (`recovery`), and power on and off in the `power` object (Wake-on-LAN
+//! through the router, SSH shutdown); kill and pause steps have no actuator and are
 //! reported as not executed. Every observer is read-only.
 
 pub mod cache;
@@ -21,6 +22,7 @@ pub mod metrics;
 pub mod metrics_server;
 pub mod object;
 pub mod persist;
+pub mod power;
 pub mod reason;
 pub mod recovery;
 pub mod replay;

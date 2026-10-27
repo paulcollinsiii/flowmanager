@@ -105,17 +105,20 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps, pinned: bool) -> Vec<&'static st
 /// stop anyone taking new work. `KillInFlight` has no actuator of its own either: the work
 /// is cut off because its model is withdrawn (KEDA scales the workload to 0): in the same
 /// tick, or when the last blocking class of the model is cut off or finishes.
-/// Powering a host on or off has no actuator yet. `RunRecovery` is carried out: the tick
-/// sends the class's `Recovery` object a request, which runs the action (config load refuses
-/// an action this build cannot run, and the sequencer emits the step only for such a class).
+/// `PowerOn` and `PowerOff` (the sequencer emits them only for hosts under managed control)
+/// are carried out: the tick sends the resource's `Power` object a request, which makes the
+/// call once. `RunRecovery` is carried out: the tick sends the class's `Recovery` object a
+/// request, which runs the action (config load refuses an action this build cannot run, and
+/// the sequencer emits the step only for such a class).
 pub fn not_executed_note(step: &Step) -> Option<&'static str> {
     match step {
-        Step::PowerOn { .. } | Step::PowerOff { .. } => Some(NOT_EXECUTED),
         Step::KillInFlight { .. } => Some(NOT_EXECUTED_KILL),
         Step::PauseIntake { .. } => Some(NOT_EXECUTED_PAUSE),
         Step::Wait { .. }
         | Step::AllowModel { .. }
         | Step::DrainModel { .. }
+        | Step::PowerOn { .. }
+        | Step::PowerOff { .. }
         | Step::RunRecovery { .. } => None,
     }
 }
@@ -125,8 +128,6 @@ pub fn not_executed(step: &Step) -> bool {
     not_executed_note(step).is_some()
 }
 
-/// Appended to the reason of a step that has no actuator in this build.
-pub const NOT_EXECUTED: &str = " [NOT EXECUTED: no actuator for this step in this build]";
 /// Appended to the reason of a `KillInFlight` step.
 pub const NOT_EXECUTED_KILL: &str = " [NOT EXECUTED: nothing stops the work directly; it ends when its model is withdrawn (its workload is scaled to 0), in the same tick or, while other classes of the model are still blocking or the switch itself is waiting (a stale host reading, say), later; the class's recovery, which re-queues failed items, runs while its model is allowed, not after the cut-off]";
 /// Appended to the reason of a `PauseIntake` step.
@@ -476,8 +477,8 @@ mod tests {
     #[test]
     fn steps_without_an_actuator_are_marked_as_not_executed() {
         let steps = vec![
-            Step::PowerOn {
-                resource: "cuda-central".into(),
+            Step::PauseIntake {
+                class: "paperless-ocr".into(),
             },
             Step::KillInFlight {
                 class: "paperless-ocr".into(),
@@ -488,7 +489,7 @@ mod tests {
             },
         ];
         let r = reason(&intent(), &steps, &DemandGaps::default());
-        assert_eq!(r.matches(NOT_EXECUTED).count(), 1, "{r}");
+        assert_eq!(r.matches(NOT_EXECUTED_PAUSE).count(), 1, "{r}");
         assert_eq!(r.matches(NOT_EXECUTED_KILL).count(), 1, "{r}");
         assert!(
             r.contains(&format!(
@@ -498,7 +499,7 @@ mod tests {
         );
         assert!(
             r.contains(&format!(
-                "power on cuda-central: the sequencer needs it up{NOT_EXECUTED}"
+                "pause intake for paperless-ocr: its model is being wound down, so the class leaves the allowed set{NOT_EXECUTED_PAUSE}"
             )),
             "{r}"
         );
@@ -577,9 +578,9 @@ mod tests {
                 Step::PowerOff {
                     resource: "r".into(),
                 },
-                true,
+                false,
             ),
-            // Carried out by the class's Recovery object.
+            // Carried out by the resource's Power object (above) and the class's Recovery object.
             (Step::RunRecovery { class: "c".into() }, false),
             (Step::KillInFlight { class: "c".into() }, true),
             (Step::PauseIntake { class: "c".into() }, true),

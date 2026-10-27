@@ -26,6 +26,9 @@ pub const LEASES_KEY: &str = "lease_book";
 /// The recovery action's attempts, kept by the `Recovery` object under the key of each
 /// class ([`sched_actuate::AttemptBook`]).
 pub const RECOVERY_KEY: &str = "recovery_attempts";
+/// The last power action of a resource, kept by the `Power` object under the key of each
+/// resource ([`crate::power::PowerLog`]). Informational: nothing reads it back to decide.
+pub const POWER_KEY: &str = "power_last_action";
 /// The backstop chain's epoch (a plain number, not versioned).
 pub const EPOCH_KEY: &str = "backstop_epoch";
 
@@ -42,6 +45,9 @@ pub const LEASES_VERSION: u32 = 1;
 
 /// Version of the [`AttemptBook`] document this build reads and writes.
 pub const RECOVERY_VERSION: u32 = 1;
+
+/// Version of the [`crate::power::PowerLog`] document this build reads and writes.
+pub const POWER_VERSION: u32 = 1;
 
 /// The keys a tick or a lease request may fail to read, and the recovery handler may clear.
 pub const DOCUMENT_KEYS: [&str; 2] = [STATE_KEY, LEASES_KEY];

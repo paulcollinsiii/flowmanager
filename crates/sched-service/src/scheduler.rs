@@ -22,8 +22,9 @@
 //! - `last_decision`: the latest tick report this process published (kept in memory, so
 //!   the report is journaled once per tick; `null` until the first tick of the process).
 //!
-//! A second object, `Recovery` (one instance per class, below), carries out recovery actions
-//! beside the ticks; the `tick` handler only sends it a one-way request.
+//! Two more objects carry out actions beside the ticks: `Recovery` (one instance per class,
+//! below) runs recovery actions, and `Power` (one instance per resource) makes the power calls;
+//! the `tick` handler only sends them one-way requests.
 //!
 //! Durable state (the object's Restate state, see [`crate::persist`]): `scheduler_state`
 //! (the sequencer state and which sources have ever reported), `lease_book`, and
@@ -36,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use restate_sdk::prelude::*;
+use sched_actuate::PowerBackend;
 use sched_model::{Fidelity, Lease, Millis, ObservedValue, SourceId};
 use sched_observe::Report;
 use serde::de::DeserializeOwned;
@@ -45,7 +47,8 @@ use crate::leases::LeaseGrant;
 use crate::object::{
     self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseLease, TickAck,
 };
-use crate::persist::{EPOCH_KEY, LEASES_KEY, RECOVERY_KEY};
+use crate::persist::{EPOCH_KEY, LEASES_KEY, POWER_KEY, RECOVERY_KEY};
+use crate::power::{self, PowerAck, PowerAction, PowerRecord, PowerRequest};
 use crate::recovery::{self, DiscardAttempts, Env, RunAck};
 use crate::tick::{Shared, TickReport};
 
@@ -175,6 +178,13 @@ impl ObjectCtx for Rctx<'_, '_> {
 
     fn request_recovery(&self, class: &str) {
         self.0.object_client::<RecoveryClient>(class).run().send();
+    }
+
+    fn request_power(&self, resource: &str, action: PowerAction) {
+        self.0
+            .object_client::<PowerClient>(resource)
+            .run(Json(PowerRequest { action }))
+            .send();
     }
 }
 
@@ -377,6 +387,52 @@ impl Recovery {
     ) -> Result<Json<Option<String>>, HandlerError> {
         let raw = ctx.get::<Vec<u8>>(RECOVERY_KEY).await?;
         Ok(Json(raw.map(|b| String::from_utf8_lossy(&b).into_owned())))
+    }
+}
+
+/// The power actions of one resource (the object key is the resource id), kept apart from
+/// the `Scheduler` so that a slow router or host never holds up a tick (see
+/// [`crate::power`]). Its state is the key `power_last_action` (versioned).
+///
+/// Handlers:
+/// - `run` (ingress-private): one power action. Sent by the `tick` handler, one way, once
+///   per `PowerOn` or `PowerOff` step of the decision.
+/// - `last_action`: the last action, when it ran and how it ended (`null` if none).
+pub struct Power {
+    shared: Arc<Shared>,
+    backend: Arc<dyn PowerBackend>,
+}
+
+impl Power {
+    pub fn new(shared: Arc<Shared>, backend: Arc<dyn PowerBackend>) -> Power {
+        Power { shared, backend }
+    }
+}
+
+#[object]
+impl Power {
+    /// Carries out one power action (the key is the resource id). It never fails the
+    /// invocation: a failed call is the answer, and nothing retries it.
+    #[handler(ingress_private)]
+    async fn run(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<PowerRequest>,
+    ) -> Result<Json<PowerAck>, HandlerError> {
+        let resource = ctx.key().to_string();
+        Ok(Json(
+            power::run(&self.shared, &self.backend, &Rctx(&ctx), &resource, req).await?,
+        ))
+    }
+
+    /// The last action of the resource.
+    #[handler]
+    async fn last_action(
+        &self,
+        ctx: SharedObjectContext<'_>,
+    ) -> Result<Json<Option<PowerRecord>>, HandlerError> {
+        let raw = ctx.get::<Vec<u8>>(POWER_KEY).await?;
+        Ok(Json(power::stored_record(raw.as_deref())?))
     }
 }
 

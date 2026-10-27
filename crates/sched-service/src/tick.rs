@@ -11,11 +11,11 @@
 //! it take effect once the scaler converges on it. A paused class leaves the set too, but
 //! nothing scales on a demand class (consumers are not gated for GPU contention), so
 //! `PauseIntake` stops nobody. `KillInFlight` has no actuator either: the work is cut off
-//! because the same tick withdraws its model. Powering a host on or off has no actuator in
-//! this build. All of these are listed in `not_executed` and logged as such. A recovery
-//! action is carried out, but not here: after publishing, the `tick` handler sends the
-//! class's `Recovery` object a one-way request (see `recovery`), so a slow or failing
-//! service can never delay a tick.
+//! because the same tick withdraws its model. These two are listed in `not_executed` and
+//! logged as such. Power on and off are carried out, in the resource's `Power` object (see
+//! `power`), and so is a recovery action, but not here: after publishing, the `tick` handler
+//! sends the resource's `Power` or the class's `Recovery` object a one-way request (see
+//! `recovery`), so a slow or failing service can never delay a tick.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -123,9 +123,9 @@ pub struct TickReport {
     pub kinds: Vec<String>,
     pub reason: String,
     pub steps: Vec<Step>,
-    /// The steps nothing in this build carries out (power on/off, stopping in-flight work,
-    /// pausing a class's intake). `RunRecovery` is carried out by the `Recovery` object. The sequencer has recorded them as taken
-    /// all the same.
+    /// The steps nothing in this build carries out (stopping in-flight work, pausing a
+    /// class's intake). `PowerOn`, `PowerOff` and `RunRecovery` are carried out by the
+    /// `Power` and `Recovery` objects. The sequencer has recorded them as taken all the same.
     #[serde(default)]
     pub not_executed: Vec<Step>,
     pub allowed_models: Vec<ModelId>,
@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn steps_without_an_actuator_are_reported_as_not_executed() {
+    fn a_power_step_is_carried_out_not_reported_as_not_executed() {
         // Managed power control (M4), the only way a power step can appear.
         let (s, _) = shared_with(&sched_model::test_support::example_yaml_managed());
         let mut d = Durable {
@@ -1002,8 +1002,8 @@ mod tests {
             resource: "cuda-central".into(),
         };
         assert!(r.steps.contains(&on), "{r:?}");
-        assert_eq!(r.not_executed, vec![on]);
-        assert!(r.reason.contains(reason::NOT_EXECUTED), "{}", r.reason);
+        assert!(r.not_executed.is_empty(), "{:?}", r.not_executed);
+        assert!(!r.reason.contains("NOT EXECUTED"), "{}", r.reason);
         // The sequencer took the step all the same: the host now reads as powering on.
         assert!(matches!(
             d.state.resource(&"cuda-central".into()).unwrap().power,

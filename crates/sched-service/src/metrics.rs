@@ -32,6 +32,7 @@ pub struct Metrics {
     state_errors: IntCounterVec,
     recovery_runs: IntCounterVec,
     recovery_requeues: IntCounterVec,
+    power_requests: IntCounterVec,
     /// Per (resource, axis), the phase whose series is set and when it began.
     phases: Mutex<HashMap<PhaseKey, (&'static str, Millis)>>,
 }
@@ -163,6 +164,15 @@ impl Metrics {
             &["class", "outcome"],
         )
         .unwrap();
+        let power_requests = IntCounterVec::new(
+            Opts::new(
+                "sched_power_requests_total",
+                "Power actions by resource, action (on, off) and outcome: requested (the router or the host accepted the request; the host's own state follows from its reachability), failed (the request failed; it is never retried automatically), not_wired (the resource has no managed power actuator in the active config, so nothing was sent)",
+            ),
+            &["resource", "action", "outcome"],
+        )
+        .unwrap();
+        registry.register(Box::new(power_requests.clone())).unwrap();
         registry.register(Box::new(recovery_runs.clone())).unwrap();
         registry
             .register(Box::new(recovery_requeues.clone()))
@@ -204,6 +214,7 @@ impl Metrics {
             state_errors,
             recovery_runs,
             recovery_requeues,
+            power_requests,
             phases: Mutex::new(HashMap::new()),
         }
     }
@@ -330,6 +341,14 @@ impl Metrics {
                 .with_label_values(&[class, outcome])
                 .inc_by(n);
         }
+    }
+
+    /// Counts one power action by outcome (see the metric's help). `resource` must be a
+    /// configured resource id.
+    pub fn power_request(&self, resource: &str, action: &str, outcome: &str) {
+        self.power_requests
+            .with_label_values(&[resource, action, outcome])
+            .inc();
     }
 
     pub fn trigger_failed(&self) {

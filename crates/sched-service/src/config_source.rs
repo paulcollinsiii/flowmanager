@@ -180,6 +180,37 @@ mod tests {
     }
 
     #[test]
+    fn power_sections_reload_and_an_incomplete_managed_one_is_rejected() {
+        let h = ConfigHolder::new(EXAMPLE_CONFIG).unwrap();
+        assert!(!h.current().power_managed(&"basestar-nfs".into()));
+        // Handing a host to the scheduler applies.
+        let managed = sched_model::test_support::example_yaml_managed();
+        assert!(matches!(h.apply_text(&managed), ReloadOutcome::Applied(_)));
+        assert!(h.current().power_managed(&"basestar-nfs".into()));
+        // A managed host without its shutdown section is refused and the last good stays.
+        let broken = managed.replacen(
+            "      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n",
+            "",
+            1,
+        );
+        assert_ne!(broken, managed);
+        match h.apply_text(&broken) {
+            ReloadOutcome::Rejected(why) => {
+                assert!(why.contains("resources[basestar-nfs].power"), "{why}");
+                assert!(why.contains("no shutdown section"), "{why}");
+            }
+            other => panic!("{}", other.label()),
+        }
+        assert!(h.current().power_managed(&"basestar-nfs".into()));
+        // And back to manual.
+        assert!(matches!(
+            h.apply_text(EXAMPLE_CONFIG),
+            ReloadOutcome::Applied(_)
+        ));
+        assert!(!h.current().power_managed(&"basestar-nfs".into()));
+    }
+
+    #[test]
     fn a_ticks_handle_keeps_its_generation_across_a_reload() {
         let h = ConfigHolder::new(EXAMPLE_CONFIG).unwrap();
         let pinned = h.current();

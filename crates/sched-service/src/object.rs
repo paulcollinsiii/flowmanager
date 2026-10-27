@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::leases::{LeaseBook, LeaseError, LeaseGrant};
 use crate::persist::{self, CoreState, LEASES_KEY, STATE_KEY, StateError};
+use crate::power::PowerAction;
 use crate::tick::{Durable, Shared, TickReport};
 
 /// A boxed, `Send` future: what the context's methods return. Boxed rather than `impl
@@ -62,6 +63,10 @@ pub trait ObjectCtx: Sync {
     /// Sends the `Recovery` object of `class` a one-way request to run its action. It never
     /// blocks this invocation: the `Recovery` object has its own lock.
     fn request_recovery(&self, class: &str);
+    /// Sends the `Power` object of `resource` a one-way request to carry out `action`. It
+    /// never blocks this invocation, and Restate journals the send, so a retried invocation
+    /// does not send it again.
+    fn request_power(&self, resource: &str, action: PowerAction);
 }
 
 /// `acquire_model_lease` request.
@@ -188,9 +193,18 @@ pub async fn tick<C: ObjectCtx>(shared: &Arc<Shared>, ctx: &C) -> Result<TickRep
     shared.publish(&outcome, !ran.load(Ordering::SeqCst));
     // Recovery runs in its own object, after the allowed set is published (it re-checks it).
     // Asked for on every tick that emits the step: the action is idempotent and gates itself.
+    // Power steps are asked for once per step: the sequencer emits one per transition (it
+    // records the host as powering on or shutting down), and the decision is journaled.
     for step in &outcome.report.steps {
-        if let sched_model::Step::RunRecovery { class } = step {
-            ctx.request_recovery(class.as_str());
+        match step {
+            sched_model::Step::RunRecovery { class } => ctx.request_recovery(class.as_str()),
+            sched_model::Step::PowerOn { resource } => {
+                ctx.request_power(resource.as_str(), PowerAction::On)
+            }
+            sched_model::Step::PowerOff { resource } => {
+                ctx.request_power(resource.as_str(), PowerAction::Off)
+            }
+            _ => {}
         }
     }
     Ok(outcome.report)
@@ -313,6 +327,8 @@ pub(crate) mod fake {
         pub ticks_requested: AtomicUsize,
         /// Classes whose recovery was requested, in order.
         pub recoveries: Mutex<Vec<String>>,
+        /// Power requests sent, in order: (resource, action).
+        pub powers: Mutex<Vec<(String, PowerAction)>>,
         /// Values `get_raw` returned in this attempt, replayed on a retry as Restate does.
         gets: Mutex<Vec<(String, Option<Vec<u8>>)>>,
         get_replay: Mutex<VecDeque<(String, Option<Vec<u8>>)>>,
@@ -535,6 +551,13 @@ pub(crate) mod fake {
 
         fn request_recovery(&self, class: &str) {
             self.recoveries.lock().unwrap().push(class.to_string());
+        }
+
+        fn request_power(&self, resource: &str, action: PowerAction) {
+            self.powers
+                .lock()
+                .unwrap()
+                .push((resource.to_string(), action));
         }
     }
 
