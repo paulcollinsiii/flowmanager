@@ -209,6 +209,13 @@ pub struct ResourceState {
     /// stored state while there is no veto, so a state without one reads and writes as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mounts_veto: Option<MountsVeto>,
+    /// When the host was observed down after flowmanager shut it down (the instant the phase
+    /// became `off` from `shutting_down`, or from a failed shutdown). It starts the `min_off`
+    /// wait before the next automatic power-on. Absent for a host found down, one that went down
+    /// by itself, and once the phase leaves `off`; absent from the stored state then, so a state
+    /// without it reads and writes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_confirmed_at: Option<Millis>,
 }
 
 impl ResourceState {
@@ -220,11 +227,24 @@ impl ResourceState {
             host_idle_since: None,
             pending_recovery: BTreeSet::new(),
             mounts_veto: None,
+            shutdown_confirmed_at: None,
         }
     }
 
     pub fn is_on(&self) -> bool {
         matches!(self.power, PowerPhase::On { .. })
+    }
+
+    /// How much of `min_off` is left to wait at `now` before the host may be powered on
+    /// again by itself: zero when the host is not off after a shutdown flowmanager started
+    /// (found down, gone down by itself, or no shutdown stamp), when `min_off` is zero or when
+    /// it has passed. A stamp in the future (the clock went back) counts as just made, so the
+    /// wait never exceeds `min_off`.
+    pub fn min_off_remaining(&self, min_off: Millis, now: Millis) -> Millis {
+        match (self.power, self.shutdown_confirmed_at) {
+            (PowerPhase::Off, Some(at)) => min_off.saturating_sub(now.saturating_sub(at)),
+            _ => Millis::ZERO,
+        }
     }
 }
 

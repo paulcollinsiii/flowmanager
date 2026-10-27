@@ -136,6 +136,14 @@ impl PowerSpec {
                 _ => {}
             }
         }
+        // Zero is allowed: no minimum off time.
+        if let Some(t) = self.min_off
+            && t > MAX_LEASE_DURATION
+        {
+            out.push(format!(
+                "min_off {t} exceeds the maximum of {MAX_LEASE_DURATION} (1 day)"
+            ));
+        }
         if let Some(w) = &self.wake_on_lan {
             out.extend(router_url_problem(&w.router_url).map(|m| format!("wake_on_lan.{m}")));
             if w.interface.trim().is_empty() {
@@ -325,6 +333,26 @@ mod tests {
             m.contains("shutdown_timeout 172800000ms exceeds the maximum"),
             "{m}"
         );
+    }
+
+    #[test]
+    fn min_off_defaults_to_disabled_and_is_bounded() {
+        let p = spec(&full("managed"));
+        assert_eq!(p.min_off(), Millis::ZERO);
+        let p = spec(&format!("{}min_off: 10m\n", full("managed")));
+        assert!(p.problems().is_empty(), "{:?}", p.problems());
+        assert_eq!(p.min_off(), Millis(600_000));
+        // Zero is allowed and means disabled; a day is the most; manual control accepts it.
+        let p = spec(&format!("{}min_off: 0\n", full("managed")));
+        assert!(p.problems().is_empty(), "{:?}", p.problems());
+        assert_eq!(p.min_off(), Millis::ZERO);
+        let p = spec(&format!("{}min_off: 1d\n", full("managed")));
+        assert!(p.problems().is_empty(), "{:?}", p.problems());
+        let p = spec(&format!("{}min_off: 2d\n", full("managed")));
+        let m = p.problems().join("; ");
+        assert!(m.contains("min_off 172800000ms exceeds the maximum"), "{m}");
+        let p = spec(&format!("{}min_off: 5m\n", full("manual")));
+        assert!(p.problems().is_empty(), "{:?}", p.problems());
     }
 
     #[test]

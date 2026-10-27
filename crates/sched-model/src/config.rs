@@ -63,6 +63,12 @@ pub struct PowerSpec {
     /// resource that a `mounts` source checks.
     #[serde(default)]
     pub mounts_timeout: Option<Millis>,
+    /// The least time flowmanager keeps a host off after it has confirmed a shutdown it
+    /// started (the host was observed down) before it powers the host on again by itself, for
+    /// a workload, a scheduled job's hold or any other automatic want. A manual lease
+    /// overrides it. Default 0: disabled. Only meaningful under `control: managed`.
+    #[serde(default)]
+    pub min_off: Option<Millis>,
 }
 
 /// Default for [`PowerSpec::power_on_timeout`].
@@ -86,6 +92,11 @@ impl PowerSpec {
     /// The effective shutdown timeout.
     pub fn shutdown_timeout(&self) -> Millis {
         self.shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT)
+    }
+
+    /// The effective minimum off time (zero: no minimum).
+    pub fn min_off(&self) -> Millis {
+        self.min_off.unwrap_or(Millis::ZERO)
     }
 }
 

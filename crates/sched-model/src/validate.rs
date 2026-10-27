@@ -1627,6 +1627,33 @@ sources:
         );
     }
 
+    #[test]
+    fn min_off_is_zero_by_default_and_bounded_in_a_whole_config() {
+        let c = Config::from_yaml(&crate::test_support::example_yaml_managed()).unwrap();
+        assert_eq!(
+            c.resource(&"basestar-nfs".into())
+                .and_then(|r| r.power.as_ref())
+                .map(|p| p.min_off()),
+            Some(crate::Millis::ZERO)
+        );
+        let ok = managed_example_with(
+            "mounts_timeout: 30m",
+            "mounts_timeout: 30m\n      min_off: 10m",
+        );
+        let c = Config::from_yaml(&ok).unwrap();
+        assert_eq!(
+            c.resource(&"basestar-nfs".into())
+                .and_then(|r| r.power.as_ref())
+                .map(|p| p.min_off()),
+            Some(crate::Millis(600_000))
+        );
+        let ps = problems(&managed_example_with("mounts_timeout: 30m", "min_off: 2d"));
+        assert!(has(&ps, "min_off 172800000ms exceeds"), "{ps:?}");
+        assert!(
+            Config::from_yaml(&managed_example_with("mounts_timeout: 30m", "min_off: 0")).is_ok()
+        );
+    }
+
     // Scheduled jobs.
 
     fn example_with(from: &str, to: &str) -> String {

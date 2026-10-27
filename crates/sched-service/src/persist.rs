@@ -180,6 +180,34 @@ mod tests {
     }
 
     #[test]
+    fn the_shutdown_stamp_survives_a_restart_and_is_absent_when_unset() {
+        use sched_model::{Millis, PowerPhase, ResourceState};
+        let mut s = CoreState::default();
+        let mut off = ResourceState::new(PowerPhase::Off);
+        off.shutdown_confirmed_at = Some(Millis(4_000));
+        s.state.resources.insert("basestar-nfs".into(), off);
+        s.state
+            .resources
+            .insert("cuda-central".into(), ResourceState::new(PowerPhase::Off));
+        let bytes = encode_state(&s);
+        assert_eq!(decode_state(Some(&bytes)).unwrap(), s);
+        // The version is unchanged, the key is written only where it is set, and a state
+        // written before the field existed reads as "no stamp".
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("{\"version\":1,\"data\":"), "{text}");
+        assert_eq!(text.matches("shutdown_confirmed_at").count(), 1, "{text}");
+        let old = br#"{"version":1,"data":{"state":{"resources":{"b":{"power":{"phase":"off"},"mode":{"phase":"idle"}}}},"reported":[]}}"#;
+        let got = decode_state(Some(old)).unwrap();
+        assert_eq!(
+            got.state
+                .resource(&"b".into())
+                .unwrap()
+                .shutdown_confirmed_at,
+            None
+        );
+    }
+
+    #[test]
     fn attempts_are_a_versioned_document_of_their_own() {
         let mut b = AttemptBook::default();
         b.record("7", sched_model::Millis(5));

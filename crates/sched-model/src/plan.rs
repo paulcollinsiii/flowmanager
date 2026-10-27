@@ -69,6 +69,10 @@ pub enum WaitReason {
     /// will not shut the host down by itself (a person acts, or a new manual request takes the
     /// host over again). The host stays up.
     ShutdownStopped,
+    /// The host was shut down by flowmanager and has not been off for `power.min_off` yet:
+    /// an automatic power-on (a workload, a scheduled job's hold) waits for it to pass. A
+    /// manual lease does not wait. The wait is a delay of a fresh decision, not a retry.
+    MinOff,
     /// The allowed model has not been allowed for `min_dwell` yet.
     MinDwell,
     /// The allowed model's active work is not declared preemptible.

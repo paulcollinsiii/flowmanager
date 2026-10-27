@@ -253,6 +253,9 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::ShutdownStopped => {
             "pods still mounted the host when mounts_timeout ran out and flowmanager stopped (the host stays up; a person must act; it is not retried)"
         }
+        WaitReason::MinOff => {
+            "the host was shut down by flowmanager and its minimum off time (min_off) has not passed yet"
+        }
         WaitReason::MinDwell => "the allowed model has not been allowed for its minimum dwell",
         WaitReason::NotPreemptible => "the allowed model's active work is not preemptible",
         WaitReason::InFlightWork => "in-flight work reported by its queue is still running",
