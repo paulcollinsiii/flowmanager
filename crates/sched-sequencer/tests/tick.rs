@@ -2622,3 +2622,84 @@ fn an_unchecked_host_is_powered_off_without_a_mount_reading() {
         .run();
     assert_steps(&d, vec![Step::PowerOff { resource: rid(G) }], "gpu");
 }
+
+// Before a managed GPU host is powered off its model is wound down: the shutdown follows the
+// mode going idle (after the bounded wind-down of in-flight work, see `drain_timeout` and
+// `reclaim_timeout`), never the other way round.
+
+#[test]
+fn a_managed_gpu_host_is_never_powered_off_while_a_model_is_allowed_and_only_after_the_drain() {
+    let state = format!(
+        "{{ power: {}, mode: {}, managed: true }}",
+        on(),
+        serving("mineru", 99 * MIN)
+    );
+    let c = Case::new().gpu_state(&state).target(None);
+    // The planner released the idle model: it is drained in this tick, and the host is not
+    // powered off in the same tick (nor is the idle clock of the host running yet).
+    let d = c.run();
+    assert!(
+        d.steps.contains(&drain("mineru"))
+            && !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+        "{d:?}"
+    );
+    assert_eq!(mode_of(&d, G), ModePhase::Idle);
+    assert_eq!(d.state.resource(&rid(G)).unwrap().host_idle_since, None);
+    // A model that is still allowed blocks the shutdown, however long the host was idle.
+    let still = Case::new().gpu_state(&state).target(Some("mineru")).run();
+    assert!(
+        !still
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::PowerOff { .. })),
+        "{still:?}"
+    );
+    // Once idle, the host needs its own grace period before it is shut down.
+    let mut st = d.state;
+    let first = c.run_fresh_at(&st, T + MIN);
+    assert!(
+        !first
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::PowerOff { .. })),
+        "{first:?}"
+    );
+    st = first.state;
+    let late = c.run_fresh_at(&st, T + 12 * MIN);
+    assert!(
+        late.steps.contains(&Step::PowerOff { resource: rid(G) }),
+        "{late:?}"
+    );
+}
+
+#[test]
+fn a_reclaim_gives_in_flight_work_its_timeout_before_the_managed_gpu_host_is_shut_down() {
+    // whisperx serving with work in flight, a reclaim: the model is wound down first. Nothing
+    // powers the host off while it is winding down, or in the tick that drains the model.
+    let serving_whisperx = format!(
+        "{{ phase: serving, model: whisperx, since: {} }}",
+        T - 99 * MIN
+    );
+    let case = Case::new()
+        .gpu_state(&format!(
+            "{{ power: {}, mode: {serving_whisperx}, managed: true }}",
+            on()
+        ))
+        .obs(demand("speakr-transcription", "speakr-pending", 0, 1, 0))
+        .reclaim();
+    let mut st = case.state();
+    let mut powered_off_at = None;
+    // The example's drain_timeout (the reclaim timeout default) is 10 minutes.
+    for i in 0..=12u64 {
+        let d = case.run_fresh_at(&st, T + i * MIN);
+        if d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })) {
+            powered_off_at = Some(i);
+            assert_eq!(mode_of(&d, G), ModePhase::Idle, "drained before it");
+            break;
+        }
+        st = d.state;
+    }
+    // Wind-down starts at minute 0, work is cut off at minute 10 (with the drain), and the
+    // host is shut down on the tick after.
+    assert_eq!(powered_off_at, Some(11));
+}
