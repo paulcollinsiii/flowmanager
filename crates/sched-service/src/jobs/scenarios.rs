@@ -275,7 +275,7 @@ async fn nfs_that_comes_up_late_still_runs_the_job_and_a_manual_host_is_never_po
 
 #[tokio::test]
 async fn a_managed_host_is_woken_by_the_hold_and_flowmanager_never_retries_power() {
-    let mut w = World::new(&example_yaml_managed());
+    let w = World::new(&example_yaml_managed());
     w.tick(SUN + H, false, false).await;
     // The first tick that sees the host off only learns its state; the due tick wakes it.
     w.tick(DUE - MIN, false, false).await;
