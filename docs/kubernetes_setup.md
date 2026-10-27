@@ -83,6 +83,8 @@ them (`sched-service --help`):
 | `--listen <ADDR>` | `SCHED_LISTEN` | `0.0.0.0:9080` | The **Restate service endpoint** (the `Scheduler` and `Recovery` virtual objects), HTTP/2 without TLS (h2c). |
 | `--metrics-listen <ADDR>` | `SCHED_METRICS_LISTEN` | `0.0.0.0:9090` | Prometheus: `GET /metrics`; also `GET /healthz` (answers `ok`). |
 | `--keda-listen <ADDR>` | `SCHED_KEDA_LISTEN` | `0.0.0.0:9095` | The **KEDA external scaler** (gRPC, plaintext). |
+| `--toggle-listen <ADDR>` | `SCHED_TOGGLE_LISTEN` | off (suggested `0.0.0.0:9096`) | The **toggle listener** for Home Assistant (plain HTTP, bearer token); off when absent; needs `--toggle-token-file`. See the toggle listener subsection of section 2. |
+| `--toggle-token-file <PATH>` | `SCHED_TOGGLE_TOKEN_FILE` | none | The bearer token the toggle listener requires (a mounted Secret, one line), read on every request. Needs `--toggle-listen`; start-up fails if the file is missing or empty. |
 | `--restate-ingress <URL>` | `SCHED_RESTATE_INGRESS` | `http://localhost:8080` | The Restate **ingress** URL. The process calls it itself: `POST {url}/Scheduler/main/tick/send` when observations or leases change, and `POST {url}/Scheduler/main/arm_backstop/send` at start-up (retried every 5 s until Restate accepts) and whenever its backstop watchdog finds the chain overdue (not run for more than three intervals plus 10 s). **Must be set in the cluster** (the default is localhost). |
 | `--backstop <DURATION>` | `SCHED_BACKSTOP` | `30s` | Interval of the periodic backstop tick. Greater than zero. |
 | `--reload-interval <DURATION>` | `SCHED_RELOAD_INTERVAL` | `5s` | How often the config file is re-read. Greater than zero. |
@@ -95,7 +97,7 @@ service account token through the Kubernetes client (set by Kubernetes in a pod)
 secret variables named by the configuration (section 5). It writes logs to stdout.
 
 Ports: **9080** Restate service endpoint, **9090** metrics and `/healthz`, **9095** KEDA
-scaler. All three bind at start; a port already in use stops the process.
+scaler, and **9096** (suggested) the toggle listener when enabled. Each binds at start; a port already in use stops the process.
 
 ### The configuration file (ConfigMap)
 
@@ -324,6 +326,231 @@ A manual model lease on a GPU host that is off wakes it too (under `managed`), s
 separate GPU lease. After a release, a managed NFS host is shut down only when no pod mounts
 it (section 8).
 
+### The toggle listener (Home Assistant)
+
+An optional HTTP listener lets Home Assistant's `rest` switch hold and release manual
+leases by name, with no lease ids and no Restate calls on its side. It is **off unless
+`--toggle-listen` is given** (the same convention as the optional secret files: an absent
+flag means the feature is off) and it **needs `--toggle-token-file`**; each flag refuses to
+parse without the other, and the process stops at start-up if the token file is missing or
+empty, or the port is taken. Suggested address: `0.0.0.0:9096`, like the other listeners.
+There is deliberately no default address: loopback would be unreachable for the client (a
+pod, or a `hostNetwork` pod arriving from the node address), and an all-interfaces default
+would open an unauthenticated-looking port on every install. Open WebUI itself is **not**
+integrated; Home Assistant is the only client this listener is built and documented for.
+
+The token is one line in a mounted Secret, read **on every request** (a rotated Secret takes
+effect without a restart). Every request, including an unknown path, needs
+`Authorization: Bearer <token>`; the comparison takes the same time wherever it differs, a
+wrong or missing token is `401` with `WWW-Authenticate: Bearer`, an empty or unreadable file
+is `503` (never a match), and the token is never logged.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata: { name: flowmanager-toggle, namespace: flowmanager }
+stringData:
+  token: "<a long random string>"       # e.g. openssl rand -hex 32; SOPS-encrypt it in git
+# in the Deployment: args --toggle-listen=0.0.0.0:9096 --toggle-token-file=/etc/toggle/token
+#   volumeMounts: { name: toggle, mountPath: /etc/toggle, readOnly: true }
+#   volumes:      { name: toggle, secret: { secretName: flowmanager-toggle } }
+```
+
+**Plain HTTP, on purpose.** Home Assistant's `rest` platform cannot trust a private CA (only
+`verify_ssl: false`), so this phase adds no TLS to the listener: the bearer token plus the
+network around the port (below) are the controls. The token travels in clear inside the
+cluster; do not expose the port outside it.
+
+**What it does.** Nothing is decided in the listener. Each request is turned into the
+Restate handler a person would call (`acquire_model_lease`, `release_lease`,
+`acquire_host_lease`, `release_host_lease`, `reclaim`, `unreclaim`, `resume`, `leases`) and
+sent through the Restate ingress (`--restate-ingress`, the URL the process already uses), so
+the object's lock, journal and persisted state are used exactly as for any other caller; the
+listener keeps no lease state. Reads come from the lease list the same way and from the last
+tick's report in the process (so a status is absent until this process has ticked).
+
+| Request | Meaning |
+| --- | --- |
+| `GET /v1/leases` | Every model, powered resource and reclaimable resource with its state, and a top-level `needs_attention`. |
+| `GET /v1/models/{model}` | A manual model lease (on = the lease is held, **not** that the model is loaded). |
+| `POST /v1/models/{model}/on`, `/off` | Take or release it. Idempotent: on when held returns the same state; off when not held is a success. |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off` | The manual host lease of a shared host with a power section (the NFS server): powers a managed host on and keeps it up. |
+| `POST /v1/resources/{resource}/resume` | Clears a failed power phase (or a shutdown stopped by mounting pods) after a person fixed the host. `409` if the resource is not stopped. |
+| `GET /v1/reclaims/{resource}`, `POST .../on`, `.../off` | `reclaim` / `unreclaim` of an exclusive resource with a power section ("this GPU is mine"): intake stops, work is cut off after the reclaim timeout, the host is shut down if its power is managed, and it is not woken until released. |
+
+`POST /v1/{models,resources,reclaims}/{name}` with a body of `ON` or `OFF` (also
+`true`/`false`, or JSON `{"state": "on"}` / `{"held": true}`) does the same as `/on` and
+`/off`: that is the shape Home Assistant's REST switch sends to a single URL. Names are the
+config's ids (percent-encoded if needed). A body over 1 KiB is refused.
+
+A state answer, for example `GET /v1/models/llm`:
+
+```json
+{"kind":"model","id":"llm","resource":"cuda-central","held":true,"state":"on",
+ "held_since_ms":1793027881869,"held_for_seconds":120,
+ "status":"waiting_for_host","detail":"cuda-central is powering_on"}
+```
+
+`held` (boolean) and `state` (`"on"` / `"off"`) are always there. `status` and `detail` are
+derived from the last tick's report and are **left out when they cannot be said**:
+
+- model: `active` (in the allowed set), `waiting_for_host` (its host is not up),
+  `host_failed`, `draining` (another model of the resource is winding down, its in-flight work
+  awaited), `pending` (the last tick predates the lease, or another model is still allowed and the
+  report gives no more);
+- host lease (`GET /v1/resources/..`): `power` (the phase as the sequencer holds it, with `since`
+  and, when failed, `during`), `wait` (a list: `min_off` with the seconds left, or
+  `shutdown_held_by_mounts` with `stopped`), `needs_attention`;
+- reclaim: `host_failed`, `powered_off`, `shutting_down`, `draining`, `pending`, the `power`
+  phase, `tick_reason` (the tick's reason in words) and `needs_attention`.
+
+`needs_attention` is true when a person has to act: a resource is in a failed power phase, or
+its shutdown was stopped by mounting pods (`resume` it after fixing the host). It is the same
+condition as the metrics `sched_resource_power_failed == 1` and
+`sched_resource_mounts_veto{state="stopped"} == 1`.
+
+Errors are JSON `{"error": "<message>"}` carrying the handler's own message, with the status
+of the handler's refusal: `400` for a resource that cannot be leased (an exclusive resource
+for a host lease, a shared one or one without a power section for a reclaim), `409` for
+another model already leased on the resource (and for `resume` of a resource that is not
+stopped), `404` for a name the config does not have (the message lists what is configured),
+`405`, `401`, `503` (Restate or the token file unreachable) and `502` (an unexpected answer
+from Restate). An exclusive resource's `GET /v1/resources/..` answers `lease_supported: false`.
+
+**Observability.** Every on/off/resume request (authorized or not) logs one structured line
+`event="toggle"` with `kind` (`model`, `host`, `reclaim`), `name`, `action` (`on`, `off`,
+`resume`), `outcome` and `status` (never the token); the acquire and release themselves log as
+before. Metrics: `sched_toggle_requests_total{endpoint,outcome}` (counted per endpoint
+label, never per name), `sched_manual_lease_age_seconds{kind,target}` for each held manual
+model lease, host lease and reclaim (`kind` is `model`, `host` or `reclaim`), and the existing
+`sched_resource_power_failed` / `sched_resource_mounts_veto` for needs-attention.
+
+**Network.** Expose the port with a named Service port and let only Home Assistant reach it:
+
+```yaml
+# Service ports: add
+    - { name: http-toggle, port: 9096, targetPort: 9096 }   # Home Assistant
+# Deployment ports: add
+            - { name: http-toggle, containerPort: 9096 }
+---
+# Home Assistant runs with hostNetwork: its packets arrive from the NODE address, not a pod
+# address, so a podSelector/namespaceSelector rule will not match it. Allow the node network
+# (the CIDR of the nodes' LAN; how a CNI treats host-network sources differs, e.g. Cilium
+# classifies them as the "host" / "remote-node" entities: check yours). Not tested here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: flowmanager-toggle, namespace: flowmanager }
+spec:
+  podSelector: { matchLabels: { app: flowmanager } }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [ { ipBlock: { cidr: 192.168.2.0/24 } } ]        # the node LAN
+      ports: [ { port: 9096, protocol: TCP } ]
+    # keep the rules for 9080/9090/9095 that you already have: a policy that selects the pod
+    # denies everything else
+```
+
+If Istio runs this workload under `PeerAuthentication` `STRICT` mTLS, a caller without a
+sidecar is refused, and Home Assistant has none (its namespace has no injection; it is
+`pod-security: privileged`). Exempt the toggle port only:
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata: { name: flowmanager-toggle, namespace: flowmanager }
+spec:
+  selector: { matchLabels: { app: flowmanager } }
+  mtls: { mode: STRICT }
+  portLevelMtls:
+    "9096": { mode: PERMISSIVE }
+```
+
+and give 9096 an `AuthorizationPolicy` rule with no `from.principals` (a plain-text caller has
+none); the bearer token and the NetworkPolicy are then what protect the port. The 9080 port
+stays as section 3 describes.
+
+**Home Assistant.** Home Assistant resolves cluster DNS names (`hostNetwork: true` with
+`dnsPolicy: ClusterFirstWithHostNet`), and it already talks to an in-cluster service over plain
+HTTP the same way. Keep the whole header value `Bearer <token>` in an environment variable (or
+`!secret`), because a YAML header cannot concatenate:
+
+```yaml
+# configuration.yaml
+switch:
+  - platform: rest                  # one model: on = a manual lease is held
+    name: Flowmanager LLM lease
+    unique_id: flowmanager_lease_llm
+    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/models/llm
+    state_resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/models/llm
+    method: post
+    body_on: "ON"
+    body_off: "OFF"
+    is_on_template: "{{ value_json.held }}"
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"   # the value is "Bearer <token>"
+    timeout: 20
+  - platform: rest                  # one host: the NFS server kept up
+    name: Flowmanager NFS host lease
+    unique_id: flowmanager_lease_basestar
+    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/basestar-nfs
+    state_resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/basestar-nfs
+    method: post
+    body_on: "ON"
+    body_off: "OFF"
+    is_on_template: "{{ value_json.held }}"
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+    timeout: 20
+  - platform: rest                  # the GPU host reclaimed: "this GPU is mine"
+    name: Flowmanager GPU reclaim
+    unique_id: flowmanager_reclaim_cuda_central
+    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/reclaims/cuda-central
+    state_resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/reclaims/cuda-central
+    method: post
+    body_on: "ON"
+    body_off: "OFF"
+    is_on_template: "{{ value_json.held }}"
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+    timeout: 20
+
+sensor:
+  - platform: rest                  # the richer status of the model lease
+    name: Flowmanager LLM status
+    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/models/llm
+    value_template: "{{ value_json.status | default(value_json.state) }}"
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+
+binary_sensor:
+  - platform: rest                  # a host flowmanager stopped at, waiting for a person
+    name: Flowmanager needs attention
+    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/leases
+    value_template: "{{ value_json.needs_attention }}"
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+
+rest_command:
+  flowmanager_resume_basestar:      # after fixing the host by hand
+    url: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/basestar-nfs/resume
+    method: post
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+```
+
+(The names `flowmanager` / `flowmanager` are the Service and namespace of section 1; the
+`rest` switch fields are from Home Assistant's documentation and were not run against a live
+Home Assistant here.) A switch that is "on" for hours is the risk this design accepts instead
+of an automatic expiry; the age metric lets Prometheus say so:
+
+```yaml
+- alert: FlowmanagerLeaseHeldTooLong      # a forgotten manual lease; tune the hours
+  expr: sched_manual_lease_age_seconds > 6 * 3600
+  for: 10m
+  annotations:
+    summary: "{{ $labels.kind }} lease on {{ $labels.target }} held for over 6 hours"
+```
+
 ## 3. Istio AuthorizationPolicy
 
 mTLS authenticates the peer, an AuthorizationPolicy decides what it may do. The
@@ -345,6 +572,7 @@ named here are guesses of common defaults; use the real ones.
 | flowmanager | Restate ingress | 8080 (Restate default), `POST /Scheduler/main/tick/send` and `POST /Scheduler/main/arm_backstop/send` | HTTP | The only ingress paths the process itself calls. |
 | operators (a person through whatever path is trusted) | Restate ingress | 8080, `POST /Scheduler/main/{leases,last_decision,tick,acquire_model_lease,release_lease,discard_state}`, `POST /Recovery/*/{attempts,discard_attempts}` | HTTP | Section 2's table. Keep the destructive ones (`discard_*`) to operators only. |
 | Open WebUI (later) | Restate ingress | 8080, `POST /Scheduler/main/{acquire_model_lease,release_lease,leases}` | HTTP | Holds a manual model lease. Nothing else. |
+| Home Assistant (`hostNetwork`, no sidecar) | flowmanager | 9096 (when `--toggle-listen` is set) | HTTP, bearer token | The toggle listener (see the toggle listener subsection of section 2): needs a PERMISSIVE port exemption under STRICT mTLS and a NetworkPolicy rule for the node network. flowmanager then calls the Restate ingress for the same handlers. |
 | nobody | Restate ingress | `/Scheduler/main/backstop` | | Not for callers. |
 
 Egress from the flowmanager pod (the services named below are the examples in
@@ -539,6 +767,10 @@ at each poll (`environment variable X is not set`), counted in
 is fixed. Check the three after deploying. The scheduler's own settings are the `SCHED_*`
 variables of section 1. In the manifests, take each token from a `Secret` (SOPS-encrypted
 in git, decrypted by Flux) with `secretKeyRef`, or mount it as a file and use `file:`.
+
+The toggle listener's bearer token (`--toggle-token-file`) is a fourth secret, not named by
+the configuration: a mounted file read on every request (the Secret in the toggle listener
+subsection of section 2). It is never logged and never sent anywhere.
 
 ## 6. KEDA
 
@@ -780,6 +1012,7 @@ event):
   seconds left of the `min_off` wait before a host that flowmanager shut down may be powered on
   again by itself (0 outside it). The power metrics (`sched_resource_power_failed`,
   `sched_power_timeouts_total`, `sched_power_requests_total`) are in the README.
+- `sched_manual_lease_age_seconds{kind,target}`: seconds since each manual model lease (`kind="model"`), manual host lease (`host`) and reclaim (`reclaim`) was granted; alert on a lease held too long. `sched_toggle_requests_total{endpoint,outcome}`: requests to the toggle listener.
 - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
   `sched_tick_trigger_failures_total` (flowmanager could not ask the Restate ingress for a
   tick), `sched_config_generation`, `sched_config_reloads_total{outcome}`
@@ -808,6 +1041,11 @@ event):
   expr: sum by (scheduled_job, event) (increase(sched_job_events_total{event=~"failed|missed|skipped_overlap|start_late|create_failed"}[30m])) > 0
 - alert: FlowmanagerBackupStale          # no success for a week and a day (a job that never succeeded has no series: it counts as 0, so this fires at once on a new install; silence it for the first week); tune per job
   expr: time() - (sched_job_last_success_timestamp_seconds{scheduled_job="backup"} or on() vector(0)) > 8 * 86400
+- alert: FlowmanagerNeedsAttention       # a host in a failed power phase (resume it after fixing it)
+  expr: sched_resource_power_failed == 1
+- alert: FlowmanagerLeaseHeldTooLong     # a forgotten manual lease or reclaim
+  expr: sched_manual_lease_age_seconds > 6 * 3600
+  for: 10m
 - alert: FlowmanagerConfigRejected       # the last good config is still active
   expr: increase(sched_config_reloads_total{outcome=~"rejected|unreadable"}[15m]) > 0
 - alert: FlowmanagerRecoveryFailing

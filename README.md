@@ -205,6 +205,8 @@ PAPERLESS_API_TOKEN=... SPEAKR_API_TOKEN=... \
 restate deployments register http://localhost:9080
 ```
 
+- `--toggle-listen` and `--toggle-token-file` (off unless given) start the Home Assistant toggle
+  listener; see *Toggle listener*.
 - `--keda-listen` (or `SCHED_KEDA_LISTEN`, default `0.0.0.0:9095`) is the KEDA external
   scaler's gRPC address; see below.
 - `--config` (or `SCHED_CONFIG`) is re-read every `--reload-interval`; an invalid file is
@@ -799,6 +801,37 @@ curl -X POST localhost:8080/Scheduler/main/resume \
 # {"resource":"basestar-nfs","cleared":"shutdown_stopped_by_mounts"}
 ```
 
+### Toggle listener (Home Assistant)
+
+`--toggle-listen` (`SCHED_TOGGLE_LISTEN`; suggested `0.0.0.0:9096`) with `--toggle-token-file`
+(`SCHED_TOGGLE_TOKEN_FILE`) starts a small authenticated HTTP listener so that Home Assistant's
+`rest` switch can hold and release manual leases by name. It is **off when the flag is absent**
+and the two flags need each other; the token is read from the file on every request, every
+request needs `Authorization: Bearer <token>` (compared in constant time, `401` otherwise), and
+the token is never logged. It is plain HTTP, on purpose (Home Assistant cannot trust a private
+CA); the token and the network policy are the controls. Open WebUI itself is not integrated.
+
+| Request | Meaning |
+| --- | --- |
+| `GET /v1/leases` | every model, powered resource and reclaimable resource with its state, and `needs_attention` |
+| `GET /v1/models/{model}`, `POST .../on`, `.../off` | the manual model lease (on = held, not "loaded") |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `POST .../resume` | the manual host lease; `resume` clears a stopped power phase |
+| `GET /v1/reclaims/{resource}`, `POST .../on`, `.../off` | `reclaim` / `unreclaim` of an exclusive resource with a power section |
+
+`POST /v1/<kind>/{name}` with the body `ON` or `OFF` is the same as `/on` and `/off`. On and
+off are idempotent (off when not held is a success), and nobody sees a lease id. Each request
+goes to the matching `Scheduler` handler through the Restate ingress, so locking and
+journaling are the handlers'; the handler's refusal comes back as `{"error": "<message>"}`
+with its status (`400` unsuitable resource, `409` another model leased or nothing to resume,
+`404` unknown name). A state read has `held` and `state`, and, when the last tick's report
+supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draining`,
+`host_failed`, `pending`), `power`, `wait` and `needs_attention`; a field that cannot be
+derived is left out. Every on/off/resume request logs one `event="toggle"` line, is counted in
+`sched_toggle_requests_total{endpoint,outcome}`, and a held lease shows in
+`sched_manual_lease_age_seconds{kind,target}`. The flags, the token Secret, the NetworkPolicy and
+`PeerAuthentication` notes for a `hostNetwork` client, the Home Assistant YAML and an alert
+are in `docs/kubernetes_setup.md` (the toggle listener subsection of section 2).
+
 ## Scheduled jobs
 
 A scheduled job starts a Kubernetes Job on a cron schedule after taking what it needs. The
@@ -905,6 +938,10 @@ curl -X POST localhost:8080/Scheduler/main/trigger_job \
 registrations in `metrics.rs`; labelled counters appear after their first event):
 
 - `sched_tick_decisions_total{kind}`: ticks by decision kind (a replayed tick is not counted again).
+- `sched_manual_lease_age_seconds{kind,target}`: seconds since each manual lease was granted, as of
+  the last tick: `kind` `model` (target the model), `host` (the manual host lease) or `reclaim`
+  (target the resource); alert on a lease held for hours. `sched_toggle_requests_total{endpoint,outcome}`:
+  requests to the toggle listener (a fixed set of endpoint and outcome labels, never a name).
 - `sched_persisted_state_errors_total{key}`: ticks and lease requests that could not read a
   persisted document (`scheduler_state`, `lease_book`); alert on any increase.
 - `sched_resource_phase_age_seconds{resource,axis,phase}`: how long each resource has been
