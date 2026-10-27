@@ -2,10 +2,13 @@
 
 use std::collections::BTreeSet;
 
-use sched_model::{Intent, Millis, ModelId, PowerWant, ResourceId, Step, WaitReason};
+use sched_model::{
+    Intent, Millis, ModelId, PowerTransition, PowerWant, ResourceId, Step, WaitReason,
+};
 use sched_observe::ObserverState;
 
 use crate::cache::InputAge;
+use crate::tick::{PowerFailed, PowerRequestFailure, PowerTimeout};
 
 /// The metric label of a step. A fixed set, so label cardinality is bounded.
 pub fn step_kind(step: &Step) -> &'static str {
@@ -45,6 +48,56 @@ pub const KIND_DEMAND_UNSUPPORTED: &str = "demand_unsupported";
 /// `params`, so nothing polls it, and that has never reported. A config gap; it counts as
 /// no demand.
 pub const KIND_DEMAND_UNPOLLED: &str = "demand_unpolled";
+
+/// Metric label for a tick in which a resource is in the failed power state: its power-on
+/// or shutdown timed out and flowmanager stopped. Never [`KIND_IDLE`].
+pub const KIND_POWER_FAILED: &str = "power_failed";
+
+/// Adds the power failures to a decision's kinds and reason: each resource in the failed
+/// state (with what a person must do), each timeout raised in this tick, and each power
+/// request whose call failed (so a failed request is never read as a success).
+pub fn with_power(
+    mut kinds: Vec<String>,
+    mut reason: String,
+    failed: &[PowerFailed],
+    timeouts: &[PowerTimeout],
+    request_failures: &[PowerRequestFailure],
+) -> (Vec<String>, String) {
+    if !failed.is_empty() {
+        kinds.push(KIND_POWER_FAILED.to_string());
+        kinds.sort();
+        kinds.dedup();
+    }
+    for f in request_failures {
+        reason.push_str(&format!(
+            "; power {} of {} FAILED at {}ms: {} (not retried; the host's state is followed from its reachability and the transition times out)",
+            f.action.as_str(),
+            f.resource,
+            f.at.as_u64(),
+            f.error
+        ));
+    }
+    for t in timeouts {
+        reason.push_str(&format!(
+            "; ALERT: {} of {} timed out in this tick",
+            t.during.as_str(),
+            t.resource
+        ));
+    }
+    for f in failed {
+        let wanted = match f.during {
+            PowerTransition::PoweringOn => "up",
+            PowerTransition::ShuttingDown => "down",
+        };
+        reason.push_str(&format!(
+            "; {} is in the FAILED power state since {}ms ({} timed out): nothing is allowed on it, no power action will be taken for it by flowmanager, and it clears when the host is observed {wanted} or a person acts (control: manual also clears it)",
+            f.resource,
+            f.since.as_u64(),
+            f.during.as_str()
+        ));
+    }
+    (kinds, reason)
+}
 
 /// Classes whose demand is unknown, by why. None of them is "zero demand".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -146,6 +199,9 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::HostNotUp => "the host is not up",
         WaitReason::PoweringOn => "the host is powering on",
         WaitReason::ShuttingDown => "the host is shutting down",
+        WaitReason::PowerFailed => {
+            "the host's power transition timed out and flowmanager stopped (a person must act; it is not retried)"
+        }
         WaitReason::MinDwell => "the allowed model has not been allowed for its minimum dwell",
         WaitReason::NotPreemptible => "the allowed model's active work is not preemptible",
         WaitReason::InFlightWork => "in-flight work reported by its queue is still running",

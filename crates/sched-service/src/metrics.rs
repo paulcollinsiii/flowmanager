@@ -8,7 +8,7 @@ use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Opts, Registry, TextEncoder,
 };
-use sched_model::{Millis, ModePhase, PowerPhase, SchedState};
+use sched_model::{Millis, ModePhase, PowerPhase, PowerTransition, SchedState};
 
 use sched_observe::ObserverState;
 
@@ -33,6 +33,10 @@ pub struct Metrics {
     recovery_runs: IntCounterVec,
     recovery_requeues: IntCounterVec,
     power_requests: IntCounterVec,
+    power_timeouts: IntCounterVec,
+    power_failed: GaugeVec,
+    /// Resources with `power_failed` series, to drop those that leave the state.
+    power_failed_resources: Mutex<HashSet<String>>,
     /// Per (resource, axis), the phase whose series is set and when it began.
     phases: Mutex<HashMap<PhaseKey, (&'static str, Millis)>>,
 }
@@ -47,6 +51,7 @@ fn power_phase(p: &PowerPhase) -> (&'static str, Option<Millis>) {
         PowerPhase::PoweringOn { since } => ("powering_on", Some(*since)),
         PowerPhase::On { since } => ("on", Some(*since)),
         PowerPhase::ShuttingDown { since } => ("shutting_down", Some(*since)),
+        PowerPhase::Failed { since, .. } => ("failed", Some(*since)),
     }
 }
 
@@ -172,7 +177,25 @@ impl Metrics {
             &["resource", "action", "outcome"],
         )
         .unwrap();
+        let power_timeouts = IntCounterVec::new(
+            Opts::new(
+                "sched_power_timeouts_total",
+                "Power transitions that outlasted their configured timeout, by resource and the transition (powering_on, shutting_down). Each one put the resource in the failed state and raised the power_timeout alert; the scheduler never retries",
+            ),
+            &["resource", "during"],
+        )
+        .unwrap();
+        let power_failed = GaugeVec::new(
+            Opts::new(
+                "sched_resource_power_failed",
+                "1 while the resource is in the failed power state (its power-on or shutdown timed out; the scheduler has stopped and a person must act), else 0, by resource and the transition that timed out. Alert on this being 1",
+            ),
+            &["resource", "during"],
+        )
+        .unwrap();
         registry.register(Box::new(power_requests.clone())).unwrap();
+        registry.register(Box::new(power_timeouts.clone())).unwrap();
+        registry.register(Box::new(power_failed.clone())).unwrap();
         registry.register(Box::new(recovery_runs.clone())).unwrap();
         registry
             .register(Box::new(recovery_requeues.clone()))
@@ -215,6 +238,9 @@ impl Metrics {
             recovery_runs,
             recovery_requeues,
             power_requests,
+            power_timeouts,
+            power_failed,
+            power_failed_resources: Mutex::new(HashSet::new()),
             phases: Mutex::new(HashMap::new()),
         }
     }
@@ -345,6 +371,42 @@ impl Metrics {
 
     /// Counts one power action by outcome (see the metric's help). `resource` must be a
     /// configured resource id.
+    /// Counts a power transition that timed out (see the metric's help).
+    pub fn power_timeout(&self, resource: &str, during: &str) {
+        self.power_timeouts
+            .with_label_values(&[resource, during])
+            .inc();
+    }
+
+    /// Sets `sched_resource_power_failed` from the state: 1 for the transition a resource
+    /// is failed in, 0 for the other; resources that left the state lose their series.
+    pub fn set_power_failed(&self, state: &SchedState) {
+        let mut known = self
+            .power_failed_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (id, st) in &state.resources {
+            for t in [PowerTransition::PoweringOn, PowerTransition::ShuttingDown] {
+                let failed = matches!(st.power, PowerPhase::Failed { during, .. } if during == t);
+                self.power_failed
+                    .with_label_values(&[id.as_str(), t.as_str()])
+                    .set(if failed { 1.0 } else { 0.0 });
+            }
+        }
+        known.retain(|id| {
+            let keep = state.resources.keys().any(|k| k.as_str() == id);
+            if !keep {
+                for t in [PowerTransition::PoweringOn, PowerTransition::ShuttingDown] {
+                    let _ = self
+                        .power_failed
+                        .remove_label_values(&[id.as_str(), t.as_str()]);
+                }
+            }
+            keep
+        });
+        known.extend(state.resources.keys().map(|k| k.to_string()));
+    }
+
     pub fn power_request(&self, resource: &str, action: &str, outcome: &str) {
         self.power_requests
             .with_label_values(&[resource, action, outcome])

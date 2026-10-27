@@ -1,0 +1,70 @@
+description: "A host that never goes down: after the shutdown request the NFS host stays observed up. At its shutdown_timeout (10m in the example) it enters the failed power state: a visible wait, nothing allowed on it, and no further power_off or power_on, however long it stays up and whatever is queued. It clears when the host is observed down."
+power_control: managed
+initial_state:
+  resources:
+    basestar-nfs: { power: { phase: "on", since: 0 }, mode: { phase: idle }, managed: true }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  # Idle for idle_grace (10m): shut down.
+  - at: 100600000
+    refresh: true
+    expect:
+      steps: [{ type: power_off, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 100630000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: shutting_down }]
+      allowed: { models: [], classes: [] }
+  # One second short of the timeout, the host still answering.
+  - at: 101199000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: shutting_down }]
+      allowed: { models: [], classes: [] }
+  # The timeout: failed, and no power step.
+  - at: 101200000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
+      allowed: { models: [], classes: [] }
+  # Work arrives and an hour passes: still failed, still no power step, nothing allowed.
+  - at: 104800000
+    refresh: true
+    observe:
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 1, in_flight: 0 } }
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
+      allowed: { models: [], classes: [] }
+  - at: 122800000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
+      allowed: { models: [], classes: [] }
+  # A person took the host down: observed down, the failed state clears (work is
+  # queued, so a fresh power-on follows from the new Off state).
+  - at: 122830000
+    refresh: true
+    observe:
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [] }

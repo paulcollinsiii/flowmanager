@@ -675,3 +675,52 @@ fn recovery_for_a_class_that_is_not_allowed_or_has_no_failed_items_is_a_violatio
         "{v:?}"
     );
 }
+
+#[test]
+fn a_power_step_or_a_silent_exit_from_the_failed_power_state_is_a_violation() {
+    let failed = prev(&format!(
+        "    cuda-central: {{ power: {{ phase: failed, since: {}, during: powering_on }}, mode: {{ phase: idle }}, managed: true }}\n",
+        NOW - MIN
+    ));
+    // The host is observed down: nothing it was waiting for. A new power-on is a violation,
+    // and so is leaving the failed state.
+    let down = {
+        let mut o = zero_pods_and_up(&[]);
+        o.push(sched_model::Observation {
+            source: "cluster-pods".into(),
+            observed_at: Millis(NOW),
+            fidelity: sched_model::Fidelity::Event,
+            value: sched_model::ObservedValue::ResourceUp {
+                resource: "cuda-central".into(),
+                up: false,
+            },
+        });
+        snap(o, vec![])
+    };
+    let v = run(
+        &down,
+        &failed,
+        vec![Step::PowerOn {
+            resource: "cuda-central".into(),
+        }],
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 11") && m.contains("failed power state")),
+        "{v:?}"
+    );
+    let mut d = decision(vec![]);
+    d.state = prev(&format!(
+        "    cuda-central: {{ power: {{ phase: on, since: {NOW} }}, mode: {{ phase: idle }} }}\n"
+    ));
+    let v = check_with(&down, &failed, &d);
+    assert!(
+        v.iter()
+            .any(|m| m.contains("invariant 11") && m.contains("left the failed power state")),
+        "{v:?}"
+    );
+    // Observed up (what a power-on was after), leaving it is fine.
+    let up = snap(zero_pods_and_up(&["cuda-central"]), vec![]);
+    let v = check_with(&up, &failed, &d);
+    assert!(!v.iter().any(|m| m.contains("invariant 11")), "{v:?}");
+}

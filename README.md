@@ -128,7 +128,7 @@ What is carried out and what is not:
   its power phase is what is observed (a fresh "up" reads on, a fresh "down" off), and work
   that needs a host that is off waits (`wait ... the host is not up`) for a person to power
   it on, including a manual model lease. A powering-on or shutting-down phase left in the
-  persisted state by managed control converges to the observed phase. `managed` (the
+  persisted state by managed control (including a failed one, see *Power actions*) converges to the observed phase. `managed` (the
   scheduler powers hosts on and off) is described under *Power actions* below.
 - **Stopping in-flight work has no actuator.** The
   sequencer still takes these steps (its state moves on as if they happened), and each one
@@ -325,7 +325,7 @@ The object keeps its state in Restate, under these keys:
 
 | Key | Holds |
 | --- | --- |
-| `scheduler_state` | Versioned document: the sequencer state (per resource the power phase: off, powering on, on, shutting down; and mode phase: idle, or serving with its wind-down; with when each began) and which configured sources have ever reported values. |
+| `scheduler_state` | Versioned document: the sequencer state (per resource the power phase: off, powering on, on, shutting down, failed (a power transition timed out); and mode phase: idle, or serving with its wind-down; with when each began) and which configured sources have ever reported values. |
 | `lease_book` | Versioned document: the leases held and the counter lease ids are drawn from. |
 | `backstop_epoch` | The current backstop chain (a number). |
 
@@ -366,7 +366,9 @@ included). Instead:
 switching rejects the shipped config: a gate class (a requirement on an exclusive resource
 without a model) fails validation with "exclusive; a model is required", and a config
 without a pods source is refused as well. Deploy the previous binary with the previous
-config (the persisted state itself is readable by both builds).
+config (the persisted state is readable by both builds, except a `failed` power phase,
+which only this build writes: a resource in that phase has to be recovered with
+`discard_state` before the older build can read the document).
 
 To recover, either deploy the build that wrote the document, or discard it. Discarding
 `scheduler_state` restarts the sequencer from observation: no model is allowed until the
@@ -499,7 +501,10 @@ harmless to repeat).
   down; that is success).
 - **Config** (`resources[].power`, typed and checked at load; see `config/example.yaml`):
   `wake_on_lan: {router_url, interface (default lan), mac}` and
-  `shutdown: {host, port (default 22), user, host_key}`. `managed` requires both. A MAC or
+  `shutdown: {host, port (default 22), user, host_key}`; `router_url` must be a plain
+  `https://` base URL, without credentials, a query string or a fragment (the API path is
+  appended to it). `managed` requires both. Optional `power_on_timeout` and
+  `shutdown_timeout` (see below). A MAC or
   an SSH target may not be shared by two resources. A reload that turns a host `managed`
   applies like any other change; one that leaves it incomplete is rejected and the previous
   config stays.
@@ -513,9 +518,41 @@ harmless to repeat).
   go down is beyond the scheduler's scope, and a retry risks flapping it. The failure is
   logged at error level (`event="power_request_failed"`), counted
   (`sched_power_requests_total{resource,action,outcome="failed"}`) and stored; the
-  invocation still succeeds, so Restate does not retry it either. The sequencer has already
-  recorded the step (the host reads as powering on or shutting down) and follows the host's
-  observed reachability from there; timeouts for those phases are later work.
+  invocation still succeeds, so Restate does not retry it either. The next ticks also say
+  so: the `TickReport` (`last_decision`) lists it in `power_request_failures` and the
+  `reason` carries `power on of <resource> FAILED at <t>ms: <error>` for as long as the
+  resource is powering on, shutting down or failed. (This is in memory of the process that
+  ran the request: after a restart only the log, the metric and `last_action` have it. A
+  request that failed is never reported as success: the sequencer's `powering on` /
+  `shutting down` phase means a request was decided, not that it was accepted.) The
+  sequencer has recorded the step and follows the host's observed reachability from there,
+  until the timeout below.
+- **Power transitions time out: alert and stop.** A power-on that is not observed up within
+  `power_on_timeout` (default 10m), or a shutdown not observed down within
+  `shutdown_timeout` (default 15m), moves the resource to the **failed** power phase
+  (`{phase: failed, since, during: powering_on|shutting_down}` in `scheduler_state`). Both
+  are set per resource under `resources[].power`, must be above 0, above
+  `policy.host_reading_stale_after` and at most 1d, and only matter under `managed` (a
+  `manual` host has no such phase). In the failed phase flowmanager:
+  - raises the alert once: an error log line with `event="power_timeout"`, a count in
+    `sched_power_timeouts_total{resource,during}` and a `power_timeouts` entry in that
+    tick's `TickReport`;
+  - stays visibly failed: `sched_resource_power_failed{resource,during} == 1` (alert on
+    it), `sched_resource_phase_age_seconds{axis="power",phase="failed"}`, every tick's
+    `reason` ends with `<resource> is in the FAILED power state ...`, the report's `kinds`
+    has `power_failed` and `power_failed` lists the resource, and the resource's step is
+    `wait ... power_failed`;
+  - allows nothing on that host (a model, or a class that requires it), exactly as while it
+    is powering on or shutting down. Other resources keep scheduling: their state machines
+    and the models and classes that need only them are unaffected by one resource's failure;
+  - **never takes a power action for it again**, however long work stays queued or the
+    host stays as it is. Waking or shutting it down is for a person.
+  It leaves the failed phase only when a fresh reachability reading shows the state the
+  transition was after (up after a power-on, down after a shutdown), which is also what
+  happens when a person fixes or powers the host, or when the resource is switched to
+  `control: manual` in the config (the phase then simply follows observation). No lease or
+  reclaim clears it. A host that comes back down to `off` while work is queued is then
+  treated like any off host (a manual lease or a power-changing class may wake it, as before).
 - `Power/{resource}/run` is ingress-private; `Power/{resource}/last_action` returns the
   last action (`{action, at, outcome: requested|failed, error}`, `null` if none).
 
@@ -598,7 +635,7 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   persisted document (`scheduler_state`, `lease_book`); alert on any increase.
 - `sched_resource_phase_age_seconds{resource,axis,phase}`: how long each resource has been
   in its current phase at the last tick, one series per axis: `axis="power"` with `phase`
-  `off`, `powering_on`, `on` or `shutting_down`, and `axis="mode"` with `phase` `idle`,
+  `off`, `powering_on`, `on`, `shutting_down` or `failed`, and `axis="mode"` with `phase` `idle`,
   `serving` (measured from the tick the model was allowed) or `winding_down` (a serving
   model whose intake is paused). `loading` and `draining` no longer exist (no phase waits on
   pods); update alerts that name them. When the phase changes, the old phase's series is
@@ -614,6 +651,10 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   (`unknown_subject`) dropped because the config has no place for them.
 - `sched_recovery_runs_total{class,outcome}` and `sched_recovery_requeues_total{class,outcome}`:
   runs and items of a class's recovery action (see *Recovery actions* for the outcomes).
+- `sched_resource_power_failed{resource,during}`: 1 while the resource is in the failed power
+  phase (a power-on or shutdown timed out; alert on `== 1`), else 0.
+- `sched_power_timeouts_total{resource,during}`: power transitions that timed out (alert on
+  any increase; the resource then stays failed until a person acts).
 - `sched_power_requests_total{resource,action,outcome}`: power actions by `on`/`off` and
   `requested` (accepted by the router or host), `failed` (never retried automatically; alert on
   any increase) or `not_wired` (the active config no longer has the host under managed control).
@@ -632,7 +673,8 @@ Notes:
 - **Decision kinds**: `sched_tick_decisions_total{kind}` counts ticks (once per distinct
   kind in a tick), not actions; ticks run on every change and on the backstop. Kinds
   include the step kinds (`allow_model`, `drain_model`, `pause_intake`, `power_on`,
-  `power_off`, `kill_in_flight`, `run_recovery`, `wait`), `idle`, `error`, `pinned` (a
+  `power_off`, `kill_in_flight`, `run_recovery`, `wait`), `idle`, `error`, `power_failed` (a
+  resource is in the failed power phase), `pinned` (a
   manual model lease pins a model; such a tick is never `idle`, even with no step), and
   `demand_unknown` (something should be reporting the demand, an observer runs or the source
   has reported before, and it is silent or stale), `demand_unsupported` (the source kind has
@@ -680,9 +722,9 @@ Notes:
 
 Read these before trusting a "no demand" or "idle" line, or a phase.
 
-- **Kill steps are not executed** (nor power steps, which only appear under
-  `power.control: managed`). Recovery is: see *Recovery actions*. The sequencer records
-  them as taken:
+- **Kill steps are not executed.** Power steps (only under `power.control: managed`) and
+  recovery are carried out: see *Power actions* and *Recovery actions*. The sequencer
+  records every one of them as taken:
   - `KillInFlight` marks the class as stopped and stops waiting for it (at `drain_timeout`
     or the class's `kill_timeout` after the wind-down started, forced or not). The model is
     withdrawn (and the next one allowed) in the same tick when no other class of it is
@@ -695,10 +737,12 @@ Read these before trusting a "no demand" or "idle" line, or a phase.
     crash between sending a re-queue request and journaling its result can repeat that one
     request.
   - `PauseIntake` stops no consumer (see above).
-  - Under `managed` without an actuator (not a supported setup before M4): `PowerOn` moves
-    the host to "powering on" until it is seen up; `PowerOff` moves it to "shutting down",
-    and a host that stays up is never read back as on, so nothing is allowed on it until it
-    is seen down. Under `manual` neither step is ever emitted.
+  - `PowerOn` and `PowerOff` (only under `managed`) are carried out (see *Power actions*).
+    `PowerOn` moves the host to "powering on" until it is seen up; `PowerOff` moves it to
+    "shutting down", and a host that stays up is never read back as on, so nothing is
+    allowed on it until it is seen down. Neither phase waits for ever: at the
+    `power_on_timeout` / `shutdown_timeout` the resource enters the failed phase, alerts and
+    stops (no automatic retry). Under `manual` neither step is ever emitted.
 - **Removing a model from the config cuts its work off at once.** A model removed while
   it is allowed leaves the allowed set at the next tick after the reload, with no dwell,
   grace or wind-down (its classes are gone with it, so there is nothing left to wait for),

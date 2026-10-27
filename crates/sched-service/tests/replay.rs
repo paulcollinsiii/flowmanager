@@ -42,11 +42,13 @@ scenarios! {
     gate_follows_host_readiness => "gate-follows-host-readiness.yaml",
     failed_transcriptions => "failed-transcriptions.yaml",
     failed_never_ages => "failed-never-ages.yaml",
+    host_never_comes_up => "host-never-comes-up.yaml",
+    host_never_goes_down => "host-never-goes-down.yaml",
 }
 
 #[test]
 fn every_scenario_file_has_a_test() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
     let count = std::fs::read_dir(dir).unwrap().count();
-    assert_eq!(count, 13, "add new scenario files to the scenarios! list");
+    assert_eq!(count, 15, "add new scenario files to the scenarios! list");
 }

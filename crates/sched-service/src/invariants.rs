@@ -16,7 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sched_model::{
     Capability, ClassId, ClassSpec, Config, Intent, LeaseKind, Millis, ModePhase, ModelId,
-    Observation, ObservedValue, ResourceId, ResourceKind, SchedState, Snapshot, SourceId, Step,
+    Observation, ObservedValue, PowerPhase, PowerTransition, ResourceId, ResourceKind, SchedState,
+    Snapshot, SourceId, Step,
 };
 use sched_sequencer::Decision;
 
@@ -318,6 +319,38 @@ pub fn check(
             .any(|s| matches!(s, Step::PauseIntake { class: c } if c == class))
         {
             out.push(format!("allowed class {class} whose intake is paused"));
+        }
+    }
+
+    // 11. A resource whose power transition timed out is never acted on again by the
+    // scheduler for that reason: unless a fresh reading shows what the transition was after
+    // (up after a power-on, down after a shutdown) or its control is manual (a person is in
+    // charge), it stays failed, with no power step and nothing allowed on it.
+    for (id, before) in &prev.resources {
+        let PowerPhase::Failed { during, .. } = before.power else {
+            continue;
+        };
+        let wanted_seen = match during {
+            PowerTransition::PoweringOn => host_up(config, snapshot, id, safety),
+            PowerTransition::ShuttingDown => host_seen_down(config, snapshot, id, safety),
+        };
+        if wanted_seen || !managed_power(config, id) {
+            continue;
+        }
+        if let Some(step) = decision.steps.iter().find(|s| {
+            matches!(s, Step::PowerOn { resource } | Step::PowerOff { resource } if resource == id)
+        }) {
+            out.push(format!(
+                "invariant 11: {step:?} for {id}, which is in the failed power state"
+            ));
+        }
+        if let Some(after) = decision.state.resource(id)
+            && !matches!(after.power, PowerPhase::Failed { .. })
+        {
+            out.push(format!(
+                "invariant 11: {id} left the failed power state ({during:?}) to {:?} without what the transition was after",
+                after.power
+            ));
         }
     }
 

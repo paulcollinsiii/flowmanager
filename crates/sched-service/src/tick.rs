@@ -17,14 +17,14 @@
 //! sends the resource's `Power` or the class's `Recovery` object a one-way request (see
 //! `recovery`), so a slow or failing service can never delay a tick.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{
-    AllowedSet, Capability, ClassId, Lease, LeaseId, Millis, ModelId, PublishedAllowed, ResourceId,
-    SchedState, SourceId, Step, class_work,
+    AllowedSet, Capability, ClassId, Lease, LeaseId, Millis, ModelId, PowerPhase, PowerTransition,
+    PublishedAllowed, ResourceId, SchedState, SourceId, Step, class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ use crate::config_source::ConfigHolder;
 use crate::core::decide;
 use crate::leases;
 use crate::metrics::Metrics;
+use crate::power::PowerAction;
 use crate::reason::{self, DemandGaps};
 
 /// One source's input age in a [`TickReport`].
@@ -95,6 +96,67 @@ impl InputReport {
     }
 }
 
+/// A resource in the failed power state, in a [`TickReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerFailed {
+    pub resource: ResourceId,
+    /// The transition that timed out.
+    pub during: PowerTransition,
+    /// When the timeout expired.
+    pub since: Millis,
+}
+
+/// A power transition that timed out in this tick: the alert (see the `power_timeout` log
+/// event and `sched_power_timeouts_total`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerTimeout {
+    pub resource: ResourceId,
+    pub during: PowerTransition,
+    /// When the transition began, if the previous state said.
+    pub started_at: Option<Millis>,
+    pub at: Millis,
+}
+
+/// A power request whose call failed, as the `Power` object reported it to this process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerRequestFailure {
+    pub resource: ResourceId,
+    pub action: PowerAction,
+    pub at: Millis,
+    pub error: String,
+}
+
+/// The resources failed in `next`, and those that entered the failed state since `prev`.
+fn power_report(prev: &SchedState, next: &SchedState) -> (Vec<PowerFailed>, Vec<PowerTimeout>) {
+    let mut failed = Vec::new();
+    let mut timeouts = Vec::new();
+    for (id, st) in &next.resources {
+        let PowerPhase::Failed { since, during } = st.power else {
+            continue;
+        };
+        failed.push(PowerFailed {
+            resource: id.clone(),
+            during,
+            since,
+        });
+        let before = prev.resource(id).map(|p| p.power);
+        if !matches!(before, Some(PowerPhase::Failed { .. })) {
+            timeouts.push(PowerTimeout {
+                resource: id.clone(),
+                during,
+                started_at: match before {
+                    Some(PowerPhase::PoweringOn { since } | PowerPhase::ShuttingDown { since }) => {
+                        Some(since)
+                    }
+                    _ => None,
+                },
+                at: since,
+            });
+        }
+    }
+    (failed, timeouts)
+}
+
 /// What a tick decided, for logs and for the `last_decision` handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TickReport {
@@ -140,6 +202,19 @@ pub struct TickReport {
     /// The sequencer state after this tick (unchanged from before if the tick failed).
     #[serde(default)]
     pub state: SchedState,
+    /// Resources in the failed power state: a power-on or shutdown outlasted its timeout and
+    /// flowmanager stopped (it never retries; a person must act). Allowed: nothing on them.
+    #[serde(default)]
+    pub power_failed: Vec<PowerFailed>,
+    /// Power transitions that timed out in this very tick (the alert fires once, then the
+    /// resource stays in `power_failed`).
+    #[serde(default)]
+    pub power_timeouts: Vec<PowerTimeout>,
+    /// Power requests that failed (the call to the router or the host), for resources still
+    /// powering on, shutting down or failed. A failed request is not retried; the host is
+    /// followed from its reachability and the transition times out.
+    #[serde(default)]
+    pub power_request_failures: Vec<PowerRequestFailure>,
     pub inputs: Vec<InputReport>,
     /// Whether observations changed since the previous tick of this process.
     pub input_changed: bool,
@@ -214,6 +289,9 @@ pub struct Shared {
     /// The latest tick report this process published (decided or failed); what
     /// `last_decision` returns. Kept in memory so the report is journaled once per tick.
     last_report: Mutex<Option<TickReport>>,
+    /// The latest failed power request per resource, as the `Power` object reported it. In
+    /// memory: the durable record is the `Power` object's `last_action`.
+    power_failures: Mutex<BTreeMap<ResourceId, PowerRequestFailure>>,
 }
 
 impl Shared {
@@ -229,6 +307,7 @@ impl Shared {
             changed: tokio::sync::Notify::new(),
             allowed: watch::channel(None).0,
             last_report: Mutex::new(None),
+            power_failures: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -238,6 +317,57 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Records the outcome of a power request for the next tick's report: a failure is kept
+    /// (it makes the transition's report say so), a success clears the resource's entry.
+    pub fn note_power_request(
+        &self,
+        resource: &ResourceId,
+        action: PowerAction,
+        at: Millis,
+        error: Option<&str>,
+    ) {
+        let mut m = self
+            .power_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match error {
+            Some(e) => {
+                m.insert(
+                    resource.clone(),
+                    PowerRequestFailure {
+                        resource: resource.clone(),
+                        action,
+                        at,
+                        error: e.to_string(),
+                    },
+                );
+            }
+            None => {
+                m.remove(resource);
+            }
+        }
+    }
+
+    /// The failed power requests that still matter for `state`: those of resources powering
+    /// on, shutting down or failed. Entries of resources that left those phases are dropped.
+    fn power_request_failures(&self, state: &SchedState) -> Vec<PowerRequestFailure> {
+        let mut m = self
+            .power_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        m.retain(|id, _| {
+            state.resource(id).is_some_and(|st| {
+                matches!(
+                    st.power,
+                    PowerPhase::PoweringOn { .. }
+                        | PowerPhase::ShuttingDown { .. }
+                        | PowerPhase::Failed { .. }
+                )
+            })
+        });
+        m.values().cloned().collect()
     }
 
     /// Remembers in the cache which sources reported before, as the durable state says.
@@ -277,6 +407,9 @@ impl Shared {
             leases: vec![],
             ignored_leases: vec![],
             state: SchedState::default(),
+            power_failed: vec![],
+            power_timeouts: vec![],
+            power_request_failures: vec![],
             inputs: vec![],
             input_changed: false,
             error: Some(format!("persisted state cannot be read: {text}")),
@@ -449,6 +582,19 @@ impl Shared {
                     Some(e.to_string()),
                 ),
             };
+        let (power_failed, power_timeouts) = power_report(&durable.state, &state);
+        let power_request_failures = self.power_request_failures(&state);
+        let (kinds, reason) = if error.is_none() {
+            reason::with_power(
+                kinds,
+                reason,
+                &power_failed,
+                &power_timeouts,
+                &power_request_failures,
+            )
+        } else {
+            (kinds, reason)
+        };
         let report = TickReport {
             config_generation: config.generation(),
             at: now,
@@ -469,6 +615,9 @@ impl Shared {
             leases,
             ignored_leases,
             state,
+            power_failed,
+            power_timeouts,
+            power_request_failures,
             inputs: ages.iter().map(InputReport::from).collect(),
             input_changed: changed,
             error,
@@ -501,6 +650,13 @@ impl Shared {
         let ages: Vec<InputAge> = r.inputs.iter().map(InputReport::to_input_age).collect();
         self.metrics.set_input_ages(&ages);
         self.metrics.set_phases(r.at, &r.state);
+        self.metrics.set_power_failed(&r.state);
+        if !replayed {
+            for t in &r.power_timeouts {
+                self.metrics
+                    .power_timeout(t.resource.as_str(), t.during.as_str());
+            }
+        }
         self.metrics.tick_finished_at(r.at);
         log_tick(r, &reason::format_inputs(&ages), replayed);
         *self.last_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
@@ -557,6 +713,23 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
         unpolled_demand = ?ids(&r.unpolled_demand),
         "tick"
     );
+    for t in &r.power_timeouts {
+        tracing::error!(
+            event = "power_timeout",
+            resource = %t.resource,
+            during = t.during.as_str(),
+            started_at_ms = ?t.started_at.map(Millis::as_u64),
+            at_ms = t.at.as_u64(),
+            replayed,
+            "ALERT: {} of {} did not complete in time; flowmanager stops here and will not retry any power action for it: nothing is allowed on it until it is observed {} or a person acts",
+            t.during.as_str(),
+            t.resource,
+            match t.during {
+                PowerTransition::PoweringOn => "up",
+                PowerTransition::ShuttingDown => "down",
+            },
+        );
+    }
     for step in &r.not_executed {
         tracing::warn!(
             generation = r.config_generation,

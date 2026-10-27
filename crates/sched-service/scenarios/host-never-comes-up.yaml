@@ -1,0 +1,63 @@
+description: "A host that never comes up: after a Wake-on-LAN the NFS host is never observed up. At its power_on_timeout (5m in the example) it enters the failed power state: a visible wait, nothing allowed on it, and no further power_on, however long the work stays queued and the observations stay fresh. It clears when the host is observed up."
+power_control: managed
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 1, in_flight: 0 } }
+    expect:
+      steps: [{ type: power_on, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 100030000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: powering_on }]
+      allowed: { models: [], classes: [] }
+  # One second short of the timeout.
+  - at: 100299000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: powering_on }]
+      allowed: { models: [], classes: [] }
+  # The timeout: failed, and no power step.
+  - at: 100300000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
+      allowed: { models: [], classes: [] }
+  # An hour, six hours and a day later: still failed, still no power step.
+  - at: 103900000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
+      allowed: { models: [], classes: [] }
+  - at: 121900000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
+      allowed: { models: [], classes: [] }
+  - at: 186400000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: power_failed }]
+      allowed: { models: [], classes: [] }
+  # A person fixed the host: it is observed up, the failed state clears.
+  - at: 186430000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }

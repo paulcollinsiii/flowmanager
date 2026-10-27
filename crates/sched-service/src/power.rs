@@ -165,6 +165,7 @@ pub async fn run<C: ObjectCtx>(
         Err(e) => ("failed", Some(e)),
     };
     metrics.power_request(label, action.as_str(), outcome);
+    shared.note_power_request(&ResourceId::new(resource), action, now, error.as_deref());
     match &error {
         None => tracing::info!(
             event = "power_requested",
@@ -497,7 +498,7 @@ mod tests {
             .unwrap();
         assert_eq!(fake.calls().len(), 1);
         // The next tick sees the host as powering on and asks for nothing more, however
-        // long the host takes: this phase does not retry or time out.
+        // long the host takes (within its timeout): nothing retries a power-on.
         for _ in 0..3 {
             down_with_lease(&s);
             object::tick(&s, &ctx).await.unwrap();
@@ -638,5 +639,154 @@ mod tests {
         );
         assert_eq!(stored_record(Some(&bytes)).unwrap().unwrap().at, Millis(5));
         assert!(stored_record(Some(br#"{"version":9,"data":{}}"#)).is_err());
+    }
+
+    fn gauge(s: &Shared, resource: &str, during: &str) -> Option<String> {
+        s.metrics
+            .render()
+            .lines()
+            .find(|l| {
+                l.starts_with("sched_resource_power_failed{")
+                    && l.contains(&format!("resource=\"{resource}\""))
+                    && l.contains(&format!("during=\"{during}\""))
+            })
+            .and_then(|l| l.rsplit(' ').next().map(str::to_string))
+    }
+
+    fn timeouts_counted(s: &Shared) -> Option<String> {
+        s.metrics
+            .render()
+            .lines()
+            .find(|l| {
+                l.starts_with("sched_power_timeouts_total{")
+                    && l.contains("resource=\"cuda-central\"")
+                    && l.contains("during=\"powering_on\"")
+            })
+            .and_then(|l| l.rsplit(' ').next().map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn a_host_that_never_comes_up_shows_the_failed_request_then_alerts_once_and_is_never_woken_again()
+     {
+        let (s, clock) = process(&example_yaml_managed());
+        let ctx = FakeCtx::default();
+        ctx.put(
+            crate::persist::LEASES_KEY,
+            &persist::encode_leases(&crate::leases::LeaseBook::default()),
+        );
+        object::acquire_model_lease(
+            &s,
+            &ctx,
+            object::AcquireModelLease {
+                model: "llm".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.commit();
+        down_with_lease(&s);
+        object::tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(ctx.powers.lock().unwrap().len(), 1);
+
+        // The router refuses: the call fails, and the next tick says so, not only the log.
+        let (fake, backend) = backend();
+        *fake.fail.lock().unwrap() = Some("router answered HTTP 503".to_string());
+        let ack = run(&s, &backend, &FakeCtx::default(), "cuda-central", on())
+            .await
+            .unwrap();
+        assert_eq!(ack.outcome, "failed");
+        clock.advance(Millis(60_000));
+        down_with_lease(&s);
+        let r = object::tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.power_request_failures.len(), 1, "{r:?}");
+        assert_eq!(r.power_request_failures[0].action, PowerAction::On);
+        assert!(
+            r.reason.contains("power on of cuda-central FAILED")
+                && r.reason.contains("router answered HTTP 503"),
+            "{}",
+            r.reason
+        );
+        assert!(r.power_failed.is_empty() && r.power_timeouts.is_empty());
+        assert_eq!(
+            gauge(&s, "cuda-central", "powering_on").as_deref(),
+            Some("0")
+        );
+
+        // Past the 10 minute power-on timeout the host is still down: the alert fires once.
+        clock.advance(Millis(10 * 60_000));
+        down_with_lease(&s);
+        let r = object::tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.power_timeouts.len(), 1, "{r:?}");
+        assert_eq!(r.power_timeouts[0].resource.as_str(), "cuda-central");
+        assert_eq!(r.power_failed.len(), 1);
+        assert!(
+            r.kinds.contains(&"power_failed".to_string()),
+            "{:?}",
+            r.kinds
+        );
+        assert!(
+            r.reason.contains("FAILED power state") && r.reason.contains("a person acts"),
+            "{}",
+            r.reason
+        );
+        assert!(r.allowed_models.is_empty());
+        assert_eq!(
+            gauge(&s, "cuda-central", "powering_on").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            gauge(&s, "cuda-central", "shutting_down").as_deref(),
+            Some("0")
+        );
+        assert_eq!(timeouts_counted(&s).as_deref(), Some("1"));
+        // The failed request stays in the report while the resource is failed.
+        assert_eq!(r.power_request_failures.len(), 1);
+
+        // Hours later, lease still held, host still down, observations fresh: no timeout
+        // again, no request, the failed state stays.
+        for _ in 0..360 {
+            clock.advance(Millis(60_000));
+            down_with_lease(&s);
+            let r = object::tick(&s, &ctx).await.unwrap();
+            ctx.commit();
+            assert!(r.power_timeouts.is_empty());
+            assert_eq!(r.power_failed.len(), 1);
+            assert!(
+                !r.steps.iter().any(|st| matches!(
+                    st,
+                    sched_model::Step::PowerOn { .. } | sched_model::Step::PowerOff { .. }
+                )),
+                "{:?}",
+                r.steps
+            );
+        }
+        assert_eq!(
+            ctx.powers.lock().unwrap().len(),
+            1,
+            "no further power request"
+        );
+        assert_eq!(timeouts_counted(&s).as_deref(), Some("1"));
+
+        // The host is observed up (a person fixed it): the failed state clears.
+        s.ingest_now(Report::Observed {
+            source: "cluster-pods".into(),
+            fidelity: Fidelity::Polled,
+            values: vec![ObservedValue::ResourceUp {
+                resource: "cuda-central".into(),
+                up: true,
+            }],
+        });
+        let r = object::tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert!(r.power_failed.is_empty(), "{r:?}");
+        assert!(r.power_request_failures.is_empty(), "{r:?}");
+        assert_eq!(
+            gauge(&s, "cuda-central", "powering_on").as_deref(),
+            Some("0")
+        );
+        assert_eq!(ctx.powers.lock().unwrap().len(), 1);
     }
 }
