@@ -3769,6 +3769,8 @@ dependencies = [
 name = "sched-actuate"
 version = "0.1.0"
 dependencies = [
+ "k8s-openapi",
+ "kube",
  "reqwest",
  "russh",
  "sched-model",

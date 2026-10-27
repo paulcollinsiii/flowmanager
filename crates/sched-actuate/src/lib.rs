@@ -19,6 +19,7 @@
 //! behalf) and share its test server.
 
 pub mod attempts;
+pub mod kube_jobs;
 pub mod power;
 pub mod requeue;
 pub mod ssh;
