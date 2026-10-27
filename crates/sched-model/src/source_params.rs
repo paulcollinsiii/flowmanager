@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_yaml_ng::Value;
 
 use crate::config::{SourceKind, SourceSpec};
 use crate::ids::ResourceId;
@@ -275,9 +274,39 @@ pub struct HttpJsonParams {
     pub auth: Option<AuthSpec>,
     #[serde(default = "default_timeout")]
     pub timeout: Millis,
-    /// Reserved for the webhook receiver (a later milestone); ignored here.
+    /// The path of the webhook listener that means "poll this source now" (see
+    /// `WebhookParams`). Without it the source is polled only at its `resync`.
     #[serde(default)]
-    pub webhook: Option<Value>,
+    pub webhook: Option<WebhookParams>,
+}
+
+/// The `webhook:` setting of an `http_json` source: an inbound request on `path` of the
+/// webhook listener asks for this source to be polled now. The request's body is ignored.
+/// Several sources may share a path; one request then nudges all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookParams {
+    pub path: String,
+}
+
+/// Why `path` cannot be a webhook path, if it cannot. The listener matches the request path
+/// exactly, so the accepted alphabet needs no decoding: letters, digits and `-._~/`.
+fn webhook_path_problem(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path.len() < 2 {
+        return Some("webhook.path must start with / and name something after it".to_string());
+    }
+    if path.ends_with('/') || path.contains("//") {
+        return Some("webhook.path must not end with / or contain //".to_string());
+    }
+    if let Some(c) = path
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || "-._~/".contains(*c)))
+    {
+        return Some(format!(
+            "webhook.path may use only letters, digits and -._~/ (found {c:?})"
+        ));
+    }
+    None
 }
 
 fn default_timeout() -> Millis {
@@ -393,6 +422,11 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
         out.push("at least one request must count as ready".to_string());
     }
     out.extend(timeout_problem(p.timeout));
+    out.extend(
+        p.webhook
+            .iter()
+            .filter_map(|w| webhook_path_problem(&w.path)),
+    );
     for (i, r) in p.requests.iter().enumerate() {
         let at = format!("requests[{i}]");
         if !(r.url.starts_with("http://") || r.url.starts_with("https://")) {
@@ -930,6 +964,47 @@ mod tests {
         // A parameter that merely shares a prefix is fine.
         let ok = dup_since.replace("updated_since=x", "updated_since_x=x");
         assert!(Config::from_yaml(&ok).is_ok());
+    }
+
+    #[test]
+    fn webhook_paths_are_typed_checked_and_looked_up() {
+        let c = example_config();
+        let ids = |p: &str| -> Vec<String> {
+            c.webhook_sources(p)
+                .iter()
+                .map(|s| s.id.to_string())
+                .collect()
+        };
+        assert_eq!(
+            ids("/hooks/paperless"),
+            ["paperless-ocr-pending", "paperless-post-ocr"]
+        );
+        assert_eq!(ids("/hooks/speakr"), ["speakr-pending", "speakr-summaries"]);
+        assert!(ids("/hooks/nothing").is_empty());
+        assert!(ids("/hooks/paperless/").is_empty());
+        assert_eq!(c.webhook_paths(), ["/hooks/paperless", "/hooks/speakr"]);
+
+        let with = |path: &str| {
+            EXAMPLE_CONFIG.replacen(
+                "webhook: { path: /hooks/paperless }",
+                &format!("webhook: {{ path: \"{path}\" }}"),
+                1,
+            )
+        };
+        assert!(Config::from_yaml(&with("/hooks/a-b_c.d~e/f")).is_ok());
+        for bad in [
+            "", "/", "hooks/x", "/hooks/", "/a//b", "/a?b=1", "/a b", "/a%2Fb", "/a#x",
+        ] {
+            let ps = problems_of(&with(bad));
+            assert!(has(&ps, "webhook.path"), "{bad:?}: {ps:?}");
+        }
+        // Unknown keys under webhook are refused rather than silently ignored.
+        let ps = problems_of(&EXAMPLE_CONFIG.replacen(
+            "webhook: { path: /hooks/paperless }",
+            "webhook: { path: /hooks/paperless, token: x }",
+            1,
+        ));
+        assert!(has(&ps, "token"), "{ps:?}");
     }
 
     #[test]

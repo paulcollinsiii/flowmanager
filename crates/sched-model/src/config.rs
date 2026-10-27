@@ -497,6 +497,37 @@ impl Config {
         self.sources.iter().find(|s| &s.id == id)
     }
 
+    /// The `http_json` sources that asked, with `webhook: { path }`, to be polled when a
+    /// request arrives on `path`, in configuration order. Sources whose params do not parse
+    /// are left out (validation refuses such a config anyway).
+    pub fn webhook_sources(&self, path: &str) -> Vec<&SourceSpec> {
+        self.sources
+            .iter()
+            .filter(|s| {
+                s.kind == SourceKind::HttpJson
+                    && s.http_json_params()
+                        .ok()
+                        .flatten()
+                        .and_then(|p| p.webhook)
+                        .is_some_and(|w| w.path == path)
+            })
+            .collect()
+    }
+
+    /// Every webhook path some source declares, sorted and without repeats.
+    pub fn webhook_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .sources
+            .iter()
+            .filter(|s| s.kind == SourceKind::HttpJson)
+            .filter_map(|s| s.http_json_params().ok().flatten()?.webhook)
+            .map(|w| w.path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// Models belonging to `resource`, in configuration order.
     pub fn models_of<'a>(
         &'a self,

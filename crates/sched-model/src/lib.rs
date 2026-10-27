@@ -45,7 +45,7 @@ pub use power_params::{MacAddr, SshShutdown, WakeOnLan};
 pub use recovery_params::{HttpMethod, ListSpec, REQUEUE_FAILED, RequeueFailedParams, RequeueSpec};
 pub use source_params::{
     AuthSpec, CountsAs, ElementFilter, ExtraCount, FilterValue, HttpJsonParams, KubeWatchParams,
-    PrometheusParams, RequestSpec, ResponseCondition, SinceSpec, TcpProbeParams,
+    PrometheusParams, RequestSpec, ResponseCondition, SinceSpec, TcpProbeParams, WebhookParams,
 };
 pub use state::{
     ModePhase, MountsVeto, PowerPhase, PowerTransition, ResourceState, SchedState, WindDown,
