@@ -194,7 +194,7 @@ impl World {
 
     fn counter(&self, job: &str, event: &str) -> String {
         let text = self.shared.metrics.render();
-        let want = format!("sched_job_events_total{{event=\"{event}\",job=\"{job}\"}} ");
+        let want = format!("sched_job_events_total{{event=\"{event}\",scheduled_job=\"{job}\"}} ");
         text.lines()
             .find_map(|l| l.strip_prefix(&want).map(str::to_string))
             .unwrap_or_else(|| "0".into())
@@ -237,11 +237,13 @@ async fn a_normal_run_creates_the_job_holds_nfs_while_it_runs_and_releases_it_wh
     assert!(w.book().jobs[&JobId::new("backup")].run.is_none());
     let text = w.shared.metrics.render();
     assert!(
-        text.contains("sched_job_last_success_timestamp_seconds{job=\"backup\"} 1772334300"),
+        text.contains(
+            "sched_job_last_success_timestamp_seconds{scheduled_job=\"backup\"} 1772334300"
+        ),
         "{text}"
     );
     assert!(
-        text.contains("sched_job_running{job=\"backup\"} 0"),
+        text.contains("sched_job_running{scheduled_job=\"backup\"} 0"),
         "{text}"
     );
     // The next run is a week away.

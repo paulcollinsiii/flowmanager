@@ -229,7 +229,7 @@ impl Metrics {
                 "sched_job_events_total",
                 "Scheduled-job events by job and event: started (a Job was created), succeeded, failed (after its retries, past its deadline or deleted; an alert), retried, missed (a run that never started, or runs dropped during downtime; an alert), skipped_overlap (a run came due or was asked for while the previous instance was pending or running; an alert), caught_up (a late run started), start_late (a catch_up run still waiting for its needs after its start window; an alert), create_failed (the Job could not be created; an alert), triggered (a person started a run)",
             ),
-            &["job", "event"],
+            &["scheduled_job", "event"],
         )
         .unwrap();
         let job_running = IntGaugeVec::new(
@@ -237,7 +237,7 @@ impl Metrics {
                 "sched_job_running",
                 "1 while the job has a run in progress (waiting for its needs, creating, running or in retry backoff), else 0, by configured job",
             ),
-            &["job"],
+            &["scheduled_job"],
         )
         .unwrap();
         let job_last_success = GaugeVec::new(
@@ -245,7 +245,7 @@ impl Metrics {
                 "sched_job_last_success_timestamp_seconds",
                 "Unix time the job last succeeded, by configured job; absent until it has. Alert on time() minus this exceeding the schedule interval plus slack",
             ),
-            &["job"],
+            &["scheduled_job"],
         )
         .unwrap();
         let job_next_due = GaugeVec::new(
@@ -253,7 +253,7 @@ impl Metrics {
                 "sched_job_next_due_timestamp_seconds",
                 "Unix time of the job's next scheduled run, by configured job",
             ),
-            &["job"],
+            &["scheduled_job"],
         )
         .unwrap();
         registry.register(Box::new(job_events.clone())).unwrap();
