@@ -2990,3 +2990,20 @@ fn the_stamp_is_state_that_survives_a_restart() {
         "due after a restart",
     );
 }
+
+#[test]
+fn without_a_min_off_no_stamp_is_ever_written_and_a_leftover_one_is_dropped() {
+    let sd = format!(
+        "{{ power: {{ phase: shutting_down, since: {} }}, mode: {{ phase: idle }} }}",
+        T - MIN
+    );
+    let d = nfs_down(Case::new().nfs_state(&sd)).run();
+    assert!(matches!(power_of(&d, N), PowerPhase::Off));
+    assert_eq!(
+        stamp_of(&d, N),
+        None,
+        "the stored state keeps its old shape"
+    );
+    let d = nfs_down(Case::new().nfs_state(&nfs_off(Some(MIN)))).run();
+    assert_eq!(stamp_of(&d, N), None);
+}

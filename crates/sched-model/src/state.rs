@@ -212,7 +212,8 @@ pub struct ResourceState {
     /// When the host was observed down after flowmanager shut it down (the instant the phase
     /// became `off` from `shutting_down`, or from a failed shutdown). It starts the `min_off`
     /// wait before the next automatic power-on. Absent for a host found down, one that went down
-    /// by itself, and once the phase leaves `off`; absent from the stored state then, so a state
+    /// by itself, once the phase leaves `off`, and for a resource without a `min_off`; absent
+    /// from the stored state then, so a state
     /// without it reads and writes as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_confirmed_at: Option<Millis>,

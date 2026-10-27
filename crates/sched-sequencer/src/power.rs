@@ -109,9 +109,11 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     // flowmanager started (also a failed one: the host was observed down after it). A host
     // found down, gone down by itself, or under manual control has none, and the stamp ends
     // with the phase `off`. A stamp from the future (the clock went back) is made again at
-    // now, so the wait is never longer than `min_off`.
+    // now, so the wait is never longer than `min_off`. Without a `min_off` (zero, the default)
+    // there is no stamp at all, so the stored state is exactly what it was before the key.
+    let min_off = cx.res.power.as_ref().map_or(Millis::ZERO, |p| p.min_off());
     st.shutdown_confirmed_at = match (st.power, st.shutdown_confirmed_at) {
-        _ if manual => None,
+        _ if manual || min_off == Millis::ZERO => None,
         (PowerPhase::Off, _)
             if matches!(
                 before,
