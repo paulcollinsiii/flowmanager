@@ -8,7 +8,7 @@ use sched_model::{
 use sched_observe::ObserverState;
 
 use crate::cache::InputAge;
-use crate::tick::{PowerFailed, PowerRequestFailure, PowerTimeout};
+use crate::tick::{MountsHeld, MountsTimeout, PowerFailed, PowerRequestFailure, PowerTimeout};
 
 /// The metric label of a step. A fixed set, so label cardinality is bounded.
 pub fn step_kind(step: &Step) -> &'static str {
@@ -95,6 +95,48 @@ pub fn with_power(
             f.since.as_u64(),
             f.during.as_str()
         ));
+    }
+    (kinds, reason)
+}
+
+/// Metric label for a tick in which a resource's shutdown wait for unmounting pods timed out
+/// and flowmanager stopped: the host stays up and a person must act.
+pub const KIND_SHUTDOWN_STOPPED: &str = "shutdown_stopped";
+
+/// Adds the held-back shutdowns to a decision's kinds and reason: each resource waiting for
+/// pods to unmount (or for a reading of them), each wait that timed out in this tick, and
+/// each resource where flowmanager stopped.
+pub fn with_mounts(
+    mut kinds: Vec<String>,
+    mut reason: String,
+    held: &[MountsHeld],
+    timeouts: &[MountsTimeout],
+) -> (Vec<String>, String) {
+    if held.iter().any(|h| h.stopped) {
+        kinds.push(KIND_SHUTDOWN_STOPPED.to_string());
+        kinds.sort();
+        kinds.dedup();
+    }
+    for t in timeouts {
+        reason.push_str(&format!(
+            "; ALERT: the shutdown of {} waited for pods to unmount until mounts_timeout ran out in this tick",
+            t.resource
+        ));
+    }
+    for h in held {
+        if h.stopped {
+            reason.push_str(&format!(
+                "; {} was NOT shut down: pods still mounted it (or the count was unknown) when mounts_timeout ran out at {}ms; flowmanager stopped, the host stays up, and it will not shut it down by itself again until a person acts (resume), it is seen down, or a new manual request takes it over",
+                h.resource,
+                h.since.as_u64()
+            ));
+        } else {
+            reason.push_str(&format!(
+                "; the shutdown of {} is held back since {}ms: pods mount its NFS server or the count is unknown (unknown counts as mounted)",
+                h.resource,
+                h.since.as_u64()
+            ));
+        }
     }
     (kinds, reason)
 }
@@ -201,6 +243,15 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::ShuttingDown => "the host is shutting down",
         WaitReason::PowerFailed => {
             "the host's power transition timed out and flowmanager stopped (a person must act; it is not retried)"
+        }
+        WaitReason::PodsMounted => {
+            "the host is due to be powered off but pods still mount its NFS server (waiting for them to unmount)"
+        }
+        WaitReason::MountsUnknown => {
+            "the host is due to be powered off but which pods mount its NFS server is unknown (no fresh reading; unknown counts as mounted)"
+        }
+        WaitReason::ShutdownStopped => {
+            "pods still mounted the host when mounts_timeout ran out and flowmanager stopped (the host stays up; a person must act; it is not retried)"
         }
         WaitReason::MinDwell => "the allowed model has not been allowed for its minimum dwell",
         WaitReason::NotPreemptible => "the allowed model's active work is not preemptible",

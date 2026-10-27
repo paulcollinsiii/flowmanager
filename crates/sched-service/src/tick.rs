@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{
-    AllowedSet, Capability, ClassId, Lease, LeaseId, Millis, ModelId, PowerPhase, PowerTransition,
-    PublishedAllowed, ResourceId, SchedState, SourceId, Step, class_work,
+    AllowedSet, Capability, ClassId, Lease, LeaseId, Millis, ModelId, MountsVeto, PowerPhase,
+    PowerTransition, PublishedAllowed, ResourceId, SchedState, SourceId, Step, class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,64 @@ fn power_report(prev: &SchedState, next: &SchedState) -> (Vec<PowerFailed>, Vec<
     (failed, timeouts)
 }
 
+/// A resource whose shutdown is held back because pods mount it (or may), in a
+/// [`TickReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountsHeld {
+    pub resource: ResourceId,
+    /// When the wait began (`stopped` false), or when flowmanager gave up (`stopped` true).
+    pub since: Millis,
+    /// The wait outlasted `mounts_timeout`: flowmanager stopped, the host stays up, and a
+    /// person must act.
+    pub stopped: bool,
+}
+
+/// A shutdown wait that timed out in this tick: the alert (see the `shutdown_mounts_timeout`
+/// log event and `sched_mounts_timeouts_total`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountsTimeout {
+    pub resource: ResourceId,
+    /// When the wait began, if the previous state said.
+    pub waiting_since: Option<Millis>,
+    pub at: Millis,
+}
+
+/// The resources whose shutdown is held back in `next`, and those that were stopped in this
+/// tick (they were not in `prev`).
+fn mounts_report(prev: &SchedState, next: &SchedState) -> (Vec<MountsHeld>, Vec<MountsTimeout>) {
+    let mut held = Vec::new();
+    let mut timeouts = Vec::new();
+    for (id, st) in &next.resources {
+        match st.mounts_veto {
+            Some(MountsVeto::Waiting { since }) => held.push(MountsHeld {
+                resource: id.clone(),
+                since,
+                stopped: false,
+            }),
+            Some(MountsVeto::Stopped { since }) => {
+                held.push(MountsHeld {
+                    resource: id.clone(),
+                    since,
+                    stopped: true,
+                });
+                let before = prev.resource(id).and_then(|p| p.mounts_veto);
+                if !matches!(before, Some(MountsVeto::Stopped { .. })) {
+                    timeouts.push(MountsTimeout {
+                        resource: id.clone(),
+                        waiting_since: match before {
+                            Some(MountsVeto::Waiting { since }) => Some(since),
+                            _ => None,
+                        },
+                        at: since,
+                    });
+                }
+            }
+            None => {}
+        }
+    }
+    (held, timeouts)
+}
+
 /// What a tick decided, for logs and for the `last_decision` handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TickReport {
@@ -215,6 +273,15 @@ pub struct TickReport {
     /// followed from its reachability and the transition times out.
     #[serde(default)]
     pub power_request_failures: Vec<PowerRequestFailure>,
+    /// Resources whose shutdown is held back because pods mount their NFS server (or the
+    /// count is unknown): waiting, bounded by `mounts_timeout`, or stopped after it ran out
+    /// (the host stays up; flowmanager does not retry; a person must act).
+    #[serde(default)]
+    pub mounts_held: Vec<MountsHeld>,
+    /// Shutdown waits that timed out in this very tick (the alert fires once, then the
+    /// resource stays in `mounts_held` as stopped).
+    #[serde(default)]
+    pub mounts_timeouts: Vec<MountsTimeout>,
     pub inputs: Vec<InputReport>,
     /// Whether observations changed since the previous tick of this process.
     pub input_changed: bool,
@@ -417,6 +484,8 @@ impl Shared {
             power_failed: vec![],
             power_timeouts: vec![],
             power_request_failures: vec![],
+            mounts_held: vec![],
+            mounts_timeouts: vec![],
             inputs: vec![],
             input_changed: false,
             error: Some(format!("persisted state cannot be read: {text}")),
@@ -591,6 +660,7 @@ impl Shared {
             };
         let (power_failed, power_timeouts) = power_report(&durable.state, &state);
         let power_request_failures = self.power_request_failures(&state);
+        let (mounts_held, mounts_timeouts) = mounts_report(&durable.state, &state);
         let (kinds, reason) = if error.is_none() {
             reason::with_power(
                 kinds,
@@ -599,6 +669,11 @@ impl Shared {
                 &power_timeouts,
                 &power_request_failures,
             )
+        } else {
+            (kinds, reason)
+        };
+        let (kinds, reason) = if error.is_none() {
+            reason::with_mounts(kinds, reason, &mounts_held, &mounts_timeouts)
         } else {
             (kinds, reason)
         };
@@ -625,6 +700,8 @@ impl Shared {
             power_failed,
             power_timeouts,
             power_request_failures,
+            mounts_held,
+            mounts_timeouts,
             inputs: ages.iter().map(InputReport::from).collect(),
             input_changed: changed,
             error,
@@ -661,6 +738,13 @@ impl Shared {
         self.metrics.set_power_failed(&r.state, |id| {
             config.resource(id).is_some_and(|res| res.power.is_some())
         });
+        self.metrics
+            .set_mounts_veto(&r.state, |id| config.mounts_checked(id));
+        if !replayed {
+            for t in &r.mounts_timeouts {
+                self.metrics.mounts_timeout(t.resource.as_str());
+            }
+        }
         if !replayed {
             for t in &r.power_timeouts {
                 self.metrics
@@ -753,6 +837,29 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
                 t.during.as_str(),
                 t.resource,
                 wanted,
+            );
+        }
+    }
+    for t in &r.mounts_timeouts {
+        // As for power timeouts: the alert-grade event is for the tick that decided it; a
+        // replay logs the same fact at info level under another event name.
+        if replayed {
+            tracing::info!(
+                event = "shutdown_mounts_timeout_replayed",
+                resource = %t.resource,
+                waiting_since_ms = ?t.waiting_since.map(Millis::as_u64),
+                at_ms = t.at.as_u64(),
+                "replayed tick: the shutdown of {} timed out waiting for pods to unmount (alerted when first decided); it is not retried",
+                t.resource,
+            );
+        } else {
+            tracing::error!(
+                event = "shutdown_mounts_timeout",
+                resource = %t.resource,
+                waiting_since_ms = ?t.waiting_since.map(Millis::as_u64),
+                at_ms = t.at.as_u64(),
+                "ALERT: pods still mount (or may mount) {} after mounts_timeout; flowmanager did NOT shut it down and stops here: it will not retry by itself, the host stays up until a person acts (or a new manual request takes it over)",
+                t.resource,
             );
         }
     }
@@ -1541,6 +1648,190 @@ mod tests {
         st.resources
             .insert(ResourceId::new(id), sched_model::ResourceState::new(power));
         st
+    }
+
+    /// The managed example with basestar up, managed and idle since long ago: the shutdown
+    /// is due as soon as the grace period is checked.
+    fn due_nfs() -> (Arc<Shared>, Arc<ManualClock>, Durable) {
+        let (s, clock) = shared_with(&sched_model::test_support::example_yaml_managed());
+        let mut d = Durable::default();
+        for (id, managed) in [("cuda-central", false), ("basestar-nfs", true)] {
+            let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
+            st.managed = managed;
+            st.host_idle_since = managed.then_some(Millis(1));
+            d.state.resources.insert(ResourceId::new(id), st);
+        }
+        (s, clock, d)
+    }
+
+    /// Every source reports again at the clock's time: both hosts up, nothing queued, and
+    /// `mounts` pods mounting basestar (no reading at all if `None`).
+    fn world(s: &Shared, mounts: Option<u32>) {
+        cluster(s);
+        for (class, source) in [
+            ("paperless-ocr", "paperless-ocr-pending"),
+            ("paperless-tagging", "paperless-post-ocr"),
+            ("speakr-transcription", "speakr-pending"),
+            ("speakr-summarization", "speakr-summaries"),
+            ("immich-ml", "immich-queues"),
+        ] {
+            push(
+                s,
+                source,
+                vec![ObservedValue::Demand {
+                    class: class.into(),
+                    ready: 0,
+                    in_flight: 0,
+                    failed: 0,
+                    oldest_ready_at: None,
+                }],
+            );
+        }
+        if let Some(pods) = mounts {
+            push(
+                s,
+                "basestar-mounts",
+                vec![ObservedValue::ResourceMounts {
+                    resource: "basestar-nfs".into(),
+                    pods,
+                }],
+            );
+        }
+    }
+
+    fn veto_gauge(s: &Shared, state: &str) -> String {
+        s.metrics
+            .render()
+            .lines()
+            .find(|l| {
+                l.starts_with("sched_resource_mounts_veto{")
+                    && l.contains("resource=\"basestar-nfs\"")
+                    && l.contains(&format!("state=\"{state}\""))
+            })
+            .and_then(|l| l.rsplit(' ').next())
+            .unwrap_or("absent")
+            .to_string()
+    }
+
+    #[test]
+    fn a_shutdown_held_by_mounting_pods_is_reported_alerts_once_on_timeout_and_is_not_retried() {
+        let (s, clock, mut d) = due_nfs();
+        let wait = |reason| Step::Wait {
+            resource: "basestar-nfs".into(),
+            reason,
+        };
+        // Due and mounted: held back, visible in the report, the reason and the gauge.
+        world(&s, Some(2));
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        assert_eq!(r.error, None);
+        assert_eq!(r.steps, vec![wait(sched_model::WaitReason::PodsMounted)]);
+        assert_eq!(
+            r.mounts_held,
+            vec![MountsHeld {
+                resource: "basestar-nfs".into(),
+                since: Millis(T0 + 1_000),
+                stopped: false
+            }]
+        );
+        assert!(r.mounts_timeouts.is_empty());
+        assert!(r.reason.contains("held back"), "{}", r.reason);
+        assert_eq!(veto_gauge(&s, "waiting"), "1");
+        assert_eq!(veto_gauge(&s, "stopped"), "0");
+
+        // mounts_timeout is 30 minutes: the tick that reaches it alerts, once.
+        let at = T0 + 1_000 + 30 * 60_000;
+        clock.set(Millis(at));
+        world(&s, Some(2));
+        let r = s.tick(Millis(at), &mut d);
+        assert_eq!(
+            r.steps,
+            vec![wait(sched_model::WaitReason::ShutdownStopped)]
+        );
+        assert_eq!(r.mounts_timeouts.len(), 1, "{r:?}");
+        assert_eq!(r.mounts_timeouts[0].waiting_since, Some(Millis(T0 + 1_000)));
+        assert!(r.kinds.contains(&"shutdown_stopped".to_string()), "{r:?}");
+        assert!(r.reason.contains("ALERT"), "{}", r.reason);
+        assert!(r.reason.contains("NOT shut down"), "{}", r.reason);
+        assert_eq!(veto_gauge(&s, "stopped"), "1");
+        assert_eq!(veto_gauge(&s, "waiting"), "0");
+        assert!(
+            s.metrics
+                .render()
+                .contains("sched_mounts_timeouts_total{resource=\"basestar-nfs\"} 1")
+        );
+        // Still allowed: the host is up.
+        assert!(r.allowed_classes.contains(&"paperless-ngx".into()), "{r:?}");
+
+        // The pods are gone: no power-off, no new alert, no second count.
+        clock.set(Millis(at + 10_000));
+        world(&s, Some(0));
+        let r = s.tick(Millis(at + 10_000), &mut d);
+        assert_eq!(
+            r.steps,
+            vec![wait(sched_model::WaitReason::ShutdownStopped)]
+        );
+        assert!(r.mounts_timeouts.is_empty(), "{r:?}");
+        assert!(r.mounts_held[0].stopped);
+        assert!(
+            s.metrics
+                .render()
+                .contains("sched_mounts_timeouts_total{resource=\"basestar-nfs\"} 1")
+        );
+    }
+
+    #[test]
+    fn a_host_whose_mounts_were_never_read_is_not_shut_down_and_the_reason_says_unknown() {
+        let (s, _, mut d) = due_nfs();
+        world(&s, None);
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        assert_eq!(
+            r.steps,
+            vec![Step::Wait {
+                resource: "basestar-nfs".into(),
+                reason: sched_model::WaitReason::MountsUnknown
+            }]
+        );
+        assert!(
+            r.reason.contains("unknown counts as mounted"),
+            "{}",
+            r.reason
+        );
+        assert!(!r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })));
+        // Once the pods are read as none, the shutdown goes ahead.
+        world(&s, Some(0));
+        let r = s.tick(Millis(T0 + 2_000), &mut d);
+        assert_eq!(
+            r.steps,
+            vec![Step::PowerOff {
+                resource: "basestar-nfs".into()
+            }]
+        );
+        assert!(r.mounts_held.is_empty());
+        assert_eq!(veto_gauge(&s, "waiting"), "0");
+    }
+
+    #[test]
+    fn a_failed_shutdown_request_from_an_earlier_cycle_is_not_shown_against_a_later_shutdown() {
+        let (s, _) = shared();
+        let id = ResourceId::new("cuda-central");
+        let shown = |s: &Shared, since: u64| {
+            s.power_request_failures(&state_in(
+                "cuda-central",
+                PowerPhase::ShuttingDown {
+                    since: Millis(since),
+                },
+            ))
+        };
+        let fail = |at| s.note_power_request(&id, PowerAction::Off, Millis(at), Some("refused"));
+
+        // The request failed before the current shutdown began (an earlier cycle): dropped.
+        fail(8_000);
+        assert!(shown(&s, 9_000).is_empty());
+        // One made when the current shutdown began, or after, is this transition's.
+        fail(9_000);
+        assert_eq!(shown(&s, 9_000).len(), 1);
+        fail(9_500);
+        assert_eq!(shown(&s, 9_000)[0].at, Millis(9_500));
     }
 
     #[test]

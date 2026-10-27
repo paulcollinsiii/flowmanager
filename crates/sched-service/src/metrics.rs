@@ -8,7 +8,9 @@ use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Opts, Registry, TextEncoder,
 };
-use sched_model::{Millis, ModePhase, PowerPhase, PowerTransition, ResourceId, SchedState};
+use sched_model::{
+    Millis, ModePhase, MountsVeto, PowerPhase, PowerTransition, ResourceId, SchedState,
+};
 
 use sched_observe::ObserverState;
 
@@ -37,6 +39,10 @@ pub struct Metrics {
     power_failed: GaugeVec,
     /// Resources with `power_failed` series, to drop those that leave the state.
     power_failed_resources: Mutex<HashSet<String>>,
+    mounts_timeouts: IntCounterVec,
+    mounts_veto: GaugeVec,
+    /// Resources with `mounts_veto` series, to drop those that leave the checked set.
+    mounts_veto_resources: Mutex<HashSet<String>>,
     /// Per (resource, axis), the phase whose series is set and when it began.
     phases: Mutex<HashMap<PhaseKey, (&'static str, Millis)>>,
 }
@@ -196,6 +202,26 @@ impl Metrics {
         registry.register(Box::new(power_requests.clone())).unwrap();
         registry.register(Box::new(power_timeouts.clone())).unwrap();
         registry.register(Box::new(power_failed.clone())).unwrap();
+        let mounts_timeouts = IntCounterVec::new(
+            Opts::new(
+                "sched_mounts_timeouts_total",
+                "Shutdowns that waited longer than the resource's mounts_timeout for pods to stop mounting its NFS server, by resource. Each one raised the shutdown_mounts_timeout alert and the scheduler stopped: the host stays up and is not shut down by flowmanager again until a person acts or a new manual request takes it over",
+            ),
+            &["resource"],
+        )
+        .unwrap();
+        let mounts_veto = GaugeVec::new(
+            Opts::new(
+                "sched_resource_mounts_veto",
+                "1 while a shutdown of the resource is held back because pods mount its NFS server or the count is unknown (state waiting, bounded by mounts_timeout), or because that wait timed out and flowmanager stopped (state stopped; a person must act), else 0, by resource and state. Only resources whose mounts are checked have a series. Alert on stopped being 1",
+            ),
+            &["resource", "state"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(mounts_timeouts.clone()))
+            .unwrap();
+        registry.register(Box::new(mounts_veto.clone())).unwrap();
         registry.register(Box::new(recovery_runs.clone())).unwrap();
         registry
             .register(Box::new(recovery_requeues.clone()))
@@ -241,6 +267,9 @@ impl Metrics {
             power_timeouts,
             power_failed,
             power_failed_resources: Mutex::new(HashSet::new()),
+            mounts_timeouts,
+            mounts_veto,
+            mounts_veto_resources: Mutex::new(HashSet::new()),
             phases: Mutex::new(HashMap::new()),
         }
     }
@@ -411,6 +440,49 @@ impl Metrics {
                 .resources
                 .keys()
                 .filter(|k| can_fail(k))
+                .map(|k| k.to_string()),
+        );
+    }
+
+    /// Counts a shutdown whose wait for unmounting pods timed out (see the metric's help).
+    pub fn mounts_timeout(&self, resource: &str) {
+        self.mounts_timeouts.with_label_values(&[resource]).inc();
+    }
+
+    /// Sets `sched_resource_mounts_veto` from the state: per resource for which `checked`
+    /// holds (its mounts are checked), 1 for the state it is in (waiting or stopped) and 0
+    /// for the other; resources that are no longer checked lose their series.
+    pub fn set_mounts_veto(&self, state: &SchedState, checked: impl Fn(&ResourceId) -> bool) {
+        let mut known = self
+            .mounts_veto_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (id, st) in state.resources.iter().filter(|(id, _)| checked(id)) {
+            let waiting = matches!(st.mounts_veto, Some(MountsVeto::Waiting { .. }));
+            let stopped = matches!(st.mounts_veto, Some(MountsVeto::Stopped { .. }));
+            for (name, on) in [("waiting", waiting), ("stopped", stopped)] {
+                self.mounts_veto
+                    .with_label_values(&[id.as_str(), name])
+                    .set(if on { 1.0 } else { 0.0 });
+            }
+        }
+        known.retain(|id| {
+            let keep = state
+                .resources
+                .keys()
+                .any(|k| k.as_str() == id && checked(k));
+            if !keep {
+                for name in ["waiting", "stopped"] {
+                    let _ = self.mounts_veto.remove_label_values(&[id.as_str(), name]);
+                }
+            }
+            keep
+        });
+        known.extend(
+            state
+                .resources
+                .keys()
+                .filter(|k| checked(k))
                 .map(|k| k.to_string()),
         );
     }

@@ -485,6 +485,22 @@ pub fn check(
                         "invariant 5: powered off {resource} without a fresh up observation"
                     ));
                 }
+                // 12. A host whose mounts are checked is powered off only on fresh readings
+                // that all say no pod mounts it; an unknown count is as good as a mounted one.
+                if config.mounts_checked(resource) {
+                    let clear = newest(config, Capability::Mounts, snapshot, safety, |v| {
+                        matches!(v, ObservedValue::ResourceMounts { resource: r, .. } if r == resource)
+                    })
+                    .is_some_and(|g| {
+                        g.iter()
+                            .all(|v| matches!(v, ObservedValue::ResourceMounts { pods: 0, .. }))
+                    });
+                    if !clear {
+                        out.push(format!(
+                            "invariant 12: powered off {resource} without a fresh reading of no mounting pods"
+                        ));
+                    }
+                }
                 for m in config.models_of(resource) {
                     if decision.allowed.models.contains(&m.id) {
                         out.push(format!(
