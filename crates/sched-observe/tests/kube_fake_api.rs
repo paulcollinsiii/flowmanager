@@ -751,3 +751,133 @@ async fn backoff_state_of_a_source_removed_from_the_config_is_dropped() {
     assert!(observers.backoff_for(&immich).is_none());
     assert!(observers.backoff_for(&"cluster-pods".into()).is_some());
 }
+
+/// The `cluster-mounts`-style source of the example config, polled fast, with one namespace
+/// filter applied by the caller.
+fn mounts_source(namespaces: &[&str]) -> (SourceSpec, KubeWatchParams) {
+    let cfg = example_config();
+    let mut spec = cfg.source(&"basestar-mounts".into()).unwrap().clone();
+    spec.resync = Millis(50);
+    let mut params = spec.kube_watch_params().unwrap().unwrap();
+    params.namespaces = namespaces.iter().map(|n| n.to_string()).collect();
+    (spec, params)
+}
+
+fn list(kind: &str, items: &[String]) -> Reply {
+    Reply::json(&format!(
+        r#"{{"apiVersion":"v1","kind":"{kind}List","metadata":{{"resourceVersion":"10"}},"items":[{}]}}"#,
+        items.join(",")
+    ))
+}
+
+/// Answers every request for `path` (whatever its query) with `reply`.
+fn serve(server: &TestServer, path: &str, reply: Reply) {
+    server.set_dynamic(path, move |_| reply.clone());
+}
+
+fn nfs_pod(name: &str, ns: &str, phase: &str, claim: &str) -> String {
+    format!(
+        r#"{{"apiVersion":"v1","kind":"Pod","metadata":{{"name":"{name}","namespace":"{ns}","uid":"{name}"}},"spec":{{"containers":[],"volumes":[{{"name":"data","persistentVolumeClaim":{{"claimName":"{claim}"}}}}]}},"status":{{"phase":"{phase}"}}}}"#
+    )
+}
+
+fn mounts_of(report: &Report) -> Option<u32> {
+    match report {
+        Report::Observed { values, .. } => values.iter().find_map(|v| match v {
+            ObservedValue::ResourceMounts { resource, pods }
+                if resource.as_str() == "basestar-nfs" =>
+            {
+                Some(*pods)
+            }
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn mounts_are_read_from_pods_claims_and_volumes_and_a_failed_list_is_a_failed_read() {
+    let server = TestServer::start().await;
+    let pods = Arc::new(Mutex::new(vec![
+        nfs_pod("paperless-1", "docs", "Running", "paperless-data"),
+        nfs_pod("old-job", "docs", "Succeeded", "paperless-data"),
+        nfs_pod("other", "media", "Running", "scratch"),
+    ]));
+    let pods_fail = Arc::new(AtomicBool::new(false));
+    serve(&server,
+        "/api/v1/persistentvolumes",
+        list(
+            "PersistentVolume",
+            &[
+                r#"{"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"pv-nfs"},"spec":{"nfs":{"server":"basestar","path":"/export"}}}"#.to_string(),
+                r#"{"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"pv-local"},"spec":{}}"#.to_string(),
+            ],
+        ),
+    );
+    serve(&server,
+        "/api/v1/persistentvolumeclaims",
+        list(
+            "PersistentVolumeClaim",
+            &[
+                r#"{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"paperless-data","namespace":"docs"},"spec":{"volumeName":"pv-nfs"}}"#.to_string(),
+                r#"{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"scratch","namespace":"media"},"spec":{"volumeName":"pv-local"}}"#.to_string(),
+            ],
+        ),
+    );
+    let (p, f) = (pods.clone(), pods_fail.clone());
+    server.set_dynamic("/api/v1/pods", move |_| {
+        if f.load(Ordering::SeqCst) {
+            return Reply::status(500);
+        }
+        list("Pod", &p.lock().unwrap())
+    });
+
+    // The client of the fake, as `Fake::client` makes it.
+    let config = kube::Config::new(server.url("").parse().unwrap());
+    let client = kube::Client::try_from(config).expect("client builds");
+    let (spec, params) = mounts_source(&[]);
+    let (tx, mut rx) = mpsc::channel(256);
+    let task = tokio::spawn(run_with_client(spec, params, vec![], client, tx, FAST));
+
+    // Every namespace is listed (none is configured): one NFS pod running, one finished,
+    // one on a local volume.
+    assert_eq!(until(&mut rx, mounts_of).await, 1);
+    // The pod goes away: zero, from a complete list.
+    pods.lock().unwrap().remove(0);
+    assert_eq!(
+        until(&mut rx, |r| mounts_of(r).filter(|n| *n == 0)).await,
+        0
+    );
+    // A failing list is reported as a failed read: never a zero.
+    pods_fail.store(true, Ordering::SeqCst);
+    until(&mut rx, |r| {
+        matches!(r, Report::Failed { error, .. } if error.contains("mounts") && error.contains("pods"))
+            .then_some(())
+    })
+    .await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn configured_namespaces_are_listed_one_by_one() {
+    let server = TestServer::start().await;
+    serve(
+        &server,
+        "/api/v1/persistentvolumes",
+        list("PersistentVolume", &[]),
+    );
+    serve(
+        &server,
+        "/api/v1/namespaces/docs/persistentvolumeclaims",
+        list("PersistentVolumeClaim", &[]),
+    );
+    serve(&server, "/api/v1/namespaces/docs/pods", list("Pod", &[]));
+    let config = kube::Config::new(server.url("").parse().unwrap());
+    let client = kube::Client::try_from(config).expect("client builds");
+    let (spec, params) = mounts_source(&["docs"]);
+    let (tx, mut rx) = mpsc::channel(256);
+    let task = tokio::spawn(run_with_client(spec, params, vec![], client, tx, FAST));
+    assert_eq!(until(&mut rx, mounts_of).await, 0);
+    assert_eq!(server.count("/api/v1/pods"), 0, "no cluster-wide pod list");
+    task.abort();
+}

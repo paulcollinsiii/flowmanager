@@ -3,7 +3,8 @@
 //!
 //! Pod counts are reported on every pod event and on every resync, but only once every
 //! watched namespace has completed its initial list, so a half-synced cache can never read
-//! as "zero pods". Node readiness is checked once per resync and debounced.
+//! as "zero pods". Node readiness is checked once per resync and debounced. A source that
+//! observes `mounts` also lists the NFS mounts once per resync (see `kube_mounts`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -395,6 +396,7 @@ pub async fn run_with_client(
     let mut tasks: JoinSet<()> = JoinSet::new();
     let observes_pods = spec.observe.contains(&Capability::Pods);
     let observes_up = spec.observe.contains(&Capability::Reachability);
+    let observes_mounts = spec.observe.contains(&Capability::Mounts);
     if observes_pods {
         for ns in params.namespaces.clone() {
             lock(&shared).pods.entry(ns.clone()).or_default();
@@ -481,6 +483,22 @@ pub async fn run_with_client(
             && tx.send(r).await.is_err()
         {
             return;
+        }
+        if observes_mounts {
+            let report = match crate::kube_mounts::read_mounts(&client, &params).await {
+                Ok(values) => Report::Observed {
+                    source: spec.id.clone(),
+                    fidelity: Fidelity::Polled,
+                    values,
+                },
+                Err(error) => Report::Failed {
+                    source: spec.id.clone(),
+                    error: format!("mounts: {error}"),
+                },
+            };
+            if tx.send(report).await.is_err() {
+                return;
+            }
         }
         if observes_up && let Some(readings) = reachability_readings(&params, &shared) {
             let values = readings
