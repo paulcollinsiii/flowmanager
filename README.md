@@ -832,7 +832,7 @@ supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draini
 left out. Every on/off/resume request and every refused request logs one `event="toggle"` line
 (names escaped, refusals rate limited), is counted in
 `sched_toggle_requests_total{endpoint,outcome}`, and a held lease shows in
-`sched_manual_lease_age_seconds{kind,target}`.
+`sched_manual_lease_age_seconds{kind,target}`. The flags, the token Secret, the NetworkPolicy and
 `PeerAuthentication` notes for a `hostNetwork` client, the Home Assistant YAML and an alert
 are in `docs/kubernetes_setup.md` (the toggle listener subsection of section 2).
 
