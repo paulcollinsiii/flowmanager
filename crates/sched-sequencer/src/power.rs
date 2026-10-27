@@ -2,8 +2,8 @@
 //! them up. Resources without a power section are always on.
 
 use sched_model::{
-    ClassSpec, ModePhase, PowerPhase, PowerTransition, PowerWant, ResourceState, Step, WaitReason,
-    class_work,
+    ClassSpec, ModePhase, MountsVeto, PowerPhase, PowerTransition, PowerWant, ResourceState, Step,
+    WaitReason, class_work,
 };
 
 use crate::Cx;
@@ -43,6 +43,7 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     if manual {
         st.managed = false;
         st.host_idle_since = None;
+        st.mounts_veto = None;
     }
     let now = cx.now();
     let observed = cx.snapshot.fresh_resource_up(
@@ -113,6 +114,7 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     if !st.is_on() {
         st.mode = ModePhase::Idle;
         st.host_idle_since = None;
+        st.mounts_veto = None;
     }
 }
 
@@ -225,6 +227,11 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
             }
             if want == Some(PowerWant::Manual) {
                 st.managed = true;
+                // A new manual request takes the host over again: an earlier stop (pods
+                // still mounted it) is over, and the next idle period decides afresh.
+                if matches!(st.mounts_veto, Some(MountsVeto::Stopped { .. })) {
+                    st.mounts_veto = None;
+                }
             }
             let h = holds(cx);
             if st.managed && idle_mode && h.count == 0 {
@@ -238,6 +245,15 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 }
             } else {
                 st.host_idle_since = None;
+                match st.mounts_veto {
+                    // Something holds the host (or it is no longer ours to power off): the
+                    // shutdown this wait was for is not due any more.
+                    Some(MountsVeto::Waiting { .. }) => st.mounts_veto = None,
+                    Some(MountsVeto::Stopped { .. }) => {
+                        wait(cx, steps, WaitReason::ShutdownStopped);
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -267,8 +283,58 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
     }
 }
 
-/// Shuts the host down, provided a fresh reading shows it up. It is only reached with no
-/// model allowed (mode idle); pod counts are not consulted.
+/// The pre-shutdown veto: whether no pod mounts the host. This is the one place a pod
+/// reading decides anything, and only to hold a shutdown back. A reading that is missing,
+/// stale or failed is unknown, and unknown counts as mounted. While pods mount (or may mount)
+/// the host the shutdown waits, bounded by the resource's `mounts_timeout`; when that runs
+/// out the scheduler stops (the host stays up, no retry) until the host is seen down, a person
+/// resets it, or a new manual request takes it over.
+fn mounts_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool {
+    if matches!(st.mounts_veto, Some(MountsVeto::Stopped { .. })) {
+        wait(cx, steps, WaitReason::ShutdownStopped);
+        return false;
+    }
+    let now = cx.now();
+    let reading = cx.snapshot.fresh_resource_mounts(
+        cx.config,
+        &cx.res.id,
+        cx.config.policy().host_reading_stale_after,
+    );
+    if reading == Some(0) {
+        st.mounts_veto = None;
+        return true;
+    }
+    let since = match st.mounts_veto {
+        Some(MountsVeto::Waiting { since }) => since,
+        _ => now,
+    };
+    let timeout = cx
+        .res
+        .power
+        .as_ref()
+        .map_or(sched_model::config::DEFAULT_MOUNTS_TIMEOUT, |p| {
+            p.mounts_timeout()
+        });
+    if now.saturating_sub(since) >= timeout {
+        st.mounts_veto = Some(MountsVeto::Stopped { since: now });
+        st.managed = false;
+        st.host_idle_since = None;
+        wait(cx, steps, WaitReason::ShutdownStopped);
+    } else {
+        st.mounts_veto = Some(MountsVeto::Waiting { since });
+        let why = if reading.is_none() {
+            WaitReason::MountsUnknown
+        } else {
+            WaitReason::PodsMounted
+        };
+        wait(cx, steps, why);
+    }
+    false
+}
+
+/// Shuts the host down, provided a fresh reading shows it up and (for a host whose mounts
+/// are checked) no pod mounts it. It is only reached with no model allowed (mode idle);
+/// pod counts of models are not consulted.
 fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
     let max_age = cx.config.policy().host_reading_stale_after;
     if cx
@@ -277,6 +343,9 @@ fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
         != Some(true)
     {
         wait(cx, steps, WaitReason::StaleObservation);
+        return;
+    }
+    if cx.config.mounts_checked(&cx.res.id) && !mounts_clear(cx, st, steps) {
         return;
     }
     steps.push(Step::PowerOff {

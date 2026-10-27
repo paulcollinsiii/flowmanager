@@ -174,6 +174,22 @@ impl ModePhase {
     }
 }
 
+/// The veto on shutting a host down while pods may still mount it (see the `mounts`
+/// capability). Only an On host that the scheduler is about to power off has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MountsVeto {
+    /// The shutdown is held back: pods mount the host, or the count is unknown (a missing,
+    /// stale or failed reading is never read as "no mounts"). `since` is when the wait began.
+    Waiting { since: Millis },
+    /// The wait outlasted the resource's `mounts_timeout`. The scheduler stops: no shutdown,
+    /// an alert, no retry, and the host is no longer managed (as after a failed power
+    /// transition). It clears only when the host is seen down or its state is reset by a
+    /// person (`resume`), or when a new manual request takes the host over again. `since` is
+    /// when the scheduler gave up.
+    Stopped { since: Millis },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceState {
@@ -189,6 +205,10 @@ pub struct ResourceState {
     /// Classes whose in-flight work was stopped and whose recovery action has not run.
     #[serde(default)]
     pub pending_recovery: BTreeSet<ClassId>,
+    /// Whether a shutdown of the host is held back by pods that may mount it. Absent from the
+    /// stored state while there is no veto, so a state without one reads and writes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounts_veto: Option<MountsVeto>,
 }
 
 impl ResourceState {
@@ -199,6 +219,7 @@ impl ResourceState {
             managed: false,
             host_idle_since: None,
             pending_recovery: BTreeSet::new(),
+            mounts_veto: None,
         }
     }
 

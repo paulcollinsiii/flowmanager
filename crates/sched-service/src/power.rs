@@ -563,6 +563,15 @@ mod tests {
                 }],
             });
         }
+        // No pod mounts basestar (the veto before a shutdown).
+        s.ingest_now(Report::Observed {
+            source: "basestar-mounts".into(),
+            fidelity: Fidelity::Polled,
+            values: vec![ObservedValue::ResourceMounts {
+                resource: "basestar-nfs".into(),
+                pods: 0,
+            }],
+        });
         // Nothing is waiting anywhere: every demand source reports zero.
         for (class, source) in [
             ("paperless-ocr", "paperless-ocr-pending"),

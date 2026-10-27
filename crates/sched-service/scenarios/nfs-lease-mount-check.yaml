@@ -1,0 +1,86 @@
+description: "A manual NFS lease wakes managed basestar and keeps the NFS-gated classes allowed; once it is released and idle grace has passed, the host is shut down only when no pod mounts it, and only after the pods are gone."
+power_control: managed
+frames:
+  # The lease wakes basestar (the GPU host is up and left alone).
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: backup-schedule, value: { type: demand, class: backup, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    leases:
+      - { id: manual-host-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: manual_host } }
+    expect:
+      steps: [{ type: power_on, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 100005000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: powering_on }]
+      allowed: { models: [], classes: [] }
+  # Observed up: the classes gated on NFS (the consumers, whatever their queues) are allowed.
+  - at: 100030000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  # An hour later, pods mount it and the lease still holds it up: nothing happens.
+  - at: 103600000
+    refresh: true
+    observe:
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 3 } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  # Released: the idle clock starts.
+  - at: 103660000
+    refresh: true
+    leases: []
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  # One second short of idle_grace (10m).
+  - at: 104259000
+    refresh: true
+    expect:
+      steps: []
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  # Idle grace over, but three pods mount basestar: no shutdown, the reason says so, the
+  # host stays up and everything that needs it stays allowed.
+  - at: 104260000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  - at: 104560000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
+      allowed: { models: [], classes: [backup, paperless-ngx, immich-server, paperless-gpt] }
+  # The pods are gone: the very next decision shuts the host down.
+  - at: 104570000
+    refresh: true
+    observe:
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+    expect:
+      steps: [{ type: power_off, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 104600000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [] }

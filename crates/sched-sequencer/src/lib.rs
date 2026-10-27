@@ -9,7 +9,7 @@
 //! Safety rules enforced here, regardless of the intent it is given:
 //! 1. At most one model of an exclusive resource is in the allowed set at a time. A switch
 //!    withdraws the old model and allows the new one in the same tick.
-//! 2. No decision is gated on pod state. GPU exclusivity is enforced by Kubernetes (every
+//! 2. No decision is gated on pod state (but see 7: a shutdown veto). GPU exclusivity is enforced by Kubernetes (every
 //!    GPU workload requests the one GPU the node exposes), so the new model's pod stays
 //!    pending until the old one has released the GPU. A model is allowed only on a host
 //!    that is up, and a model the config does not have is never allowed (one removed while
@@ -29,6 +29,12 @@
 //!    nothing is allowed on it, no power step is ever emitted for it again, and it leaves that
 //!    phase only when a fresh reading shows the state the transition was after (or its
 //!    control is manual). Other resources are unaffected.
+//! 7. A host whose NFS mounts are checked (a `mounts` source names it) is powered off only
+//!    on a fresh reading of zero mounting pods. A reading that is missing, stale or failed is
+//!    unknown and counts as mounted: the shutdown waits, bounded by `power.mounts_timeout`,
+//!    and on expiry the scheduler stops (the host stays up, the managed flag is dropped, no
+//!    retry) until the host is seen down, a person resets it, or a new manual request takes it
+//!    over. This is the only place a pod reading holds anything back, and it only ever vetoes.
 //! 8. Early switching happens only away from classes that declare it safe, or when forced,
 //!    and forced switches still give in-flight work its timeout. In-flight work is stopped
 //!    only on a forced switch (reclaim or manual model lease), class by class, each when

@@ -10,6 +10,8 @@ frames:
       - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
       - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
       - { source: basestar-probe, value: { type: resource_up, resource: basestar-nfs, up: false } }
+      # No pod mounts the NFS host (the veto before a shutdown reads this).
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
       - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }

@@ -137,6 +137,15 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
                 up: nfs_up,
             },
         ));
+        // No pod mounts the NFS host (the veto before a shutdown reads this).
+        observations.push(obs(
+            "basestar-mounts",
+            now,
+            ObservedValue::ResourceMounts {
+                resource: ResourceId::new("basestar-nfs"),
+                pods: 0,
+            },
+        ));
         for (c, s) in CLASSES {
             let q = &queues[c];
             observations.push(obs(

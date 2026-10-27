@@ -59,6 +59,16 @@ pub enum WaitReason {
     /// no further power action for the host by itself and allows nothing on it until a
     /// reachability observation shows the state the transition was after, or a person acts.
     PowerFailed,
+    /// The host is idle and due to be powered off, but pods mount its NFS server (a fresh
+    /// reading says so): the shutdown waits, bounded by the resource's `mounts_timeout`.
+    PodsMounted,
+    /// As `PodsMounted`, but the number of mounting pods is unknown (no reading, a stale or
+    /// failed one). Unknown means possibly mounted, never "no mounts".
+    MountsUnknown,
+    /// The wait for the pods to unmount outlasted `mounts_timeout`: the scheduler stopped and
+    /// will not shut the host down by itself (a person acts, or a new manual request takes the
+    /// host over again). The host stays up.
+    ShutdownStopped,
     /// The allowed model has not been allowed for `min_dwell` yet.
     MinDwell,
     /// The allowed model's active work is not declared preemptible.

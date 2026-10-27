@@ -44,6 +44,18 @@ fn up(res: &str, at: u64, up: bool) -> Observation {
     )
 }
 
+/// A fresh reading that no pod mounts the NFS host.
+fn no_mounts(at: u64) -> Observation {
+    obs(
+        "basestar-mounts",
+        at,
+        ObservedValue::ResourceMounts {
+            resource: ResourceId::new("basestar-nfs"),
+            pods: 0,
+        },
+    )
+}
+
 fn demand(
     class: &str,
     source: &str,
@@ -197,6 +209,7 @@ fn equal_timestamp_reachability_reads_as_not_up_in_either_order() {
     // Everything that lets a managed, idle, held-by-nothing NFS host power down is in place.
     let mut fixed = base_zero_pods(&[]);
     fixed.push(up("cuda-central", NOW, true));
+    fixed.push(no_mounts(NOW));
     for (c, s) in [
         ("paperless-ocr", "paperless-ocr-pending"),
         ("paperless-tagging", "paperless-post-ocr"),

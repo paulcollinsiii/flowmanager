@@ -53,6 +53,14 @@ fn up(resource: &str, up: bool, age: u64) -> String {
     )
 }
 
+/// A fresh reading (aged `age` ms) of how many pods mount the NFS host.
+fn mounts(pods: u32, age: u64) -> String {
+    format!(
+        "    - {{ source: basestar-mounts, observed_at: {}, fidelity: polled, value: {{ type: resource_mounts, resource: {N}, pods: {pods} }} }}\n",
+        T - age
+    )
+}
+
 fn demand(class: &str, source: &str, ready: u64, in_flight: u64, age: u64) -> String {
     let oldest = if ready > 0 {
         format!(", oldest_ready_at: {}", T - age - 1000)
@@ -107,6 +115,7 @@ impl Case {
         obs.extend(zero_pods());
         obs.push(up(G, true, 0));
         obs.push(up(N, true, 0));
+        obs.push(mounts(0, 0));
         Case {
             obs,
             leases: vec![],
@@ -128,6 +137,7 @@ impl Case {
             };
             (
                 v.contains("type: demand"),
+                v.contains("type: resource_mounts"),
                 name("class"),
                 name("model"),
                 name("resource"),
@@ -2370,4 +2380,245 @@ fn other_resources_keep_scheduling_while_one_is_failed() {
     assert!(d.allowed.classes.contains(&cid("backup")));
     assert!(d.allowed.classes.contains(&cid("paperless-ngx")));
     assert!(!d.allowed.classes.contains(&cid("paperless-gpt")));
+}
+
+// The pre-shutdown mount check: a managed NFS host that is idle and due to be powered off is
+// held up while pods mount it, and an unknown count counts as mounted.
+
+/// The NFS host managed and idle since `idle` ms ago, with a veto (`veto` is YAML) if any.
+fn nfs_due(idle: u64, veto: Option<&str>) -> String {
+    let veto = veto
+        .map(|v| format!(", mounts_veto: {v}"))
+        .unwrap_or_default();
+    format!(
+        "{{ power: {}, mode: {}, managed: true, host_idle_since: {}{veto} }}",
+        on(),
+        mode_idle(),
+        T - idle
+    )
+}
+
+fn waiting_since(ago: u64) -> String {
+    format!("{{ phase: waiting, since: {} }}", T - ago)
+}
+
+fn veto_of(d: &Decision) -> Option<sched_model::MountsVeto> {
+    d.state.resource(&rid(N)).unwrap().mounts_veto
+}
+
+#[test]
+fn a_host_that_pods_mount_is_not_powered_off_and_the_wait_begins_when_it_is_due() {
+    let due = || Case::new().nfs_state(&nfs_due(10 * MIN, None));
+    let d = due().obs(mounts(2, 0)).run();
+    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
+    assert_eq!(
+        veto_of(&d),
+        Some(sched_model::MountsVeto::Waiting {
+            since: sched_model::Millis(T)
+        })
+    );
+    let n = d.state.resource(&rid(N)).unwrap();
+    assert!(n.managed && n.is_on(), "still ours and still up");
+    assert!(
+        !d.allowed.classes.is_empty(),
+        "the host is up, so what needs it stays allowed"
+    );
+    // Not yet due (grace not over): no veto, no wait.
+    let d = Case::new()
+        .nfs_state(&nfs_due(10 * MIN - 1, None))
+        .obs(mounts(2, 0))
+        .run();
+    assert_steps(&d, vec![], "grace not over");
+    assert_eq!(veto_of(&d), None);
+}
+
+#[test]
+fn an_unknown_mount_count_counts_as_mounted() {
+    let due = || Case::new().nfs_state(&nfs_due(10 * MIN, None));
+    for (name, case) in [
+        ("never reported", due().drop_obs("resource_mounts")),
+        ("stale", due().obs(mounts(0, 31_000))),
+    ] {
+        let d = case.run();
+        assert_steps(&d, vec![wait(N, WaitReason::MountsUnknown)], name);
+        assert!(
+            !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+            "{name}"
+        );
+    }
+    // A reading exactly at the bound is still fresh, and zero lets the shutdown through.
+    let d = due().obs(mounts(0, 30_000)).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "fresh zero");
+    assert_eq!(veto_of(&d), None);
+}
+
+#[test]
+fn a_reading_from_a_source_without_the_capability_does_not_stand_in() {
+    // The scheduler ignores it (the fixture loader refuses it, so it is built by hand).
+    let c = Case::new()
+        .nfs_state(&nfs_due(10 * MIN, None))
+        .drop_obs("resource_mounts");
+    let snap_text = {
+        let mut y = format!("description: t\nsnapshot:\n  now: {T}\n  observations:\n");
+        for o in &c.obs {
+            y.push_str(o);
+        }
+        y.push_str("  leases: []\n");
+        y
+    };
+    let mut snap = Fixture::from_yaml(&snap_text).unwrap().snapshot;
+    snap.observations.push(sched_model::Observation {
+        source: "cluster-pods".into(),
+        observed_at: sched_model::Millis(T),
+        fidelity: sched_model::Fidelity::Polled,
+        value: sched_model::ObservedValue::ResourceMounts {
+            resource: rid(N),
+            pods: 0,
+        },
+    });
+    let d = tick(&c.config, &snap, &c.state(), &c.intent).unwrap();
+    assert_steps(&d, vec![wait(N, WaitReason::MountsUnknown)], "stray source");
+}
+
+#[test]
+fn the_wait_ends_in_the_shutdown_when_the_pods_are_gone() {
+    let case = |ago: u64, pods: u32| {
+        Case::new()
+            .nfs_state(&nfs_due(20 * MIN, Some(&waiting_since(ago))))
+            .obs(mounts(pods, 0))
+    };
+    let d = case(5 * MIN, 1).run();
+    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "still mounted");
+    assert_eq!(
+        veto_of(&d),
+        Some(sched_model::MountsVeto::Waiting {
+            since: sched_model::Millis(T - 5 * MIN)
+        }),
+        "the wait keeps its start"
+    );
+    let d = case(5 * MIN, 0).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "unmounted");
+    assert_eq!(veto_of(&d), None);
+    assert!(matches!(power_of(&d, N), PowerPhase::ShuttingDown { .. }));
+}
+
+#[test]
+fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retry() {
+    // mounts_timeout of the example is 30 minutes.
+    let case = |ago: u64, pods: u32| {
+        Case::new()
+            .nfs_state(&nfs_due(60 * MIN, Some(&waiting_since(ago))))
+            .obs(mounts(pods, 0))
+    };
+    let d = case(30 * MIN - 1, 1).run();
+    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "just inside");
+    let d = case(30 * MIN, 1).run();
+    assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], "timed out");
+    assert_eq!(
+        veto_of(&d),
+        Some(sched_model::MountsVeto::Stopped {
+            since: sched_model::Millis(T)
+        })
+    );
+    let n = d.state.resource(&rid(N)).unwrap();
+    assert!(!n.managed, "no automatic power-off follows");
+    assert!(n.is_on(), "the host stays up");
+    assert!(
+        !d.allowed.classes.is_empty(),
+        "and what needs it stays allowed"
+    );
+    // A timeout is also reached on unknown readings.
+    let d = case(30 * MIN, 0).drop_obs("resource_mounts").run();
+    assert_steps(
+        &d,
+        vec![wait(N, WaitReason::ShutdownStopped)],
+        "unknown too",
+    );
+
+    // Stopped stays stopped, however long, even once the pods are gone: no automatic retry.
+    let stopped = |pods: u32| {
+        Case::new()
+            .nfs_state(
+                &nfs_due(0, Some("{ phase: stopped, since: 1 }"))
+                    .replace("managed: true", "managed: false")
+                    .replace(&format!("host_idle_since: {}", T), "host_idle_since: null"),
+            )
+            .obs(mounts(pods, 0))
+    };
+    for pods in [0, 3] {
+        let d = stopped(pods).run_at(&stopped(pods).state(), T + 99 * 60 * MIN);
+        assert!(
+            !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+            "{d:?}"
+        );
+        assert!(
+            d.steps.contains(&wait(N, WaitReason::ShutdownStopped)),
+            "{d:?}"
+        );
+        assert!(matches!(
+            veto_of(&d),
+            Some(sched_model::MountsVeto::Stopped { .. })
+        ));
+    }
+}
+
+#[test]
+fn a_new_manual_request_takes_a_stopped_host_over_and_the_next_idle_period_decides_afresh() {
+    let stopped = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: false, mounts_veto: { phase: stopped, since: 1 } }";
+    let d = Case::new()
+        .nfs_state(stopped)
+        .want(N, PowerWant::Manual)
+        .obs(mounts(4, 0))
+        .run();
+    assert_eq!(veto_of(&d), None);
+    assert!(d.state.resource(&rid(N)).unwrap().managed);
+    assert_steps(&d, vec![], "held by the request");
+    // A workload want alone does not take it over.
+    let d = Case::new()
+        .nfs_state(stopped)
+        .want(N, PowerWant::Workload)
+        .obs(mounts(4, 0))
+        .run();
+    assert!(matches!(
+        veto_of(&d),
+        Some(sched_model::MountsVeto::Stopped { .. })
+    ));
+    assert!(!d.state.resource(&rid(N)).unwrap().managed);
+}
+
+#[test]
+fn something_holding_the_host_ends_the_wait_and_a_host_seen_down_ends_a_stop() {
+    let hold = format!(
+        "{{ id: h, resource: {N}, granted_at: 0, kind: {{ type: shared_hold, holder: x }} }}"
+    );
+    let d = Case::new()
+        .nfs_state(&nfs_due(60 * MIN, Some(&waiting_since(10 * MIN))))
+        .obs(mounts(1, 0))
+        .lease(hold)
+        .run();
+    assert_eq!(veto_of(&d), None, "a hold makes the shutdown moot");
+    assert_steps(&d, vec![], "kept up");
+    // The host went down by itself (a person, a power cut): nothing left to veto.
+    for veto in [
+        "{ phase: waiting, since: 1 }",
+        "{ phase: stopped, since: 1 }",
+    ] {
+        let d = Case::new()
+            .nfs_state(&nfs_due(60 * MIN, Some(veto)))
+            .obs(up(N, false, 0))
+            .run();
+        assert_eq!(power_of(&d, N), PowerPhase::Off);
+        assert_eq!(veto_of(&d), None, "{veto}");
+    }
+}
+
+#[test]
+fn an_unchecked_host_is_powered_off_without_a_mount_reading() {
+    // The GPU host has no mounts source: the veto does not apply to it (its drain is the
+    // model wind-down), and a mount reading is not needed.
+    let managed = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: ";
+    let d = Case::new()
+        .gpu_state(&format!("{managed}{} }}", T - 10 * MIN))
+        .run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(G) }], "gpu");
 }
