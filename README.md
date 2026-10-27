@@ -368,9 +368,10 @@ included). Instead:
 switching rejects the shipped config: a gate class (a requirement on an exclusive resource
 without a model) fails validation with "exclusive; a model is required", and a config
 without a pods source is refused as well. Deploy the previous binary with the previous
-config (the persisted state is readable by both builds, except a `failed` power phase,
-which only this build writes: a resource in that phase has to be recovered with
-`discard_state` before the older build can read the document).
+config (the persisted state is readable by both builds, except while it holds what only
+this build writes: a `failed` power phase, or a `mounts_veto` entry, which is present
+whenever a shutdown is waiting on pods that still mount NFS or has stopped. Until those
+clear, or until `discard_state` is used, the older build cannot read the document).
 
 To recover, either deploy the build that wrote the document, or discard it. Discarding
 `scheduler_state` restarts the sequencer from observation: no model is allowed until the
