@@ -88,7 +88,11 @@ M0 through M3 ran in sequence, and M3 was rescoped while it ran (see *Scope rese
 
 - **In scope:** Open WebUI acquires and holds a **manual model lease** through the existing ingress handlers (`acquire_model_lease`, `release_lease`, `leases`) and the **release is manual** (a person releases it); the lease cuts batch work short with its timeout, as a reclaim does.
 - **Out of scope:** interactive leases with renewal and expiry, a request path for clients to renew, priority over batch work at job boundaries for ordinary interactive requests, a model-routing proxy, demand-driven power.
-- **Exit criteria:** a manual LLM lease preempts batch work within its timeout and holds the LLM until released; releasing it lets batch draining resume.
+- **Decided by the user (Oct 27, 2026), which changes the trigger route above:** the toggle is **Home Assistant**, not Open WebUI. Home Assistant runs inside the cluster with `hostNetwork: true` (mDNS on the 192.168.2.x network).
+  - *API:* a small dedicated HTTP listener in flowmanager (its own address, like the metrics and KEDA listeners) that Home Assistant's REST switch can use: plain `GET` for state, `POST` for on and off, idempotent by name so Home Assistant never needs a lease id. A bearer token (read from a secret file) is mandatory.
+  - *Scope:* manual **model leases** (one toggle per configured model; **on means a lease is held**, not that the model is loaded) **and host controls** (the manual GPU and NFS host leases, plus `resume` for a failed power phase; `reclaim`/`unreclaim` are left out unless the user asks, a default taken because the user said "host controls" without naming them). The read side reports held or not held plus a richer status (waiting for the host, draining batch work, model active) for a sensor.
+  - *Acquire:* explicit action only, never automatic. *Release:* manual; the safety net is visibility only (a lease-age metric and an example alert), no automatic expiry.
+- **Exit criteria:** a manual LLM lease preempts batch work within its timeout and holds the LLM until released; releasing it lets batch draining resume. Through the HTTP listener, a request without the token is refused; on and off are idempotent; the state read agrees with `leases` and the sequencer's reasons; a host toggle brings a managed host up (or waits under `control: manual`) and releases it again.
 
 ### M7: Remaining immich and preemption items
 
