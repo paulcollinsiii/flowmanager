@@ -3744,6 +3744,7 @@ name = "sched-actuate"
 version = "0.1.0"
 dependencies = [
  "reqwest",
+ "russh",
  "sched-model",
  "sched-observe",
  "serde",
