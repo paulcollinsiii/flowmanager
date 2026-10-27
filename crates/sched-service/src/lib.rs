@@ -19,6 +19,7 @@ pub mod invariants;
 pub mod jobs;
 pub mod keda_scaler;
 pub mod leases;
+pub mod listener;
 pub mod metrics;
 pub mod metrics_server;
 pub mod object;

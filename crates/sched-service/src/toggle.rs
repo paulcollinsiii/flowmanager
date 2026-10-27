@@ -29,19 +29,13 @@
 //! Plain HTTP: the intended client cannot trust a private CA, so the bearer token is the
 //! control, together with the network (NetworkPolicy, mesh) around the port.
 
-use std::convert::Infallible;
 use std::future::Future;
-use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper::body::{Body, Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper::Method;
 use sched_model::{
     Config, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, PowerPhase, ResourceId,
     ResourceKind,
@@ -49,10 +43,10 @@ use sched_model::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 
 use crate::leases::LeaseGrant;
-use crate::metrics_server::OneShot;
+pub use crate::listener::{Limits, Reply, constant_time_eq};
+use crate::listener::{LogLimiter, bearer, read_body, read_token};
 use crate::object::BoxFut;
 use crate::resume::ResumeAck;
 use crate::runtime::OBJECT;
@@ -406,39 +400,6 @@ impl ToggleLog {
     }
 }
 
-/// Keeps a burst of refused requests (a scan, a wrong token tried in a loop) from flooding
-/// the log: at most `LOG_BURST` refusals are logged per `LOG_WINDOW`, and the next line
-/// that is logged says how many were left out. Changes that succeed are always logged.
-struct LogLimiter(std::sync::Mutex<(std::time::Instant, u32, u32)>);
-
-const LOG_BURST: u32 = 30;
-const LOG_WINDOW: Duration = Duration::from_secs(10);
-
-impl LogLimiter {
-    fn new(now: std::time::Instant) -> LogLimiter {
-        LogLimiter(std::sync::Mutex::new((now, 0, 0)))
-    }
-
-    /// `Some(left_out)` if the line is to be logged.
-    fn admit(&self, now: std::time::Instant, refused: bool) -> Option<u32> {
-        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if !refused {
-            return Some(0);
-        }
-        if now.duration_since(s.0) >= LOG_WINDOW {
-            s.0 = now;
-            s.1 = 0;
-        }
-        if s.1 < LOG_BURST {
-            s.1 += 1;
-            Some(std::mem::take(&mut s.2))
-        } else {
-            s.2 += 1;
-            None
-        }
-    }
-}
-
 fn outcome_label(status: u16) -> &'static str {
     match status {
         200 => "ok",
@@ -476,50 +437,6 @@ pub fn parse_wish(body: &str) -> Option<bool> {
     }
 }
 
-/// Equality that takes the same time wherever two inputs differ (the length is not hidden).
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
-    }
-    std::hint::black_box(diff) == 0
-}
-
-/// The token in an `Authorization: Bearer <token>` header value.
-fn bearer(header: Option<&str>) -> Option<&str> {
-    let h = header?.trim();
-    let (scheme, token) = h.split_once(' ')?;
-    scheme
-        .eq_ignore_ascii_case("bearer")
-        .then_some(token.trim())
-}
-
-/// A finished answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reply {
-    pub status: u16,
-    pub body: String,
-    /// Sent with a 401 so a client knows what is wanted.
-    pub challenge: bool,
-    /// The methods a 405 allows (its `Allow` header).
-    pub allow: Option<&'static str>,
-}
-
-impl Reply {
-    fn json(status: u16, v: Value) -> Reply {
-        Reply {
-            status,
-            body: v.to_string(),
-            challenge: false,
-            allow: None,
-        }
-    }
-
-    fn error(e: ApiError) -> Reply {
-        Reply::json(e.status, json!({ "error": e.message }))
-    }
-}
-
 /// The toggle listener's logic: authentication, routing, and the calls behind them.
 pub struct Toggle {
     shared: Arc<Shared>,
@@ -541,17 +458,9 @@ impl Toggle {
     /// The token, read from its file on every request. A missing, unreadable or empty file
     /// is an error, never a match.
     async fn token(&self) -> Result<String, ApiError> {
-        match tokio::fs::read_to_string(&self.token_file).await {
-            Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
-            Ok(_) => {
-                tracing::error!(path = %self.token_file.display(), "the toggle token file is empty");
-                Err(ApiError::new(503, "the toggle token is not available"))
-            }
-            Err(e) => {
-                tracing::error!(path = %self.token_file.display(), "the toggle token file cannot be read: {e}");
-                Err(ApiError::new(503, "the toggle token is not available"))
-            }
-        }
+        read_token(&self.token_file, "toggle")
+            .await
+            .ok_or_else(|| ApiError::new(503, "the toggle token is not available"))
     }
 
     /// Answers one request whose body is already in hand.
@@ -590,7 +499,7 @@ impl Toggle {
                     }
                     None => {
                         want = Some(None);
-                        Reply::error(ApiError::new(
+                        error_reply(ApiError::new(
                             400,
                             format!(
                                 "the request body is larger than {MAX_BODY} bytes or unreadable"
@@ -620,15 +529,10 @@ impl Toggle {
     }
 
     async fn authorize(&self, header: Option<&str>) -> Result<(), Reply> {
-        let token = self.token().await.map_err(Reply::error)?;
+        let token = self.token().await.map_err(error_reply)?;
         match bearer(header) {
             Some(given) if constant_time_eq(given.as_bytes(), token.as_bytes()) => Ok(()),
-            _ => Err(Reply {
-                status: 401,
-                body: json!({ "error": "a valid bearer token is required" }).to_string(),
-                challenge: true,
-                allow: None,
-            }),
+            _ => Err(Reply::unauthorized()),
         }
     }
 
@@ -636,7 +540,7 @@ impl Toggle {
         let result = match route {
             Route::NotFound => Err(ApiError::new(404, "not found")),
             Route::MethodNotAllowed(allow) => {
-                let mut r = Reply::error(ApiError::new(405, "method not allowed"));
+                let mut r = error_reply(ApiError::new(405, "method not allowed"));
                 r.allow = Some(allow);
                 return r;
             }
@@ -650,7 +554,7 @@ impl Toggle {
         };
         match result {
             Ok(v) => Reply::json(200, v),
-            Err(e) => Reply::error(e),
+            Err(e) => error_reply(e),
         }
     }
 
@@ -1147,108 +1051,28 @@ pub fn resource_state(
     Value::Object(m)
 }
 
-/// Limits on the toggle listener (the metrics listener's, see `metrics_server`).
-#[derive(Debug, Clone, Copy)]
-pub struct Limits {
-    pub max_connections: usize,
-    pub connection_timeout: Duration,
-    /// How long a client may take to send the headers of a request. Short, and apart from
-    /// `connection_timeout`, so that connections that say nothing cannot hold the slots.
-    pub header_read_timeout: Duration,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        // A request may wait on a tick holding the object's lock, so it gets longer than
-        // a metrics scrape.
-        Limits {
-            max_connections: 64,
-            connection_timeout: Duration::from_secs(30),
-            header_read_timeout: Duration::from_secs(5),
-        }
-    }
-}
-
-/// Reads at most `MAX_BODY` bytes; `None` if the body is larger or fails.
-async fn read_body(mut body: Incoming) -> Option<String> {
-    let mut buf = Vec::new();
-    while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-        let frame = frame.ok()?;
-        if let Some(data) = frame.data_ref() {
-            if buf.len() + data.len() > MAX_BODY {
-                return None;
-            }
-            buf.extend_from_slice(data);
-        }
-    }
-    String::from_utf8(buf).ok()
-}
-
-fn response(reply: Reply) -> Response<OneShot> {
-    let mut b = Response::builder()
-        .status(reply.status)
-        .header("content-type", "application/json")
-        .header("cache-control", "no-store");
-    if let Some(allow) = reply.allow {
-        b = b.header("allow", allow);
-    }
-    if reply.challenge {
-        b = b.header("www-authenticate", "Bearer");
-    }
-    b.body(OneShot::new(Bytes::from(reply.body)))
-        .expect("static response parts are valid")
+fn error_reply(e: ApiError) -> Reply {
+    Reply::failure(e.status, &e.message)
 }
 
 /// Serves until the task is dropped or aborted.
 pub async fn serve(listener: TcpListener, toggle: Arc<Toggle>, limits: Limits) {
-    let slots = Arc::new(Semaphore::new(limits.max_connections.max(1)));
-    let mut backoff = Duration::from_millis(50);
-    loop {
-        let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
-            return;
-        };
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => {
-                backoff = Duration::from_millis(50);
-                stream
+    crate::listener::serve(
+        listener,
+        limits,
+        "toggle",
+        move |method, path, auth, body| {
+            let toggle = Arc::clone(&toggle);
+            async move {
+                // The body is read only once the caller has been authenticated.
+                let body = read_body(body, MAX_BODY);
+                toggle
+                    .handle_with(&method, &path, auth.as_deref(), body)
+                    .await
             }
-            Err(e) => {
-                tracing::warn!("toggle listener accept failed: {e}");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(2));
-                continue;
-            }
-        };
-        let toggle = Arc::clone(&toggle);
-        tokio::spawn(async move {
-            let _permit = permit;
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let toggle = Arc::clone(&toggle);
-                async move {
-                    let method = req.method().clone();
-                    let path = req.uri().path().to_string();
-                    let auth = req
-                        .headers()
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string);
-                    // The body is read only once the caller has been authenticated.
-                    let body = read_body(req.into_body());
-                    let reply = toggle
-                        .handle_with(&method, &path, auth.as_deref(), body)
-                        .await;
-                    Ok::<_, Infallible>(response(reply))
-                }
-            });
-            // A client that does not finish its request headers promptly is dropped long
-            // before the whole-connection limit, so idle connections cannot hold the slots.
-            let conn = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(limits.header_read_timeout)
-                .serve_connection(TokioIo::new(stream), svc);
-            let _ = tokio::time::timeout(limits.connection_timeout, conn).await;
-        });
-    }
+        },
+    )
+    .await
 }
 
 /// Reads the token once (so a missing or empty file fails startup), binds `addr` (so a taken
@@ -1271,6 +1095,7 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
     use crate::config_source::ConfigHolder;
+    use crate::listener::{LOG_BURST, LOG_WINDOW};
     use crate::metrics::Metrics;
     use crate::object::{self, AcquireModelLease, ReleaseLease, ResourceRequest, fake::FakeCtx};
     use crate::persist::LEASES_KEY;
