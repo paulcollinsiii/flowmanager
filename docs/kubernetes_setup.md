@@ -738,6 +738,16 @@ and allowing one needs a fresh "up" reading (`policy.host_reading_stale_after`, 
   `resume`, it is seen down, or a new manual lease takes it over. A GPU host's shutdown
   follows the bounded wind-down of its model (`drain_timeout`, `reclaim_timeout`); see "Power
   actions" in the README.
+- **A minimum off time for a managed host** (`resources[].power.min_off`, default 0:
+  disabled; at most 1 d): after flowmanager has shut a host down and seen it down, it does not
+  power the host on again by itself (a workload, a scheduled job's hold) until `min_off` has
+  passed; a manual lease does not wait. Meant for a host such as the NFS server, where
+  flapping power is worse than a delayed job. While it waits the step is
+  `wait ... min_off`, the tick's `reason` says `waiting for min_off, N s left`, and
+  `sched_resource_min_off_remaining_seconds{resource}` counts down. A scheduled job's start
+  window keeps running during the wait, so keep `min_off` well inside the job's
+  `start_window` (or accept that a `skip` run is missed). Rolling the binary back needs the
+  config rolled back too (an older build rejects the key). See "Power actions" in the README.
 
 ## 9. Operations
 
@@ -765,7 +775,9 @@ event):
   `skipped_cap`, `skipped_not_allowed`, `deferred`).
 - `sched_resource_mounts_veto{resource,state}` (`waiting`, `stopped`; only resources a
   `mounts` source names) and `sched_mounts_timeouts_total{resource}`: a shutdown held back by
-  mounting pods, and the waits that timed out. The power metrics (`sched_resource_power_failed`,
+  mounting pods, and the waits that timed out. `sched_resource_min_off_remaining_seconds{resource}`:
+  seconds left of the `min_off` wait before a host that flowmanager shut down may be powered on
+  again by itself (0 outside it). The power metrics (`sched_resource_power_failed`,
   `sched_power_timeouts_total`, `sched_power_requests_total`) are in the README.
 - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
   `sched_tick_trigger_failures_total` (flowmanager could not ask the Restate ingress for a

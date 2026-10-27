@@ -370,7 +370,7 @@ switching rejects the shipped config: a gate class (a requirement on an exclusiv
 without a model) fails validation with "exclusive; a model is required", and a config
 without a pods source is refused as well. Deploy the previous binary with the previous
 config (the persisted state is readable by both builds, except while it holds what only
-this build writes: a `failed` power phase, or a `mounts_veto` entry, which is present
+this build writes: a `failed` power phase, a `shutdown_confirmed_at` stamp (only for a resource with a `min_off`, see *A minimum off time*), or a `mounts_veto` entry, which is present
 whenever a shutdown is waiting on pods that still mount NFS or has stopped. Until those
 clear, or until `discard_state` is used, the older build cannot read the document).
 
@@ -520,7 +520,7 @@ harmless to repeat).
   `wake_on_lan: {router_url, interface (default lan), mac}` and
   `shutdown: {host, port (default 22), user, host_key}`; `router_url` must be a plain
   `https://` base URL, without credentials, a query string or a fragment (the API path is
-  appended to it). `managed` requires both. Optional `power_on_timeout`, `mounts_timeout` and
+  appended to it). `managed` requires both. Optional `power_on_timeout`, `mounts_timeout`, `min_off` and
   `shutdown_timeout` (see below). A MAC or
   an SSH target may not be shared by two resources. A reload that turns a host `managed`
   applies like any other change; one that leaves it incomplete is rejected and the previous
@@ -581,6 +581,51 @@ harmless to repeat).
   scheduler restart or a long outage can raise the alert before a fresh reading could show
   the host in the state wanted (a known trade-off; the failed phase then clears on that
   reading, but the alert has fired).
+- **A minimum off time (`min_off`), so a host does not flap.** Per resource under
+  `resources[].power`, a duration, **default 0: disabled**, and then nothing here applies and
+  nothing in the stored state changes. At most 1d; `0` is allowed; it only matters under
+  `control: managed` (a `manual` host accepts and ignores it). With `min_off` set, after a
+  shutdown that **flowmanager started** and saw **confirmed** (the phase reached `off` because a
+  fresh reading showed the host down while it was `shutting_down`, or `failed` while shutting
+  down), an *automatic* power-on waits until `min_off` has passed: a power-changing class with
+  demand, the hold of a scheduled job, any other want that is not a manual lease. A **manual
+  lease overrides it** (the person asked; they do not wait).
+  - *What starts the clock.* The instant of the reading that confirmed the shutdown (the tick
+    that moved the phase to `off`), kept as `shutdown_confirmed_at` on the resource in
+    `scheduler_state`. A host found down at first sight, one that was up and went down by
+    itself, a host never managed, and one under manual control have no stamp and are not
+    delayed: flowmanager did not shut them down. The stamp ends when the phase leaves `off`.
+    It is written only for a resource that has a `min_off`. Changing `min_off` takes effect
+    on the next confirmed shutdown for a host with no stamp yet (a stamp already kept uses
+    the new value; setting it back to 0 drops the stamp).
+  - *Durable.* The stamp is part of the persisted sequencer state, so a scheduler restart
+    does not shorten the wait. `STATE_VERSION` is unchanged: the key is optional and absent
+    while unset. **Rolling back:** a build without `min_off` cannot read a state that has the
+    key (like `failed` and `mounts_veto`), which is only while a host with a `min_off` is
+    `off` after a shutdown of ours and the wait has not been left (the key goes away when the
+    host is powered on or seen up). Until then, or until `discard_state`, the older build
+    reports a persisted-state error. Roll the config back (remove `min_off`, which an older
+    build rejects as an unknown key) with it.
+  - *Clock going backwards.* A stamp in the future (the wall clock moved back) is made again
+    at the current time on the next tick, so the wait is never longer than `min_off`.
+  - *Never a retry.* The wait only delays a fresh decision: nothing is requested while it
+    lasts, and when it is over the next tick decides from the then current intent, so a want
+    that went away in the meantime powers nothing on. A power-on that is then requested is
+    subject to everything else as before (timeouts, failed phase).
+  - *Reported.* Step `wait <resource> min_off`, a `min_off_waits` entry in the tick's report
+    (`resource`, `since`, `until`, `remaining`, all in ms), the `reason` says `<resource> is
+    wanted but was shut down by flowmanager and seen down at <t>ms: waiting for min_off, <N>s
+    left`, and the gauge `sched_resource_min_off_remaining_seconds{resource}` counts the
+    seconds left (0 outside the window; series only for managed resources with a `min_off`).
+  - *Scheduled jobs.* A job's hold is a want like any other, so a run waits for the host
+    through the wait. Its start window keeps running meanwhile: under `skip` a run whose
+    window ends inside the wait is dropped as `missed` and its hold released (the host is then
+    not powered on); under `catch_up` it alerts `start_late` at the end of the window and
+    starts, late and once, after the host is up. Choose `min_off` with the start window in
+    mind. Checked by the end-to-end tests in `crates/sched-service/src/jobs/scenarios.rs`.
+  - Invariant 4b (`crates/sched-service/src/invariants.rs`): no `power_on` within `min_off` of
+    a confirmed shutdown without a manual lease. Replay scenarios `min-off-wait.yaml` and
+    `min-off-manual-lease.yaml`.
 - **A shutdown first checks that no pod mounts the host, and a GPU shutdown first winds
   its model down.** Neither is a retry or a new power action; both only hold a shutdown back.
   - *NFS host (the mount check).* A host named by a `mounts` source (`kubernetes_watch`
@@ -885,6 +930,10 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   `power` section have the series.
 - `sched_power_timeouts_total{resource,during}`: power transitions that timed out (alert on
   any increase; the resource then stays failed until a person acts).
+- `sched_resource_min_off_remaining_seconds{resource}`: seconds left of the resource's `min_off`
+  after a shutdown flowmanager started (an automatic power-on waits meanwhile, the step is
+  `wait ... min_off`; a manual lease does not wait); 0 outside the window. Only managed
+  resources with a `min_off` above zero have the series.
 - `sched_resource_mounts_veto{resource,state}`: 1 while a shutdown of the resource is held back
   because pods mount its NFS server or the count is unknown (`waiting`, bounded by
   `mounts_timeout`), or because that wait timed out and flowmanager stopped (`stopped`; alert

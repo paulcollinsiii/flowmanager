@@ -58,6 +58,12 @@ resources:
       # host (see the basestar-mounts source) before the scheduler alerts and stops, without
       # shutting it down and without retrying (default 30m, at most 1d).
       mounts_timeout: 30m
+      # Under managed control, the least time flowmanager keeps this host off after a
+      # shutdown it started and saw confirmed, before it powers it on again by itself (a
+      # workload, a scheduled job's hold); a manual lease does not wait. Default 0 (disabled),
+      # at most 1d. Meant to stop slow power flapping of the NFS host; keep it well inside a
+      # job's start_window. Shown commented out so the shipped behaviour is the default.
+      # min_off: 10m
 
 models:
   - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru] }
