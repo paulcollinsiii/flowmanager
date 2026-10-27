@@ -129,8 +129,8 @@ What is carried out and what is not:
   that needs a host that is off waits (`wait ... the host is not up`) for a person to power
   it on, including a manual model lease. A powering-on or shutting-down phase left in the
   persisted state by managed control converges to the observed phase. `managed` (the
-  scheduler powers hosts on and off) is for M4, with the power actuators.
-- **Stopping in-flight work has no actuator** (nor do power steps under `managed`). The
+  scheduler powers hosts on and off) is described under *Power actions* below.
+- **Stopping in-flight work has no actuator.** The
   sequencer still takes these steps (its state moves on as if they happened), and each one
   is reported as not executed: listed in the tick's `not_executed`, marked
   `[NOT EXECUTED: ...]` in the reason, and logged as a warning. See Known blind spots.
@@ -479,6 +479,46 @@ Metrics: `sched_recovery_runs_total{class,outcome}` (`ran`, `skipped_interval`,
 `sched_recovery_requeues_total{class,outcome}` (`attempted`, `queued`, `failed`,
 `skipped_cap`, `skipped_not_allowed`, `deferred`).
 
+## Power actions
+
+A resource with `power.control: managed` is powered on and off by the scheduler. The
+sequencer emits `PowerOn` and `PowerOff` steps for it (never for a `manual` one), and the
+tick carries each one out by sending the resource's `Power` object (key: the resource id)
+a one-way request after storing the decision; Restate journals the send, so a retried or
+replayed tick sends it once, and the sequencer emits one step per transition. The object
+makes the call in a journaled step, so a replay never repeats it (a crash after the call
+but before its result is journaled makes Restate run the step once more: both calls are
+harmless to repeat).
+
+- **Power on** is Wake-on-LAN sent by the router, because flowmanager runs in the cluster
+  and cannot broadcast on the LAN: `POST /api/wol/wol/set` to the OPNsense `os-wol` API with
+  basic auth. `https` only, verification never off, no redirect followed.
+- **Power off** is SSH (`russh`) with a forced-command key: the host key is pinned by its
+  SHA256 fingerprint (any other key is refused), `poweroff` is exec'd (the forced command
+  ignores it), and the wait after the exec is bounded (the link may drop as the host goes
+  down; that is success).
+- **Config** (`resources[].power`, typed and checked at load; see `config/example.yaml`):
+  `wake_on_lan: {router_url, interface (default lan), mac}` and
+  `shutdown: {host, port (default 22), user, host_key}`. `managed` requires both. A MAC or
+  an SSH target may not be shared by two resources. A reload that turns a host `managed`
+  applies like any other change; one that leaves it incomplete is rejected and the previous
+  config stays.
+- **Secrets are not config.** Files mounted from Kubernetes Secrets and named on the
+  command line (or in the environment), read on every call so rotation needs no restart:
+  `--opnsense-credentials-file` (`SCHED_OPNSENSE_CREDENTIALS_FILE`, `key:secret` on one
+  line), `--opnsense-ca-file` (`SCHED_OPNSENSE_CA_FILE`, optional PEM bundle, the only CA
+  trusted when given) and `--ssh-key-file` (`SCHED_SSH_KEY_FILE`). The service refuses to
+  start when the config has a managed host and the files its calls need are not given.
+- **A failed power action is never retried automatically.** A host that does not come up or
+  go down is beyond the scheduler's scope, and a retry risks flapping it. The failure is
+  logged at error level (`event="power_request_failed"`), counted
+  (`sched_power_requests_total{resource,action,outcome="failed"}`) and stored; the
+  invocation still succeeds, so Restate does not retry it either. The sequencer has already
+  recorded the step (the host reads as powering on or shutting down) and follows the host's
+  observed reachability from there; timeouts for those phases are later work.
+- `Power/{resource}/run` is ingress-private; `Power/{resource}/last_action` returns the
+  last action (`{action, at, outcome: requested|failed, error}`, `null` if none).
+
 ## Handlers
 
 All are called as `POST {ingress}/Scheduler/main/{handler}`. The `Recovery` object's
@@ -574,6 +614,9 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   (`unknown_subject`) dropped because the config has no place for them.
 - `sched_recovery_runs_total{class,outcome}` and `sched_recovery_requeues_total{class,outcome}`:
   runs and items of a class's recovery action (see *Recovery actions* for the outcomes).
+- `sched_power_requests_total{resource,action,outcome}`: power actions by `on`/`off` and
+  `requested` (accepted by the router or host), `failed` (never retried automatically; alert on
+  any increase) or `not_wired` (the active config no longer has the host under managed control).
 - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
   `sched_tick_trigger_failures_total`.
 - `sched_config_generation`, `sched_config_reloads_total{outcome}`.

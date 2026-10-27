@@ -615,7 +615,8 @@ and allowing one needs a fresh "up" reading (`policy.host_reading_stale_after`, 
   hosts): a person powers the hosts on and off. flowmanager never emits a power step and
   follows the observed reachability: work that needs a host that is off waits
   (`wait ... the host is not up`), including a manual model lease. `managed` (flowmanager
-  powers hosts) is later work; do not configure it.
+  powers hosts) needs the `wake_on_lan` and `shutdown` sections of the resource and the
+  secret files below; see "Power actions" in the README.
 
 ## 9. Operations
 
