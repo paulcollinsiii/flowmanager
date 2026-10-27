@@ -290,7 +290,9 @@ sources:
         # page_size=1: only the `count` of the document list is used.
         - url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=ocr-pending&page_size=1
           count: /count
-      # Accepted and ignored: this build has no webhook receiver, sources are polled only.
+      # A POST to this path of the webhook listener (--webhook-listen) makes this source poll
+      # now, no more often than --webhook-min-interval; the body is ignored. resync stays the
+      # safety net, and without the listener the source is polled at its resync only.
       webhook: { path: /hooks/paperless }
 
   - id: paperless-post-ocr

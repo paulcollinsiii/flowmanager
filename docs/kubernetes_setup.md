@@ -85,6 +85,10 @@ them (`sched-service --help`):
 | `--keda-listen <ADDR>` | `SCHED_KEDA_LISTEN` | `0.0.0.0:9095` | The **KEDA external scaler** (gRPC, plaintext). |
 | `--toggle-listen <ADDR>` | `SCHED_TOGGLE_LISTEN` | off (suggested `0.0.0.0:9096`) | The **toggle listener** for Home Assistant (plain HTTP, bearer token); off when absent; needs `--toggle-token-file`. See the toggle listener subsection of section 2. |
 | `--toggle-token-file <PATH>` | `SCHED_TOGGLE_TOKEN_FILE` | none | The bearer token the toggle listener requires (a mounted Secret, one line), read on every request. Needs `--toggle-listen`; start-up fails if the file is missing or empty. |
+| `--webhook-listen <ADDR>` | `SCHED_WEBHOOK_LISTEN` | off (suggested `0.0.0.0:9097`) | The **webhook listener** ("poll now", plain HTTP); off when absent; needs `--webhook-auth`. See the webhook listener subsection of section 2. |
+| `--webhook-auth <mesh\|token>` | `SCHED_WEBHOOK_AUTH` | none, **no default** | `mesh`: this process authenticates no one, Istio must. `token`: bearer token from `--webhook-token-file`. Needs `--webhook-listen`. |
+| `--webhook-token-file <PATH>` | `SCHED_WEBHOOK_TOKEN_FILE` | none | The bearer token for `--webhook-auth token` (a mounted Secret, one line), read on every request; start-up fails if missing or empty. Refused with `mesh`. |
+| `--webhook-min-interval <DURATION>` | `SCHED_WEBHOOK_MIN_INTERVAL` | `10s` | The least time between two polls of a source that webhooks nudge. Greater than zero. |
 | `--restate-ingress <URL>` | `SCHED_RESTATE_INGRESS` | `http://localhost:8080` | The Restate **ingress** URL. The process calls it itself: `POST {url}/Scheduler/main/tick/send` when observations or leases change, and `POST {url}/Scheduler/main/arm_backstop/send` at start-up (retried every 5 s until Restate accepts) and whenever its backstop watchdog finds the chain overdue (not run for more than three intervals plus 10 s). **Must be set in the cluster** (the default is localhost). |
 | `--backstop <DURATION>` | `SCHED_BACKSTOP` | `30s` | Interval of the periodic backstop tick. Greater than zero. |
 | `--reload-interval <DURATION>` | `SCHED_RELOAD_INTERVAL` | `5s` | How often the config file is re-read. Greater than zero. |
@@ -97,7 +101,7 @@ service account token through the Kubernetes client (set by Kubernetes in a pod)
 secret variables named by the configuration (section 5). It writes logs to stdout.
 
 Ports: **9080** Restate service endpoint, **9090** metrics and `/healthz`, **9095** KEDA
-scaler, and **9096** (suggested) the toggle listener when enabled. Each binds at start; a port already in use stops the process.
+scaler, **9096** (suggested) the toggle listener and **9097** (suggested) the webhook listener when enabled. Each binds at start; a port already in use stops the process.
 
 ### The configuration file (ConfigMap)
 
@@ -575,6 +579,126 @@ of an automatic expiry; the age metric lets Prometheus say so:
     summary: "{{ $labels.kind }} lease on {{ $labels.target }} held for over 6 hours"
 ```
 
+### The webhook listener ("poll now")
+
+An optional listener makes a source poll now when something tells it to. It is **off unless
+`--webhook-listen` is given**, it is **separate from the toggle listener** (its own port, suggested
+`0.0.0.0:9097`) because the two need different policies, and **`--webhook-auth` has no default**:
+the process refuses to start with `--webhook-listen` and no `--webhook-auth`, with
+`--webhook-auth` and no `--webhook-listen`, with `token` and no `--webhook-token-file`, and with
+`mesh` and a token file (a token that is never checked would only look like protection). What a
+request means, the answers, the rate limit and the metrics are in the README (*Webhook listener*);
+the interval is `--webhook-min-interval`, default **10 s**: a source starts a poll at least that
+long after its previous poll started, however many requests arrive, and the source's `resync`
+still polls as before. 10 s was chosen so that a burst of paperless events becomes one poll
+within seconds while a flood cannot make flowmanager hammer paperless or speakr; lengthen it with
+the flag if those services prefer. A source takes part by declaring
+`webhook: { path: /hooks/paperless }` in its `http_json` params (the example config does for
+four sources); nothing else about the source changes. Nothing sends webhooks today.
+
+Ports and Service:
+
+```yaml
+# Service ports: add
+    - { name: http-webhook, port: 9097, targetPort: 9097 }
+# Deployment ports: add
+            - { name: http-webhook, containerPort: 9097 }
+```
+
+**`mesh` mode.** flowmanager authenticates no one; Istio does. Flags: `--webhook-listen
+0.0.0.0:9097 --webhook-auth mesh`. A caller must be a meshed workload (it has a sidecar), and
+the port must be `STRICT` so that a plain-text caller is refused rather than let through, and
+an `AuthorizationPolicy` must name who may call. Example, with the paperless-ngx and speakr
+service accounts as placeholders (use the real ones):
+
+```yaml
+# Not tested: written from Istio's documented API, not run on this cluster.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata: { name: flowmanager-webhook, namespace: flowmanager }
+spec:
+  selector: { matchLabels: { app: flowmanager } }
+  mtls: { mode: STRICT }                 # the workload default; shown for clarity
+  portLevelMtls:
+    "9097": { mode: STRICT }             # the webhook port is never PERMISSIVE
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: { name: flowmanager-webhook, namespace: flowmanager }
+spec:
+  selector: { matchLabels: { app: flowmanager } }
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/docs/sa/paperless-ngx     # placeholder
+              - cluster.local/ns/media/sa/speakr           # placeholder
+      to:
+        - operation: { ports: ["9097"], methods: ["POST"] }
+```
+
+Two cautions that follow from Istio's model rather than from a run here: an ALLOW policy applies
+to the whole workload, so as soon as one ALLOW policy selects the pod, any port without an
+ALLOW rule is denied (merge these rules with section 3's policies for 9080, 9090, 9095 and 9096,
+or the existing ones stop applying as intended); and the toggle port's `PERMISSIVE` exemption
+(above) must not be extended to 9097. If the sender is not in the mesh, use `token` mode instead.
+
+**`token` mode**, for a sender outside the mesh. Flags: `--webhook-listen 0.0.0.0:9097
+--webhook-auth token --webhook-token-file /var/run/secrets/webhook/token`. The token is one line
+of a Secret, read on every request (a rotated Secret takes effect without a restart):
+
+```yaml
+# Not tested.
+apiVersion: v1
+kind: Secret
+metadata: { name: flowmanager-webhook-token, namespace: flowmanager }
+type: Opaque
+stringData:
+  token: "<a long random string>"
+# Deployment: a volume from the Secret, mounted read-only at /var/run/secrets/webhook
+#   volumes:      [ { name: webhook-token, secret: { secretName: flowmanager-webhook-token } } ]
+#   volumeMounts: [ { name: webhook-token, mountPath: /var/run/secrets/webhook, readOnly: true } ]
+```
+
+A sender outside the mesh also needs a way in: a `NetworkPolicy` that allows its address to
+port 9097 (modelled on the toggle one above), and, because it has no sidecar, a `PERMISSIVE`
+`portLevelMtls` entry for `"9097"` under STRICT mTLS plus an `AuthorizationPolicy` rule on 9097
+without `from.principals`; the bearer token is then the only authentication on the port. Not
+tested.
+
+**Pointing paperless-ngx and speakr at it.**
+
+- paperless-ngx. Verified from paperless-ngx's documentation (`docs/usage.md` and
+  `docs/configuration.md` on its `dev` branch, read on Oct 27, 2026; not checked against the
+  deployed 3.2.1): a workflow can have a *Webhook* action that sends a `POST` to a URL, with a
+  body as text or key-value pairs in JSON or form encoding, and **request headers as key-value
+  pairs**; *Document Updated* is a trigger type. So a workflow with a Document Added and/or
+  Document Updated trigger and a Webhook action to
+  `http://flowmanager.flowmanager.svc.cluster.local:9097/hooks/paperless` fits (the body can
+  be anything, it is ignored), and in `token` mode the header `Authorization: Bearer <token>` can be
+  configured in the action. paperless-ngx can restrict where webhooks go:
+  `PAPERLESS_WEBHOOKS_ALLOWED_PORTS` (default: all ports allowed) and
+  `PAPERLESS_WEBHOOKS_ALLOW_INTERNAL_REQUESTS` (default true; a cluster-internal URL is refused
+  if set to false). Not verified: whether a paperless-ngx sidecar originates the call with the
+  principal you put in the `AuthorizationPolicy`, whether paperless-gpt's tag edits through the
+  API fire an Updated trigger, and that a tag-filter trigger fires when a tag is removed (the
+  earlier planning note says it does not fire when a document *leaves* a state, hence the
+  `resync`).
+- speakr. **Unverified:** the architecture notes say speakr has webhooks for created,
+  transcription and summary events, but speakr's documentation could not be fetched while this
+  was written, so what it can send (events, URL configuration, headers, whether it can send an
+  `Authorization` header at all) is unknown here. If it cannot send a header, use `mesh` mode
+  with a meshed speakr, or a token only if a header can be set. The example config already
+  declares `/hooks/speakr` for its two sources.
+
+**Checks to run when deploying** (none were run against a cluster): `curl -X POST
+http://<pod>:9097/hooks/paperless` from an allowed caller returns `202 {"sources":2,"nudged":2}`
+and, from a caller the policy does not allow, is refused by the mesh (not by flowmanager); in
+`token` mode a request without the header is `401`; `sched_webhook_requests_total` counts them
+and `sched_observation_age_seconds{source="paperless-ocr-pending"}` drops
+within the minimum interval of an accepted request.
+
 ## 3. Istio AuthorizationPolicy
 
 mTLS authenticates the peer, an AuthorizationPolicy decides what it may do. The
@@ -597,6 +721,7 @@ named here are guesses of common defaults; use the real ones.
 | operators (a person through whatever path is trusted) | Restate ingress | 8080, `POST /Scheduler/main/{leases,last_decision,tick,acquire_model_lease,release_lease,discard_state}`, `POST /Recovery/*/{attempts,discard_attempts}` | HTTP | Section 2's table. Keep the destructive ones (`discard_*`) to operators only. |
 | A client calling the ingress directly (Open WebUI is not integrated) | Restate ingress | 8080, `POST /Scheduler/main/{acquire_model_lease,release_lease,leases}` | HTTP | Holds a manual model lease. Nothing else. |
 | Home Assistant (`hostNetwork`, no sidecar) | flowmanager | 9096 (when `--toggle-listen` is set) | HTTP, bearer token | The toggle listener (see the toggle listener subsection of section 2): needs a PERMISSIVE port exemption under STRICT mTLS and a NetworkPolicy rule for the node network. flowmanager then calls the Restate ingress for the same handlers. |
+| A webhook sender (paperless-ngx, speakr; none sends today) | flowmanager | 9097, `POST` (when `--webhook-listen` is set) | HTTP | The webhook listener: in `mesh` mode STRICT mTLS and an AuthorizationPolicy on the sender's principal, in `token` mode a bearer token. A different policy from 9096. See the webhook listener subsection of section 2. |
 | nobody | Restate ingress | `/Scheduler/main/backstop` | | Not for callers. |
 
 Egress from the flowmanager pod (the services named below are the examples in
@@ -1036,7 +1161,7 @@ event):
   seconds left of the `min_off` wait before a host that flowmanager shut down may be powered on
   again by itself (0 outside it). The power metrics (`sched_resource_power_failed`,
   `sched_power_timeouts_total`, `sched_power_requests_total`) are in the README.
-- `sched_manual_lease_age_seconds{kind,target}`: seconds since each manual model lease (`kind="model"`), manual host lease (`host`) and reclaim (`reclaim`) was granted; alert on a lease held too long. `sched_toggle_requests_total{endpoint,outcome}`: requests to the toggle listener.
+- `sched_manual_lease_age_seconds{kind,target}`: seconds since each manual model lease (`kind="model"`), manual host lease (`host`) and reclaim (`reclaim`) was granted; alert on a lease held too long. `sched_toggle_requests_total{endpoint,outcome}`: requests to the toggle listener. `sched_webhook_requests_total{outcome}`: requests to the webhook listener; `sched_webhook_nudges_total`: sources nudged to poll now.
 - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
   `sched_tick_trigger_failures_total` (flowmanager could not ask the Restate ingress for a
   tick), `sched_config_generation`, `sched_config_reloads_total{outcome}`
@@ -1160,6 +1285,7 @@ workstation and the image built from the Dockerfile above:
 **Not checked (no cluster, no Istio, no live upstream services here)** and to be verified
 when deploying:
 
+- the webhook listener's manifests (PeerAuthentication, AuthorizationPolicy, NetworkPolicy, Secret), what paperless-ngx and speakr send and whether they can set an Authorization header (paperless-ngx: from its `dev` documentation only; speakr: not read), and the webhook listener against a live Istio;
 - Istio behaviour: port protocol selection for the h2c and gRPC ports, the policies in
   section 3, `REGISTRY_ONLY`, and above all the TCP probe through a sidecar;
 - KEDA v2.21 behaviour on scaler errors without `fallback` (stated by the scaler's

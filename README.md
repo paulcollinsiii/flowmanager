@@ -836,6 +836,61 @@ left out. Every on/off/resume request and every refused request logs one `event=
 `PeerAuthentication` notes for a `hostNetwork` client, the Home Assistant YAML and an alert
 are in `docs/kubernetes_setup.md` (the toggle listener subsection of section 2).
 
+### Webhook listener ("poll now")
+
+`--webhook-listen` (`SCHED_WEBHOOK_LISTEN`; suggested `0.0.0.0:9097`) starts a second small HTTP
+listener, separate from the toggle listener (its own port, so the two can have different
+network and Istio policies). It is **off when the flag is absent**. A webhook here means one
+thing: *poll the sources mapped to this path now*. The source declares the path in its params,
+`webhook: { path: /hooks/paperless }`; several sources may share a path (the example config has
+two for paperless and two for speakr), and one request nudges all of them. The body is never
+interpreted: it is read up to 64 KiB and thrown away. The nudged source polls exactly as it
+does on its `resync`, and the result enters the pipeline unchanged (the `Report` channel, the
+cache, a tick if the value changed), so no report type or decision logic is involved and a lost
+webhook costs only the wait until the next `resync`, which stays the safety net. Only `http_json`
+sources take nudges; `tcp_probe`, `prometheus` and the Kubernetes observers are not nudged. (The
+`webhook` source kind in the config model is unused and unchanged: it can supply nothing, no
+observer starts for it, and nothing in this listener refers to it.)
+
+Authentication is chosen at startup and **has no default**: `--webhook-listen` without
+`--webhook-auth` refuses to start, as does `--webhook-auth` without `--webhook-listen`.
+
+- `--webhook-auth mesh` (`SCHED_WEBHOOK_AUTH`): this process authenticates no one (it logs a
+  warning at start). Istio must: `STRICT` mTLS on the port and an `AuthorizationPolicy` naming the
+  caller principals. `--webhook-token-file` is refused with `mesh`.
+- `--webhook-auth token` with `--webhook-token-file` (`SCHED_WEBHOOK_TOKEN_FILE`): every request
+  needs `Authorization: Bearer <token>`; the token is read from the file on every request,
+  compared in constant time and never logged, and start-up fails if the file is missing or
+  empty. The token is checked **first**: before the path is looked up and before any of the body
+  is read, so a caller without it gets `401` for every path and learns nothing.
+
+| Request | Answer |
+| --- | --- |
+| `POST <declared path>` | `202 {"sources": n, "nudged": m}` |
+| `POST <any other path>` | `404` (token mode: only after authentication) |
+| another method on a declared path | `405`, `Allow: POST` |
+| body over 65536 bytes | `413` (nothing is nudged) |
+| `POST` on a declared path whose sources have no running observer yet | `503` |
+| token mode, token missing or wrong | `401`; token file unreadable or empty `503` |
+
+Nudges are coalesced and rate-limited **per source**, in the observer, not in the listener:
+a source starts a poll at least `--webhook-min-interval` (`SCHED_WEBHOOK_MIN_INTERVAL`, default
+`10s`) after its previous poll started, nudges that arrive while it waits are merged into that one
+poll, and a nudge that arrives during a poll causes one more poll after the interval (the poll may
+have read before the change). A flood of requests therefore costs at most one poll per source per
+interval. A nudged poll restarts the source's `resync` clock. The nudge handle of a source lives
+outside its observer task, so an observer restarted by a config reload keeps it; a source that
+loses its `webhook:` setting or is removed from the config loses the handle.
+
+Every request is counted in `sched_webhook_requests_total{outcome}` (`accepted`, `unauthorized`,
+`not_found`, `method_not_allowed`, `payload_too_large`, `bad_request`, `unavailable`, `error`; no
+path or source label) and `sched_webhook_nudges_total` counts sources nudged. Every request logs one
+`event="webhook"` line with `path` (escaped, at most 64 characters), `outcome`, `status`, `sources`,
+`nudged` and `suppressed`; at most 30 lines are logged per 10 seconds (accepted ones too), the next
+line says how many were left out. The flags, the Secret, the Service and NetworkPolicy, and the
+`PeerAuthentication` / `AuthorizationPolicy` for `mesh` mode are in `docs/kubernetes_setup.md`
+(the webhook listener subsection of section 2). Nothing sends webhooks to flowmanager today.
+
 ## Scheduled jobs
 
 A scheduled job starts a Kubernetes Job on a cron schedule after taking what it needs. The
@@ -946,6 +1001,9 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   the last tick: `kind` `model` (target the model), `host` (the manual host lease) or `reclaim`
   (target the resource); alert on a lease held for hours. `sched_toggle_requests_total{endpoint,outcome}`:
   requests to the toggle listener (a fixed set of endpoint and outcome labels, never a name).
+- `sched_webhook_requests_total{outcome}`: requests to the webhook listener (a fixed set of outcomes,
+  never a path or source); `sched_webhook_nudges_total`: sources asked to poll now by accepted
+  webhooks (merged and rate-limited by each observer, so polls can be fewer).
 - `sched_persisted_state_errors_total{key}`: ticks and lease requests that could not read a
   persisted document (`scheduler_state`, `lease_book`); alert on any increase.
 - `sched_resource_phase_age_seconds{resource,axis,phase}`: how long each resource has been
@@ -1033,10 +1091,11 @@ Notes:
   JSON type, or a response whose `when` field is missing or of another type, now fails the
   whole source (its demand becomes unknown) instead of silently counting low. Before M3 a
   number after `equals:` was compared as text.
-- **`webhook:` in an `http_json` source's params is accepted and ignored.** The example
-  config carries `webhook: { path: ... }` for paperless and speakr, but this build has no
-  webhook receiver (event-driven observation is not built yet; see `planning/milestones.md`):
-  sources are polled at their `resync` only.
+- **`webhook: { path: ... }` in an `http_json` source's params** names the path of the webhook
+  listener that makes this source poll now (see *Webhook listener*). It is validated at load
+  (a path of letters, digits and `-._~/`, starting with `/`, no trailing `/`; unknown keys under
+  `webhook` are refused). Without `--webhook-listen` it has no effect and the source is polled at
+  its `resync` only.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - **Reachability sources for hosts outside the cluster**: `tcp_probe` (params `host`,
