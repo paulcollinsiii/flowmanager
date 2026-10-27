@@ -70,6 +70,7 @@ M0 through M3 ran in sequence, and M3 was rescoped while it ran (see *Scope rese
 - **Open questions** (to settle with the user before building):
   - the catch-up policy for scheduled runs that were missed (flowmanager or the cluster down at the time);
   - the overlap policy when a run is still going at the next schedule (a proposal, not yet confirmed: skip);
+  - the retry policy for a failed scheduled job (see the proposals below);
   - server definitions (host, MAC, shutdown user, ...) in labelled ConfigMaps (the legacy convention in `kubernetes-requirements.md`) versus in the scheduler config;
   - timeouts and alerts for `PoweringOn` and `ShuttingDown` (the managed machine waits for an observation indefinitely today; `sched_resource_phase_age_seconds` exposes the age).
 - **Exit criteria (proposed):** basestar never powers down while a lease is held or a pod mounts NFS; a scheduled job starts at its time with its needs held and releases them when it finishes or fails; parallel backup jobs complete without disrupting paperless work; a failed job raises an alert and releases; a manual NFS lease brings up basestar and its consumers; a GPU shutdown drains with a bound; the `low` state can be reproduced.
@@ -170,6 +171,11 @@ These are inferences made while rewriting the plan; confirm or change them.
 - The `session` source kind and the interactive-session marker go away with the reduced M6; interactive TTL leases and the model-routing proxy move to *Deferred*.
 - The `schedule` source kind is replaced by the scheduled-jobs design in M4.
 - Proposed overlap-policy default for scheduled jobs: skip a run while the previous one is still going.
+- Proposed policies for scheduled jobs, raised when asking what happens if basestar cannot come up for a backup window and the next window arrives (not yet confirmed):
+  - *Overlap, per job:* at most one instance of a given job at any time. A run that comes due while the previous instance of the same job is pending or running is skipped and logged, never run in parallel or queued behind it. This is separate from distinct jobs running in parallel, which stays as written for M4.
+  - *Catch-up:* a run missed because flowmanager or the cluster was down, or because its needs (NFS) could not be brought up, is run at most once, late, and only if it has not been superseded by the next scheduled time. If the next window arrives first, the missed one is dropped and the skip is logged and alerted, so a long outage never produces a burst of back-to-back backups.
+  - *Retry:* each job declares a retry limit (proposed default 1 retry after a failure, with a backoff). After the limit the job is marked failed, an alert is raised and what it held is released; the next scheduled time starts a fresh attempt. A job whose needs never came up counts as a missed run (above), not as a failed attempt.
+  - Neither exists in M3: the `schedule` source kind has no observer, so the example's `backup` class has no demand and flowmanager starts no backup yet.
 - M6 needs only what M3 built (the manual model lease and its handlers), so it could proceed any time.
 - What may remain of M7 (validating immich's alpha queue API under a real import, consumer-side actuators, re-queueing interrupted speakr summaries, tightening the speakr counts), and dropping M7 if none is wanted.
 - The M4 exit criteria written above.
