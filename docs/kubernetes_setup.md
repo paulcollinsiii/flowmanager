@@ -242,6 +242,11 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/leases` | none | Read only. The leases held (a JSON array). | operators, monitoring, Open WebUI. |
 | `Scheduler/main/acquire_model_lease` | `{"model": "<id>"}` | **Pins a model on its GPU**: batch work is cut short (its classes leave the allowed set at once, in-flight work gets `drain_timeout`, or a class's `kill_timeout`, then is stopped) and the model stays allowed however much other work waits, until the lease is released. Asking again for the leased model returns the existing lease; another model of the same resource is `409`; an unknown model is `400`. | an operator (a person); later Open WebUI's service account. |
 | `Scheduler/main/release_lease` | `{"id": "manual-model-<n>"}` | Releases a lease and returns it; unknown id `404`. Whoever can release can end somebody's pin. | an operator; the same identity that acquired it. |
+| `Scheduler/main/acquire_host_lease` | `{"resource": "<id>"}` | **Holds a shared host up** (the NFS server): a `managed` host that is off is powered on, and while the lease is held everything gated on the host is allowed even with no work queued. Asking again returns the lease; an exclusive resource, one without a power section or an unknown one is `400`. Ids `manual-host-<n>`. | an operator. |
+| `Scheduler/main/release_host_lease` | `{"resource": "<id>"}` | Releases the manual host lease of a resource; none held is `404`. The host is then shut down once nothing else holds it, `idle_grace` has passed and no pod mounts it. | an operator. |
+| `Scheduler/main/reclaim` | `{"resource": "<id>"}` | **Takes an exclusive host back despite pending work**: intake stops, in-flight work gets `reclaim_timeout` and is then cut off, a `managed` host is shut down and not woken until `unreclaim`. Only for an exclusive resource with a power section (`400` otherwise). Ids `reclaim-<n>`. | an operator. |
+| `Scheduler/main/unreclaim` | `{"resource": "<id>"}` | Releases the reclaim; none held is `404`. | an operator. |
+| `Scheduler/main/resume` | `{"resource": "<id>"}` | After a host was fixed by hand: clears a failed power transition, or a shutdown stopped by mounting pods, for that one resource, which then follows observation (found running means up and not managed). Powers nothing; other resources and the leases are untouched. Not stopped: `409`. | an operator. |
 | `Scheduler/main/discard_state` | `{"key": "scheduler_state"\|"lease_book", "force": bool}` | **Destructive**: deletes a persisted document so the next tick starts it afresh. Without `force` only a document that cannot be read (`409` otherwise). `lease_book` drops every lease; `scheduler_state` drops the sequencer state. Returns what was stored. | operators only. |
 | `Recovery/{class}/attempts` | none | Read only. The stored attempts document (text, `null` if none). | operators, monitoring. |
 | `Recovery/{class}/discard_attempts` | `{"force": bool}` | Deletes the re-queue attempts of a class (with `force`, a readable document too, which gives every failed recording a fresh set of attempts). | operators only. |
@@ -287,6 +292,29 @@ curl -sS -X POST $INGRESS/Scheduler/main/tick
 
 Acquiring and releasing also ask for a tick, so the effect shows within seconds (the
 published set changes; KEDA follows at its next poll, section 6).
+
+The same shape serves the other lease handlers (`README.md`, *Host leases, reclaim and
+resume*):
+
+```sh
+# Bring basestar up and keep it up (the consumers' gates stay open), then let it go:
+curl -sS -X POST $INGRESS/Scheduler/main/acquire_host_lease \
+  -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
+curl -sS -X POST $INGRESS/Scheduler/main/release_host_lease \
+  -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
+# Take the GPU host back / give it up again:
+curl -sS -X POST $INGRESS/Scheduler/main/reclaim \
+  -H 'content-type: application/json' -d '{"resource": "cuda-central"}'
+curl -sS -X POST $INGRESS/Scheduler/main/unreclaim \
+  -H 'content-type: application/json' -d '{"resource": "cuda-central"}'
+# After fixing a host flowmanager stopped at (the answer says what was cleared):
+curl -sS -X POST $INGRESS/Scheduler/main/resume \
+  -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
+```
+
+A manual model lease on a GPU host that is off wakes it too (under `managed`), so there is no
+separate GPU lease. After a release, a managed NFS host is shut down only when no pod mounts
+it (section 8).
 
 ## 3. Istio AuthorizationPolicy
 
@@ -368,6 +396,18 @@ nothing else (no `get`, no writes, no ConfigMaps, no Secrets):
   no decision reads them. A config whose kube source observes only `[reachability]`
   (and needs no `namespaces`) validates and starts (checked), which removes the pod
   permissions entirely.
+- **pods, volumes and claims for the NFS mount check**: only when a source declares
+  `observe: [mounts]` (the example's `basestar-mounts`, a `kubernetes_watch` source of its
+  own). It makes plain `list` calls once per `resync` (no `watch`): `persistentvolumes`
+  (**cluster-scoped**), `persistentvolumeclaims` and `pods`. With no `params.namespaces` the
+  claims and pods are listed in **every namespace** (cluster-wide `list`), which is what a
+  safety check wants, since a pod in a namespace nobody listed would be missed; with
+  `namespaces` they are listed in each of those (a Role per namespace). It reads pod
+  phases and volumes, claims' `spec.volumeName` and volumes' `spec.nfs.server` or an NFS CSI
+  volume's `server` attribute; which servers count comes from `params.nfs_servers` in the
+  config. This is the one place a pod reading decides anything, and only to hold a
+  shutdown back: a missing permission is a failed read, the count is then unknown, and an
+  unknown count counts as mounted (the NFS host is never powered off while it lasts).
 
 ```yaml
 apiVersion: v1
@@ -403,12 +443,33 @@ kind: RoleBinding
 metadata: { name: flowmanager-pods, namespace: ai }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: flowmanager-pods }
 subjects: [{ kind: ServiceAccount, name: flowmanager, namespace: flowmanager }]
+---
+# Only if a source observes mounts (the NFS shutdown check). PersistentVolumes are
+# cluster-scoped; claims and pods are listed in every namespace when the source has no
+# params.namespaces (as in the example), otherwise use a Role + RoleBinding per namespace as for pods.
+# `list` only: the mount check does not watch.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: flowmanager-mounts }
+rules:
+  - apiGroups: [""]
+    resources: [pods, persistentvolumeclaims, persistentvolumes]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: flowmanager-mounts }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: flowmanager-mounts }
+subjects: [{ kind: ServiceAccount, name: flowmanager, namespace: flowmanager }]
 ```
 
 A missing permission shows up as a source error (`sched_source_errors_total{source="cluster-pods"}`,
 a warning in the log); the host's reachability then goes stale and nothing is allowed on it
 (safe, but nothing runs). The retired legacy ClusterRole (`configmaps: list`, KEDA
 `scaledobjects` patch, pods/PVs/nodes list) is not needed; drop it.
+A missing permission for the mount check shows up the same way, as errors of the
+`basestar-mounts` source: the NFS host is then never powered off (the step is
+`wait ... mounts_unknown`, and after `mounts_timeout` flowmanager alerts and stops).
 
 ## 5. Secrets and environment
 
@@ -617,6 +678,20 @@ and allowing one needs a fresh "up" reading (`policy.host_reading_stale_after`, 
   (`wait ... the host is not up`), including a manual model lease. `managed` (flowmanager
   powers hosts) needs the `wake_on_lan` and `shutdown` sections of the resource and the
   secret files below; see "Power actions" in the README.
+- **Before a managed host is shut down** (`control: managed`; the example leaves both hosts
+  `manual`): an NFS host is powered off only when no pod mounts it. The `basestar-mounts`
+  source (section 4 has its RBAC) names the NFS server as the pods and PersistentVolumes
+  write it (`params.nfs_servers: {basestar-nfs: [basestar]}`; add the address too if volumes
+  use it). A managed shared host without such a source is refused at load. While pods mount
+  it, or the reading is unknown (a failed list, a missing permission, a reading older than
+  `host_reading_stale_after`; unknown counts as mounted), the shutdown waits
+  (`wait ... pods_mounted` / `mounts_unknown`) for at most the resource's `mounts_timeout`
+  (default 30 m); then flowmanager alerts (`event="shutdown_mounts_timeout"`,
+  `sched_mounts_timeouts_total`, `sched_resource_mounts_veto{state="stopped"} == 1`) and
+  stops: the host stays up and is not shut down by flowmanager again until a person calls
+  `resume`, it is seen down, or a new manual lease takes it over. A GPU host's shutdown
+  follows the bounded wind-down of its model (`drain_timeout`, `reclaim_timeout`); see "Power
+  actions" in the README.
 
 ## 9. Operations
 
@@ -628,7 +703,7 @@ event):
 
 - `sched_tick_decisions_total{kind}`: ticks by decision kind (`allow_model`, `drain_model`,
   `pause_intake`, `power_on`, `power_off`, `kill_in_flight`, `run_recovery`, `wait`, `idle`,
-  `error`, `pinned`, `demand_unknown`, `demand_unsupported`, `demand_unpolled`).
+  `error`, `pinned`, `shutdown_stopped`, `power_failed`, `demand_unknown`, `demand_unsupported`, `demand_unpolled`).
 - `sched_persisted_state_errors_total{key}`: a tick or lease request could not read a
   persisted document (`scheduler_state`, `lease_book`).
 - `sched_resource_phase_age_seconds{resource,axis,phase}`: age of the current power phase
@@ -642,6 +717,10 @@ event):
   `skipped_not_allowed`, `not_wired`, `list_failed`, `state_error`) and
   `sched_recovery_requeues_total{class,outcome}` (`attempted`, `queued`, `failed`,
   `skipped_cap`, `skipped_not_allowed`, `deferred`).
+- `sched_resource_mounts_veto{resource,state}` (`waiting`, `stopped`; only resources a
+  `mounts` source names) and `sched_mounts_timeouts_total{resource}`: a shutdown held back by
+  mounting pods, and the waits that timed out. The power metrics (`sched_resource_power_failed`,
+  `sched_power_timeouts_total`, `sched_power_requests_total`) are in the README.
 - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
   `sched_tick_trigger_failures_total` (flowmanager could not ask the Restate ingress for a
   tick), `sched_config_generation`, `sched_config_reloads_total{outcome}`
@@ -664,6 +743,8 @@ event):
   for: 5m
 - alert: FlowmanagerSourceErrors
   expr: increase(sched_source_errors_total[15m]) > 5
+- alert: FlowmanagerShutdownStopped      # pods kept mounting a managed NFS host past mounts_timeout; it stays up until a person acts
+  expr: sched_resource_mounts_veto{state="stopped"} == 1
 - alert: FlowmanagerConfigRejected       # the last good config is still active
   expr: increase(sched_config_reloads_total{outcome=~"rejected|unreadable"}[15m]) > 0
 - alert: FlowmanagerRecoveryFailing

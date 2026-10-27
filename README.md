@@ -47,7 +47,9 @@ see `docs/kubernetes_setup.md`.
 **GPU exclusivity is Kubernetes' job (deployment requirement).** Every GPU workload must
 request `nvidia.com/gpu: 1`, the device plugin must expose exactly one GPU on cuda-central
 (no time-slicing, no MIG), and the GPU node must be tainted so only those workloads land
-there. The scheduler decides from queues, leases and policy only, never from pod state, and
+there. The scheduler decides from queues, leases and policy only, never from pod state (the
+one exception is a veto: a managed NFS host is not powered off while a pod may mount it, see
+*Power actions*), and
 publishes at most one model per exclusive resource. When it switches, the old model leaves
 the allowed set and the new one enters it in the same tick; the new pod stays pending in
 Kubernetes until the old one has released the GPU. Pod counts from the cluster watch are
@@ -503,7 +505,7 @@ harmless to repeat).
   `wake_on_lan: {router_url, interface (default lan), mac}` and
   `shutdown: {host, port (default 22), user, host_key}`; `router_url` must be a plain
   `https://` base URL, without credentials, a query string or a fragment (the API path is
-  appended to it). `managed` requires both. Optional `power_on_timeout` and
+  appended to it). `managed` requires both. Optional `power_on_timeout`, `mounts_timeout` and
   `shutdown_timeout` (see below). A MAC or
   an SSH target may not be shared by two resources. A reload that turns a host `managed`
   applies like any other change; one that leaves it incomplete is rejected and the previous
@@ -552,7 +554,8 @@ harmless to repeat).
   transition was after (up after a power-on, down after a shutdown), which is also what
   happens when a person fixes or powers the host, or when the resource is switched to
   `control: manual` in the config (the phase then simply follows observation). No lease or
-  reclaim clears it. A host that comes back down to `off` while work is queued is then
+  reclaim clears it; a person can clear it with `resume` (see *Host leases, reclaim and
+  resume*). A host that comes back down to `off` while work is queued is then
   treated like any off host (a manual lease or a power-changing class may wake it, as before).
   A host that comes back up out of a failed power-on is treated like a host found running,
   not as one flowmanager powered on: the recovery itself never powers it off. Afterwards it is
@@ -563,6 +566,49 @@ harmless to repeat).
   scheduler restart or a long outage can raise the alert before a fresh reading could show
   the host in the state wanted (a known trade-off; the failed phase then clears on that
   reading, but the alert has fired).
+- **A shutdown first checks that no pod mounts the host, and a GPU shutdown first winds
+  its model down.** Neither is a retry or a new power action; both only hold a shutdown back.
+  - *NFS host (the mount check).* A host named by a `mounts` source (`kubernetes_watch`
+    with `observe: [mounts]` and `params.nfs_servers: {<resource>: [<server name or address>]}`,
+    see `config/example.yaml` and `docs/kubernetes_setup.md` for the RBAC) is powered off
+    only on a fresh reading that no pod mounts it. A pod mounts it when it has not finished
+    and one of its volumes, directly or through a PersistentVolumeClaim, is an NFS volume
+    (or an NFS CSI volume, by its `server` attribute) of one of the configured servers
+    (compared ignoring case; list the name and the address if the cluster uses both). The
+    mapping from a host to its servers is in the config, never in the code. The source lists
+    PersistentVolumes, claims and pods once per `resync` (every namespace unless
+    `params.namespaces` restricts them). **Unknown is never "no mounts"**: a failed or slow
+    list, a reading older than `policy.host_reading_stale_after`, or a pod whose claim or
+    volume the lists do not show makes the count unknown, and unknown counts as mounted. (One
+    thing is not counted: a claim not bound to any volume yet, which cannot be mounted.) A
+    `managed` shared host must be named by such a source, or the config is refused at load.
+    While the shutdown is due (idle, no holds, `idle_grace` over) and pods mount the host
+    (or the count is unknown), the step is `wait ... pods_mounted` (or `mounts_unknown`), the
+    `reason` says so, the host stays up and what needs it stays allowed, and
+    `sched_resource_mounts_veto{resource,state="waiting"}` is 1. The wait is bounded by
+    `resources[].power.mounts_timeout` (default 30m, above `host_reading_stale_after`, at most
+    1d). When it runs out flowmanager **alerts and stops**: `event="shutdown_mounts_timeout"`
+    at error level once (a replayed tick logs `shutdown_mounts_timeout_replayed` at info),
+    `sched_mounts_timeouts_total{resource}`, a `mounts_timeouts` entry in that tick's report,
+    then `mounts_held` lists the resource with `stopped: true`, the kind
+    `shutdown_stopped`, the step `wait ... shutdown_stopped` and
+    `sched_resource_mounts_veto{state="stopped"} == 1` (alert on it). The host is **not** shut
+    down, however long it stays like this and even after the pods are gone, and the
+    `managed` flag is dropped (as after a failed power transition). It leaves the stopped
+    state when the host is observed down (a person shut it down), when a person calls
+    `resume` for it, or when a new manual lease takes the host over again (the next idle
+    period then decides afresh). The wait counts from the moment the shutdown is due, not
+    from when the host went idle, and is cleared at once if something holds the host again.
+  - *GPU host (the wind-down).* No mount check applies unless a `mounts` source names it.
+    Its shutdown is already preceded by the bounded wind-down of the model: a managed
+    exclusive host is powered off only when its mode is idle, so a model that is allowed, or
+    being wound down, blocks it. The wind-down gives in-flight work `drain_timeout` (a class's
+    `kill_timeout`; `reclaim_timeout` for a reclaim), then stops it and withdraws the model in
+    one tick, and the shutdown is decided on a later tick, after the host has also been idle for
+    `idle_grace` (a reclaim overrides that grace). Checked by the sequencer tests
+    `a_managed_gpu_host_is_never_powered_off_while_a_model_is_allowed_and_only_after_the_drain`
+    and `a_reclaim_gives_in_flight_work_its_timeout_before_the_managed_gpu_host_is_shut_down`,
+    and the `reclaim.yaml` scenario.
 - `Power/{resource}/run` is ingress-private; `Power/{resource}/last_action` returns the
   last action (`{action, at, outcome: requested|failed, error}`, `null` if none).
 
@@ -585,6 +631,11 @@ counted under `unknown`).
 | `last_decision` | yes (shared) | The latest tick report this process published (`null` until its first tick), without waiting behind a tick. |
 | `acquire_model_lease` | yes | Acquires a manual model lease. |
 | `release_lease` | yes | Releases a lease by id. |
+| `acquire_host_lease` | yes | Acquires a manual lease on a shared host (`{"resource": "basestar-nfs"}`). |
+| `release_host_lease` | yes | Releases the manual host lease of a resource (`{"resource": ...}`). |
+| `reclaim` | yes | Reclaims an exclusive resource with a power section (`{"resource": "cuda-central"}`). |
+| `unreclaim` | yes | Releases the reclaim of a resource (`{"resource": ...}`). |
+| `resume` | yes | Clears a failed power transition, or a shutdown stopped by mounting pods, for one resource (`{"resource": ...}`). |
 | `leases` | yes (shared) | Every lease held. |
 | `discard_state` | yes | Recovery: discards an unreadable persisted document (see above). |
 | `observe` | **no** (ingress-private) | Pushed observations, from other Restate handlers only. |
@@ -611,7 +662,7 @@ model stays allowed however much other work waits. While it is pinned, ticks lis
 - Lease ids are `manual-model-<n>`, from a counter in the object's state.
 - A lease whose model or resource later disappears from the config is kept but ignored
   (listed in the tick's `ignored_leases` and logged).
-- Other lease kinds (reclaim, manual host power, shared holds) have no API yet; interactive
+- Other lease kinds: manual host leases and reclaims have handlers (see below); shared holds have no API yet; interactive
   leases with expiry are no longer planned (see `planning/milestones.md`, *Scope reset
   during M3*).
 - A manual model lease also asks for its host to be up. Under `power.control: manual` this
@@ -633,6 +684,57 @@ curl -X POST localhost:8080/Scheduler/main/release_lease \
 
 # The latest decision, with the sequencer state and the leases it saw.
 curl -X POST localhost:8080/Scheduler/main/last_decision
+```
+
+### Host leases, reclaim and resume
+
+These four handlers and `resume` take `{"resource": "<id>"}`, are validated against the
+active config inside a journaled step (a replay gets the same answer after a reload), answer
+`400` for an unknown or unsuitable resource (the message lists what is configured), `404` for
+a release with nothing to release and `409` for a `resume` with nothing to resume, and ask for
+a tick. Like the other lease handlers they are public on the Restate ingress: keep it on a
+trusted network.
+
+- **Manual host lease** (`acquire_host_lease` / `release_host_lease`): a hold on a *shared*
+  resource with a `power` section, typically the NFS host. It wakes the host when it is off
+  (under `managed`; under `manual` it waits for a person to power it on), keeps it up until it
+  is released, and, because the host is up, allows everything gated on it (the NFS-only
+  consumers and the gate classes that require it) even with no work queued, so their queues
+  become visible. Asking again returns the lease (`"created": false`); an exclusive resource
+  is refused (lease its models instead). Ids are `manual-host-<n>`. Released, the host is
+  shut down only when nothing else holds it (a shared hold, another lease, queued or
+  in-flight work of a class that needs it), `idle_grace` has passed and the mount check above
+  passes; two holders keep it up until both are gone.
+- **A manual model lease on a host that is off** already wakes a managed host (the planner
+  asks for the power of any resource a manual lease names), and the model is allowed once the
+  host is observed up; there is no separate GPU lease.
+- **Reclaim** (`reclaim` / `unreclaim`): the existing `Reclaim` lease, for an exclusive
+  resource with a power section only (`400` otherwise, as for any resource it cannot apply
+  to). Until released, intake stops, in-flight work gets `reclaim_timeout` and is then cut
+  off, the model is withdrawn, a `managed` host is shut down (a `manual` one is left for a
+  person) and it is not woken. Ids are `reclaim-<n>`; asking again returns the lease.
+- **`resume`**: for a person who has fixed a host by hand. It applies to a resource in the
+  failed power phase, or whose shutdown was stopped by mounting pods, and forgets that
+  resource's state so the sequencer starts it afresh from observation, as for a resource it
+  has not seen: found running is up and *not managed* (flowmanager will not power it off on
+  account of an earlier action), found down is off. It powers nothing on or off itself, does
+  not touch any other resource's state or the leases, and is logged at warn level
+  (`event="power_resumed"`). `409` if the resource is not stopped (including a host that is
+  merely powering on or shutting down, or has no state yet).
+
+```sh
+curl -X POST localhost:8080/Scheduler/main/acquire_host_lease \
+  -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
+curl -X POST localhost:8080/Scheduler/main/release_host_lease \
+  -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
+curl -X POST localhost:8080/Scheduler/main/reclaim \
+  -H 'content-type: application/json' -d '{"resource": "cuda-central"}'
+curl -X POST localhost:8080/Scheduler/main/unreclaim \
+  -H 'content-type: application/json' -d '{"resource": "cuda-central"}'
+# After fixing a host that flowmanager stopped at (the answer says what was cleared).
+curl -X POST localhost:8080/Scheduler/main/resume \
+  -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
+# {"resource":"basestar-nfs","cleared":"shutdown_stopped_by_mounts"}
 ```
 
 ## Metrics
@@ -666,6 +768,12 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   `power` section have the series.
 - `sched_power_timeouts_total{resource,during}`: power transitions that timed out (alert on
   any increase; the resource then stays failed until a person acts).
+- `sched_resource_mounts_veto{resource,state}`: 1 while a shutdown of the resource is held back
+  because pods mount its NFS server or the count is unknown (`waiting`, bounded by
+  `mounts_timeout`), or because that wait timed out and flowmanager stopped (`stopped`; alert
+  on `== 1`), else 0. Only resources named by a `mounts` source have the series.
+- `sched_mounts_timeouts_total{resource}`: shutdown waits that timed out (alert on any
+  increase; the host stays up until a person acts).
 - `sched_power_requests_total{resource,action,outcome}`: power actions by `on`/`off` and
   `requested` (accepted by the router or host), `failed` (never retried automatically; alert on
   any increase) or `not_wired` (the active config no longer has the host under managed control).
@@ -684,7 +792,8 @@ Notes:
 - **Decision kinds**: `sched_tick_decisions_total{kind}` counts ticks (once per distinct
   kind in a tick), not actions; ticks run on every change and on the backstop. Kinds
   include the step kinds (`allow_model`, `drain_model`, `pause_intake`, `power_on`,
-  `power_off`, `kill_in_flight`, `run_recovery`, `wait`), `idle`, `error`, `power_failed` (a
+  `power_off`, `kill_in_flight`, `run_recovery`, `wait`), `idle`, `error`, `shutdown_stopped` (a
+  shutdown stopped after pods kept mounting the host), `power_failed` (a
   resource is in the failed power phase), `pinned` (a
   manual model lease pins a model; such a tick is never `idle`, even with no step), and
   `demand_unknown` (something should be reporting the demand, an observer runs or the source
