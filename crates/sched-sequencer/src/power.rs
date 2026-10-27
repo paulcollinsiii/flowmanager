@@ -220,9 +220,10 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
             }
             let idle_mode = matches!(st.mode, ModePhase::Idle);
             if cx.reclaimed() {
-                if idle_mode {
-                    power_off(cx, st, steps);
-                }
+                // No `idle` check: a reclaim exists only for an exclusive resource, whose mode
+                // step has run just before this (the host is on) and always acts while a model
+                // is allowed (`acted`, returned above), so a host that gets here has no model.
+                power_off(cx, st, steps);
                 return;
             }
             if want == Some(PowerWant::Manual) {
