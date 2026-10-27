@@ -43,6 +43,8 @@ pub struct Metrics {
     mounts_veto: GaugeVec,
     min_off_remaining: GaugeVec,
     toggle_requests: IntCounterVec,
+    webhook_requests: IntCounterVec,
+    webhook_nudges: IntCounter,
     manual_lease_age: GaugeVec,
     /// (kind, target) pairs with `manual_lease_age` series, to drop released leases.
     manual_lease_labels: Mutex<HashSet<(String, String)>>,
@@ -284,6 +286,23 @@ impl Metrics {
         registry
             .register(Box::new(toggle_requests.clone()))
             .unwrap();
+        let webhook_requests = IntCounterVec::new(
+            Opts::new(
+                "sched_webhook_requests_total",
+                "Requests to the webhook listener by outcome (a fixed set: accepted, unauthorized, not_found, method_not_allowed, payload_too_large, bad_request, unavailable, error); never labelled with a path or a source",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(webhook_requests.clone()))
+            .unwrap();
+        let webhook_nudges = IntCounter::new(
+            "sched_webhook_nudges_total",
+            "Sources asked to poll now by accepted webhooks (one request counts once per source it maps to). Nudges are merged and rate-limited by each observer, so this can exceed the polls they caused",
+        )
+        .unwrap();
+        registry.register(Box::new(webhook_nudges.clone())).unwrap();
         let manual_lease_age = GaugeVec::new(
             Opts::new(
                 "sched_manual_lease_age_seconds",
@@ -355,6 +374,8 @@ impl Metrics {
             mounts_veto,
             min_off_remaining,
             toggle_requests,
+            webhook_requests,
+            webhook_nudges,
             manual_lease_age,
             manual_lease_labels: Mutex::new(HashSet::new()),
             min_off_resources: Mutex::new(HashSet::new()),
@@ -657,6 +678,17 @@ impl Metrics {
         self.toggle_requests
             .with_label_values(&[endpoint, outcome])
             .inc();
+    }
+
+    /// Counts one webhook-listener request; `outcome` is from the fixed set in the
+    /// metric's help.
+    pub fn webhook_request(&self, outcome: &str) {
+        self.webhook_requests.with_label_values(&[outcome]).inc();
+    }
+
+    /// Counts sources nudged by an accepted webhook.
+    pub fn webhook_nudged(&self, sources: u64) {
+        self.webhook_nudges.inc_by(sources);
     }
 
     /// Sets `sched_manual_lease_age_seconds` from the leases the tick gave the core: one

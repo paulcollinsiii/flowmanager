@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sched_model::Millis;
-use sched_observe::{Observers, Report, ReportTx, SpawnOptions};
+use sched_observe::{Nudges, Observers, Report, ReportTx, SpawnOptions};
 use tokio::sync::mpsc;
 
 use crate::scheduler::KEY;
@@ -31,13 +31,22 @@ pub async fn pump(shared: Arc<Shared>, mut rx: mpsc::Receiver<Report>) {
 }
 
 /// Runs the observers for the active config and, on a reload, restarts only those whose
-/// own inputs changed (the rest keep running, with their state).
-pub async fn supervise_observers(shared: Arc<Shared>, tx: ReportTx) {
+/// own inputs changed (the rest keep running, with their state). `nudges` is the registry
+/// the webhook listener nudges polls through; it lives outside the observers, so it
+/// survives their restarts. A nudged source polls no more often than `nudge_min_interval`.
+pub async fn supervise_observers(
+    shared: Arc<Shared>,
+    tx: ReportTx,
+    nudges: Nudges,
+    nudge_min_interval: Duration,
+) {
     let mut rx = shared.config.subscribe();
     let clock = Arc::clone(&shared.clock);
     let opts = SpawnOptions {
         // Adapters date their `since` windows from the scheduler's clock.
         now: Some(Arc::new(move || clock.now())),
+        nudges,
+        nudge_min_interval: Some(nudge_min_interval),
         ..SpawnOptions::default()
     };
     let mut observers = Observers::default();

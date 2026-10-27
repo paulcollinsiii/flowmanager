@@ -146,19 +146,33 @@ impl Default for Limits {
     }
 }
 
-/// Reads at most `max` bytes; `None` if the body is larger, fails, or is not UTF-8.
-pub async fn read_body(mut body: Incoming, max: usize) -> Option<String> {
+/// Why a body could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyError {
+    /// More than the cap arrived (reading stopped there).
+    TooLarge,
+    /// The connection failed mid-body.
+    Unreadable,
+}
+
+/// Reads at most `max` bytes.
+pub async fn read_capped(mut body: Incoming, max: usize) -> Result<Vec<u8>, BodyError> {
     let mut buf = Vec::new();
     while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-        let frame = frame.ok()?;
+        let frame = frame.map_err(|_| BodyError::Unreadable)?;
         if let Some(data) = frame.data_ref() {
             if buf.len() + data.len() > max {
-                return None;
+                return Err(BodyError::TooLarge);
             }
             buf.extend_from_slice(data);
         }
     }
-    String::from_utf8(buf).ok()
+    Ok(buf)
+}
+
+/// Reads at most `max` bytes; `None` if the body is larger, fails, or is not UTF-8.
+pub async fn read_body(body: Incoming, max: usize) -> Option<String> {
+    String::from_utf8(read_capped(body, max).await.ok()?).ok()
 }
 
 fn response(reply: Reply) -> Response<OneShot> {

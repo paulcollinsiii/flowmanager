@@ -14,12 +14,13 @@ use restate_sdk::endpoint::Endpoint;
 use restate_sdk::http_server::HttpServer;
 use sched_actuate::{HostPower, SecretFiles};
 use sched_model::{Config, Millis};
+use sched_observe::Nudges;
 use sched_service::clock::SystemClock;
 use sched_service::config_source::{ConfigHolder, watch_file};
 use sched_service::metrics::Metrics;
 use sched_service::scheduler::{Power, Recovery, Scheduler};
 use sched_service::tick::Shared;
-use sched_service::{keda_scaler, metrics_server, recovery, runtime, toggle};
+use sched_service::{keda_scaler, metrics_server, recovery, runtime, toggle, webhook};
 
 fn duration(text: &str) -> Result<Duration, String> {
     Millis::parse(text).map(|m| Duration::from_millis(m.as_u64()))
@@ -63,6 +64,26 @@ struct Args {
     /// the file is missing or empty.
     #[arg(long, env = "SCHED_TOGGLE_TOKEN_FILE", requires = "toggle_listen")]
     toggle_token_file: Option<PathBuf>,
+    /// Address of the webhook listener (plain HTTP): `POST` on a path an `http_json` source
+    /// declared with `webhook: { path: ... }` makes that source poll now. Off when not
+    /// given. Needs `--webhook-auth`. Suggested: 0.0.0.0:9097, a port of its own (not the
+    /// toggle port: the two need different network and mesh policies).
+    #[arg(long, env = "SCHED_WEBHOOK_LISTEN")]
+    webhook_listen: Option<SocketAddr>,
+    /// Who may send webhooks; there is no default. `mesh`: this process authenticates no
+    /// one and the service mesh must (STRICT mTLS plus an AuthorizationPolicy on the
+    /// port). `token`: `Authorization: Bearer` with the token of `--webhook-token-file`.
+    #[arg(long, env = "SCHED_WEBHOOK_AUTH", value_enum)]
+    webhook_auth: Option<WebhookAuth>,
+    /// Bearer token the webhook listener requires with `--webhook-auth token` (a mounted
+    /// Kubernetes Secret, one line), read on every request; the listener refuses to start
+    /// when the file is missing or empty. Not allowed with `--webhook-auth mesh`.
+    #[arg(long, env = "SCHED_WEBHOOK_TOKEN_FILE")]
+    webhook_token_file: Option<PathBuf>,
+    /// The least time between two polls of a source that webhooks nudge; nudges that come
+    /// sooner are merged into one poll. The source's `resync` still applies.
+    #[arg(long, env = "SCHED_WEBHOOK_MIN_INTERVAL", default_value = "10s", value_parser = positive_duration)]
+    webhook_min_interval: Duration,
     /// Restate ingress, used to ask for a tick when observations change and to arm the backstop.
     #[arg(
         long,
@@ -94,6 +115,45 @@ struct Args {
     /// Log level: error, warn, info, debug or trace.
     #[arg(long, env = "SCHED_LOG", default_value = "info")]
     log_level: tracing::Level,
+}
+
+/// How the webhook listener decides who may send (`--webhook-auth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum WebhookAuth {
+    Mesh,
+    Token,
+}
+
+/// The webhook listener's address and authentication from the flags, or `None` when no
+/// webhook flag was given. Choosing no authentication is not an option: a listener needs
+/// `--webhook-auth`, and the token file goes with `token` and with nothing else.
+fn webhook_settings(args: &Args) -> Result<Option<(SocketAddr, webhook::Auth)>, String> {
+    let (listen, auth, file) = (
+        args.webhook_listen,
+        args.webhook_auth,
+        args.webhook_token_file.clone(),
+    );
+    match (listen, auth, file) {
+        (None, None, None) => Ok(None),
+        (None, _, _) => Err("--webhook-auth and --webhook-token-file need --webhook-listen".into()),
+        (Some(_), None, _) => Err(
+            "--webhook-listen needs --webhook-auth mesh or token (there is no default: mesh \
+             means this process authenticates no one and the service mesh must)"
+                .into(),
+        ),
+        (Some(addr), Some(WebhookAuth::Mesh), None) => Ok(Some((addr, webhook::Auth::Mesh))),
+        (Some(_), Some(WebhookAuth::Mesh), Some(_)) => Err(
+            "--webhook-token-file is given with --webhook-auth mesh, where no token is checked; \
+             use --webhook-auth token or drop the file"
+                .into(),
+        ),
+        (Some(addr), Some(WebhookAuth::Token), Some(f)) => {
+            Ok(Some((addr, webhook::Auth::Token(f))))
+        }
+        (Some(_), Some(WebhookAuth::Token), None) => {
+            Err("--webhook-auth token needs --webhook-token-file".into())
+        }
+    }
 }
 
 fn secret_files(args: &Args) -> SecretFiles {
@@ -139,6 +199,7 @@ fn check_power_files(config: &Config, files: &SecretFiles) -> Result<(), String>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let webhook_cfg = webhook_settings(&args)?;
     tracing_subscriber::fmt()
         .with_max_level(args.log_level)
         .init();
@@ -162,7 +223,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, rx) = runtime::report_channel();
     tokio::spawn(runtime::pump(Arc::clone(&shared), rx));
-    tokio::spawn(runtime::supervise_observers(Arc::clone(&shared), tx));
+    let nudges = Nudges::default();
+    tokio::spawn(runtime::supervise_observers(
+        Arc::clone(&shared),
+        tx,
+        nudges.clone(),
+        args.webhook_min_interval,
+    ));
     tokio::spawn(watch_file(
         holder,
         args.config.clone(),
@@ -198,6 +265,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let bound = toggle::spawn(toggle, addr).await?;
         tracing::info!(addr = %bound, "serving the toggle listener (HTTP, bearer token)");
+    }
+    if let Some((addr, auth)) = webhook_cfg {
+        if auth == webhook::Auth::Mesh {
+            tracing::warn!(
+                "the webhook listener authenticates no one (--webhook-auth mesh): the service mesh must restrict who can reach it"
+            );
+        }
+        let hook = webhook::Webhook::new(Arc::clone(&shared), nudges, auth);
+        let bound = webhook::spawn(hook, addr).await?;
+        tracing::info!(addr = %bound, min_interval = ?args.webhook_min_interval, "serving the webhook listener (HTTP)");
+    } else if !shared.config.current().webhook_paths().is_empty() {
+        tracing::info!(
+            "sources declare webhook paths but the webhook listener is off (no --webhook-listen); they are polled at their resync only"
+        );
     }
     tracing::info!(addr = %args.listen, "serving the Restate endpoint");
     HttpServer::new(
@@ -258,6 +339,72 @@ mod tests {
         assert!(parse(&["--toggle-listen", "nope", "--toggle-token-file", "/t"]).is_err());
     }
 
+    #[test]
+    fn the_webhook_listener_is_off_unless_given_and_never_without_an_authentication_choice() {
+        let off = |a: &Args| webhook_settings(a).unwrap().is_none();
+        assert!(off(&parse(&[]).unwrap()));
+        let addr: SocketAddr = "127.0.0.1:9097".parse().unwrap();
+        let settings = |extra: &[&str]| webhook_settings(&parse(extra).unwrap());
+        assert_eq!(
+            settings(&[
+                "--webhook-listen",
+                "127.0.0.1:9097",
+                "--webhook-auth",
+                "mesh"
+            ]),
+            Ok(Some((addr, webhook::Auth::Mesh)))
+        );
+        assert_eq!(
+            settings(&[
+                "--webhook-listen",
+                "127.0.0.1:9097",
+                "--webhook-auth",
+                "token",
+                "--webhook-token-file",
+                "/t"
+            ]),
+            Ok(Some((addr, webhook::Auth::Token("/t".into()))))
+        );
+        // No default authentication, and each piece needs the others.
+        for bad in [
+            &["--webhook-listen", "127.0.0.1:9097"][..],
+            &["--webhook-auth", "mesh"],
+            &["--webhook-token-file", "/t"],
+            &[
+                "--webhook-listen",
+                "127.0.0.1:9097",
+                "--webhook-auth",
+                "token",
+            ],
+            &[
+                "--webhook-listen",
+                "127.0.0.1:9097",
+                "--webhook-auth",
+                "mesh",
+                "--webhook-token-file",
+                "/t",
+            ],
+        ] {
+            assert!(settings(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse(&["--webhook-auth", "none"]).is_err());
+        assert!(parse(&["--webhook-listen", "nope", "--webhook-auth", "mesh"]).is_err());
+    }
+
+    #[test]
+    fn the_webhook_minimum_interval_defaults_to_ten_seconds_and_must_be_positive() {
+        assert_eq!(
+            parse(&[]).unwrap().webhook_min_interval,
+            Duration::from_secs(10)
+        );
+        assert!(parse(&["--webhook-min-interval", "0s"]).is_err());
+        assert_eq!(
+            parse(&["--webhook-min-interval", "30s"])
+                .unwrap()
+                .webhook_min_interval,
+            Duration::from_secs(30)
+        );
+    }
     #[test]
     fn the_keda_scaler_listens_on_its_own_address() {
         assert_eq!(
