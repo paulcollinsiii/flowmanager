@@ -10,4 +10,5 @@ workspace = true
 sched-model = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 sched-model = { workspace = true, features = ["test-support"] }

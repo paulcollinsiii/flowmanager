@@ -41,6 +41,7 @@
 //!    its own timeout has run out. In-flight work is what the queues report, not pods.
 
 mod exclusive;
+pub mod jobs;
 mod power;
 
 use sched_model::{
