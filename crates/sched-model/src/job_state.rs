@@ -39,7 +39,8 @@ pub enum RunPhase {
         #[serde(default)]
         last_error: Option<String>,
     },
-    /// The Job exists. `created_at` is when its creation was recorded.
+    /// The Job exists. `created_at` is a time at which it certainly existed: when the creation
+    /// call returned, not when the tick decided to make it.
     Running { name: String, created_at: Millis },
     /// A failed attempt is waiting out its backoff; the hold is kept.
     Backoff { until: Millis },
@@ -67,6 +68,11 @@ pub struct Run {
     /// The number of the attempt in progress, or of the next one while in backoff (from 1).
     pub attempt: u32,
     pub phase: RunPhase,
+    /// When creating the Job of this attempt last failed: alerted once per attempt (even if the
+    /// run goes back to waiting and creating again). The Job may exist even so, because the
+    /// call can fail after the API created it, so a run that gives up now is not plainly missed.
+    #[serde(default)]
+    pub create_failed_at: Option<Millis>,
 }
 
 /// How a run ended.
@@ -119,6 +125,15 @@ pub struct JobRecord {
     /// while it is (or while that cannot be told), so a job never runs beside itself.
     #[serde(default)]
     pub lingering: Option<String>,
+    /// The lingering Job can only be shown absent by a reading taken after this (a creation
+    /// that failed ambiguously: the Job may have been made at any time up to then).
+    #[serde(default)]
+    pub lingering_after: Option<Millis>,
+    /// The namespace of the CronJob the latest Job (running, or lingering) was made in. The
+    /// Jobs are read where the config says; a changed namespace makes the reading say nothing
+    /// about that Job.
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default)]
     pub last: Option<LastRun>,
     #[serde(default)]

@@ -36,6 +36,8 @@ struct FakeKube {
     made: Mutex<Vec<String>>,
     calls: Mutex<Vec<String>>,
     refuse: AtomicBool,
+    /// Runs when a creation starts, to let the world change while the call is in progress.
+    on_create: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl JobBackend for FakeKube {
@@ -47,6 +49,9 @@ impl JobBackend for FakeKube {
         _at: Millis,
     ) -> sched_actuate::BoxFut<'static, Result<Created, String>> {
         self.calls.lock().unwrap().push(name.clone());
+        if let Some(hook) = self.on_create.lock().unwrap().as_ref() {
+            hook();
+        }
         let r = if self.refuse.load(Ordering::SeqCst) {
             Err("forbidden".to_string())
         } else {
@@ -662,4 +667,63 @@ async fn an_unreadable_job_book_switches_only_the_jobs_off() {
         w.shared.metrics.render().contains("job_book"),
         "counted as a state error"
     );
+}
+
+#[tokio::test]
+async fn a_reading_received_while_the_job_was_being_made_never_proves_it_deleted() {
+    let w = World::example();
+    w.tick(SUN + H, true, false).await;
+    // The tick decides at DUE; the call takes 10 s, and the observer's read, which cannot list
+    // the Job yet, is received in the meantime.
+    let (clock, shared) = (w.clock.clone(), w.shared.clone());
+    *w.kube.on_create.lock().unwrap() = Some(Box::new(move || {
+        clock.set(Millis(DUE + 10_000));
+        shared.ingest_now(Report::Observed {
+            source: "scheduled-jobs".into(),
+            fidelity: Fidelity::Polled,
+            values: vec![ObservedValue::JobRuns {
+                job: "backup".into(),
+                runs: vec![],
+            }],
+        });
+    }));
+    let r = w.tick(DUE, true, false).await;
+    assert_eq!(kinds(&r), vec!["backup:started"]);
+    *w.kube.on_create.lock().unwrap() = None;
+    // That reading is still the newest at the next ticks (an unchanged reading wakes nothing).
+    for k in 1..=2 {
+        let r = w.tick(DUE + k * 30_000, true, false).await;
+        assert!(r.job_events.is_empty(), "{k}: {r:?}");
+        assert_eq!(w.holds(), vec![hold()]);
+    }
+    let rec = &w.book().jobs[&JobId::new("backup")];
+    assert!(rec.run.is_some() && rec.last.is_none(), "{rec:?}");
+    // The run is stamped with the time the call returned, not the time of the decision.
+    assert!(
+        matches!(
+            rec.run.as_ref().unwrap().phase,
+            sched_model::RunPhase::Running { created_at, .. } if created_at == Millis(DUE + 10_000)
+        ),
+        "{rec:?}"
+    );
+    // The Job is really there, and the next full read lists it.
+    w.tick(DUE + 2 * MIN, true, true).await;
+    assert!(w.book().jobs[&JobId::new("backup")].run.is_some());
+}
+
+#[tokio::test]
+async fn a_creation_that_never_worked_leaves_the_job_marked_in_case_it_exists() {
+    let skip = EXAMPLE_CONFIG.replace("missed_run: catch_up", "missed_run: skip");
+    let w = World::new(&skip);
+    w.tick(SUN + H, true, false).await;
+    w.kube.refuse.store(true, Ordering::SeqCst);
+    w.tick(DUE, true, false).await;
+    let r = w.tick(DUE + 30 * MIN, true, false).await;
+    assert_eq!(kinds(&r), vec!["backup:missed"]);
+    assert!(w.holds().is_empty());
+    let rec = &w.book().jobs[&JobId::new("backup")];
+    assert_eq!(rec.lingering.as_deref(), Some(NAME));
+    // A reading that does not list it frees the job once it is newer than the failed try.
+    w.tick(DUE + 31 * MIN, true, true).await;
+    assert_eq!(w.book().jobs[&JobId::new("backup")].lingering, None);
 }

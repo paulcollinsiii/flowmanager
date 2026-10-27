@@ -42,6 +42,12 @@ pub const DEFAULT_DEADLINE: Millis = Millis(6 * 3_600_000);
 /// Longest `start_window`, `deadline` and `retry_backoff` accepted.
 pub const MAX_JOB_DURATION: Millis = Millis(7 * 86_400_000);
 
+/// How long after a Job was made a reading still proves nothing about whether it exists: a
+/// read of the Jobs can be in flight (up to the observer's read timeout, 20 s) when the Job is
+/// made, and is then received after the creation although it was taken before it. Absence is
+/// concluded only from a reading received later than the creation plus this.
+pub const JOB_READ_SETTLE: Millis = Millis(20_000);
+
 /// The label every Job flowmanager creates carries, with [`MANAGED_BY_VALUE`].
 pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const MANAGED_BY_VALUE: &str = "flowmanager";

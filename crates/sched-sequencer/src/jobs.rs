@@ -30,8 +30,11 @@
 //!   The next scheduled time starts afresh. A Job that outran its `deadline`, or is gone, is
 //!   not retried.
 //! - **Readings.** A missing or stale reading of the Jobs is never taken as "finished", and
-//!   a Job missing from a reading older than its creation proves nothing.
+//!   a Job missing from a reading older than its creation (plus the time a read can be in
+//!   flight) proves nothing. A creation that failed may still have made the Job, so a run that
+//!   gives up while creating leaves a lingering mark until a later reading shows it is not there.
 
+use sched_model::jobs::JOB_READ_SETTLE;
 use sched_model::{
     CreateJob, JobEvent, JobEventKind, JobRecord, JobRunReading, JobRunState, JobSpec, LastRun,
     Millis, Run, RunOutcome, RunPhase, Trigger,
@@ -84,6 +87,17 @@ pub fn schedule_key(spec: &JobSpec) -> String {
 
 /// Moves job `rec` forward to `i.now`.
 pub fn advance(rec: &mut JobRecord, i: &Inputs) -> Advance {
+    // The Jobs are read in the namespace the config names now. If the live Job was made in
+    // another, the reading cannot show it: it says nothing (neither "gone" nor "finished").
+    let moved = rec
+        .namespace
+        .as_deref()
+        .is_some_and(|ns| ns != i.spec.cronjob.namespace);
+    let masked = Inputs {
+        reading: None,
+        ..*i
+    };
+    let i = if moved { &masked } else { i };
     let (spec, now) = (i.spec, i.now);
     let mut out = Advance::default();
 
@@ -194,6 +208,7 @@ fn due_run(rec: &mut JobRecord, i: &Inputs, scheduled_at: Millis, out: &mut Adva
             since: now,
             late_alerted: false,
         },
+        create_failed_at: None,
     });
 }
 
@@ -239,12 +254,21 @@ fn clear_lingering(rec: &mut JobRecord, i: &Inputs) {
     let (Some(name), Some(r)) = (&rec.lingering, &i.reading) else {
         return;
     };
+    // After a creation that failed ambiguously, only a reading received well after that
+    // proves the Job is not there.
+    if rec
+        .lingering_after
+        .is_some_and(|t| r.at <= t.saturating_add(JOB_READ_SETTLE))
+    {
+        return;
+    }
     let active = r
         .runs
         .iter()
         .any(|x| &x.name == name && x.state == JobRunState::Active);
     if !active {
         rec.lingering = None;
+        rec.lingering_after = None;
     }
 }
 
@@ -357,6 +381,12 @@ fn expire(rec: &mut JobRecord, run: &Run, i: &Inputs, since: Millis, out: &mut A
     if now < at {
         return false;
     }
+    if let Some(failed_at) = run.create_failed_at {
+        // Creating the Job failed, but a call can fail after the API made the Job: it may
+        // exist, so the next run must not start beside it until a reading shows it is not.
+        rec.lingering = Some(spec.job_name(run.scheduled_at, run.attempt));
+        rec.lingering_after = Some(failed_at);
+    }
     if run.attempt == 1 {
         end_run(rec, now, RunOutcome::Missed, Some(why.to_string()));
         out.events.push(event(
@@ -418,8 +448,13 @@ fn running(
             return;
         }
         Some(JobRunState::Active) => {}
-        // Absence proves something only in a reading taken after the Job was made.
-        None if i.reading.is_some_and(|r| r.at > created_at) => {
+        // Absence proves something only in a reading taken after the Job was made. `created_at`
+        // is when the creation call returned, and a read in flight at that moment is received
+        // after it, so the reading must also be received `JOB_READ_SETTLE` later.
+        None if i
+            .reading
+            .is_some_and(|r| r.at > created_at.saturating_add(JOB_READ_SETTLE)) =>
+        {
             end_run(
                 rec,
                 now,
@@ -442,6 +477,7 @@ fn running(
     if now >= created_at.saturating_add(spec.deadline()) {
         end_run(rec, now, RunOutcome::Failed, Some("deadline".to_string()));
         rec.lingering = Some(name.to_string());
+        rec.lingering_after = None;
         out.events.push(event(
             spec,
             now,
@@ -461,6 +497,7 @@ fn attempt_failed(rec: &mut JobRecord, run: &Run, i: &Inputs, why: &str, out: &m
         let after = spec.backoff_before(next);
         if let Some(r) = rec.run.as_mut() {
             r.attempt = next;
+            r.create_failed_at = None;
             r.phase = RunPhase::Backoff {
                 until: now.saturating_add(after),
             };
@@ -498,7 +535,9 @@ pub enum Created {
     Failed(String),
 }
 
-/// Records the outcome of creating the Job asked for by [`advance`].
+/// Records the outcome of creating the Job asked for by [`advance`]. `now` is when the call
+/// returned (not when the tick decided to make the Job): a Job exists from then at the latest,
+/// and only a reading received well after it can show the Job gone.
 pub fn created(rec: &mut JobRecord, spec: &JobSpec, now: Millis, result: Created) -> Vec<JobEvent> {
     let Some(run) = rec.run.clone() else {
         return vec![];
@@ -515,6 +554,7 @@ pub fn created(rec: &mut JobRecord, spec: &JobSpec, now: Millis, result: Created
     match result {
         Created::Made => {
             let name = spec.job_name(run.scheduled_at, run.attempt);
+            rec.namespace = Some(spec.cronjob.namespace.clone());
             set_phase(
                 rec,
                 RunPhase::Running {
@@ -544,7 +584,9 @@ pub fn created(rec: &mut JobRecord, spec: &JobSpec, now: Millis, result: Created
             }
         }
         Created::Failed(error) => {
-            if failures == 0 {
+            // Alerted once per attempt: going back to waiting and creating again (the needs
+            // came and went) does not alert again.
+            if run.create_failed_at.is_none() {
                 events.push(event(
                     spec,
                     now,
@@ -553,6 +595,9 @@ pub fn created(rec: &mut JobRecord, spec: &JobSpec, now: Millis, result: Created
                         error: error.clone(),
                     },
                 ));
+            }
+            if let Some(r) = rec.run.as_mut() {
+                r.create_failed_at = Some(now);
             }
             set_phase(
                 rec,
@@ -582,6 +627,7 @@ pub fn trigger(rec: &mut JobRecord, spec: &JobSpec, now: Millis) -> Result<JobEv
             since: now,
             late_alerted: false,
         },
+        create_failed_at: None,
     });
     Ok(event(spec, now, now, JobEventKind::Triggered))
 }

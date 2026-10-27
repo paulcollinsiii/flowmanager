@@ -192,6 +192,12 @@ mod tests {
     use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
     use std::collections::BTreeMap;
 
+    #[test]
+    fn the_settle_time_the_state_machine_waits_covers_a_read_in_flight() {
+        // A read taken before a Job was made can be received up to READ_TIMEOUT later.
+        assert!(sched_model::jobs::JOB_READ_SETTLE.as_u64() >= READ_TIMEOUT.as_millis() as u64);
+    }
+
     fn job(name: &str, ns: &str, id: Option<&str>, conds: &[(&str, &str)]) -> Job {
         let mut j = Job::default();
         j.metadata.name = Some(name.into());

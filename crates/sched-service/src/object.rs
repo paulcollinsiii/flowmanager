@@ -262,7 +262,7 @@ async fn create_jobs<C: ObjectCtx>(
     }
     let config = shared.config.current();
     let backend = shared.job_backend();
-    let at = outcome.report.at;
+    let decided_at = outcome.report.at;
     for c in outcome.creates.clone() {
         let Some(spec) = config.job(&c.job).cloned() else {
             continue;
@@ -274,16 +274,23 @@ async fn create_jobs<C: ObjectCtx>(
             c.name.clone(),
             c.scheduled_at,
         );
-        let result: Result<(), String> = ctx
+        let clock = Arc::clone(&shared.clock);
+        // The time is taken when the call returns and journaled with its result. The decision
+        // was made earlier (the calls take up to 15 s), and a reading received in between
+        // does not show the Job: the run must be stamped with a time at which the Job really
+        // existed, or such a reading would later prove it deleted.
+        let (result, returned_at): (Result<(), String>, Millis) = ctx
             .run_journaled_async("create_job", move || {
                 Box::pin(async move {
-                    match b {
+                    let r = match b {
                         Some(b) => b.create(cronjob, job, name, scheduled_at).await.map(|_| ()),
                         None => Err("no Kubernetes client is configured for jobs".to_string()),
-                    }
+                    };
+                    (r, clock.now())
                 })
             })
             .await?;
+        let at = returned_at.max(decided_at);
         let rec = outcome.jobs.jobs.entry(c.job.clone()).or_default();
         let events = sched_sequencer::jobs::created(
             rec,

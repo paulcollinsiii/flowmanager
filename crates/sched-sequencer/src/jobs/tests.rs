@@ -758,3 +758,164 @@ fn a_changed_schedule_starts_from_now_and_two_jobs_are_independent() {
         "one finishing releases only its own"
     );
 }
+
+/// Creation takes time: the tick decided at `DUE`, the call returned at `DUE + 10 s`, and a
+/// reading that lacks the Job was received in between, at `DUE + 5 s`.
+#[test]
+fn a_reading_received_before_the_creation_returned_never_proves_the_job_deleted() {
+    let mut j = Job::new(weekly(MissedRun::CatchUp), SUN);
+    j.at(DUE);
+    assert!(j.step(true, None).create.is_some());
+    j.at(DUE + 10_000);
+    assert_eq!(kinds(&j.made()), vec!["started"]);
+    // The stale reading is the newest one at the next ticks, however many there are.
+    for k in 1..=3 {
+        j.at(DUE + 10_000 + k * 30_000);
+        let a = j.step(true, Some((DUE + 5_000, &[])));
+        assert!(a.events.is_empty(), "{k}: {a:?}");
+        assert_eq!(j.phase(), "running");
+    }
+    // A read that was in flight when the Job was made is received just after it.
+    j.at(DUE + 60_000);
+    assert!(j.step(true, Some((DUE + 25_000, &[]))).events.is_empty());
+    assert_eq!(j.phase(), "running");
+    // One received after that settles it.
+    j.at(DUE + 90_000);
+    let a = j.step(true, Some((DUE + 30_001, &[])));
+    assert_eq!(kinds(&a.events), vec!["failed"]);
+}
+
+#[test]
+fn a_creation_that_failed_may_have_made_the_job_so_giving_up_leaves_a_lingering_mark() {
+    let mut j = Job::new(weekly(MissedRun::Skip), SUN);
+    j.at(DUE);
+    j.step(true, None);
+    created(
+        &mut j.rec,
+        &j.spec,
+        Millis(DUE + 5_000),
+        Created::Failed("timed out".into()),
+    );
+    j.at(DUE + 30 * MIN);
+    let a = j.step(true, None);
+    assert_eq!(kinds(&a.events), vec!["missed"]);
+    assert!(j.rec.run.is_none());
+    assert_eq!(j.rec.lingering.as_deref(), Some(NAME1));
+    // The next due run is skipped while the Job may exist.
+    let next = DUE + 7 * D;
+    j.at(next);
+    let r = reading(NAME1, JobRunState::Active);
+    assert_eq!(
+        kinds(&j.step(true, Some((next - 1, &r))).events),
+        vec!["skipped_overlap"]
+    );
+    // A reading from before the failed try ended proves nothing; a later one that lacks the
+    // Job frees the job.
+    j.at(DUE + 31 * MIN);
+    j.step(true, Some((DUE + 5_000, &[])));
+    assert!(
+        j.rec.lingering.is_some(),
+        "an older reading cannot clear it"
+    );
+    j.step(true, Some((DUE + 25_000, &[])));
+    assert!(
+        j.rec.lingering.is_some(),
+        "one in flight at the failure neither"
+    );
+    j.step(true, Some((DUE + 25_001, &[])));
+    assert_eq!(j.rec.lingering, None);
+    assert_eq!(j.rec.lingering_after, None);
+}
+
+#[test]
+fn a_creation_that_failed_and_then_lost_its_needs_still_leaves_the_mark_when_the_window_ends() {
+    let mut j = Job::new(weekly(MissedRun::Skip), SUN);
+    j.at(DUE);
+    j.step(true, None);
+    created(
+        &mut j.rec,
+        &j.spec,
+        Millis(DUE),
+        Created::Failed("timed out".into()),
+    );
+    j.at(DUE + MIN);
+    j.step(false, None);
+    assert_eq!(j.phase(), "waiting");
+    j.at(DUE + 30 * MIN);
+    assert_eq!(kinds(&j.step(false, None).events), vec!["missed"]);
+    assert_eq!(j.rec.lingering.as_deref(), Some(NAME1));
+}
+
+#[test]
+fn a_creation_failure_is_alerted_once_per_attempt_even_across_waiting_and_creating() {
+    let mut j = Job::new(weekly(MissedRun::CatchUp), SUN);
+    j.at(DUE);
+    j.step(true, None);
+    let ev = created(
+        &mut j.rec,
+        &j.spec,
+        Millis(j.now),
+        Created::Failed("x".into()),
+    );
+    assert_eq!(kinds(&ev), vec!["create_failed"]);
+    // The needs go away and come back: creating again fails again, silently.
+    j.at(DUE + MIN);
+    j.step(false, None);
+    assert_eq!(j.phase(), "waiting");
+    j.at(DUE + 2 * MIN);
+    assert!(j.step(true, None).create.is_some());
+    let ev = created(
+        &mut j.rec,
+        &j.spec,
+        Millis(j.now),
+        Created::Failed("x".into()),
+    );
+    assert!(ev.is_empty(), "{ev:?}");
+    // A later attempt is a new alert.
+    j.at(DUE + 3 * MIN);
+    j.step(true, None);
+    assert_eq!(kinds(&j.made()), vec!["started"]);
+    let r = reading(NAME1, JobRunState::Failed);
+    j.at(DUE + 4 * MIN);
+    j.step(true, Some((j.now, &r)));
+    j.at(DUE + 10 * MIN);
+    assert!(j.step(true, Some((j.now, &r))).create.is_some());
+    let ev = created(
+        &mut j.rec,
+        &j.spec,
+        Millis(j.now),
+        Created::Failed("y".into()),
+    );
+    assert_eq!(kinds(&ev), vec!["create_failed"]);
+}
+
+#[test]
+fn a_reading_in_another_namespace_than_the_live_job_was_made_in_says_nothing_about_it() {
+    let mut j = running_job(MissedRun::CatchUp);
+    assert_eq!(j.rec.namespace.as_deref(), Some("backups"));
+    // The config now names another namespace: the observer reads there, and the Job is not.
+    j.spec.cronjob.namespace = "archive".into();
+    j.at(DUE + 5 * MIN);
+    let a = j.step(true, Some((DUE + 5 * MIN, &[])));
+    assert!(a.events.is_empty(), "{a:?}");
+    assert_eq!(j.phase(), "running");
+    // Nor does a reading finish it, or free a lingering Job.
+    let done = reading(NAME1, JobRunState::Complete);
+    j.at(DUE + 6 * MIN);
+    assert!(j.step(true, Some((j.now, &done))).events.is_empty());
+    assert_eq!(j.phase(), "running");
+    j.at(DUE + 6 * H);
+    assert_eq!(
+        kinds(&j.step(true, Some((j.now, &[]))).events),
+        vec!["failed"]
+    );
+    assert_eq!(j.rec.lingering.as_deref(), Some(NAME1));
+    j.at(DUE + 7 * H);
+    j.step(true, Some((j.now, &[])));
+    assert_eq!(j.rec.lingering.as_deref(), Some(NAME1), "still unknown");
+    // Back to the namespace it was made in, the reading counts again.
+    j.spec.cronjob.namespace = "backups".into();
+    j.at(DUE + 8 * H);
+    j.step(true, Some((j.now, &[])));
+    assert_eq!(j.rec.lingering, None);
+}
