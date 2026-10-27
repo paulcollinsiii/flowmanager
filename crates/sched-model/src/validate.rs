@@ -215,14 +215,15 @@ fn models(c: &Config, p: &mut Problems) {
             );
         }
         if let Some(pw) = &r.power {
-            // A timeout no longer than the staleness bound could expire before one fresh
+            // Under manual control the timeouts are never applied, so only managed resources
+            // are cross-checked. A timeout no longer than the staleness bound could expire before one fresh
             // reading can show the host's state.
             let stale = c.policy().host_reading_stale_after;
             for (name, value) in [
                 ("power_on_timeout", pw.power_on_timeout()),
                 ("shutdown_timeout", pw.shutdown_timeout()),
             ] {
-                if value <= stale {
+                if c.power_managed(&r.id) && value <= stale {
                     p.add(
                         format!("resources[{}].power", r.id),
                         format!(
@@ -1082,6 +1083,46 @@ sources:
             ),
             "{ps:?}"
         );
+    }
+
+    #[test]
+    fn the_staleness_cross_check_applies_only_to_managed_resources() {
+        // Manual control: the timeouts have no effect, so a large staleness bound (and the
+        // defaults, and a short explicit timeout) are fine; zero is still rejected.
+        let manual = |stale: &str, extra: &str| {
+            VALID
+                .replace("host_reading_stale_after: 30s", stale)
+                .replace(
+                    "{ id: gpu, kind: exclusive, power: { control: manual } }",
+                    &format!("{{ id: gpu, kind: exclusive, power: {{ control: manual{extra} }} }}"),
+                )
+        };
+        let ps = problems(&manual("host_reading_stale_after: 20m", ""));
+        assert!(
+            !has(&ps, "must be greater than policy.host_reading_stale_after"),
+            "{ps:?}"
+        );
+        let ps = problems(&manual(
+            "host_reading_stale_after: 20m",
+            ", power_on_timeout: 1s, shutdown_timeout: 1s",
+        ));
+        assert!(
+            !has(&ps, "must be greater than policy.host_reading_stale_after"),
+            "{ps:?}"
+        );
+        let ps = problems(&manual(
+            "host_reading_stale_after: 30s",
+            ", power_on_timeout: 0",
+        ));
+        assert!(
+            has(&ps, "power_on_timeout must be greater than zero"),
+            "{ps:?}"
+        );
+        let ps = problems(&manual(
+            "host_reading_stale_after: 30s",
+            ", shutdown_timeout: 2d",
+        ));
+        assert!(has(&ps, "shutdown_timeout 172800000ms exceeds"), "{ps:?}");
     }
 
     #[test]
