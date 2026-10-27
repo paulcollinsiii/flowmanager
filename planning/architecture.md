@@ -57,7 +57,7 @@ The cluster has two nodes plus an NFS host, and the workload classes below compe
 | speakr transcription | speakr (whisperX) | GPU: whisperX, NFS | speakr API v1 (pending recordings; failed ones counted in a separate `failed` bucket and re-queued by the class's recovery) and webhooks |
 | speakr summarization | speakr (LLM) | GPU: LLM, NFS | speakr API v1 (pending recordings, stats) and webhooks |
 | immich ML | immich machine-learning (GPU replica only; a CPU replica on blade-runner always serves) | GPU: immich ML, NFS | immich job queues (Valkey); API preferred |
-| backup | Postgres dump cronjob | NFS | Weekly schedule |
+| backup (a scheduled job, not a class) | Postgres dump CronJob | NFS (a hold) | Cron schedule in the `jobs` config |
 | interactive LLM | Open WebUI, editor code assist | GPU: LLM | None planned: Open WebUI will hold a manual model lease (the class and its session source stay in the example config until removed) |
 | paperless-gpt (gate) | paperless-gpt itself | cuda-central up, NFS up (no model) | None: a gate class on host readiness |
 
@@ -114,7 +114,7 @@ The workspace splits into three pure crates that hold the decision logic and fou
 | `sched-model` | Shared types: snapshot, observation, intent, step, lease, resource, model, workload class, config schema | No |
 | `sched-planner` | Policy strategies that turn a snapshot and leases into an intent | No |
 | `sched-sequencer` | Resource state machines and safety rules that turn an intent and current state into the next step | No |
-| `sched-observe` | Adapter kinds and their registry. Built: Kubernetes watch, HTTP/JSON, Prometheus, TCP probe (`tcp_probe`). Planned, no observer yet: SQL, webhook receiver, and the `schedule` and `session` kinds | Yes |
+| `sched-observe` | Adapter kinds and their registry. Built: Kubernetes watch, HTTP/JSON, Prometheus, TCP probe (`tcp_probe`). Planned, no observer yet: SQL, webhook receiver, and the `session` kind | Yes |
 | `sched-actuate` | Actuator I/O: recovery actions (`requeue_failed`: list, re-queue request, attempt bookkeeping), later power and backup. The Restate object that sequences and journals an action (`Recovery`) lives in `sched-service`, which owns the Restate SDK | Yes |
 | `sched-keda` | KEDA external scaler server | Yes |
 | `sched-service` | The flowmanager binary: Restate service wiring (the scheduler virtual object, invoked directly by Restate), the KEDA scaler endpoint, config loading, startup | Yes |

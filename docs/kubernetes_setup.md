@@ -51,7 +51,7 @@ RUN cargo build --release --locked -p sched-service
 
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/sched-service /usr/local/bin/sched-service
 USER 65532:65532
@@ -247,7 +247,9 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/reclaim` | `{"resource": "<id>"}` | **Takes an exclusive host back despite pending work**: intake stops, in-flight work gets `reclaim_timeout` and is then cut off, a `managed` host is shut down and not woken until `unreclaim`. Only for an exclusive resource with a power section (`400` otherwise). Ids `reclaim-<n>`. | an operator. |
 | `Scheduler/main/unreclaim` | `{"resource": "<id>"}` | Releases the reclaim; none held is `404`. | an operator. |
 | `Scheduler/main/resume` | `{"resource": "<id>"}` | After a host was fixed by hand: clears a failed power transition, or a shutdown stopped by mounting pods, for that one resource, which then follows observation (found running means up and not managed). Powers nothing; other resources and the leases are untouched. Not stopped: `409`. | an operator. |
-| `Scheduler/main/discard_state` | `{"key": "scheduler_state"\|"lease_book", "force": bool}` | **Destructive**: deletes a persisted document so the next tick starts it afresh. Without `force` only a document that cannot be read (`409` otherwise). `lease_book` drops every lease; `scheduler_state` drops the sequencer state. Returns what was stored. | operators only. |
+| `Scheduler/main/jobs` | none | Read only. Every configured scheduled job with its state: next time, the run in progress (phase, attempt, Job name, retry time), the last outcome and the last success, and a Job past its deadline that may still be active. | operators, monitoring. |
+| `Scheduler/main/trigger_job` | `{"id": "<job id>"}` | **Starts a run of a scheduled job now** (it waits for the job's needs, then the Job is created). Refused with `409` while the previous instance is pending or running, never queued; unknown id `404`. | an operator. |
+| `Scheduler/main/discard_state` | `{"key": "scheduler_state"\|"lease_book"\|"job_book", "force": bool}` | **Destructive**: deletes a persisted document so the next tick starts it afresh. Without `force` only a document that cannot be read (`409` otherwise). `lease_book` drops every lease; `scheduler_state` drops the sequencer state. Returns what was stored. | operators only. |
 | `Recovery/{class}/attempts` | none | Read only. The stored attempts document (text, `null` if none). | operators, monitoring. |
 | `Recovery/{class}/discard_attempts` | `{"force": bool}` | Deletes the re-queue attempts of a class (with `force`, a readable document too, which gives every failed recording a fresh set of attempts). | operators only. |
 
@@ -384,7 +386,7 @@ Only the `kubernetes_watch` source talks to the Kubernetes API (the KEDA scaler 
 permissions: KEDA calls it). The client is built from the pod's environment
 (`kube::Client::try_default`: in-cluster service account). From `kube_watch.rs`, the
 observer does exactly this, with `list` followed by `watch` (kube's default watcher), and
-nothing else (no `get`, no writes, no ConfigMaps, no Secrets):
+nothing else (no ConfigMaps, no Secrets), with one exception, the scheduled jobs below, which is the only place it writes:
 
 - **nodes**: `Api::<Node>::all`: `list` and `watch` on `nodes`, **cluster-wide**, when the
   source declares `observe: [reachability]`. It reads each node's `Ready` condition; the
@@ -396,6 +398,16 @@ nothing else (no `get`, no writes, no ConfigMaps, no Secrets):
   no decision reads them. A config whose kube source observes only `[reachability]`
   (and needs no `namespaces`) validates and starts (checked), which removes the pod
   permissions entirely.
+- **scheduled jobs** (a `kubernetes_watch` source that declares `observe: [jobs]` and
+  `job_namespaces`, the example's `scheduled-jobs`; and the jobs themselves): the one place
+  flowmanager *writes* to Kubernetes. In each namespace of a job's `cronjob.namespace`
+  (and the source's `job_namespaces`, which must include them) it **gets** the CronJob named
+  by the job (its `spec.jobTemplate` is the template), **creates** Jobs, and **lists** Jobs by
+  the label `app.kubernetes.io/managed-by=flowmanager` once per `resync` (no `watch`). It
+  never deletes, patches or updates anything: a Job it made stays for the CronJob's or your
+  own cleanup (`ttlSecondsAfterFinished` in the template, say). Creating a Job owned by a
+  CronJob also needs no `cronjobs/finalizers` permission here, because flowmanager does not
+  set `blockOwnerDeletion`.
 - **pods, volumes and claims for the NFS mount check**: only when a source declares
   `observe: [mounts]` (the example's `basestar-mounts`, a `kubernetes_watch` source of its
   own). It makes plain `list` calls once per `resync` (no `watch`): `persistentvolumes`
@@ -460,6 +472,26 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata: { name: flowmanager-mounts }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: flowmanager-mounts }
+subjects: [{ kind: ServiceAccount, name: flowmanager, namespace: flowmanager }]
+---
+# Only if jobs are configured. One Role + RoleBinding per namespace that holds a job's
+# CronJob (the example: backups). Least privilege: read the template, make Jobs, list them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: flowmanager-jobs, namespace: backups }
+rules:
+  - apiGroups: [batch]
+    resources: [cronjobs]
+    verbs: [get]
+    # resourceNames: [postgres-backup, actualbudget-backup]   # narrower still
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: flowmanager-jobs, namespace: backups }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: flowmanager-jobs }
 subjects: [{ kind: ServiceAccount, name: flowmanager, namespace: flowmanager }]
 ```
 
@@ -745,6 +777,10 @@ event):
   expr: increase(sched_source_errors_total[15m]) > 5
 - alert: FlowmanagerShutdownStopped      # pods kept mounting a managed NFS host past mounts_timeout; it stays up until a person acts
   expr: sched_resource_mounts_veto{state="stopped"} == 1
+- alert: FlowmanagerJobProblem           # a scheduled job failed for good, was missed, overlapped, started late or could not be created
+  expr: sum by (job, event) (increase(sched_job_events_total{event=~"failed|missed|skipped_overlap|start_late|create_failed"}[30m])) > 0
+- alert: FlowmanagerBackupStale          # no success for a week and a day; tune per job
+  expr: time() - sched_job_last_success_timestamp_seconds{job="backup"} > 8 * 86400
 - alert: FlowmanagerConfigRejected       # the last good config is still active
   expr: increase(sched_config_reloads_total{outcome=~"rejected|unreadable"}[15m]) > 0
 - alert: FlowmanagerRecoveryFailing

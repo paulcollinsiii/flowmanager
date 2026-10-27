@@ -3,7 +3,7 @@
 
 # Workflows
 ## Backups
-* Ensure power is on for nfs
+* Ensure power is on for nfs (the scheduled job `backup`, see *Scheduled jobs*)
 * trigger backup jobs across systems and wait for completion
   * postgres
   * actualbudget
@@ -330,6 +330,7 @@ The object keeps its state in Restate, under these keys:
 | `scheduler_state` | Versioned document: the sequencer state (per resource the power phase: off, powering on, on, shutting down, failed (a power transition timed out); and mode phase: idle, or serving with its wind-down; with when each began) and which configured sources have ever reported values. |
 | `lease_book` | Versioned document: the leases held and the counter lease ids are drawn from. |
 | `backstop_epoch` | The current backstop chain (a number). |
+| `job_book` | Versioned document: per scheduled job the next scheduled time, the run in progress (phase, attempt), a Job that outran its deadline and may still be active, and the last outcome and success. Unreadable: only the job step is switched off (an error log `job_book_unreadable`, `sched_persisted_state_errors_total{key="job_book"}`); `discard_state` with `"key": "job_book"` clears it. |
 
 The `Recovery` virtual object (one instance per class id) keeps its own state:
 
@@ -635,6 +636,8 @@ counted under `unknown`).
 | `acquire_host_lease` | yes | Acquires a manual lease on a shared host (`{"resource": "basestar-nfs"}`). |
 | `release_host_lease` | yes | Releases the manual host lease of a resource (`{"resource": ...}`). |
 | `reclaim` | yes | Reclaims an exclusive resource with a power section (`{"resource": "cuda-central"}`). |
+| `jobs` | yes (shared) | Every configured scheduled job with its state (see *Scheduled jobs*). |
+| `trigger_job` | yes | Starts a run of a scheduled job now (`{"id": "backup"}`); `409` while the previous instance is pending or running, `404` for an unknown job. |
 | `unreclaim` | yes | Releases the reclaim of a resource (`{"resource": ...}`). |
 | `resume` | yes | Clears a failed power transition, or a shutdown stopped by mounting pods, for one resource (`{"resource": ...}`). |
 | `leases` | yes (shared) | Every lease held. |
@@ -663,7 +666,7 @@ model stays allowed however much other work waits. While it is pinned, ticks lis
 - Lease ids are `manual-model-<n>`, from a counter in the object's state.
 - A lease whose model or resource later disappears from the config is kept but ignored
   (listed in the tick's `ignored_leases` and logged).
-- Other lease kinds: manual host leases and reclaims have handlers (see below); shared holds have no API yet; interactive
+- Other lease kinds: manual host leases and reclaims have handlers (see below); shared holds are taken only by scheduled jobs (see *Scheduled jobs*), with no handler; interactive
   leases with expiry are no longer planned (see `planning/milestones.md`, *Scope reset
   during M3*).
 - A manual model lease also asks for its host to be up. Under `power.control: manual` this
@@ -738,6 +741,78 @@ curl -X POST localhost:8080/Scheduler/main/resume \
 # {"resource":"basestar-nfs","cleared":"shutdown_stopped_by_mounts"}
 ```
 
+## Scheduled jobs
+
+A scheduled job starts a Kubernetes Job on a cron schedule after taking what it needs. The
+definition stays where it is: a Kubernetes **CronJob kept `suspend: true`** is the template,
+and flowmanager creates a Job from its `spec.jobTemplate` the way
+`kubectl create job --from=cronjob/<name>` does (the template's labels, annotations and spec,
+an owner reference to the CronJob, the annotation `cronjob.kubernetes.io/instantiate: manual`),
+and marks it with the annotations `invoked-by: flowmanager` and `flowmanager/scheduled-at`
+(RFC3339 UTC) and the labels `app.kubernetes.io/managed-by: flowmanager` and
+`flowmanager/job: <id>`. It does not store or maintain the definition, never deletes a Job, and
+runs no verification (the backup Jobs check their own preconditions in init containers). RBAC:
+`docs/kubernetes_setup.md`, section 4. Config (`jobs:` in `config/example.yaml`, validated and
+hot-reloaded like the rest; the `schedule` source kind is gone):
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `cron`, `timezone` | Five-field crontab and an IANA zone. A time in the hour DST skips does not run that day; one in the hour it repeats runs twice (use `UTC` for a strict once). Named zones need the host's tz database (`tzdata` in the image); `UTC` needs none, and an unknown zone rejects the config. | `UTC` |
+| `cronjob` | `{namespace, name}` of the template CronJob. | required |
+| `needs` | A list of tagged needs; only `{type: nfs, resource: <shared resource>}` (a hold on it) today, so a model need can be added later without changing existing configs. | none |
+| `retries`, `retry_backoff` | Retries after a failed Job (0: none); the wait doubles from `retry_backoff` up to 1h. Power is never retried: that is not about the Job. | 1, 5m |
+| `missed_run` | `skip` or `catch_up` (below). | `skip` |
+| `start_window` | How long after its time a run may still start. | 30m |
+| `deadline` | How long a started run may take before it is alerted and failed. | 6h |
+
+How a run goes (the state machine is pure, `sched_sequencer::jobs`, with a test per rule):
+
+- **Needs.** From the moment a run exists it holds each need (a shared hold of holder
+  `job:<id>` in the lease book; a managed host that is off is woken for it, a `manual` one waits
+  for a person within the window). The Job is created only while every needed host is up in
+  the sequencer's state; a host whose power is failed, or whose shutdown flowmanager gave up,
+  does not count, and flowmanager does not try to repair power. The hold is released when the
+  run ends however it ends, and the holds are *derived* from the runs on every tick, so one
+  cannot leak: a stray `job:` hold with no run (a lost record, a removed job) is released by
+  the next tick. After the Job completes, the host powers down only after all holds are gone,
+  `idle_grace` and the mount check.
+- **One instance.** A run that comes due (or is asked for with `trigger_job`) while the previous
+  instance is waiting, running or in backoff, or while a Job past its deadline may still be
+  active, is skipped, logged and alerted (`job_skipped_overlap`), never run beside itself or
+  queued. Different jobs run in parallel.
+- **Missed runs.** A run whose needs did not come up within `start_window` is *missed*, not
+  failed: it uses no retries. `skip` drops it then (`job_missed`). `catch_up` alerts once
+  (`job_start_late`), keeps waiting, and runs late (counted `caught_up`) if the needs come up
+  before the next scheduled time; at that time it is dropped and the new run starts, so an
+  outage never produces a burst. Downtime is the same: of all the times missed while
+  flowmanager was down only the latest can run (late, under `catch_up`, or on time under
+  `skip` if still inside its window); the older ones are dropped in one `missed` event. A
+  freshly configured job, or one whose schedule changed, never runs for the past.
+- **Failure.** A failed Job is retried after the backoff, keeping the hold. After the last
+  retry the run is failed (`job_failed`, an alert) and the hold released; the next scheduled
+  time starts afresh. A Job deleted by hand fails the run without a retry. A Job past its
+  `deadline` is alerted and failed without deleting it (the job then stays blocked while the
+  Job is still active).
+- **Readings.** Job states come from listing Jobs by label every resync. A reading that is
+  stale (older than `host_reading_stale_after`), failed or missing never means "finished", and
+  a Job absent from a reading older than its creation proves nothing.
+- **Durability.** Per-job state is the `job_book` document in the Scheduler object. The Job's
+  name is `<id>-<scheduled epoch seconds>-a<attempt>` and creation runs in a journaled step in
+  which `AlreadyExists` is success, so a replay or crash creates it once. A tick (every
+  backstop interval, 30 s by default, and on every change) drives it rather than a Restate
+  timer: the machine is a pure function of the clock and the readings, so there is nothing
+  extra to keep alive. A time is noticed up to one interval late, and a host that just came up
+  counts from the next tick.
+- **Alerts** are log events `job_failed`, `job_missed`, `job_skipped_overlap`,
+  `job_start_late`, `job_create_failed` (error level; a replayed tick logs `<event>_replayed`
+  at info) and the counters in *Metrics*.
+
+```sh
+curl -X POST localhost:8080/Scheduler/main/jobs
+curl -X POST localhost:8080/Scheduler/main/trigger_job \
+  -H 'content-type: application/json' -d '{"id": "backup"}'
+```
+
 ## Metrics
 
 `/metrics` on `--metrics-listen`, the complete set (checked against a scrape and the
@@ -775,6 +850,12 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   on `== 1`), else 0. Only resources named by a `mounts` source have the series.
 - `sched_mounts_timeouts_total{resource}`: shutdown waits that timed out (alert on any
   increase; the host stays up until a person acts).
+- `sched_job_events_total{job,event}`: scheduled-job events by configured job: `started` (a Job
+  was created), `succeeded`, `failed` (after its retries, past its deadline, or deleted;
+  alert), `retried`, `missed` (alert), `skipped_overlap` (alert), `caught_up`, `start_late`
+  (alert), `create_failed` (alert) and `triggered`. `sched_job_running{job}` is 1 while a run
+  exists, `sched_job_last_success_timestamp_seconds{job}` the last success (absent until one),
+  `sched_job_next_due_timestamp_seconds{job}` the next scheduled time.
 - `sched_power_requests_total{resource,action,outcome}`: power actions by `on`/`off` and
   `requested` (accepted by the router or host), `failed` (never retried automatically; alert on
   any increase) or `not_wired` (the active config no longer has the host under managed control).
