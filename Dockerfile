@@ -19,15 +19,15 @@ ENV CARGO_PROFILE_RELEASE_STRIP=symbols \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p sched-service \
- && cp target/release/sched-service /sched-service
+ && cp target/release/flowmanager /flowmanager
 
 # Runtime stage: distroless "cc" is glibc, libgcc, CA certificates and tzdata, with no shell
 # or package manager. The binary needs the CA store (TLS to the cluster and the router) and
 # tzdata (job time zones); `static` would lack both. The nonroot variant runs as 65532.
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY --from=build /sched-service /usr/local/bin/sched-service
+COPY --from=build /flowmanager /usr/local/bin/flowmanager
 USER 65532:65532
 # 9080 Restate endpoint (HTTP/2), 9090 metrics and /healthz, 9095 KEDA scaler (gRPC),
 # 9096 toggle listener and 9097 webhook listener (both off unless their flags are set).
 EXPOSE 9080 9090 9095 9096 9097
-ENTRYPOINT ["/usr/local/bin/sched-service"]
+ENTRYPOINT ["/usr/local/bin/flowmanager"]

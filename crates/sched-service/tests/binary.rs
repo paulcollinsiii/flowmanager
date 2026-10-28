@@ -38,7 +38,7 @@ async fn the_binary_serves_the_restate_endpoint_metrics_and_the_keda_scaler() {
     std::fs::write(&config, EXAMPLE_CONFIG).unwrap();
     let (restate, metrics, keda, ingress) = (free_addr(), free_addr(), free_addr(), free_addr());
     let mut child = Running(
-        Command::new(env!("CARGO_BIN_EXE_sched-service"))
+        Command::new(env!("CARGO_BIN_EXE_flowmanager"))
             .arg("--config")
             .arg(&config)
             .args(["--listen", &restate.to_string()])

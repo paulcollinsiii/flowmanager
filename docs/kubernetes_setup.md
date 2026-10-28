@@ -22,7 +22,7 @@ verified.
 
 ### Build
 
-The binary is `sched-service` (package `sched-service`, `crates/sched-service/src/main.rs`).
+The binary is `flowmanager` (package `sched-service`, `crates/sched-service/src/main.rs`).
 It is a Rust workspace and needs these at **build** time:
 
 - a Rust toolchain with edition 2024 support (a current stable `rust` image);
@@ -34,8 +34,8 @@ It is a Rust workspace and needs these at **build** time:
 
 Nothing is needed at runtime except `ca-certificates` (the HTTP and Kubernetes clients use
 the system root store through `rustls-platform-verifier`) and a glibc matching the build.
-Build only the service: `cargo build --release --locked -p sched-service`. Do not build
-the workspace root package `flowmanager` (the retired legacy app, not part of the image).
+Build only the service: `cargo build --release --locked -p sched-service`. The executable is
+`target/release/flowmanager` (the `[[bin]]` name; the package is still `sched-service`).
 
 The repository's `Dockerfile` builds that binary inside the image build
 (`docker build -t flowmanager .`) and ships it on `gcr.io/distroless/cc-debian12:nonroot`:
@@ -60,7 +60,7 @@ directories); keep it when building from the repository, or `COPY . .` sends the
 ### Flags and environment
 
 Every flag has an environment variable; a flag wins over its variable. These are all of
-them (`sched-service --help`):
+them (`flowmanager --help`):
 
 | Flag | Environment variable | Default | Meaning |
 | --- | --- | --- | --- |

@@ -298,7 +298,7 @@ mod tests {
     use super::*;
 
     fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
-        let mut argv = vec!["sched-service", "--config", "c.yaml"];
+        let mut argv = vec!["flowmanager", "--config", "c.yaml"];
         argv.extend_from_slice(extra);
         Args::try_parse_from(argv)
     }
@@ -459,7 +459,7 @@ mod power_file_tests {
     #[test]
     fn the_secret_files_come_from_the_command_line() {
         let a = Args::try_parse_from([
-            "sched-service",
+            "flowmanager",
             "--config",
             "c.yaml",
             "--ssh-key-file",

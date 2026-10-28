@@ -3,6 +3,11 @@ name = "sched-service"
 version = "0.1.0"
 edition = "2024"
 
+# The package keeps its crate name; the executable is named after the project.
+[[bin]]
+name = "flowmanager"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 

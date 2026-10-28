@@ -34,7 +34,7 @@ fn dir(name: &str) -> PathBuf {
 }
 
 fn command(dir: &Path, metrics: SocketAddr, extra: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_sched-service"));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_flowmanager"));
     c.arg("--config")
         .arg(dir.join("config.yaml"))
         .args(["--listen", &free_addr().to_string()])
