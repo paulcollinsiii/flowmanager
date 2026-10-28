@@ -37,27 +37,12 @@ the system root store through `rustls-platform-verifier`) and a glibc matching t
 Build only the service: `cargo build --release --locked -p sched-service`. Do not build
 the workspace root package `flowmanager` (the retired legacy app, not part of the image).
 
-This Dockerfile was built and the resulting image was run (`--help`, start-up with the
-example config) while writing this document:
-
-```dockerfile
-FROM rust:1-bookworm AS build
-RUN apt-get update \
- && apt-get install -y --no-install-recommends protobuf-compiler \
- && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-COPY . .
-RUN cargo build --release --locked -p sched-service
-
-FROM debian:bookworm-slim
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/sched-service /usr/local/bin/sched-service
-USER 65532:65532
-EXPOSE 9080 9090 9095
-ENTRYPOINT ["/usr/local/bin/sched-service"]
-```
+The repository's `Dockerfile` builds that binary inside the image build
+(`docker build -t flowmanager .`) and ships it on `gcr.io/distroless/cc-debian12:nonroot`:
+glibc, CA certificates and `tzdata`, no shell or package manager, about 16 MB compressed. It
+runs as UID/GID 65532 and exposes 9080, 9090, 9095, 9096 and 9097. It was built and run
+(`--help`, start-up with `config/example.yaml`) when it was written. Do not move to
+`distroless/static` or `scratch` without adding the CA bundle and `tzdata` back.
 
 The repository root has a `.dockerignore` (`target/`, `.git/`, scratch and worktree
 directories); keep it when building from the repository, or `COPY . .` sends the whole
