@@ -41,6 +41,10 @@ GPU, and publishes the resulting **allowed set** (models and workload classes) f
 external scaler. It runs as the `Scheduler` Restate virtual object (key `main`); a tick is
 snapshot, then planner, then sequencer, then publication and a log line with the decision,
 its reason, the config generation and each input's age (per source and capability).
+Each tick also logs one `event="queue"` line per class that has a demand source, with
+`class`, `ready`, `in_flight`, `failed`, `oldest_ready_age_ms` and `known` (false when the
+reading is missing or stale; the counts are then zero, not measured). A replayed tick does
+not log them again, so a graph does not count a tick twice.
 To deploy it on Kubernetes (image, flags, Restate, Istio, RBAC, KEDA, secrets, operations),
 see `docs/kubernetes_setup.md`.
 

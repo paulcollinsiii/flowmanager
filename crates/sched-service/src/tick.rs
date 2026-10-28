@@ -216,6 +216,21 @@ fn mounts_report(prev: &SchedState, next: &SchedState) -> (Vec<MountsHeld>, Vec<
     (held, timeouts)
 }
 
+/// One class's queue counts in a [`TickReport`], as the planner read them in this tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueReport {
+    pub class: ClassId,
+    /// Items whose upstream steps are done. Zero when `known` is false.
+    pub ready: u64,
+    pub in_flight: u64,
+    /// Items waiting for the class's recovery action to re-queue them.
+    pub failed: u64,
+    /// How long the oldest ready item has been ready; absent if nothing is ready.
+    pub oldest_ready_age_ms: Option<u64>,
+    /// False when the reading is missing or stale (the counts are then zero, not measured).
+    pub known: bool,
+}
+
 /// A resource whose automatic power-on waits for `min_off`, in a [`TickReport`]: flowmanager
 /// shut the host down and saw it down, and a want arrived before the minimum off time passed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +351,9 @@ pub struct TickReport {
     #[serde(default)]
     pub jobs: Vec<crate::jobs::JobSummary>,
     pub inputs: Vec<InputReport>,
+    /// The queue counts of every class that has a demand source.
+    #[serde(default)]
+    pub queues: Vec<QueueReport>,
     /// Whether observations changed since the previous tick of this process.
     pub input_changed: bool,
     pub error: Option<String>,
@@ -577,6 +595,7 @@ impl Shared {
             job_events: vec![],
             jobs: vec![],
             inputs: vec![],
+            queues: vec![],
             input_changed: false,
             error: Some(format!("persisted state cannot be read: {text}")),
         };
@@ -727,14 +746,26 @@ impl Shared {
             .map(|s| s.id.clone())
             .collect();
         let mut gaps = DemandGaps::default();
+        let mut queues = Vec::new();
         for c in config.classes() {
             let Some(d) = &c.demand else { continue };
+            let work = class_work(&config, &snapshot, c);
+            queues.push(QueueReport {
+                class: c.id.clone(),
+                ready: work.ready,
+                in_flight: work.in_flight,
+                failed: work.failed,
+                oldest_ready_age_ms: work
+                    .oldest_ready_at
+                    .map(|at| now.saturating_sub(at).as_u64()),
+                known: work.known,
+            });
             if snapshot.unobservable.contains(&d.source) {
                 match config.source(&d.source).map(observer_state) {
                     Some(ObserverState::NoParams) => gaps.unpolled.push(c.id.clone()),
                     _ => gaps.unsupported.push(c.id.clone()),
                 }
-            } else if !class_work(&config, &snapshot, c).known {
+            } else if !work.known {
                 gaps.unknown.push(c.id.clone());
             }
         }
@@ -825,6 +856,7 @@ impl Shared {
             mounts_timeouts,
             min_off_waits,
             inputs: ages.iter().map(InputReport::from).collect(),
+            queues,
             job_events,
             jobs: crate::jobs::summaries(&config, &jobs),
             input_changed: changed,
@@ -966,6 +998,27 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
         unpolled_demand = ?ids(&r.unpolled_demand),
         "tick"
     );
+    // One line per class, so a log query can graph each queue on its own. Not on a replay:
+    // the same tick would be counted twice.
+    if !replayed {
+        for q in &r.queues {
+            tracing::info!(
+                event = "queue",
+                class = %q.class,
+                ready = q.ready,
+                in_flight = q.in_flight,
+                failed = q.failed,
+                oldest_ready_age_ms = ?q.oldest_ready_age_ms,
+                known = q.known,
+                at_ms = r.at.as_u64(),
+                "queue {}: {} ready, {} in flight, {} failed",
+                q.class,
+                q.ready,
+                q.in_flight,
+                q.failed,
+            );
+        }
+    }
     for t in &r.power_timeouts {
         let wanted = match t.during {
             PowerTransition::PoweringOn => "up",
@@ -1138,6 +1191,97 @@ mod tests {
         let text = s.metrics.render();
         assert!(text.contains("sched_tick_decisions_total{kind=\"allow_model\"} 1"));
         assert!(!text.contains("sched_tick_decisions_total{kind=\"wait\"}"));
+    }
+
+    #[test]
+    fn every_tick_reports_each_classs_queue_counts() {
+        let (s, _) = shared();
+        let mut d = Durable::default();
+        cluster(&s);
+        push(
+            &s,
+            "paperless-ocr-pending",
+            vec![ObservedValue::Demand {
+                class: "paperless-ocr".into(),
+                ready: 7,
+                in_flight: 2,
+                failed: 1,
+                oldest_ready_at: None,
+            }],
+        );
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        let ocr = r
+            .queues
+            .iter()
+            .find(|q| q.class.as_str() == "paperless-ocr")
+            .unwrap_or_else(|| panic!("no queue report for paperless-ocr: {:?}", r.queues));
+        assert_eq!(
+            (ocr.ready, ocr.in_flight, ocr.failed, ocr.known),
+            (7, 2, 1, true)
+        );
+        // The cache stamps when it first saw the queue non-empty (T0, the test clock), not the
+        // reported time, so the age is the time since then.
+        assert_eq!(ocr.oldest_ready_age_ms, Some(1_000));
+        // A class whose source has not reported is listed too, marked unknown rather than
+        // read as an empty queue.
+        let silent = r.queues.iter().find(|q| !q.known);
+        assert!(
+            silent.is_some_and(|q| q.ready == 0 && q.oldest_ready_age_ms.is_none()),
+            "{:?}",
+            r.queues
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn queue_counts_are_logged_one_line_per_class_and_not_again_on_replay() {
+        let (s, _) = shared();
+        let mut d = Durable::default();
+        cluster(&s);
+        ocr_demand(&s, 3);
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        let out = Captured::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            log_tick(&r, "", false);
+            log_tick(&r, "", true);
+        });
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("event=\"queue\""))
+            .collect();
+        assert_eq!(lines.len(), r.queues.len(), "{text}");
+        let ocr = lines
+            .iter()
+            .find(|l| l.contains("class=paperless-ocr"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            ocr.contains("ready=3") && ocr.contains("in_flight=0") && ocr.contains("failed=0"),
+            "{ocr}"
+        );
     }
 
     #[test]
