@@ -882,14 +882,14 @@ interval. A nudged poll restarts the source's `resync` clock. The nudge handle o
 outside its observer task, so an observer restarted by a config reload keeps it; a source that
 loses its `webhook:` setting or is removed from the config loses the handle.
 
-Every request is counted in `sched_webhook_requests_total{outcome}` (`accepted`, `unauthorized`,
-`not_found`, `method_not_allowed`, `payload_too_large`, `bad_request`, `unavailable`, `error`; no
+Every request that reaches the handler is counted in `sched_webhook_requests_total{outcome}` (`accepted`, `unauthorized`,
+`not_found`, `method_not_allowed`, `payload_too_large`, `bad_request`, `unavailable`; no
 path or source label) and `sched_webhook_nudges_total` counts sources nudged. Every request logs one
 `event="webhook"` line with `path` (escaped, at most 64 characters), `outcome`, `status`, `sources`,
 `nudged` and `suppressed`; at most 30 lines are logged per 10 seconds (accepted ones too), the next
 line says how many were left out. The flags, the Secret, the Service and NetworkPolicy, and the
 `PeerAuthentication` / `AuthorizationPolicy` for `mesh` mode are in `docs/kubernetes_setup.md`
-(the webhook listener subsection of section 2). Nothing sends webhooks to flowmanager today.
+(the webhook listener subsection of section 2). Requests the HTTP layer rejects before the handler (a malformed request line, an oversized header block, a non-UTF-8 path) are neither counted nor logged. Nothing sends webhooks to flowmanager today.
 
 ## Scheduled jobs
 
@@ -1091,7 +1091,7 @@ Notes:
   JSON type, or a response whose `when` field is missing or of another type, now fails the
   whole source (its demand becomes unknown) instead of silently counting low. Before M3 a
   number after `equals:` was compared as text.
-- **`webhook: { path: ... }` in an `http_json` source's params** names the path of the webhook
+- **Behaviour change (M5): `webhook: { path: ... }` in an `http_json` source's params** names the path of the webhook
   listener that makes this source poll now (see *Webhook listener*). It is validated at load
   (a path of letters, digits and `-._~/`, starting with `/`, no trailing `/`; unknown keys under
   `webhook` are refused). Without `--webhook-listen` it has no effect and the source is polled at

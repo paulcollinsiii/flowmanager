@@ -13,8 +13,9 @@
 //! "nudged": m}`), `404` for a path no source declared (the same whatever the method),
 //! `405` for another method on a known path, `413` for a body over [`MAX_BODY`], `503`
 //! when the sources of the path have no running observer yet or (token mode) the token is
-//! unavailable. Every request is counted in `sched_webhook_requests_total` and logged as
-//! one `webhook` line (rate-limited, with a count of the lines left out).
+//! unavailable. Every request that reaches the handler is counted in
+//! `sched_webhook_requests_total` and logged as one `webhook` line (rate-limited, with a
+//! count of the lines left out).
 //!
 //! Authentication is chosen at startup and has no default:
 //!

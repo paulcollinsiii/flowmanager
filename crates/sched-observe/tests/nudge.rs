@@ -1,6 +1,6 @@
 //! A nudge brings an `http_json` poll forward, is rate-limited, and survives the observer
 //! being restarted by a config reload. Uses the example config with the paperless sources
-//! pointed at a local server and a `resync` of minutes than the test.
+//! pointed at a local server and a `resync` of minutes, far longer than the test.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,7 +71,7 @@ async fn nudges_poll_early_coalesce_survive_a_restart_and_go_with_the_webhook_se
     );
     let handle = nudges.handle(&id);
 
-    // One nudge: a poll long before the 1h resync.
+    // One nudge: a poll long before the 9m resync.
     tokio::time::sleep(MIN).await;
     assert!(nudges.nudge(&id));
     until("the nudged poll", || polls(&server) == 2).await;

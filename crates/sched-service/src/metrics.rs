@@ -289,7 +289,7 @@ impl Metrics {
         let webhook_requests = IntCounterVec::new(
             Opts::new(
                 "sched_webhook_requests_total",
-                "Requests to the webhook listener by outcome (a fixed set: accepted, unauthorized, not_found, method_not_allowed, payload_too_large, bad_request, unavailable, error); never labelled with a path or a source",
+                "Requests to the webhook listener by outcome (a fixed set: accepted, unauthorized, not_found, method_not_allowed, payload_too_large, bad_request, unavailable); never labelled with a path or a source",
             ),
             &["outcome"],
         )

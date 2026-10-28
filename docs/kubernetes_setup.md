@@ -55,7 +55,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/sched-service /usr/local/bin/sched-service
 USER 65532:65532
-EXPOSE 9080 9090 9095
+EXPOSE 9080 9090 9095 9096 9097
 ENTRYPOINT ["/usr/local/bin/sched-service"]
 ```
 
@@ -482,13 +482,18 @@ sidecar is refused, and Home Assistant has none (its namespace has no injection;
 ```yaml
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
-metadata: { name: flowmanager-toggle, namespace: flowmanager }
+metadata: { name: flowmanager, namespace: flowmanager }
 spec:
   selector: { matchLabels: { app: flowmanager } }
   mtls: { mode: STRICT }
   portLevelMtls:
     "9096": { mode: PERMISSIVE }
 ```
+
+Keep one `PeerAuthentication` per workload: Istio applies a single workload-selector policy to a
+workload (when several select it, the oldest wins), so a second resource for another port would
+have its port setting silently ignored. If the webhook listener (section below) is also enabled,
+add its port to this same resource instead. (Not tested.)
 
 and give 9096 an `AuthorizationPolicy` rule with no `from.principals` (a plain-text caller has
 none); the bearer token and the NetworkPolicy are then what protect the port. (Not tested: the
@@ -615,12 +620,13 @@ service accounts as placeholders (use the real ones):
 # Not tested: written from Istio's documented API, not run on this cluster.
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
-metadata: { name: flowmanager-webhook, namespace: flowmanager }
+metadata: { name: flowmanager, namespace: flowmanager }   # the one PeerAuthentication of this workload
 spec:
   selector: { matchLabels: { app: flowmanager } }
   mtls: { mode: STRICT }                 # the workload default; shown for clarity
   portLevelMtls:
-    "9097": { mode: STRICT }             # the webhook port is never PERMISSIVE
+    "9096": { mode: PERMISSIVE }         # the toggle port, only if the toggle listener is enabled (Home Assistant has no sidecar)
+    "9097": { mode: STRICT }             # the webhook port is never PERMISSIVE in `mesh` mode
 ---
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
@@ -663,7 +669,8 @@ stringData:
 
 A sender outside the mesh also needs a way in: a `NetworkPolicy` that allows its address to
 port 9097 (modelled on the toggle one above), and, because it has no sidecar, a `PERMISSIVE`
-`portLevelMtls` entry for `"9097"` under STRICT mTLS plus an `AuthorizationPolicy` rule on 9097
+`portLevelMtls` entry for `"9097"` under STRICT mTLS (in the workload's one `PeerAuthentication`,
+not a second resource) plus an `AuthorizationPolicy` rule on 9097
 without `from.principals`; the bearer token is then the only authentication on the port. Not
 tested.
 

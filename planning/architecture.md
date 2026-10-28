@@ -114,7 +114,7 @@ The workspace splits into three pure crates that hold the decision logic and fou
 | `sched-model` | Shared types: snapshot, observation, intent, step, lease, resource, model, workload class, config schema | No |
 | `sched-planner` | Policy strategies that turn a snapshot and leases into an intent | No |
 | `sched-sequencer` | Resource state machines and safety rules that turn an intent and current state into the next step | No |
-| `sched-observe` | Adapter kinds and their registry. Built: Kubernetes watch, HTTP/JSON, Prometheus, TCP probe (`tcp_probe`). Planned, no observer yet: SQL, webhook receiver, and the `session` kind | Yes |
+| `sched-observe` | Adapter kinds and their registry. Built: Kubernetes watch, HTTP/JSON, Prometheus, TCP probe (`tcp_probe`). Planned, no observer yet: SQL and the `session` kind. The webhook receiver is built (M5), not an observer: it nudges `http_json` sources to poll now | Yes |
 | `sched-actuate` | Actuator I/O: recovery actions (`requeue_failed`: list, re-queue request, attempt bookkeeping), later power and backup. The Restate object that sequences and journals an action (`Recovery`) lives in `sched-service`, which owns the Restate SDK | Yes |
 | `sched-keda` | KEDA external scaler server | Yes |
 | `sched-service` | The flowmanager binary: Restate service wiring (the scheduler virtual object, invoked directly by Restate), the KEDA scaler endpoint, config loading, startup | Yes |
@@ -162,7 +162,7 @@ Kinds live in code and instances live in configuration, so adding a service that
 | Policy parameters (dwell, grace, age thresholds) | Config | Tuning |
 | Resource kinds (exclusive, shared) | Code | Almost never |
 | Resources, models, workload classes | Config | Hardware, model, or service added |
-| Adapter kinds (HTTP/JSON, Prometheus, TCP probe, Kubernetes watch built; SQL, webhook planned) | Code (`sched-observe`) | A new protocol is needed |
+| Adapter kinds (HTTP/JSON, Prometheus, TCP probe, Kubernetes watch built; SQL planned; the webhook receiver built as a nudge, M5) | Code (`sched-observe`) | A new protocol is needed |
 | Adapter instances (endpoint, query, field extraction) | Config | A service is added |
 | Power actuator kinds | Code (`sched-actuate`) | New power hardware |
 
