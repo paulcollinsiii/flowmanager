@@ -63,6 +63,10 @@ pub struct RequeueSpec {
     /// URL with `{id}` where the item's identifier goes (percent-encoding is not applied:
     /// an identifier that is not made of letters, digits and `-_.` is skipped).
     pub url: String,
+    /// A JSON body to send (for example `{}`), with `Content-Type: application/json`.
+    /// Absent: the request has no body and no content type.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
     /// Conditions on the JSON response that must all hold for the request to count as
     /// queued (for example `{field: /success, equals: true}`); a non-2xx answer never does.
     #[serde(default)]

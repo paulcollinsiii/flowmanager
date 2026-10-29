@@ -3710,6 +3710,7 @@ dependencies = [
  "cronexpr",
  "proptest",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror",
 ]

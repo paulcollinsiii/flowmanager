@@ -374,7 +374,22 @@ pub async fn send_request(
     url: &str,
     auth: Option<&(String, String)>,
 ) -> Result<reqwest::Response, String> {
+    send_request_with_body(client, method, url, auth, None).await
+}
+
+/// [`send_request`] with a JSON body (and `Content-Type: application/json`) when `body`
+/// is given.
+pub async fn send_request_with_body(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    auth: Option<&(String, String)>,
+    body: Option<&serde_json::Value>,
+) -> Result<reqwest::Response, String> {
     let mut builder = client.request(method, url);
+    if let Some(body) = body {
+        builder = builder.json(body);
+    }
     if let Some((name, value)) = auth {
         let mut v = reqwest::header::HeaderValue::from_str(value)
             .map_err(|_| "the secret is not a valid header value".to_string())?;

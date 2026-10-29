@@ -119,6 +119,8 @@ classes:
         requeue:
           method: POST
           url: http://speakr.media.svc:8899/api/v1/recordings/{id}/transcribe
+          # Sent as JSON with Content-Type: application/json. Leave it out for no body.
+          body: {}
           # Queued only if the answer says so: {"success": true, "job_id": ..., "status": "QUEUED"}.
           expect:
             - { field: /success, equals: true }

@@ -5,7 +5,7 @@
 use sched_model::{HttpMethod, Millis, RequeueFailedParams};
 use sched_observe::http_json::{
     EnvFn, MAX_BODY, client_with_timeout, field_equals, read_body, redact_url, resolve_auth,
-    select_items, send_get, send_request, status_error, url_with_since,
+    select_items, send_get, send_request_with_body, status_error, url_with_since,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -127,7 +127,7 @@ pub async fn requeue(
         HttpMethod::Patch => reqwest::Method::PATCH,
     };
     let url = r.url.replace("{id}", id);
-    let mut resp = match send_request(client, method, &url, auth).await {
+    let mut resp = match send_request_with_body(client, method, &url, auth, r.body.as_ref()).await {
         Ok(r) => r,
         Err(e) => return PostOutcome::Failed(e),
     };
@@ -348,6 +348,27 @@ params:
             PostOutcome::Failed(_)
         ));
         assert_eq!(server.requests().len(), n);
+    }
+
+    #[tokio::test]
+    async fn a_configured_body_is_sent_as_json_and_otherwise_none_is() {
+        let server = TestServer::start().await;
+        let mut p = params(&server, "");
+        let c = client(&p).unwrap();
+        let path = "/api/v1/recordings/1/transcribe";
+        server.set(
+            path,
+            Reply::json(r#"{"success": true, "job_id": 9, "status": "QUEUED"}"#),
+        );
+        assert_eq!(requeue(&c, &p, None, "1").await, PostOutcome::Queued);
+        p.requeue.body = Some(serde_json::json!({}));
+        assert_eq!(requeue(&c, &p, None, "1").await, PostOutcome::Queued);
+        let kind = server.requests_with_header("content-type");
+        assert_eq!(kind[0].1, None);
+        assert_eq!(kind[1].1.as_deref(), Some("application/json"));
+        let len = server.requests_with_header("content-length");
+        assert_ne!(len[0].1.as_deref(), Some("2"));
+        assert_eq!(len[1].1.as_deref(), Some("2"), "the body is {{}}");
     }
 
     #[tokio::test]

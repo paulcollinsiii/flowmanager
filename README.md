@@ -492,6 +492,7 @@ shared by two classes is counted per class (nothing to fix; the ids are the serv
 | `list.url`, `list.items`, `list.id` | The list request, the JSON pointer to the items array, the pointer (inside an item) to its id (a string or an integer made of letters, digits and `-_.`; anything else is skipped). |
 | `list.where`, `list.since`, `list.max_items` | As for an `http_json` request. A full page (`max_items`) is normal here: up to `max_per_run` items are re-queued per run, it is warned about, and the rest follows on later runs. |
 | `requeue.method`, `requeue.url` | `POST` (default), `PUT` or `PATCH`; the URL with `{id}` once. |
+| `requeue.body` | Optional JSON body (for example `{}`), sent with `Content-Type: application/json`. Absent: no body and no content type. |
 | `requeue.expect` | Conditions on the JSON answer (`{field, equals}`), all of which must hold for the request to count as queued. A non-2xx answer never does. |
 | `auth` | As for a source: an env var or file, never the secret. |
 | `max_attempts` / `window` / `retention` / `min_interval` / `max_per_run` / `timeout` | 2 / 15m / 24h / 60s / 5 / 10s by default. `window` is the list's `since` window, for reference; `retention` must be at least it. URLs must carry no userinfo (`user:pw@`); use `auth`. |
