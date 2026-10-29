@@ -449,8 +449,8 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
 
 /// The shutdown of a host with a drain: it waits for the consumers to be scaled down, for
 /// every lease that holds the host (`lease_holds`: a job's hold, say; the drain overrides
-/// none), and, where no pod reading exists to say the pods are gone, for `idle_grace` after
-/// the scale-down. Then `power_off` applies the mount veto as for any shutdown.
+/// none). Then `power_off` applies the mount veto as for any shutdown (a managed shared host
+/// always has a mounts source, so there is a pod reading to wait for; no `idle_grace` applies).
 fn drain_shutdown(
     cx: &Cx,
     st: &mut ResourceState,
@@ -467,14 +467,6 @@ fn drain_shutdown(
         st.host_idle_since = None;
         wait(cx, steps, WaitReason::DrainHeld);
         return;
-    }
-    if !cx.config.mounts_checked(&cx.res.id) {
-        let now = cx.now();
-        let since = *st.host_idle_since.get_or_insert(now);
-        if now.saturating_sub(since) < cx.config.policy().idle_grace {
-            wait(cx, steps, WaitReason::Draining);
-            return;
-        }
     }
     power_off(cx, st, steps);
 }

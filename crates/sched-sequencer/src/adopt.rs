@@ -9,11 +9,13 @@
 //! A host is found running when it is shared, has a power section under `control: managed`,
 //! a fresh reading says it is up, and flowmanager did not power it on: the previous state
 //! has no entry for it (first start, discarded state), has it off (a power button, a manual
-//! Wake-on-LAN, a host that went down and came back), or has it in a failed power-on that
+//! Wake-on-LAN, a host that went down and came back), has it in a failed power-on that
 //! the reading has now cleared (whatever brought it up, the sequencer treats it as found
-//! running). A host in `powering_on` that is seen up is flowmanager's own, a host that was
-//! already `on` is not found again (a restart with persisted state adopts nothing), and under
-//! `control: manual` nothing is ever adopted.
+//! running), or has it `on` but not managed (stored by a build that did not adopt, or kept
+//! so by a tick that skipped adoption), unless the scheduler left it so on purpose: a stopped
+//! mount veto, a drain, or a job's hold. A host in `powering_on` that is seen up is
+//! flowmanager's own and an `on` host it manages is not found again (a restart with persisted
+//! state adopts nothing), and under `control: manual` nothing is ever adopted.
 
 use sched_model::{
     ADOPTED_HOST_PREFIX, Config, Lease, LeaseId, LeaseKind, Millis, PowerPhase, ResourceId,
@@ -40,13 +42,30 @@ pub fn found_running(
         .filter(|r| r.kind == ResourceKind::Shared && r.power.is_some())
         .filter(|r| config.power_managed(&r.id))
         .filter(|r| snapshot.fresh_resource_up(config, &r.id, max_age) == Some(true))
-        .filter(|r| match prev.resource(&r.id).map(|s| s.power) {
-            None | Some(PowerPhase::Off) => true,
-            Some(PowerPhase::Failed {
-                during: sched_model::PowerTransition::PoweringOn,
-                ..
-            }) => true,
-            Some(_) => false,
+        .filter(|r| match prev.resource(&r.id) {
+            None => true,
+            Some(st) => match st.power {
+                PowerPhase::Off
+                | PowerPhase::Failed {
+                    during: sched_model::PowerTransition::PoweringOn,
+                    ..
+                } => true,
+                // Up, not ours, and nothing says the scheduler left it so on purpose: a state
+                // an older build stored for a host found running, or one whose adoption was
+                // skipped (an unreadable job book). Not a host we powered on (managed), one
+                // whose shutdown was stopped by mounting pods (veto), one being drained, or
+                // one a job holds (a hold never takes a host over; it is adopted once the
+                // hold ends).
+                PowerPhase::On { .. } => {
+                    !st.managed
+                        && st.drain.is_none()
+                        && st.mounts_veto.is_none()
+                        && !leases.iter().any(|l| {
+                            l.resource == r.id && matches!(l.kind, LeaseKind::SharedHold { .. })
+                        })
+                }
+                _ => false,
+            },
         })
         .filter(|r| {
             !leases

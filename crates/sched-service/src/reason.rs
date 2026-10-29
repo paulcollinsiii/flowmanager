@@ -276,7 +276,7 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::NotPreemptible => "the allowed model's active work is not preemptible",
         WaitReason::InFlightWork => "in-flight work reported by its queue is still running",
         WaitReason::Draining => {
-            "a drain of the host is under way: its consumers are still allowed while in-flight work gets its drain_timeout, or they are scaled down and idle_grace has not passed"
+            "a drain of the host is under way: its consumers are still allowed while in-flight work gets its drain_timeout"
         }
         WaitReason::DrainHeld => {
             "a drain of the host is under way and its consumers are scaled down, but a lease still holds the host (a drain overrides no lease); the shutdown waits for it"

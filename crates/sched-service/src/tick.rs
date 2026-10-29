@@ -2589,4 +2589,65 @@ mod tests {
             "{r:?}"
         );
     }
+
+    #[test]
+    fn a_host_an_older_build_stored_as_on_and_unmanaged_is_adopted_once_unless_left_so_on_purpose()
+    {
+        let stored = |veto: Option<sched_model::MountsVeto>, managed: bool| {
+            let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
+            st.managed = managed;
+            st.mounts_veto = veto;
+            let mut d = Durable::default();
+            d.state.resources.insert(nfs(), st);
+            d
+        };
+        // Old state, probe up, no lease: adopted, once.
+        let (s, clock) = managed_world();
+        let mut d = stored(None, false);
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        assert!(d.state.resource(&nfs()).unwrap().managed);
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
+        assert_eq!(d.leases.len(), 1);
+        // A host we powered on (managed): not adopted.
+        let (s, clock) = managed_world();
+        let mut d = stored(None, true);
+        world(&s, Some(0));
+        assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
+        assert!(d.leases.is_empty());
+        // A shutdown stopped by mounting pods: left as it is.
+        let (s, clock) = managed_world();
+        let mut d = stored(
+            Some(sched_model::MountsVeto::Stopped { since: Millis(2) }),
+            false,
+        );
+        world(&s, Some(1));
+        assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
+        assert!(d.leases.is_empty());
+    }
+
+    #[test]
+    fn an_adoption_skipped_for_an_unreadable_job_book_happens_on_a_later_tick() {
+        let (s, clock) = managed_world();
+        let mut d = Durable {
+            jobs_off: true,
+            ..Durable::default()
+        };
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(r.adopted.is_empty() && d.leases.is_empty(), "{r:?}");
+        // The state is stored as on and unmanaged all the same.
+        let st = d.state.resource(&nfs()).unwrap();
+        assert!(st.is_on() && !st.managed);
+        // The book is readable again: the host is adopted then.
+        d.jobs_off = false;
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        assert!(d.state.resource(&nfs()).unwrap().managed);
+    }
 }

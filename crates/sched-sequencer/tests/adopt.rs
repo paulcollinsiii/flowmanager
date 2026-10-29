@@ -80,8 +80,12 @@ fn a_host_flowmanager_powered_on_or_already_held_or_not_read_up_is_not_adopted()
             "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, managed: true }",
         ),
         (
-            "already on and not managed (adopted before, or lease released)",
-            "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle } }",
+            "on, not managed, but a drain is under way",
+            "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, drain: { mode: graceful, since: 5 } }",
+        ),
+        (
+            "on, not managed, shutdown stopped by mounting pods",
+            "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, mounts_veto: { phase: stopped, since: 6 } }",
         ),
         (
             "shutting down",
@@ -140,4 +144,26 @@ fn only_an_adopted_lease_ends_when_its_host_is_seen_down() {
     for snap in [snapshot(Some(true), None, &[]), snapshot(None, None, &[])] {
         assert!(gone_down(&config, &snap, &leases).is_empty());
     }
+}
+
+#[test]
+fn a_host_stored_as_on_and_not_managed_is_adopted_unless_left_so_on_purpose() {
+    let config = example_config_managed();
+    let up = snapshot(Some(true), None, &[]);
+    // As an older build stored a host it found running (or a tick that skipped adoption).
+    let old = state("{ power: { phase: \"on\", since: 5 }, mode: { phase: idle } }");
+    assert_eq!(found(&config, &up, &old), vec![N]);
+    // A host held by a job is not adopted while the hold lasts.
+    let hold =
+        "{ id: h, resource: basestar-nfs, granted_at: 1, kind: { type: shared_hold, holder: x } }";
+    let held = snapshot(Some(true), None, &[hold]);
+    assert!(found_with(&config, &held, &old, &held.leases).is_empty());
+    // Nor one that already has a manual host lease.
+    let lease = "{ id: m, resource: basestar-nfs, granted_at: 1, kind: { type: manual_host } }";
+    let leased = snapshot(Some(true), None, &[lease]);
+    assert!(found_with(&config, &leased, &old, &leased.leases).is_empty());
+    // A host we manage (powered on by us, or taken over) is never found again.
+    let ours =
+        state("{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, managed: true }");
+    assert!(found(&config, &up, &ours).is_empty());
 }
