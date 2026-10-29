@@ -1,4 +1,4 @@
-description: "Failed transcriptions alone bring whisperx in, and RunRecovery is emitted for the class in the tick that allows it and on every tick while it serves and items are still failed; once they are re-queued (no failed items) no recovery step is emitted, and the model is released only after idle_grace."
+description: "Failed transcriptions alone bring whisperx in; RunRecovery is withheld while its pod is missing or not ready, emitted from the first tick the pod is ready and on every tick while it serves and items are still failed; once they are re-queued (no failed items) no recovery step is emitted, and the model is released only after idle_grace."
 initial_state:
   resources:
     cuda-central:
@@ -20,10 +20,25 @@ frames:
       - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
       - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
     expect:
-      steps: [{ type: allow_model, resource: cuda-central, model: whisperx }, { type: run_recovery, class: speakr-transcription }]
+      steps: [{ type: allow_model, resource: cuda-central, model: whisperx }]
       allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
-  # Still failed a minute later (the re-queue is paced by the action itself): emitted again.
+  # The pod exists but is not ready: a re-queue now would meet a 503, so it still waits.
+  - at: 100030000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 1, ready_pods: 0 } }
+    refresh: true
+    expect:
+      steps: []
+      allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+  # Ready, items still failed (the re-queue is paced by the action itself): emitted, and again each tick.
   - at: 100060000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 1, ready_pods: 1 } }
+    refresh: true
+    expect:
+      steps: [{ type: run_recovery, class: speakr-transcription }]
+      allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+  - at: 100090000
     refresh: true
     expect:
       steps: [{ type: run_recovery, class: speakr-transcription }]

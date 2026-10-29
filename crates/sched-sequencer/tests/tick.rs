@@ -2016,6 +2016,7 @@ fn recovery_runs_while_the_model_serves_and_items_have_failed() {
         Case::new()
             .gpu(&serving("whisperx", 10 * MIN))
             .target(Some("whisperx"))
+            .obs(pods("whisperx", 1, 1, 0))
     };
     // Failed items, model serving: emitted, on every tick (it is idempotent).
     let d = serve().obs(failed_transcriptions(2)).run();
@@ -2104,13 +2105,32 @@ fn recovery_never_runs_while_the_class_is_not_allowed() {
 }
 
 #[test]
-fn recovery_is_emitted_in_the_tick_that_allows_the_model() {
-    let d = Case::new()
-        .target(Some("whisperx"))
-        .obs(failed_transcriptions(1))
-        .run();
+fn recovery_waits_for_a_ready_pod_but_not_for_an_unknown_reading() {
+    let case = |p: Option<String>| {
+        let c = Case::new()
+            .target(Some("whisperx"))
+            .obs(failed_transcriptions(1));
+        match p {
+            Some(p) => c.obs(p),
+            None => c,
+        }
+    };
+    // The tick that allows the model: the pod does not exist yet, so the requeue would be lost.
+    let d = case(Some(pods("whisperx", 0, 0, 0))).run();
     assert!(d.steps.contains(&allow("whisperx")), "{:?}", d.steps);
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // Starting, not ready.
+    let d = case(Some(pods("whisperx", 1, 0, 0))).run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
+    // Ready: the first tick that sees it.
+    let d = case(Some(pods("whisperx", 1, 1, 0))).run();
     assert!(d.steps.contains(&recovery()), "{:?}", d.steps);
+    // Unknown (stale) is not a reason to hold back: pods sources are optional.
+    let d = case(Some(pods("whisperx", 0, 0, 11 * MIN))).run();
+    assert!(d.steps.contains(&recovery()), "{:?}", d.steps);
+    // A rollout with two pods and none ready yet.
+    let d = case(Some(pods("whisperx", 2, 0, 0))).run();
+    assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
 }
 
 #[test]

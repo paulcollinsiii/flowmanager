@@ -257,13 +257,25 @@ proptest! {
     }
 
     #[test]
-    fn pod_observations_never_change_any_decision(frames in prop::collection::vec(raw(), 1..40), managed in any::<bool>()) {
+    fn pod_observations_only_ever_hold_back_a_recovery(frames in prop::collection::vec(raw(), 1..40), managed in any::<bool>()) {
         let config = if managed { example_config_managed() } else { example_config() };
         let with = run(&config, &scenario(&frames)).unwrap();
         let without = run(&config, &scenario(&without_pods(&frames))).unwrap();
         for (i, (a, b)) in with.iter().zip(&without).enumerate() {
             prop_assert_eq!(&a.intent, &b.intent, "frame {}", i);
-            prop_assert_eq!(&a.decision, &b.decision, "frame {}", i);
+            // Pods only ever hold back a recovery request (until a pod is ready); every other
+            // step, the allowed set and the state are the same with or without them.
+            let strip = |d: &sched_sequencer::Decision| {
+                let mut d = d.clone();
+                d.steps.retain(|s| !matches!(s, sched_model::Step::RunRecovery { .. }));
+                d
+            };
+            prop_assert_eq!(strip(&a.decision), strip(&b.decision), "frame {}", i);
+            for s in &a.decision.steps {
+                if matches!(s, sched_model::Step::RunRecovery { .. }) {
+                    prop_assert!(b.decision.steps.contains(s), "frame {}: {:?}", i, s);
+                }
+            }
         }
     }
 

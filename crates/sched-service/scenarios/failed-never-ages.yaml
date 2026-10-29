@@ -1,4 +1,4 @@
-description: "Failed items never age into starvation priority and never hold a model: mineru keeps its ready work while whisperx has only failed items (however long they stay listed), and once mineru is idle for idle_grace the GPU goes to whisperx, with RunRecovery in the tick that allows it."
+description: "Failed items never age into starvation priority and never hold a model: mineru keeps its ready work while whisperx has only failed items (however long they stay listed), and once mineru is idle for idle_grace the GPU goes to whisperx, with RunRecovery only once its pod is ready."
 initial_state:
   resources:
     cuda-central:
@@ -49,5 +49,12 @@ frames:
   - at: 105600000
     refresh: true
     expect:
-      steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }, { type: run_recovery, class: speakr-transcription }]
+      steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }]
       allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
+  # The pod is up and ready a minute later: now the re-queue goes out.
+  - at: 105660000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 1, ready_pods: 1 } }
+    refresh: true
+    expect:
+      steps: [{ type: run_recovery, class: speakr-transcription }]

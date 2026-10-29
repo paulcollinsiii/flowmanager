@@ -1158,15 +1158,32 @@ mod tests {
         );
     }
 
+    fn whisperx_ready(s: &Shared, ready_pods: u32) {
+        push(
+            s,
+            "cluster-pods",
+            vec![ObservedValue::ModelPods {
+                model: "whisperx".into(),
+                pods: 1,
+                ready_pods,
+            }],
+        );
+    }
+
     #[tokio::test]
     async fn a_tick_with_failed_items_asks_the_recovery_object_after_publishing() {
         let (s, _) = process();
         let ctx = FakeCtx::default();
         world(&s, 0);
         failed_transcriptions(&s, 2);
+        // Allowed but no ready pod yet: nothing is requeued into the void.
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
         assert_eq!(r.allowed_models, vec![ModelId::from("whisperx")], "{r:?}");
+        assert!(ctx.recoveries.lock().unwrap().is_empty());
+        whisperx_ready(&s, 1);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
         // The step is reported as carried out (not in `not_executed`), the object asked once.
         assert!(
             r.steps
@@ -1194,6 +1211,7 @@ mod tests {
         let (s, _) = process();
         let ctx = FakeCtx::default();
         world(&s, 0);
+        whisperx_ready(&s, 1);
         failed_transcriptions(&s, 2);
         tick(&s, &ctx).await.unwrap();
         ctx.crash_and_retry();

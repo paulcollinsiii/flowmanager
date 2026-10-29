@@ -9,7 +9,8 @@
 //! Safety rules enforced here, regardless of the intent it is given:
 //! 1. At most one model of an exclusive resource is in the allowed set at a time. A switch
 //!    withdraws the old model and allows the new one in the same tick.
-//! 2. No decision is gated on pod state (but see 7: a shutdown veto). GPU exclusivity is enforced by Kubernetes (every
+//! 2. No decision is gated on pod state (but see 7: a shutdown veto, and recovery, which waits
+//!    for a ready pod). GPU exclusivity is enforced by Kubernetes (every
 //!    GPU workload requests the one GPU the node exposes), so the new model's pod stays
 //!    pending until the old one has released the GPU. A model is allowed only on a host
 //!    that is up, and a model the config does not have is never allowed (one removed while
@@ -180,6 +181,9 @@ fn resource_tick(
 /// the snapshot reports failed items for it. Emitted on every such tick: the action is
 /// idempotent and rate-limited by itself, and must re-check the allowed set before it acts.
 /// Never for a class that is not allowed, so recovery never runs for a model that is not.
+/// Held back while a fresh pods reading says one of the class's models has no ready pod:
+/// allowed only means KEDA may start it, and a request sent before the pod serves is lost.
+/// An unknown reading (no pods source, or a stale one) does not hold it back.
 fn recovery_steps(
     config: &Config,
     snapshot: &Snapshot,
@@ -194,12 +198,27 @@ fn recovery_steps(
         if needs_model
             && allowed.classes.contains(&class.id)
             && sched_model::class_work(config, snapshot, class).failed > 0
+            && !model_known_not_ready(config, snapshot, class)
         {
             steps.push(Step::RunRecovery {
                 class: class.id.clone(),
             });
         }
     }
+}
+
+/// Whether a fresh pods reading shows a model the class requires with no ready pod.
+fn model_known_not_ready(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> bool {
+    let max_age = config.policy().host_reading_stale_after;
+    class
+        .requires
+        .iter()
+        .filter_map(|r| r.model.as_ref())
+        .any(|m| {
+            snapshot
+                .fresh_model_pods(config, m, max_age)
+                .is_some_and(|(_, ready)| ready == 0)
+        })
 }
 
 /// What KEDA may run, derived from the new state alone.

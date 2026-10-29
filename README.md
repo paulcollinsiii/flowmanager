@@ -450,6 +450,12 @@ for it (fresh demand, `failed > 0`). That is the existing allowed-set rule, not 
 host check: a serving model stays allowed on a stale reachability reading until a reading
 says the host is down, and recovery follows it. It is emitted on
 every such tick; the action is idempotent and rate-limited by itself, so that is cheap.
+It is also held back while a fresh pods reading shows one of the class's models with no ready
+pod: allowed only means the model may start, and a re-queue sent before its pod serves meets a
+503 (the consumer, such as speakr, gives up within seconds) and spends one of the item's
+attempts. It is sent from the first tick that reads a ready pod. A missing or stale pods
+reading does not hold it back (a pods source is optional). A ready pod can still be loading
+weights; that is not detected.
 It never runs for a class that is not allowed: the action re-checks the allowed set the tick
 published before listing and again **before every request**, and stops when the class has
 left it. After in-flight work is cut off the model is withdrawn, so an action that needs the
