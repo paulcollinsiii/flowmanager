@@ -789,7 +789,9 @@ trusted network.
   Wake-on-LAN, a host flowmanager shut down or one that went down by itself and came back,
   adopted afresh each time; a host flowmanager powered on that blips down and back keeps its
   `managed` flag and is *not* adopted, and an adopted host the person switched off by hand
-  loses it, so their next power-on is adopted), or a failed
+  loses it while that lease is held, so their next power-on is adopted. Two limits: after `release`,
+  or after a host flowmanager powered on went down for any length of time, a person's power-on cannot be
+  told from a blip and is not adopted), or a failed
   power-on that a reading has now cleared. A host flowmanager powered on itself (a backup
   job's hold, a lease acquired through the API) is `powering_on` and is not adopted, and a
   restart with the persisted state adopts nothing (the host is already `on`). The lease is
