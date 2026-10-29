@@ -835,6 +835,36 @@ trusted network.
   is under way makes the older build report the persisted state unreadable until the drain
   clears (the host is seen off, or a new manual lease cancels it) or the state is discarded
   (`discard_state`). Let a drain finish before rolling back.
+- **Idle drain: the consumers go down before an idle host does.** Consumers of a shared host
+  run for as long as the host is up, whoever woke it (a backup job's hold, a lease, a person).
+  When a `managed` shared host reaches the point where it would be powered off (nothing holds
+  it: no lease, no queued or in-flight work of a class that needs it, no unknown demand
+  reading; `idle_grace` over), the sequencer first starts an **idle drain** of its own: an
+  `immediate` drain with `origin: idle`, stored in the host's state like any drain. The
+  classes that need the host leave the allowed set in that very tick (KEDA scales them to
+  zero), then the shutdown goes through the usual path: the mount check (`wait ...
+  pods_mounted` while their pods still mount it, bounded by `mounts_timeout`), then
+  `PowerOff`. Without it every host a backup woke would sit out `mounts_timeout` (30m) on its
+  own consumers' pods and then stop with an alert. An idle drain differs from a requested one:
+  **any hold cancels it** and re-allows the consumers at once (a manual or adopted lease, a
+  job's lease, work queued or in flight for a class that needs the host), and the idle clock
+  then starts from scratch. Unknown demand starts no idle drain (`wait ... stale_demand`), and
+  keeps one that is set without shutting the host down. If the mount wait runs out
+  (`shutdown_stopped`, alert, host stays up, no retry) the idle drain is cleared so the
+  consumers come back; the host is then no longer managed, so no idle drain starts again until
+  a new manual lease takes it over (a requested drain keeps today's behaviour). A person's
+  `drain_host` or switch-off on a host with an idle drain turns it into a requested drain
+  (start and scale-down kept). The drain ends when the host is seen down. Not changed: `control:
+  manual` hosts, exclusive hosts (the GPU host is shut down directly after its wind-down), and
+  hosts that are not managed (not ours). Visible as `origin` in `drains` of the tick report and
+  `last_decision`, in the `drain` log line, in the `tick` line's `drains` field and as `origin`
+  in the Home Assistant state of the host. **Rollback caveat:** a stored idle drain carries
+  `origin`, which an older build cannot decode, and unlike a requested drain it appears at
+  every idle shutdown (from the start of the drain until the host is seen off, the length of
+  the mount wait). A rollback in that window makes the older build report the persisted state
+  unreadable until the host is seen off or a hold cancels the drain, or the state is
+  discarded (`discard_state`); a requested drain is stored exactly as before. Roll back
+  between idle shutdowns.
 - **A manual model lease on a host that is off** already wakes a managed host (the planner
   asks for the power of any resource a manual lease names), and the model is allowed once the
   host is observed up; there is no separate GPU lease.

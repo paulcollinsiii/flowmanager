@@ -1247,6 +1247,15 @@ newer build that this one cannot decode makes ticks report an error and publish 
 (the scaler keeps what it had); the fix is the build that wrote it, or `discard_state`.
 After a rollback that changes handlers, re-register the deployment (section 2).
 
+A `managed` shared host's consumers are scaled down before the host is shut down when it
+goes idle: the scheduler starts an **idle drain** (the `drains` entry has `origin: "idle"`) at
+the moment it would have powered the host off, the consumers leave the allowed set, the mount
+check waits for their pods to go, then the host is shut down. Any hold (a lease, a job, work
+for a consumer) cancels it. A state document holding an idle drain carries an `origin` field
+that an older build cannot decode (a requested drain is stored as before), so roll back
+between idle shutdowns, or `discard_state` after. See the README, *Host leases, reclaim and
+resume*.
+
 A build without scheduled jobs rejects the `jobs:` section of the config (roll the config back
 with it), ignores the `job_book` key and never releases `hold-job-*` leases already in the
 lease book: a run in progress at the moment of the rollback leaves its NFS hold in place and
