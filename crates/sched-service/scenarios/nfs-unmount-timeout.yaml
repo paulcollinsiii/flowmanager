@@ -29,19 +29,21 @@ frames:
     expect:
       steps: []
       allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
-  # Idle grace (10m) over: due, and mounted.
+  # Idle grace (10m) over: due, and mounted. The idle drain scales the consumers down
+  # (they leave the allowed set) while the shutdown waits for the pods to unmount.
   - at: 100660000
     refresh: true
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
-      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [] }
   # One second short of the timeout (30m after it became due).
   - at: 102459000
     refresh: true
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
-      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
-  # Timed out: stopped. Nothing is powered off and the host stays allowed.
+      allowed: { models: [], classes: [] }
+  # Timed out: stopped. Nothing is powered off, the idle drain ends and the consumers are
+  # allowed again (nobody asked for them to stay down).
   - at: 102460000
     refresh: true
     expect:

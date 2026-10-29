@@ -57,17 +57,17 @@ frames:
       steps: []
       allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Idle grace over, but three pods mount basestar: no shutdown, the reason says so, the
-  # host stays up and everything that needs it stays allowed.
+  # host stays up and the idle drain has scaled everything that needs it down (not allowed).
   - at: 104260000
     refresh: true
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
-      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [] }
   - at: 104560000
     refresh: true
     expect:
       steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
-      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
+      allowed: { models: [], classes: [] }
   # The pods are gone: the very next decision shuts the host down.
   - at: 104570000
     refresh: true

@@ -2,8 +2,8 @@
 //! them up. Resources without a power section are always on.
 
 use sched_model::{
-    ClassSpec, Drain, DrainMode, Millis, ModePhase, MountsVeto, PowerPhase, PowerTransition,
-    PowerWant, ResourceState, Step, WaitReason, class_work,
+    ClassSpec, Drain, DrainMode, DrainOrigin, Millis, ModePhase, MountsVeto, PowerPhase,
+    PowerTransition, PowerWant, ResourceKind, ResourceState, Step, WaitReason, class_work,
 };
 
 use crate::Cx;
@@ -279,11 +279,25 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                     st.mounts_veto = None;
                 }
             }
-            let h = holds(cx, st.drain.is_some());
+            // A requested drain ignores queued and in-flight work; an idle one ignores nothing.
+            let idle_drain = st.drain.is_some_and(|d| d.origin == DrainOrigin::Idle);
+            let h = holds(cx, st.drain.is_some() && !idle_drain);
+            if idle_drain && h.count > 0 {
+                // Something holds the host again (a lease, or work for a class that needs it):
+                // the consumers are allowed again and the idle clock starts from scratch.
+                st.drain = None;
+                st.host_idle_since = None;
+            }
             if let Some(d) = st.drain
                 && st.managed
                 && idle_mode
             {
+                if d.origin == DrainOrigin::Idle && h.unknown {
+                    // As for any shutdown: not while a demand reading is unknown (the drain
+                    // stays, nothing is shut down).
+                    wait(cx, steps, WaitReason::StaleDemand);
+                    return;
+                }
                 drain_shutdown(cx, st, steps, d, h.count);
             } else if st.managed && idle_mode && h.count == 0 {
                 if h.unknown {
@@ -292,7 +306,21 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 }
                 let since = *st.host_idle_since.get_or_insert(now);
                 if now.saturating_sub(since) >= policy.idle_grace {
-                    power_off(cx, st, steps);
+                    if cx.res.kind == ResourceKind::Shared {
+                        // The consumers go first: an idle drain scales them down (they leave
+                        // the allowed set in this very tick), and the shutdown goes on through
+                        // the usual mount veto, which waits while pods still mount the host.
+                        let d = Drain {
+                            mode: DrainMode::Immediate,
+                            since: now,
+                            scaled_down: true,
+                            origin: DrainOrigin::Idle,
+                        };
+                        st.drain = Some(d);
+                        drain_shutdown(cx, st, steps, d, 0);
+                    } else {
+                        power_off(cx, st, steps);
+                    }
                 }
             } else {
                 st.host_idle_since = None;
@@ -370,6 +398,12 @@ fn mounts_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool 
         st.mounts_veto = Some(MountsVeto::Stopped { since: now });
         st.managed = false;
         st.host_idle_since = None;
+        // Nobody asked for the consumers to stay down: an idle drain ends, they come back, and
+        // the stopped state holds the host as for any shutdown (no longer managed, so no idle
+        // drain starts again). A requested drain is kept.
+        if st.drain.is_some_and(|d| d.origin == DrainOrigin::Idle) {
+            st.drain = None;
+        }
         wait(cx, steps, WaitReason::ShutdownStopped);
     } else {
         st.mounts_veto = Some(MountsVeto::Waiting { since });
@@ -435,6 +469,11 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
         return;
     }
     if cx.intent.power_up.get(&cx.res.id) == Some(&PowerWant::Manual) {
+        st.drain = None;
+        return;
+    }
+    // An idle drain exists only for a host that is ours to power off.
+    if d.origin == DrainOrigin::Idle && !st.managed {
         st.drain = None;
         return;
     }

@@ -211,20 +211,53 @@ impl DrainMode {
     }
 }
 
-/// A person's request to take a shared host down: set when a manual host lease is released
-/// with a drain mode, kept in the host's state so it survives a restart, and cleared once the
-/// host is no longer up (or a new manual host lease cancels it). While it is set, queued and
-/// in-flight work no longer holds the host up; leases still do.
+/// Who started a drain (see [`Drain`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainOrigin {
+    /// A person asked (a manual host lease released with a drain, or `drain_host`). The
+    /// default, so a stored drain without the field reads as requested.
+    #[default]
+    Requested,
+    /// The scheduler started it: a managed shared host reached the point where it would be
+    /// powered off (nothing holds it, `idle_grace` over), so its consumers are scaled down
+    /// first. Any hold arriving cancels it.
+    Idle,
+}
+
+impl DrainOrigin {
+    /// The label used in logs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DrainOrigin::Requested => "requested",
+            DrainOrigin::Idle => "idle",
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        *self == DrainOrigin::Requested
+    }
+}
+
+/// A drain of a shared host: the classes that need it are scaled down and the host is then
+/// shut down. A person's request (a manual host lease released with a drain, or `drain_host`)
+/// is kept in the host's state so it survives a restart, and cleared once the host is no
+/// longer up or a new manual host lease cancels it; it ignores queued and in-flight work,
+/// never leases. An idle drain (see [`DrainOrigin`]) ignores nothing: any hold cancels it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Drain {
     pub mode: DrainMode,
-    /// When the drain was requested.
+    /// When the drain was requested (or, for an idle drain, started).
     pub since: Millis,
     /// Whether the classes that need the host have been taken out of the allowed set (their
     /// consumers are scaled down). Once set it stays set for as long as the drain does.
     #[serde(default)]
     pub scaled_down: bool,
+    /// Who started it. Absent from the stored form when requested, so a requested drain is
+    /// stored exactly as before this field existed.
+    #[serde(default, skip_serializing_if = "DrainOrigin::is_requested")]
+    pub origin: DrainOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,12 +425,21 @@ mod tests {
             Some(Drain {
                 mode: DrainMode::Graceful,
                 since: Millis(9),
-                scaled_down: false
+                scaled_down: false,
+                origin: DrainOrigin::Requested
             })
         );
         let text = serde_json::to_string(&st).unwrap();
         assert_eq!(serde_json::from_str::<ResourceState>(&text).unwrap(), st);
         assert!(text.contains(r#""mode":"graceful""#), "{text}");
+        // A requested drain is stored exactly as before the origin existed; an idle one adds it.
+        assert!(!text.contains("origin"), "{text}");
+        let idle = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"drain":{"mode":"immediate","since":9,"scaled_down":true,"origin":"idle"}}"#;
+        let st: ResourceState = serde_json::from_str(idle).unwrap();
+        assert_eq!(st.drain.map(|d| d.origin), Some(DrainOrigin::Idle));
+        let text = serde_json::to_string(&st).unwrap();
+        assert!(text.contains(r#""origin":"idle""#), "{text}");
+        assert_eq!(serde_json::from_str::<ResourceState>(&text).unwrap(), st);
     }
 
     #[test]

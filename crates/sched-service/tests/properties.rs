@@ -288,15 +288,18 @@ proptest! {
         immediate in any::<bool>(),
         scaled_down in any::<bool>(),
         ago in 0u64..1_500_000,
+        idle in any::<bool>(),
     ) {
         let config = example_config_managed();
         let mut sc = scenario(&frames);
         let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1) });
         st.managed = true;
+        // An idle drain (the scheduler's own) is always immediate and already scaled down.
         st.drain = Some(sched_model::Drain {
-            mode: if immediate { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful },
+            mode: if immediate || idle { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful },
             since: Millis(50_000_000 - ago),
-            scaled_down,
+            scaled_down: scaled_down || idle,
+            origin: if idle { sched_model::DrainOrigin::Idle } else { sched_model::DrainOrigin::Requested },
         });
         sc.initial_state.resources.insert("basestar-nfs".into(), st);
         let results = run(&config, &sc).unwrap();

@@ -1618,7 +1618,8 @@ mod tests {
             Some(sched_model::Drain {
                 mode: DrainMode::Graceful,
                 since: Millis(T0 + 7_000),
-                scaled_down: false
+                scaled_down: false,
+                origin: sched_model::DrainOrigin::Requested
             })
         );
         assert!(

@@ -9,7 +9,7 @@
 //! The rules are pure, so they are tested without Restate; `object::release_host_lease`
 //! journals them.
 
-use sched_model::{Config, Drain, DrainMode, Millis, MountsVeto, ResourceId};
+use sched_model::{Config, Drain, DrainMode, DrainOrigin, Millis, MountsVeto, ResourceId};
 
 use crate::persist::CoreState;
 
@@ -56,6 +56,9 @@ pub fn request(
         },
         since: before.map_or(now, |d| d.since),
         scaled_down: before.is_some_and(|d| d.scaled_down),
+        // A person's request takes over an idle drain: it is a requested drain from now on, with
+        // the start and the scale-down kept.
+        origin: DrainOrigin::Requested,
     });
     st.managed = true;
     st.host_idle_since = None;
@@ -103,7 +106,8 @@ mod tests {
             Some(Drain {
                 mode: DrainMode::Graceful,
                 since: Millis(9),
-                scaled_down: false
+                scaled_down: false,
+                origin: DrainOrigin::Requested
             })
         );
         assert!(st.managed);
@@ -129,7 +133,8 @@ mod tests {
             Some(Drain {
                 mode: DrainMode::Immediate,
                 since: Millis(9),
-                scaled_down: true
+                scaled_down: true,
+                origin: DrainOrigin::Requested
             })
         );
         // Graceful asked of an immediate drain leaves it immediate.
@@ -137,6 +142,33 @@ mod tests {
         assert_eq!(
             c.state.resource(&nfs()).unwrap().drain.map(|d| d.mode),
             Some(DrainMode::Immediate)
+        );
+    }
+
+    #[test]
+    fn a_request_takes_over_an_idle_drain_keeping_its_start_and_scale_down() {
+        let mut c = core(PowerPhase::On { since: Millis(1) });
+        c.state.resources.get_mut(&nfs()).unwrap().drain = Some(Drain {
+            mode: DrainMode::Immediate,
+            since: Millis(4),
+            scaled_down: true,
+            origin: DrainOrigin::Idle,
+        });
+        request(
+            &mut c,
+            &example_config_managed(),
+            &nfs(),
+            DrainMode::Graceful,
+            Millis(50),
+        );
+        assert_eq!(
+            c.state.resource(&nfs()).unwrap().drain,
+            Some(Drain {
+                mode: DrainMode::Immediate,
+                since: Millis(4),
+                scaled_down: true,
+                origin: DrainOrigin::Requested
+            })
         );
     }
 

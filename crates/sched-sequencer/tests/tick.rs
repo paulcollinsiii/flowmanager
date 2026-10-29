@@ -2416,9 +2416,12 @@ fn a_host_that_pods_mount_is_not_powered_off_and_the_wait_begins_when_it_is_due(
     );
     let n = d.state.resource(&rid(N)).unwrap();
     assert!(n.managed && n.is_on(), "still ours and still up");
-    assert!(
-        !d.allowed.classes.is_empty(),
-        "the host is up, so what needs it stays allowed"
+    // An idle drain scaled its consumers down so their pods stop mounting it.
+    assert!(d.allowed.classes.is_empty(), "{:?}", d.allowed);
+    assert_eq!(
+        n.drain.map(|x| x.origin),
+        Some(sched_model::DrainOrigin::Idle),
+        "the scheduler's own drain"
     );
     // Not yet due (grace not over): no veto, no wait.
     let d = Case::new()
@@ -3164,4 +3167,188 @@ fn a_drain_state_reads_and_writes_without_changing_a_state_that_has_none() {
     assert_eq!(back, d.state);
     let none = serde_json::to_string(&Case::new().run().state).unwrap();
     assert!(!none.contains("drain"), "{none}");
+}
+
+// ---- idle drain: a managed shared host that would be powered off scales its consumers down first ----
+
+/// The NFS host managed, idle since `idle` ms ago, with an idle drain started `ago` ms ago.
+fn nfs_idle_drain(idle: u64, ago: u64, veto: Option<&str>) -> String {
+    let veto = veto
+        .map(|v| format!(", mounts_veto: {v}"))
+        .unwrap_or_default();
+    format!(
+        "{{ power: {}, mode: {}, managed: true, host_idle_since: {}, drain: {{ mode: immediate, since: {}, scaled_down: true, origin: idle }}{veto} }}",
+        on(),
+        mode_idle(),
+        T - idle,
+        T - ago
+    )
+}
+
+fn nfs_state_of(d: &Decision) -> sched_model::ResourceState {
+    d.state.resource(&rid(N)).unwrap().clone()
+}
+
+fn is_idle_drain(d: &Decision) -> bool {
+    nfs_drain_of(d).is_some_and(|x| x.origin == sched_model::DrainOrigin::Idle)
+}
+
+#[test]
+fn a_host_that_goes_idle_scales_its_consumers_down_before_it_is_shut_down() {
+    // Grace not over: nothing yet, the consumers run.
+    let d = Case::new().nfs_state(&nfs_due(10 * MIN - 1, None)).run();
+    assert!(d.steps.is_empty(), "{:?}", d.steps);
+    assert_eq!(nfs_drain_of(&d), None);
+    assert!(gate_allowed(&d));
+    // Grace over, no pod mounts it: the idle drain starts, the consumers leave the allowed
+    // set in this very tick, and the shutdown goes ahead.
+    let d = Case::new().nfs_state(&nfs_due(10 * MIN, None)).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "idle");
+    assert!(is_idle_drain(&d), "{:?}", nfs_drain_of(&d));
+    let x = nfs_drain_of(&d).unwrap();
+    assert!(x.scaled_down && x.mode == sched_model::DrainMode::Immediate);
+    assert!(!gate_allowed(&d), "{:?}", d.allowed);
+    assert!(matches!(power_of(&d, N), PowerPhase::ShuttingDown { .. }));
+}
+
+#[test]
+fn an_idle_drain_waits_for_the_pods_to_unmount_and_then_shuts_the_host_down() {
+    let c = Case::new()
+        .nfs_state(&nfs_due(10 * MIN, None))
+        .obs(mounts(2, 0));
+    let d = c.run();
+    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
+    assert!(is_idle_drain(&d) && !gate_allowed(&d));
+    // The state is carried (as persisted): still draining, pods gone, shut down.
+    let d2 = Case::new().run_fresh_at(&d.state, T + MIN);
+    assert_steps(&d2, vec![Step::PowerOff { resource: rid(N) }], "unmounted");
+    assert!(is_idle_drain(&d2));
+}
+
+#[test]
+fn any_hold_cancels_an_idle_drain_and_the_idle_clock_starts_again() {
+    let drained = nfs_idle_drain(11 * MIN, MIN, None);
+    let cases: Vec<(&str, Case)> = vec![
+        (
+            "a job's lease",
+            Case::new().lease(lease_on("h", N, "{ type: shared_hold, holder: backup }")),
+        ),
+        (
+            "a manual or adopted lease",
+            Case::new()
+                .lease(lease_on("m", N, "{ type: manual_host }"))
+                .want(N, PowerWant::Manual),
+        ),
+        (
+            "busy demand on a class that needs the host",
+            Case::new().obs(demand("paperless-ocr", "paperless-ocr-pending", 3, 0, 0)),
+        ),
+        (
+            "work in flight",
+            Case::new().obs(demand("paperless-ocr", "paperless-ocr-pending", 0, 1, 0)),
+        ),
+    ];
+    for (name, c) in cases {
+        let d = c.nfs_state(&drained).run();
+        assert_eq!(nfs_drain_of(&d), None, "{name}");
+        assert!(gate_allowed(&d), "{name}: the consumers are allowed again");
+        assert!(
+            !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+            "{name}"
+        );
+        assert_eq!(nfs_state_of(&d).host_idle_since, None, "{name}");
+    }
+    // Once the hold is gone the clock starts from scratch: no new idle drain until a full
+    // idle_grace has passed again.
+    let d = Case::new().nfs_state(&nfs_due(0, None)).run();
+    assert_eq!(nfs_drain_of(&d), None);
+    assert_eq!(
+        nfs_state_of(&d).host_idle_since,
+        Some(sched_model::Millis(T))
+    );
+    let d = Case::new().run_fresh_at(&d.state, T + 10 * MIN - 1);
+    assert_eq!(nfs_drain_of(&d), None);
+    let d = Case::new().run_fresh_at(&d.state, T + 10 * MIN);
+    assert!(is_idle_drain(&d));
+}
+
+#[test]
+fn unknown_demand_starts_no_idle_drain_and_keeps_one_that_is_set_without_a_shutdown() {
+    let c = || Case::new().drop_obs("class: paperless-ocr,");
+    let d = c().nfs_state(&nfs_due(10 * MIN, None)).run();
+    assert_steps(&d, vec![wait(N, WaitReason::StaleDemand)], "not started");
+    assert_eq!(nfs_drain_of(&d), None);
+    assert!(gate_allowed(&d));
+    let d = c().nfs_state(&nfs_idle_drain(11 * MIN, MIN, None)).run();
+    assert_steps(&d, vec![wait(N, WaitReason::StaleDemand)], "kept");
+    assert!(is_idle_drain(&d) && !gate_allowed(&d));
+}
+
+#[test]
+fn a_stopped_mount_veto_ends_the_idle_drain_and_it_does_not_start_again() {
+    // Pods kept mounting past mounts_timeout (30m): the scheduler stops.
+    let c = Case::new()
+        .nfs_state(&nfs_idle_drain(
+            60 * MIN,
+            31 * MIN,
+            Some(&waiting_since(30 * MIN)),
+        ))
+        .obs(mounts(2, 0));
+    let d = c.run();
+    assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], "stopped");
+    assert!(matches!(
+        veto_of(&d),
+        Some(sched_model::MountsVeto::Stopped { .. })
+    ));
+    assert_eq!(nfs_drain_of(&d), None, "the idle drain ends");
+    assert!(gate_allowed(&d), "the consumers come back");
+    assert!(!nfs_state_of(&d).managed);
+    // Later ticks (the pods are gone, the host has been idle for ever): it stays stopped, no
+    // new idle drain, no shutdown.
+    let mut state = d.state.clone();
+    for k in 1..=4u64 {
+        let d = Case::new().run_fresh_at(&state, T + k * 20 * MIN);
+        assert_steps(
+            &d,
+            vec![wait(N, WaitReason::ShutdownStopped)],
+            "still stopped",
+        );
+        assert_eq!(nfs_drain_of(&d), None);
+        assert!(gate_allowed(&d));
+        state = d.state;
+    }
+}
+
+#[test]
+fn a_host_seen_down_ends_an_idle_drain_and_manual_control_never_starts_one() {
+    let d = Case::new()
+        .obs(up(N, false, 0))
+        .nfs_state(&nfs_idle_drain(11 * MIN, MIN, None))
+        .run();
+    assert_eq!(nfs_drain_of(&d), None);
+    assert_eq!(power_of(&d, N), PowerPhase::Off);
+    // control: manual: nothing is ever drained or powered off.
+    let mut c = Case::new().nfs_state(&nfs_due(60 * MIN, None));
+    c.config = example_config();
+    let d = c.run();
+    assert!(d.steps.is_empty(), "{:?}", d.steps);
+    assert_eq!(nfs_drain_of(&d), None);
+    assert!(gate_allowed(&d));
+}
+
+#[test]
+fn an_exclusive_host_is_shut_down_without_an_idle_drain() {
+    let gpu = format!(
+        "{{ power: {}, mode: {}, managed: true, host_idle_since: {} }}",
+        on(),
+        mode_idle(),
+        T - 60 * MIN
+    );
+    let d = Case::new().gpu_state(&gpu).run();
+    assert!(
+        d.steps.contains(&Step::PowerOff { resource: rid(G) }),
+        "{:?}",
+        d.steps
+    );
+    assert_eq!(d.state.resource(&rid(G)).unwrap().drain, None);
 }

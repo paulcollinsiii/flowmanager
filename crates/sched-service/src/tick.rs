@@ -284,6 +284,8 @@ pub struct DrainReport {
     pub since: Millis,
     /// Whether the host's consumers have been scaled down (left the allowed set).
     pub scaled_down: bool,
+    /// `requested` (a person asked) or `idle` (the scheduler started it when the host went idle).
+    pub origin: String,
 }
 
 /// The drains in `state`.
@@ -298,6 +300,7 @@ fn drain_report(state: &SchedState) -> Vec<DrainReport> {
                 mode: d.mode.as_str().to_string(),
                 since: d.since,
                 scaled_down: d.scaled_down,
+                origin: d.origin.as_str().to_string(),
             })
         })
         .collect()
@@ -1077,7 +1080,7 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
         drains = ?r
             .drains
             .iter()
-            .map(|d| format!("{}:{}:{}", d.resource, d.mode, if d.scaled_down { "scaled_down" } else { "running" }))
+            .map(|d| format!("{}:{}:{}:{}", d.resource, d.origin, d.mode, if d.scaled_down { "scaled_down" } else { "running" }))
             .collect::<Vec<_>>(),
         "tick"
     );
@@ -1104,10 +1107,12 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
             event = "drain",
             resource = %d.resource,
             mode = %d.mode,
+            origin = %d.origin,
             since_ms = d.since.as_u64(),
             scaled_down = d.scaled_down,
             replayed,
-            "drain of {} ({}): {}",
+            "{} drain of {} ({}): {}",
+            d.origin,
             d.resource,
             d.mode,
             if d.scaled_down { "consumers scaled down, shutting down once nothing holds the host" } else { "in-flight work is still given its drain_timeout" }
@@ -2547,6 +2552,7 @@ mod tests {
         );
         assert_eq!(r.drains.len(), 1, "{r:?}");
         assert!(r.drains[0].scaled_down && r.drains[0].mode == "immediate");
+        assert_eq!(r.drains[0].origin, "requested");
         let nfs_consumers: Vec<_> = r
             .allowed_classes
             .iter()
@@ -2678,6 +2684,7 @@ mod tests {
                     mode: sched_model::DrainMode::Graceful,
                     since: clock.now(),
                     scaled_down: false,
+                    origin: sched_model::DrainOrigin::Requested,
                 });
             }
             d.state.resources.insert(nfs(), st);
@@ -2736,5 +2743,162 @@ mod tests {
             );
             assert!(r.adopted.is_empty());
         }
+    }
+
+    fn nfs_consumers_allowed(s: &Shared, r: &TickReport) -> bool {
+        let config = s.config.current();
+        r.allowed_classes.iter().any(|c| {
+            config
+                .class(c)
+                .is_some_and(|c| c.requires.iter().any(|q| q.resource == nfs()))
+        })
+    }
+
+    /// The managed example with basestar off and a backup job's hold on it (the hold is a
+    /// shared hold of a holder that is not a job record, so the job step leaves it alone).
+    fn woken_by_a_hold() -> (Arc<Shared>, Arc<ManualClock>, Durable) {
+        let (s, clock) = managed_world();
+        let mut d = Durable::default();
+        d.leases.push(Lease {
+            id: "hold-backup".into(),
+            resource: nfs(),
+            kind: sched_model::LeaseKind::SharedHold {
+                holder: "backup".into(),
+            },
+            granted_at: clock.now(),
+        });
+        world(&s, Some(0));
+        nfs_probe(&s, false);
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.steps.contains(&Step::PowerOn { resource: nfs() }),
+            "{r:?}"
+        );
+        // Seen up: powered on by us, so it is ours and not adopted.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.adopted.is_empty() && nfs_consumers_allowed(&s, &r),
+            "{r:?}"
+        );
+        (s, clock, d)
+    }
+
+    #[test]
+    fn a_host_a_job_woke_scales_its_consumers_down_when_the_last_hold_ends_then_shuts_down() {
+        let (s, clock, mut d) = woken_by_a_hold();
+        // The hold keeps it up, however long.
+        clock.advance(Millis(30 * 60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.drains.is_empty() && nfs_consumers_allowed(&s, &r),
+            "{r:?}"
+        );
+        // The job ends: the idle clock starts; the consumers run until idle_grace (10m).
+        d.leases.clear();
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.drains.is_empty() && nfs_consumers_allowed(&s, &r),
+            "{r:?}"
+        );
+        // Grace over with pods still mounting: the idle drain starts, the consumers leave the
+        // allowed set, the shutdown waits for the pods, and the report says whose drain it is.
+        clock.advance(Millis(10 * 60_000));
+        world(&s, Some(2));
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.drains.len(), 1, "{r:?}");
+        assert_eq!(
+            (r.drains[0].origin.as_str(), r.drains[0].mode.as_str()),
+            ("idle", "immediate")
+        );
+        assert!(!nfs_consumers_allowed(&s, &r), "{:?}", r.allowed_classes);
+        assert!(
+            !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+            "{r:?}"
+        );
+        // A restart in the middle of it: the drain is in the persisted state and goes on.
+        let (s2, clock2, d2) = restart_managed(&d);
+        let mut d2 = d2;
+        clock2.set(Millis(clock.now().as_u64() + 30_000));
+        world(&s2, Some(2));
+        let r = s2.tick(clock2.now(), &mut d2);
+        assert_eq!(r.drains.len(), 1, "{r:?}");
+        assert!(!nfs_consumers_allowed(&s2, &r));
+        // The pods are gone: shut down.
+        clock2.advance(Millis(30_000));
+        world(&s2, Some(0));
+        let r = s2.tick(clock2.now(), &mut d2);
+        assert!(
+            r.steps.contains(&Step::PowerOff { resource: nfs() }),
+            "{r:?}"
+        );
+        // Seen down: the drain ends.
+        clock2.advance(Millis(30_000));
+        world(&s2, Some(0));
+        nfs_probe(&s2, false);
+        let r = s2.tick(clock2.now(), &mut d2);
+        assert!(r.drains.is_empty(), "{r:?}");
+        assert_eq!(d2.state.resource(&nfs()).unwrap().drain, None);
+    }
+
+    #[test]
+    fn a_new_job_lease_or_a_person_or_work_cancels_an_idle_drain_on_a_job_woken_host() {
+        for how in ["job", "manual", "work"] {
+            let (s, clock, mut d) = woken_by_a_hold();
+            d.leases.clear();
+            clock.advance(Millis(60_000));
+            world(&s, Some(2));
+            s.tick(clock.now(), &mut d);
+            clock.advance(Millis(10 * 60_000));
+            world(&s, Some(2));
+            let r = s.tick(clock.now(), &mut d);
+            assert_eq!(r.drains.len(), 1, "{how}: {r:?}");
+            clock.advance(Millis(30_000));
+            world(&s, Some(2));
+            match how {
+                "job" => d.leases.push(Lease {
+                    id: "hold-backup2".into(),
+                    resource: nfs(),
+                    kind: sched_model::LeaseKind::SharedHold {
+                        holder: "backup".into(),
+                    },
+                    granted_at: clock.now(),
+                }),
+                "manual" => d.leases.push(Lease {
+                    id: "manual-host-1".into(),
+                    resource: nfs(),
+                    kind: sched_model::LeaseKind::ManualHost,
+                    granted_at: clock.now(),
+                }),
+                _ => ocr_demand(&s, 4),
+            }
+            let r = s.tick(clock.now(), &mut d);
+            assert!(r.drains.is_empty(), "{how}: {r:?}");
+            assert_eq!(d.state.resource(&nfs()).unwrap().drain, None);
+            assert!(nfs_consumers_allowed(&s, &r), "{how}: consumers are back");
+            assert_eq!(d.state.resource(&nfs()).unwrap().host_idle_since, None);
+        }
+    }
+
+    #[test]
+    fn a_host_a_person_powered_on_never_idles_out() {
+        let (s, clock) = managed_world();
+        let mut d = Durable::default();
+        for _ in 0..6 {
+            world(&s, Some(0));
+            let r = s.tick(clock.now(), &mut d);
+            assert!(r.drains.is_empty(), "{r:?}");
+            assert!(
+                !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+                "{r:?}"
+            );
+            assert!(nfs_consumers_allowed(&s, &r));
+            clock.advance(Millis(20 * 60_000));
+        }
+        assert_eq!(d.leases.len(), 1, "the adopted lease holds it");
     }
 }

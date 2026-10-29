@@ -322,6 +322,32 @@ pub fn check(
         }
     }
 
+    // 14. An idle drain (the scheduler's own) ends the moment anything holds the host: a lease
+    // that holds it, or work for a class that needs it. Unknown demand is not work.
+    for (id, st) in &decision.state.resources {
+        if !st
+            .drain
+            .is_some_and(|d| d.origin == sched_model::DrainOrigin::Idle)
+        {
+            continue;
+        }
+        let leased = snapshot.leases.iter().any(|l| {
+            &l.resource == id
+                && !matches!(l.kind, LeaseKind::Reclaim)
+                && active(&l.kind, snapshot.now)
+        });
+        let busy = config
+            .classes()
+            .iter()
+            .filter(|c| c.demand.is_some() && needs(c, id))
+            .any(|c| demand(config, snapshot, c).is_some_and(|d| d.0));
+        if leased || busy {
+            out.push(format!(
+                "invariant 14: idle drain of {id} still set while something holds the host"
+            ));
+        }
+    }
+
     // 11. A resource whose power transition timed out is never acted on again by the
     // scheduler for that reason: unless a fresh reading shows what the transition was after
     // (up after a power-on, down after a shutdown) or its control is manual (a person is in
@@ -486,6 +512,20 @@ pub fn check(
                             "invariant 4: powered off unmanaged host {resource}"
                         ));
                     }
+                    // 13. A shared host's consumers are scaled down before it is shut down: by a
+                    // drain a person asked for or, when it merely went idle, by its own idle drain.
+                    if config
+                        .resource(resource)
+                        .is_some_and(|r| r.kind == ResourceKind::Shared)
+                        && !decision
+                            .state
+                            .resource(resource)
+                            .is_some_and(|s| s.drain.is_some())
+                    {
+                        out.push(format!(
+                            "invariant 13: powered off shared {resource} with no drain scaling its consumers down first"
+                        ));
+                    }
                     let held = snapshot.leases.iter().any(|l| {
                         &l.resource == resource
                             && !matches!(l.kind, LeaseKind::Reclaim)
@@ -500,7 +540,10 @@ pub fn check(
                     // a lease, and only once its consumers are scaled down: `immediate`, or the
                     // scale-down already happened, or `drain_timeout` has passed, or every class
                     // that needs the host is known to have nothing in flight.
-                    let drain = before.and_then(|s| s.drain);
+                    // Only a requested drain waives work and grace: an idle drain ignores nothing.
+                    let drain = before
+                        .and_then(|s| s.drain)
+                        .filter(|d| d.origin == sched_model::DrainOrigin::Requested);
                     let draining = drain.is_some();
                     if let Some(d) = drain {
                         let scaled = d.mode == sched_model::DrainMode::Immediate

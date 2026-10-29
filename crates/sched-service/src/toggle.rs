@@ -1127,17 +1127,24 @@ pub fn resource_state(
         json!(kind == Some(ResourceKind::Shared)),
     );
     let draining = match requested {
-        Some(d) => d.map(|d| (d.mode.as_str().to_string(), d.since, d.scaled_down)),
+        Some(d) => d.map(|d| {
+            (
+                d.mode.as_str().to_string(),
+                d.since,
+                d.scaled_down,
+                d.origin.as_str().to_string(),
+            )
+        }),
         None => report.as_ref().and_then(|r| {
             r.state.resource(resource).filter(|st| st.is_on())?;
             let d = r.drains.iter().find(|d| &d.resource == resource)?;
-            Some((d.mode.clone(), d.since, d.scaled_down))
+            Some((d.mode.clone(), d.since, d.scaled_down, d.origin.clone()))
         }),
     };
-    if let Some((mode, since, scaled_down)) = draining {
+    if let Some((mode, since, scaled_down, origin)) = draining {
         m.insert(
             "drain".into(),
-            json!({ "mode": mode, "since_ms": since.as_u64(), "scaled_down": scaled_down }),
+            json!({ "mode": mode, "origin": origin, "since_ms": since.as_u64(), "scaled_down": scaled_down }),
         );
         if held.is_none() {
             m.insert("state".into(), json!("draining"));
@@ -1857,6 +1864,7 @@ mod tests {
             mode: "graceful".into(),
             since: Millis(1),
             scaled_down: false,
+            origin: "requested".into(),
         }];
         let mut st = sched_model::ResourceState::new(PowerPhase::ShuttingDown { since: Millis(2) });
         rep.state.resources.insert(nfs.clone(), st.clone());
