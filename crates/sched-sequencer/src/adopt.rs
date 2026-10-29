@@ -45,8 +45,11 @@ pub fn found_running(
         .filter(|r| match prev.resource(&r.id) {
             None => true,
             Some(st) => match st.power {
-                PowerPhase::Off
-                | PowerPhase::Failed {
+                // Off after a shutdown we started or a failed power-on is not managed; off with
+                // the flag still set is a host we powered on that went down for a moment
+                // (only `power_off` clears it), and it is not found running when it is back.
+                PowerPhase::Off => !st.managed,
+                PowerPhase::Failed {
                     during: sched_model::PowerTransition::PoweringOn,
                     ..
                 } => true,

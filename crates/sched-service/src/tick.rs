@@ -781,6 +781,11 @@ impl Shared {
         // follow from the previous state and fresh readings alone. Skipped with the job step,
         // when the lease book is not written back.
         let (mut adopted, mut adoptions_ended) = (Vec::new(), Vec::new());
+        // The previous state this tick starts from: a host whose adopted lease ends because it
+        // was seen down is no longer ours (the person took it down), so a later power-on of
+        // theirs is found running and adopted afresh, while a host flowmanager powered on
+        // itself that merely blips down and back (managed stays true) is not.
+        let mut prev_state = durable.state.clone();
         if !durable.jobs_off {
             let gone = sched_sequencer::adopt::gone_down(&config, &snapshot, &all_leases);
             adoptions_ended = all_leases
@@ -789,12 +794,14 @@ impl Shared {
                 .map(|l| l.resource.clone())
                 .collect();
             all_leases.retain(|l| !gone.contains(&l.id));
-            adopted = sched_sequencer::adopt::found_running(
-                &config,
-                &snapshot,
-                &durable.state,
-                &all_leases,
-            );
+            for r in &adoptions_ended {
+                if let Some(st) = prev_state.resources.get_mut(r) {
+                    st.managed = false;
+                    st.host_idle_since = None;
+                }
+            }
+            adopted =
+                sched_sequencer::adopt::found_running(&config, &snapshot, &prev_state, &all_leases);
             for r in &adopted {
                 all_leases.push(sched_sequencer::adopt::adopted_lease(r, now));
             }
@@ -837,7 +844,7 @@ impl Shared {
             }
         }
         let (kinds, reason, steps, allowed, state, forced, error) =
-            match decide(&config, &snapshot, &durable.state) {
+            match decide(&config, &snapshot, &prev_state) {
                 Ok((intent, decision)) => {
                     // Power wishes of hosts under manual control are never acted on; the
                     // reason does not list them.
@@ -862,7 +869,7 @@ impl Shared {
                     format!("no decision: {e}"),
                     Vec::new(),
                     AllowedSet::default(),
-                    durable.state.clone(),
+                    prev_state.clone(),
                     Vec::new(),
                     Some(e.to_string()),
                 ),
@@ -2649,5 +2656,78 @@ mod tests {
         let r = s.tick(clock.now(), &mut d);
         assert_eq!(r.adopted, vec![nfs()], "{r:?}");
         assert!(d.state.resource(&nfs()).unwrap().managed);
+    }
+
+    #[test]
+    fn a_host_flowmanager_powered_on_that_blips_down_and_back_is_not_adopted_and_still_shuts_down()
+    {
+        for with_drain in [false, true] {
+            let (s, clock) = managed_world();
+            let mut d = Durable::default();
+            let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
+            st.managed = true;
+            if with_drain {
+                st.drain = Some(sched_model::Drain {
+                    mode: sched_model::DrainMode::Graceful,
+                    since: clock.now(),
+                    scaled_down: false,
+                });
+            }
+            d.state.resources.insert(nfs(), st);
+            world(&s, Some(0));
+            if with_drain {
+                // Work in flight keeps a graceful drain waiting, so the host is still up and
+                // draining when the blip comes.
+                push(
+                    &s,
+                    "paperless-ocr-pending",
+                    vec![ObservedValue::Demand {
+                        failed: 0,
+                        class: "paperless-ocr".into(),
+                        ready: 0,
+                        in_flight: 1,
+                        oldest_ready_at: None,
+                    }],
+                );
+            }
+            let r = s.tick(clock.now(), &mut d);
+            assert!(r.adopted.is_empty(), "{r:?}");
+            // Down for one tick, then up again.
+            clock.advance(Millis(10_000));
+            world(&s, Some(0));
+            nfs_probe(&s, false);
+            let r = s.tick(clock.now(), &mut d);
+            assert_eq!(
+                d.state.resource(&nfs()).unwrap().power,
+                PowerPhase::Off,
+                "{r:?}"
+            );
+            assert!(d.state.resource(&nfs()).unwrap().managed);
+            clock.advance(Millis(10_000));
+            world(&s, Some(0));
+            let r = s.tick(clock.now(), &mut d);
+            assert!(
+                r.adopted.is_empty() && d.leases.is_empty(),
+                "{with_drain}: {r:?}"
+            );
+            assert!(d.state.resource(&nfs()).unwrap().managed);
+            // The shutdown proceeds as before: after idle_grace (10m in the example), none
+            // earlier.
+            clock.advance(Millis(9 * 60_000));
+            world(&s, Some(0));
+            let r = s.tick(clock.now(), &mut d);
+            assert!(
+                !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+                "{r:?}"
+            );
+            clock.advance(Millis(2 * 60_000));
+            world(&s, Some(0));
+            let r = s.tick(clock.now(), &mut d);
+            assert!(
+                r.steps.contains(&Step::PowerOff { resource: nfs() }),
+                "{with_drain}: {r:?}"
+            );
+            assert!(r.adopted.is_empty());
+        }
     }
 }

@@ -167,3 +167,15 @@ fn a_host_stored_as_on_and_not_managed_is_adopted_unless_left_so_on_purpose() {
         state("{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, managed: true }");
     assert!(found(&config, &up, &ours).is_empty());
 }
+
+#[test]
+fn a_host_we_powered_on_that_went_down_for_a_moment_is_not_found_running_when_it_is_back() {
+    let config = example_config_managed();
+    let up = snapshot(Some(true), None, &[]);
+    // Off with the flag still set: only a shutdown we started (`power_off`) clears it.
+    let blip = state("{ power: { phase: off }, mode: { phase: idle }, managed: true }");
+    assert!(found(&config, &up, &blip).is_empty());
+    // Off after our own shutdown, or found down: adopted when it comes back.
+    let after = state("{ power: { phase: off }, mode: { phase: idle } }");
+    assert_eq!(found(&config, &up, &after), vec![N]);
+}
