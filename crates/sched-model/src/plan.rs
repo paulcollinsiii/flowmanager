@@ -80,6 +80,14 @@ pub enum WaitReason {
     /// In-flight work (as its queue reports it) is still running, and no timeout applies
     /// or it has not expired.
     InFlightWork,
+    /// A drain was requested for the host (its manual lease was released with a drain mode)
+    /// and the shutdown has not been decided yet: `graceful` in-flight work is still given its
+    /// `drain_timeout` (the consumers are still allowed), or the consumers are scaled down and
+    /// `idle_grace` (standing in for a pod reading, where none exists) has not passed.
+    Draining,
+    /// A drain is under way (the consumers are scaled down) but a lease other than a manual
+    /// one still holds the host (a scheduled job's hold, say): the shutdown waits for it.
+    DrainHeld,
 }
 
 /// The next safe action toward an intent.

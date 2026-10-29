@@ -15,7 +15,11 @@
 //!    that is up, and a model the config does not have is never allowed (one removed while
 //!    allowed leaves the set at the next tick).
 //! 3. A host is powered down only when no lease holds it and no queued or in-flight work
-//!    needs it, after `idle_grace`; the one override is a reclaim.
+//!    needs it, after `idle_grace`; the overrides are a reclaim and a drain. A drain (a person
+//!    released the host's manual lease asking for the host to go down) ignores queued and
+//!    in-flight work, never a lease: its consumers leave the allowed set at once (`immediate`)
+//!    or when their in-flight work is done or `drain_timeout` has passed (`graceful`), and the
+//!    host is shut down once no lease holds it and the mount veto (7) is clear.
 //! 4. Power changes come only from the intent's `power_up` (manual requests, or classes
 //!    that may change power), and a host is powered down only if the scheduler took
 //!    responsibility for it. A host under `power.control: manual` never gets a power step
@@ -44,6 +48,7 @@
 //!    (default 0: no wait); a manual lease does not wait. A host found down, or gone down by
 //!    itself, is not penalised. The wait only delays a fresh decision; it is never a retry.
 
+pub mod adopt;
 mod exclusive;
 pub mod jobs;
 mod power;
@@ -161,6 +166,7 @@ fn resource_tick(
         None => power::initial(cx, steps)?,
     };
     power::reconcile(cx, &mut st);
+    power::drain_step(cx, &mut st);
     let mut acted = false;
     if cx.res.kind == sched_model::ResourceKind::Exclusive && st.is_on() {
         acted = exclusive::step(cx, &mut st, steps);
@@ -221,6 +227,8 @@ fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent:
             return false;
         };
         if !st.is_on()
+            // A drain has scaled the consumers of this host down.
+            || st.drain.is_some_and(|d| d.scaled_down)
             || (intent.reclaim.contains(&req.resource) && config.supports_reclaim(&req.resource))
         {
             return false;

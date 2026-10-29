@@ -190,13 +190,53 @@ pub enum MountsVeto {
     Stopped { since: Millis },
 }
 
+/// How a drain treats in-flight work (see [`Drain`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainMode {
+    /// In-flight work of the classes that need the host runs for at most `policy.drain_timeout`
+    /// (less if it finishes) before their consumers are scaled down.
+    Graceful,
+    /// The consumers are scaled down at once.
+    Immediate,
+}
+
+impl DrainMode {
+    /// The label used in logs, reports and requests.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DrainMode::Graceful => "graceful",
+            DrainMode::Immediate => "immediate",
+        }
+    }
+}
+
+/// A person's request to take a shared host down: set when a manual host lease is released
+/// with a drain mode, kept in the host's state so it survives a restart, and cleared once the
+/// host is no longer up (or a new manual host lease cancels it). While it is set, queued and
+/// in-flight work no longer holds the host up; leases still do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drain {
+    pub mode: DrainMode,
+    /// When the drain was requested.
+    pub since: Millis,
+    /// Whether the classes that need the host have been taken out of the allowed set (their
+    /// consumers are scaled down). Once set it stays set for as long as the drain does.
+    #[serde(default)]
+    pub scaled_down: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceState {
     pub power: PowerPhase,
     pub mode: ModePhase,
     /// Whether the scheduler may power this host down: set when it woke the host or took
-    /// over a manual request, never for a host merely found running.
+    /// over a manual request, never for a host merely found running. (Under `control: managed`
+    /// the service turns a shared host found running into a manual request by minting a manual
+    /// host lease for it, see `sched_sequencer::adopt`; the sequencer itself still never owns
+    /// a host it only found.)
     #[serde(default)]
     pub managed: bool,
     /// When the host last had nothing holding it.
@@ -217,6 +257,11 @@ pub struct ResourceState {
     /// without it reads and writes as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_confirmed_at: Option<Millis>,
+    /// A person's request to take the host down (a manual host lease released with a drain
+    /// mode). Absent from the stored state while there is none, so a state without one reads
+    /// and writes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<Drain>,
 }
 
 impl ResourceState {
@@ -229,6 +274,7 @@ impl ResourceState {
             pending_recovery: BTreeSet::new(),
             mounts_veto: None,
             shutdown_confirmed_at: None,
+            drain: None,
         }
     }
 
@@ -331,6 +377,27 @@ mod tests {
             );
             assert_eq!(mode(&text).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn a_drain_reads_and_writes_and_a_state_without_one_is_unchanged() {
+        let old = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true}"#;
+        let st: ResourceState = serde_json::from_str(old).unwrap();
+        assert_eq!(st.drain, None);
+        assert!(!serde_json::to_string(&st).unwrap().contains("drain"));
+        let drain = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"drain":{"mode":"graceful","since":9}}"#;
+        let st: ResourceState = serde_json::from_str(drain).unwrap();
+        assert_eq!(
+            st.drain,
+            Some(Drain {
+                mode: DrainMode::Graceful,
+                since: Millis(9),
+                scaled_down: false
+            })
+        );
+        let text = serde_json::to_string(&st).unwrap();
+        assert_eq!(serde_json::from_str::<ResourceState>(&text).unwrap(), st);
+        assert!(text.contains(r#""mode":"graceful""#), "{text}");
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! them up. Resources without a power section are always on.
 
 use sched_model::{
-    ClassSpec, Millis, ModePhase, MountsVeto, PowerPhase, PowerTransition, PowerWant,
-    ResourceState, Step, WaitReason, class_work,
+    ClassSpec, Drain, DrainMode, Millis, ModePhase, MountsVeto, PowerPhase, PowerTransition,
+    PowerWant, ResourceState, Step, WaitReason, class_work,
 };
 
 use crate::Cx;
@@ -44,6 +44,7 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         st.managed = false;
         st.host_idle_since = None;
         st.mounts_veto = None;
+        st.drain = None;
     }
     let now = cx.now();
     let before = st.power;
@@ -140,6 +141,8 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         st.mode = ModePhase::Idle;
         st.host_idle_since = None;
         st.mounts_veto = None;
+        // A drain ends when the host is no longer up: seen off, or on its way there.
+        st.drain = None;
     }
 }
 
@@ -157,8 +160,10 @@ pub(crate) struct Holds {
     pub unknown: bool,
 }
 
-/// Active leases plus classes with queued or in-flight work that need the host.
-pub(crate) fn holds(cx: &Cx) -> Holds {
+/// Active leases plus classes with queued or in-flight work that need the host. During a
+/// drain (`ignore_work`) only the leases count: the person asked for the host to go down, so
+/// work does not hold it (its consumers are scaled down instead, see [`drain_step`]).
+pub(crate) fn holds(cx: &Cx, ignore_work: bool) -> Holds {
     let now = cx.now();
     let mut h = Holds {
         count: 0,
@@ -170,6 +175,9 @@ pub(crate) fn holds(cx: &Cx) -> Holds {
         .iter()
         .filter(|l| l.resource == cx.res.id && l.holds_host(now))
         .count();
+    if ignore_work {
+        return h;
+    }
     for class in cx.config.classes().iter().filter(|c| needs(c, cx)) {
         if class.demand.is_none() {
             continue;
@@ -271,8 +279,13 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                     st.mounts_veto = None;
                 }
             }
-            let h = holds(cx);
-            if st.managed && idle_mode && h.count == 0 {
+            let h = holds(cx, st.drain.is_some());
+            if let Some(d) = st.drain
+                && st.managed
+                && idle_mode
+            {
+                drain_shutdown(cx, st, steps, d, h.count);
+            } else if st.managed && idle_mode && h.count == 0 {
                 if h.unknown {
                     wait(cx, steps, WaitReason::StaleDemand);
                     return;
@@ -393,4 +406,75 @@ fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
     st.managed = false;
     st.host_idle_since = None;
     st.mode = ModePhase::Idle;
+}
+
+/// Whether every class that needs the host and has a demand source is known to have nothing
+/// in flight (the work the consumers would be cut off from is already done).
+fn no_work_in_flight(cx: &Cx) -> bool {
+    cx.config
+        .classes()
+        .iter()
+        .filter(|c| needs(c, cx) && c.demand.is_some())
+        .all(|c| {
+            let w = class_work(cx.config, cx.snapshot, c);
+            w.known && w.in_flight == 0
+        })
+}
+
+/// Advances a drain on a host that is up under managed control (run before the power step):
+/// a new manual lease cancels it; otherwise the consumers that need the host are scaled down
+/// (the classes leave the allowed set, see `class_allowed`) at once for `immediate`, and for
+/// `graceful` when their in-flight work is done or `policy.drain_timeout` has passed since the
+/// request, whichever is first. Once scaled down it stays so until the drain ends.
+pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
+    let Some(mut d) = st.drain else {
+        return;
+    };
+    if !st.is_on() || !cx.config.power_managed(&cx.res.id) {
+        st.drain = None;
+        return;
+    }
+    if cx.intent.power_up.get(&cx.res.id) == Some(&PowerWant::Manual) {
+        st.drain = None;
+        return;
+    }
+    if !d.scaled_down {
+        let waited = cx.now().saturating_sub(d.since);
+        d.scaled_down = d.mode == DrainMode::Immediate
+            || waited >= cx.config.policy().drain_timeout
+            || no_work_in_flight(cx);
+        st.drain = Some(d);
+    }
+}
+
+/// The shutdown of a host with a drain: it waits for the consumers to be scaled down, for
+/// every lease that holds the host (`lease_holds`: a job's hold, say; the drain overrides
+/// none), and, where no pod reading exists to say the pods are gone, for `idle_grace` after
+/// the scale-down. Then `power_off` applies the mount veto as for any shutdown.
+fn drain_shutdown(
+    cx: &Cx,
+    st: &mut ResourceState,
+    steps: &mut Vec<Step>,
+    d: Drain,
+    lease_holds: usize,
+) {
+    if !d.scaled_down {
+        st.host_idle_since = None;
+        wait(cx, steps, WaitReason::Draining);
+        return;
+    }
+    if lease_holds > 0 {
+        st.host_idle_since = None;
+        wait(cx, steps, WaitReason::DrainHeld);
+        return;
+    }
+    if !cx.config.mounts_checked(&cx.res.id) {
+        let now = cx.now();
+        let since = *st.host_idle_since.get_or_insert(now);
+        if now.saturating_sub(since) < cx.config.policy().idle_grace {
+            wait(cx, steps, WaitReason::Draining);
+            return;
+        }
+    }
+    power_off(cx, st, steps);
 }

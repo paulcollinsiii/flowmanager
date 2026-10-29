@@ -38,7 +38,7 @@ pub use job_state::{
     Trigger,
 };
 pub use jobs::{CronJobRef, JobNeed, JobSpec, MissedRun};
-pub use lease::{Lease, LeaseKind, host_hold_count};
+pub use lease::{ADOPTED_HOST_PREFIX, Lease, LeaseKind, host_hold_count};
 pub use observation::{Fidelity, JobRunReading, JobRunState, Observation, ObservedValue, Snapshot};
 pub use plan::{AllowedSet, Intent, PowerWant, PublishedAllowed, Step, WaitReason};
 pub use power_params::{MacAddr, SshShutdown, WakeOnLan};
@@ -48,7 +48,8 @@ pub use source_params::{
     PrometheusParams, RequestSpec, ResponseCondition, SinceSpec, TcpProbeParams, WebhookParams,
 };
 pub use state::{
-    ModePhase, MountsVeto, PowerPhase, PowerTransition, ResourceState, SchedState, WindDown,
+    Drain, DrainMode, ModePhase, MountsVeto, PowerPhase, PowerTransition, ResourceState,
+    SchedState, WindDown,
 };
 pub use store::ConfigStore;
 pub use time::Millis;

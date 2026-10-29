@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{HolderId, LeaseId, ModelId, ResourceId};
 use crate::time::Millis;
 
+/// Prefix of the id of a manual host lease the scheduler minted for a host it found running
+/// (an "adopted" lease); the rest of the id is the resource.
+pub const ADOPTED_HOST_PREFIX: &str = "adopted-host-";
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lease {
@@ -62,6 +66,13 @@ impl Lease {
     /// active lease does except a reclaim, which asks for the opposite.
     pub fn holds_host(&self, now: Millis) -> bool {
         self.is_active(now) && !matches!(self.kind, LeaseKind::Reclaim)
+    }
+
+    /// Whether this is a manual host lease the scheduler minted for a host found running
+    /// (see [`ADOPTED_HOST_PREFIX`]) rather than one a person asked for.
+    pub fn is_adopted_host(&self) -> bool {
+        matches!(self.kind, LeaseKind::ManualHost)
+            && self.id.as_str().starts_with(ADOPTED_HOST_PREFIX)
     }
 
     pub fn is_reclaim(&self) -> bool {

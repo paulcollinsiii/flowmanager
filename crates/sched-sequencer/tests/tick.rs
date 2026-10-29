@@ -3007,3 +3007,161 @@ fn without_a_min_off_no_stamp_is_ever_written_and_a_leftover_one_is_dropped() {
     let d = nfs_down(Case::new().nfs_state(&nfs_off(Some(MIN)))).run();
     assert_eq!(stamp_of(&d, N), None);
 }
+
+// ---- drain: a person released the host's manual lease asking for the host to go down ----
+
+/// The NFS host managed and up with a drain `mode` requested `ago` ms before the tick.
+fn nfs_draining(mode: &str, ago: u64) -> String {
+    format!(
+        "{{ power: {}, mode: {}, managed: true, drain: {{ mode: {mode}, since: {} }} }}",
+        on(),
+        mode_idle(),
+        T - ago
+    )
+}
+
+fn nfs_drain_of(d: &Decision) -> Option<sched_model::Drain> {
+    d.state.resource(&rid(N)).unwrap().drain
+}
+
+/// Whether the gate class of paperless-gpt (which needs basestar-nfs and the GPU host) is allowed.
+fn gate_allowed(d: &Decision) -> bool {
+    d.allowed.classes.contains(&cid("paperless-gpt"))
+}
+
+/// Work queued and in flight for a class that needs the NFS host.
+fn nfs_busy() -> Case {
+    Case::new().obs(demand("paperless-ocr", "paperless-ocr-pending", 5, 1, 0))
+}
+
+#[test]
+fn an_immediate_drain_scales_the_consumers_down_and_shuts_the_host_down_despite_queued_work() {
+    // Without the drain, the same state and work keep the host up.
+    let held = nfs_busy().nfs_state(&nfs_due(60 * MIN, None)).run();
+    assert!(
+        !held
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::PowerOff { .. }))
+    );
+    assert!(gate_allowed(&held));
+
+    let d = nfs_busy().nfs_state(&nfs_draining("immediate", 0)).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "drain");
+    assert!(!gate_allowed(&d), "{:?}", d.allowed);
+    assert_eq!(
+        nfs_drain_of(&d).map(|x| (x.mode, x.scaled_down)),
+        Some((sched_model::DrainMode::Immediate, true))
+    );
+    assert!(matches!(power_of(&d, N), PowerPhase::ShuttingDown { .. }));
+}
+
+#[test]
+fn a_graceful_drain_lets_in_flight_work_run_for_the_drain_timeout_and_no_longer() {
+    // drain_timeout of the example is 10 minutes; work is in flight throughout.
+    let at = |ago: u64| nfs_busy().nfs_state(&nfs_draining("graceful", ago)).run();
+    let d = at(10 * MIN - 1);
+    assert_steps(
+        &d,
+        vec![wait(N, WaitReason::Draining)],
+        "inside the timeout",
+    );
+    assert!(gate_allowed(&d), "consumers still allowed");
+    assert_eq!(nfs_drain_of(&d).map(|x| x.scaled_down), Some(false));
+
+    let d = at(10 * MIN);
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "timed out");
+    assert!(!gate_allowed(&d));
+}
+
+#[test]
+fn a_graceful_drain_scales_down_as_soon_as_nothing_is_in_flight() {
+    // Queued work alone does not hold a drain.
+    let queued = Case::new()
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 5, 0, 0))
+        .nfs_state(&nfs_draining("graceful", MIN))
+        .run();
+    assert_steps(
+        &queued,
+        vec![Step::PowerOff { resource: rid(N) }],
+        "queued only",
+    );
+    assert!(!gate_allowed(&queued));
+    // An unknown reading of in-flight work is not "none": the timeout decides.
+    let unknown = Case::new()
+        .drop_obs("class: paperless-ocr,")
+        .nfs_state(&nfs_draining("graceful", MIN))
+        .run();
+    assert_steps(&unknown, vec![wait(N, WaitReason::Draining)], "unknown");
+    assert!(gate_allowed(&unknown));
+}
+
+#[test]
+fn a_drain_never_overrides_a_lease_and_the_shutdown_follows_its_release() {
+    let hold = lease_on("h", N, "{ type: shared_hold, holder: x }");
+    let c = Case::new()
+        .lease(hold)
+        .nfs_state(&nfs_draining("immediate", 0));
+    let d = c.run();
+    assert_steps(&d, vec![wait(N, WaitReason::DrainHeld)], "held by a lease");
+    assert!(
+        !gate_allowed(&d),
+        "the consumers are scaled down all the same"
+    );
+    assert!(nfs_drain_of(&d).is_some_and(|x| x.scaled_down));
+    // Next tick the scale-down is remembered and the lease is gone.
+    let gone = Case::new();
+    let d2 = gone.run_fresh_at(&d.state, T + MIN);
+    assert_steps(&d2, vec![Step::PowerOff { resource: rid(N) }], "released");
+}
+
+#[test]
+fn the_mount_veto_and_its_timeout_still_apply_after_the_scale_down() {
+    let c = Case::new()
+        .obs(mounts(2, 0))
+        .nfs_state(&nfs_draining("immediate", 0));
+    let d = c.run();
+    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
+    assert!(!gate_allowed(&d));
+    assert!(matches!(
+        veto_of(&d),
+        Some(sched_model::MountsVeto::Waiting { .. })
+    ));
+    // The pods are gone: the shutdown goes ahead.
+    let d2 = Case::new().run_fresh_at(&d.state, T + MIN);
+    assert_steps(&d2, vec![Step::PowerOff { resource: rid(N) }], "unmounted");
+    // A wait that outlasts mounts_timeout (30m) stops the scheduler.
+    let d3 = c.run_fresh_at(&d.state, T + 30 * MIN);
+    assert_steps(&d3, vec![wait(N, WaitReason::ShutdownStopped)], "timed out");
+}
+
+#[test]
+fn a_new_manual_lease_cancels_a_drain_and_a_host_seen_off_ends_it() {
+    let lease = lease_on("m", N, "{ type: manual_host }");
+    let d = Case::new()
+        .lease(lease)
+        .want(N, PowerWant::Manual)
+        .nfs_state(&nfs_draining("immediate", 0))
+        .run();
+    assert_eq!(nfs_drain_of(&d), None);
+    assert!(gate_allowed(&d), "consumers are allowed again");
+    assert!(!d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })));
+
+    let d = Case::new()
+        .obs(up(N, false, 0))
+        .nfs_state(&nfs_draining("immediate", 0))
+        .run();
+    assert_eq!(nfs_drain_of(&d), None);
+    assert_eq!(power_of(&d, N), PowerPhase::Off);
+}
+
+#[test]
+fn a_drain_state_reads_and_writes_without_changing_a_state_that_has_none() {
+    let d = Case::new().nfs_state(&nfs_draining("graceful", 0)).run();
+    let text = serde_json::to_string(&d.state).unwrap();
+    assert_eq!(text.matches("\"drain\"").count(), 1, "{text}");
+    let back: SchedState = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, d.state);
+    let none = serde_json::to_string(&Case::new().run().state).unwrap();
+    assert!(!none.contains("drain"), "{none}");
+}
