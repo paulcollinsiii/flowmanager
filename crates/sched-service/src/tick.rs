@@ -1380,6 +1380,13 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(sub, || {
+            // Tests run in parallel and log with no subscriber, and a callsite first
+            // registered while another thread installs a dispatcher can be left cached
+            // as uninteresting. Register every callsite first, then rebuild the cache
+            // (which does reach registered callsites) and start the capture clean.
+            log_tick(&r, "", false);
+            tracing::callsite::rebuild_interest_cache();
+            out.0.lock().unwrap().clear();
             log_tick(&r, "", false);
             log_tick(&r, "", true);
         });
