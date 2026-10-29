@@ -782,7 +782,10 @@ trusted network.
   `power.control: managed`, when a fresh reading shows it up and flowmanager did not power it
   on, it counts as held by the user and the tick mints the same manual host lease for it
   (id `adopted-host-<resource>`, listed by `leases`). "Did not power it on" is read from the
-  previous state: no state (first start, discarded state), `off` (a power button, a manual
+  previous state: no state (first start, discarded state), `on` and not managed (what an
+  older build stored for a host it found running, or what a tick that skipped adoption left;
+  not when a mount veto stopped the shutdown, a drain is under way or a job holds the host),
+  `off` (a power button, a manual
   Wake-on-LAN, a host that went down and came back, adopted afresh each time), or a failed
   power-on that a reading has now cleared. A host flowmanager powered on itself (a backup
   job's hold, a lease acquired through the API) is `powering_on` and is not adopted, and a
@@ -807,14 +810,26 @@ trusted network.
   mount check above passes. **A drain overrides no lease**: a scheduled job's hold or another
   lease keeps the host up, the step is `wait ... drain_held` and the shutdown follows when
   they are gone. Before the scale-down the step is `wait ... draining`. The mount check and
-  `mounts_timeout` apply after the scale-down as for any shutdown; for a host with no `mounts`
-  source the shutdown waits `idle_grace` after the scale-down, as nothing can show the pods
-  are gone. The drain ends when the host is no longer up, and a **new manual host lease
+  `mounts_timeout` apply after the scale-down as for any shutdown (a managed shared host always
+  has a `mounts` source, so there is no `idle_grace` wait). The drain ends when the host is no longer up, and a **new manual host lease
   cancels it** (the consumers are allowed again). It is visible as `drains` in the tick
   report (and `last_decision`), as `drain` in the Home Assistant state of the host, and as
   `event="drain_requested"` / `event="drain"` log lines. Known limit: a class that may change
   power and still has queued work wakes the host again once it is off (after `min_off`),
   exactly as it would after any shutdown.
+  `drain_host` (`{"resource", "drain"}`, mode required) is the same request without the
+  lease being a precondition: it releases the manual lease if one is held, records the drain,
+  and answers `{resource, released, drain}` (`drain` absent when the host is not up under
+  managed control). It is what the Home Assistant switch-off calls, so a host held up only by
+  queued work can be taken down too. Asked again, it changes the drain under way in place,
+  from the stored state (also right after a restart): `immediate` escalates, `graceful` leaves
+  an immediate drain as it is, the start and the scale-down are kept. Only a shared host with a
+  power section is accepted (`400` otherwise).
+  **Rollback caveat:** a state holding a drain has a field an older build cannot decode (the
+  state version was not bumped, as the field is absent when unset), so a rollback while a drain
+  is under way makes the older build report the persisted state unreadable until the drain
+  clears (the host is seen off, or a new manual lease cancels it) or the state is discarded
+  (`discard_state`). Let a drain finish before rolling back.
 - **A manual model lease on a host that is off** already wakes a managed host (the planner
   asks for the power of any resource a manual lease names), and the model is allowed once the
   host is observed up; there is no separate GPU lease.
