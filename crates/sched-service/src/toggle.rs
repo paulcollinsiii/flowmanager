@@ -18,7 +18,11 @@
 //!   of `on` or `off` (also `true`/`false`, or JSON `{"state": "on"}` / `{"held": true}`),
 //!   which is the shape Home Assistant's REST switch sends.
 //! - `GET  /v1/resources/{resource}`, `POST /v1/resources/{resource}/on|off` (or a body),
-//!   and `POST /v1/resources/{resource}/resume`: the manual host lease of a shared host.
+//!   and `POST /v1/resources/{resource}/resume`: the manual host lease of a shared host. A host
+//!   found running reads on (flowmanager holds it for the user, see `adopt`). `off` releases
+//!   the lease with a **graceful drain** (queued work no longer keeps the host up; in-flight
+//!   work gets `drain_timeout`), and `POST /v1/resources/{resource}/off-now` with an
+//!   **immediate** one (the consumers are scaled down at once). Neither overrides a job's hold.
 //! - `GET  /v1/reclaims/{resource}` and `POST /v1/reclaims/{resource}[/on|/off]`: the
 //!   reclaim of an exclusive resource with a power section ("this GPU is mine"): `reclaim`
 //!   and `unreclaim`.
@@ -37,8 +41,8 @@ use std::time::Duration;
 
 use hyper::Method;
 use sched_model::{
-    Config, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, PowerPhase, ResourceId,
-    ResourceKind,
+    Config, DrainMode, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, PowerPhase,
+    ResourceId, ResourceKind,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -79,7 +83,11 @@ pub trait Backend: Send + Sync {
     fn acquire_model(&self, model: &ModelId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
     fn release_lease(&self, id: &LeaseId) -> BoxFut<'_, Result<Lease, ApiError>>;
     fn acquire_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
-    fn release_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>>;
+    fn release_host(
+        &self,
+        resource: &ResourceId,
+        drain: Option<DrainMode>,
+    ) -> BoxFut<'_, Result<Lease, ApiError>>;
     fn resume(&self, resource: &ResourceId) -> BoxFut<'_, Result<ResumeAck, ApiError>>;
     fn reclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
     fn unreclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>>;
@@ -173,8 +181,15 @@ impl Backend for RestateIngress {
         Box::pin(self.call("acquire_host_lease", Some(body)))
     }
 
-    fn release_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
-        let body = json!({ "resource": resource });
+    fn release_host(
+        &self,
+        resource: &ResourceId,
+        drain: Option<DrainMode>,
+    ) -> BoxFut<'_, Result<Lease, ApiError>> {
+        let mut body = json!({ "resource": resource });
+        if let Some(mode) = drain {
+            body["drain"] = json!(mode);
+        }
         Box::pin(self.call("release_host_lease", Some(body)))
     }
 
@@ -218,6 +233,8 @@ pub enum Act {
     /// `Some(true)` is on, `Some(false)` off; `None` takes it from the body.
     Set(Option<bool>),
     Resume,
+    /// A host switched off with an immediate drain (`POST /v1/resources/{resource}/off-now`).
+    OffNow,
 }
 
 /// Decodes `%XX` escapes; `None` for a malformed escape or a result that is not UTF-8.
@@ -259,7 +276,7 @@ pub fn route(method: &Method, path: &str) -> Route {
             "v1",
             k @ ("models" | "resources" | "reclaims"),
             n,
-            t @ ("on" | "off" | "resume"),
+            t @ ("on" | "off" | "resume" | "off-now"),
         ] => (*k, *n, Some(*t)),
         _ => return Route::NotFound,
     };
@@ -277,7 +294,9 @@ pub fn route(method: &Method, path: &str) -> Route {
         (Some("on"), m) if m == Method::POST => Act::Set(Some(true)),
         (Some("off"), m) if m == Method::POST => Act::Set(Some(false)),
         (Some("resume"), m) if m == Method::POST && kind == Kind::Host => Act::Resume,
+        (Some("off-now"), m) if m == Method::POST && kind == Kind::Host => Act::OffNow,
         (Some("resume"), _) if kind != Kind::Host => return Route::NotFound,
+        (Some("off-now"), _) if kind != Kind::Host => return Route::NotFound,
         _ => {
             return Route::MethodNotAllowed(if tail.is_none() { "GET, POST" } else { "POST" });
         }
@@ -293,12 +312,13 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
             _ => "unmatched",
         };
     };
-    let labels: [&'static str; 5] = match kind {
+    let labels: [&'static str; 6] = match kind {
         Kind::Model => [
             "model_get",
             "model_on",
             "model_off",
             "model_set",
+            "unmatched",
             "unmatched",
         ],
         Kind::Host => [
@@ -307,6 +327,7 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
             "resource_off",
             "resource_set",
             "resource_resume",
+            "resource_off_now",
         ],
         Kind::Reclaim => [
             "reclaim_get",
@@ -314,11 +335,13 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
             "reclaim_off",
             "reclaim_set",
             "unmatched",
+            "unmatched",
         ],
     };
     match act {
         Act::Get => labels[0],
         Act::Resume => labels[4],
+        Act::OffNow => labels[5],
         Act::Set(w) => match w.or(want.flatten()) {
             Some(true) => labels[1],
             Some(false) => labels[2],
@@ -363,6 +386,7 @@ impl ToggleLog {
                 let action = match (act, wish) {
                     (Act::Get, _) => "get",
                     (Act::Resume, _) => "resume",
+                    (Act::OffNow, _) => "off_now",
                     (_, Some(true)) => "on",
                     (_, Some(false)) => "off",
                     _ => "unknown",
@@ -551,6 +575,9 @@ impl Toggle {
                 None => Err(bad_wish()),
             },
             Route::Switch(_, name, Act::Resume) => self.resume(name).await,
+            Route::Switch(_, name, Act::OffNow) => {
+                self.resource(name, Some(false), DrainMode::Immediate).await
+            }
         };
         match result {
             Ok(v) => Reply::json(200, v),
@@ -561,7 +588,7 @@ impl Toggle {
     async fn switch(&self, kind: Kind, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
         match kind {
             Kind::Model => self.model(name, set).await,
-            Kind::Host => self.resource(name, set).await,
+            Kind::Host => self.resource(name, set, DrainMode::Graceful).await,
             Kind::Reclaim => self.reclaim(name, set).await,
         }
     }
@@ -658,7 +685,17 @@ impl Toggle {
         ))
     }
 
-    async fn resource(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
+    /// A host switch. Off releases the manual host lease and asks for a drain (`drain`: the
+    /// host's switch is `graceful`, `off-now` is `immediate`): queued and in-flight work no
+    /// longer keeps the host up. A lease that is not held is not an error, but while a drain
+    /// is under way a second request changes its mode, so that `off-now` after `off` ends
+    /// the wait (the lease is taken and released again, which merges into the drain).
+    async fn resource(
+        &self,
+        name: &str,
+        set: Option<bool>,
+        drain: DrainMode,
+    ) -> Result<Value, ApiError> {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
         let held = match set {
@@ -666,8 +703,12 @@ impl Toggle {
             Some(true) => Some(self.backend.acquire_host(&id).await?.lease),
             Some(false) => {
                 let l = self.backend.leases().await?;
-                if let Some(lease) = find_host(&l, &id).cloned()
-                    && let Err(e) = self.backend.release_host(&id).await
+                let mut lease = find_host(&l, &id).cloned();
+                if lease.is_none() && self.draining(&id) {
+                    lease = Some(self.backend.acquire_host(&id).await?.lease);
+                }
+                if let Some(lease) = lease
+                    && let Err(e) = self.backend.release_host(&id, Some(drain)).await
                 {
                     self.gone_after(e, &lease.id).await?;
                 }
@@ -681,6 +722,13 @@ impl Toggle {
             &self.shared.last_report(),
             self.shared.clock.now(),
         ))
+    }
+
+    /// Whether the last tick of this process shows a drain under way on `id`.
+    fn draining(&self, id: &ResourceId) -> bool {
+        self.shared
+            .last_report()
+            .is_some_and(|r| r.drains.iter().any(|d| &d.resource == id))
     }
 
     async fn reclaim(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
@@ -1000,7 +1048,9 @@ fn reclaim_status(
 
 /// A resource (host) switch. `power`, `wait` and `needs_attention` come from the last tick's
 /// report of this process and are absent before the first tick; `wait` names why the
-/// scheduler holds something back (`min_off`, `shutdown_held_by_mounts`).
+/// scheduler holds something back (`min_off`, `shutdown_held_by_mounts`). `drain` is present while
+/// a drain is under way (a switch-off asked for the host to go down): its mode and whether
+/// the consumers are already scaled down.
 pub fn resource_state(
     config: &Config,
     resource: &ResourceId,
@@ -1028,6 +1078,16 @@ pub fn resource_state(
             "power".into(),
             serde_json::to_value(st.power).unwrap_or(Value::Null),
         );
+        if let Some(d) = r.drains.iter().find(|d| &d.resource == resource) {
+            m.insert(
+                "drain".into(),
+                json!({
+                    "mode": d.mode,
+                    "since_ms": d.since.as_u64(),
+                    "scaled_down": d.scaled_down,
+                }),
+            );
+        }
         let mounts = r.mounts_held.iter().find(|h| &h.resource == resource);
         let mut waits = Vec::new();
         if let Some(h) = mounts {
@@ -1164,9 +1224,14 @@ mod tests {
             })
         }
 
-        fn release_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
-            let req = ResourceRequest {
+        fn release_host(
+            &self,
+            resource: &ResourceId,
+            drain: Option<DrainMode>,
+        ) -> BoxFut<'_, Result<Lease, ApiError>> {
+            let req = crate::object::ReleaseHostLease {
                 resource: resource.clone(),
+                drain,
             };
             Box::pin(async move {
                 let r = object::release_host_lease(&self.shared, &self.ctx, req).await;
@@ -1337,6 +1402,16 @@ mod tests {
         assert_eq!(
             route(&p, "/v1/resources/nfs/resume"),
             Route::Switch(Kind::Host, "nfs".into(), Act::Resume)
+        );
+        assert_eq!(
+            route(&p, "/v1/resources/nfs/off-now"),
+            Route::Switch(Kind::Host, "nfs".into(), Act::OffNow)
+        );
+        assert_eq!(route(&p, "/v1/models/llm/off-now"), Route::NotFound);
+        assert_eq!(route(&p, "/v1/reclaims/gpu/off-now"), Route::NotFound);
+        assert_eq!(
+            route(&g, "/v1/resources/nfs/off-now"),
+            Route::MethodNotAllowed("POST")
         );
         assert_eq!(route(&p, "/v1/models/llm/resume"), Route::NotFound);
         assert_eq!(
@@ -1591,6 +1666,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_adopted_host_reads_on_and_off_drains_it_gracefully_and_off_now_immediately() {
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        r.tick().await;
+        // Found running: the adopted lease is a manual host lease, so the switch reads on.
+        let (s, v) = r.get("/v1/resources/basestar-nfs").await;
+        assert_eq!(
+            (s, &v["held"], &v["state"]),
+            (200, &json!(true), &json!("on")),
+            "{v}"
+        );
+        let drain = |r: &Rig| {
+            let core = crate::persist::decode_state(
+                r.backend.ctx.stored(crate::persist::STATE_KEY).as_deref(),
+            )
+            .unwrap();
+            core.state
+                .resource(&"basestar-nfs".into())
+                .and_then(|st| st.drain)
+        };
+        // Off: the lease is released and a graceful drain is recorded.
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off", "").await;
+        assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
+        assert_eq!(r.lease_count(), 0);
+        assert_eq!(
+            drain(&r).map(|d| d.mode),
+            Some(sched_model::DrainMode::Graceful)
+        );
+        r.tick().await;
+        let (_, v) = r.get("/v1/resources/basestar-nfs").await;
+        assert_eq!(v["drain"]["mode"], "graceful", "{v}");
+        // Off-now while the drain is under way, with no lease held: the drain is made
+        // immediate (and keeps its start).
+        let since = drain(&r).map(|d| d.since);
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
+        assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
+        let d = drain(&r).unwrap();
+        assert_eq!(d.mode, sched_model::DrainMode::Immediate);
+        assert_eq!(Some(d.since), since);
+        // Off-now from a held lease starts an immediate drain; a body naming the wish works too.
+        r.post("/v1/resources/basestar-nfs/on", "").await;
+        assert_eq!(r.lease_count(), 1);
+        r.tick().await;
+        assert_eq!(drain(&r), None, "the new lease cancelled it");
+        let (s, _) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
+        assert_eq!(s, 200);
+        assert_eq!(
+            drain(&r).map(|d| d.mode),
+            Some(sched_model::DrainMode::Immediate)
+        );
+        // Off with nothing held and no drain under way is still a success that does nothing.
+        r.tick().await;
+        r.post("/v1/resources/basestar-nfs/on", "").await;
+        r.tick().await;
+        assert_eq!(r.post("/v1/resources/basestar-nfs", "off").await.0, 200);
+        assert_eq!(
+            drain(&r).map(|d| d.mode),
+            Some(sched_model::DrainMode::Graceful)
+        );
+    }
+
+    #[tokio::test]
     async fn the_listing_has_every_model_and_every_powered_resource() {
         let r = rig(EXAMPLE_CONFIG);
         r.post("/v1/models/whisperx/on", "").await;
@@ -1800,7 +1937,7 @@ mod tests {
         );
         let e = ingress.acquire_host(&"nfs".into()).await.unwrap_err();
         assert_eq!((e.status, e.message.as_str()), (409, "held by another"));
-        let e = ingress.release_host(&"nfs".into()).await.unwrap_err();
+        let e = ingress.release_host(&"nfs".into(), None).await.unwrap_err();
         assert_eq!(e.status, 502, "{e:?}");
         assert!(e.message.contains("500") && e.message.contains("boom"));
         let e = ingress.resume(&"nfs".into()).await.unwrap_err();

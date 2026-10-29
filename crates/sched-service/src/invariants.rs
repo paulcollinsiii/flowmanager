@@ -496,10 +496,12 @@ pub fn check(
                             "invariant 3: powered off {resource} while a lease holds it"
                         ));
                     }
+                    // A drain (a person asked for the host to go down) ignores work, never a lease.
+                    let draining = before.is_some_and(|s| s.drain.is_some());
                     for class in config
                         .classes()
                         .iter()
-                        .filter(|c| c.demand.is_some() && needs(c, resource))
+                        .filter(|c| !draining && c.demand.is_some() && needs(c, resource))
                     {
                         if demand(config, snapshot, class).is_none_or(|d| d.0) {
                             out.push(format!(
@@ -509,6 +511,7 @@ pub fn check(
                         }
                     }
                     let grace_ok = policy.idle_grace == Millis::ZERO
+                        || (draining && config.mounts_checked(resource))
                         || before.and_then(|s| s.host_idle_since).is_some_and(|t| {
                             now.as_u64() - t.as_u64().min(now.as_u64())
                                 >= policy.idle_grace.as_u64()

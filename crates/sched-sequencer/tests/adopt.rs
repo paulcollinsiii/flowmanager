@@ -36,7 +36,16 @@ fn state(nfs: &str) -> SchedState {
 }
 
 fn found(config: &Config, snap: &Snapshot, prev: &SchedState) -> Vec<String> {
-    found_running(config, snap, prev)
+    found_with(config, snap, prev, &[])
+}
+
+fn found_with(
+    config: &Config,
+    snap: &Snapshot,
+    prev: &SchedState,
+    leases: &[Lease],
+) -> Vec<String> {
+    found_running(config, snap, prev, leases)
         .iter()
         .map(|r| r.to_string())
         .collect()
@@ -88,7 +97,7 @@ fn a_host_flowmanager_powered_on_or_already_held_or_not_read_up_is_not_adopted()
     let lease = "{ id: m, resource: basestar-nfs, granted_at: 1, kind: { type: manual_host } }";
     let held = snapshot(Some(true), None, &[lease]);
     assert!(
-        found(&config, &held, &SchedState::default()).is_empty(),
+        found_with(&config, &held, &SchedState::default(), &held.leases).is_empty(),
         "held"
     );
     assert!(

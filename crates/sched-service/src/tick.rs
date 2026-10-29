@@ -273,6 +273,36 @@ fn min_off_report(
         .collect()
 }
 
+/// A drain under way on a host, in a [`TickReport`]: a person released its manual lease and
+/// asked for it to go down. The shutdown itself waits (or not) as the tick's steps say.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainReport {
+    pub resource: ResourceId,
+    /// `graceful` or `immediate`.
+    pub mode: String,
+    /// When the drain was requested.
+    pub since: Millis,
+    /// Whether the host's consumers have been scaled down (left the allowed set).
+    pub scaled_down: bool,
+}
+
+/// The drains in `state`.
+fn drain_report(state: &SchedState) -> Vec<DrainReport> {
+    state
+        .resources
+        .iter()
+        .filter_map(|(id, st)| {
+            let d = st.drain?;
+            Some(DrainReport {
+                resource: id.clone(),
+                mode: d.mode.as_str().to_string(),
+                since: d.since,
+                scaled_down: d.scaled_down,
+            })
+        })
+        .collect()
+}
+
 /// What a tick decided, for logs and for the `last_decision` handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TickReport {
@@ -344,6 +374,16 @@ pub struct TickReport {
     /// flowmanager started: the time left per resource. A manual lease never waits.
     #[serde(default)]
     pub min_off_waits: Vec<MinOffWait>,
+    /// Shared hosts found running in this tick that were adopted: a manual host lease was
+    /// minted for each, so the user is taken to hold them up.
+    #[serde(default)]
+    pub adopted: Vec<ResourceId>,
+    /// Hosts whose adopted lease was dropped in this tick because the host was seen down.
+    #[serde(default)]
+    pub adoptions_ended: Vec<ResourceId>,
+    /// Hosts with a drain under way (see `sched_model::Drain`), from the state after this tick.
+    #[serde(default)]
+    pub drains: Vec<DrainReport>,
     /// What the scheduled jobs did in this tick (alerts among them).
     #[serde(default)]
     pub job_events: Vec<JobEvent>,
@@ -592,6 +632,9 @@ impl Shared {
             mounts_held: vec![],
             mounts_timeouts: vec![],
             min_off_waits: vec![],
+            adopted: vec![],
+            adoptions_ended: vec![],
+            drains: vec![],
             job_events: vec![],
             jobs: vec![],
             inputs: vec![],
@@ -714,7 +757,7 @@ impl Shared {
         // The scheduled jobs move first: their holds enter the lease book before the planner
         // looks at it, so a job that comes due is seen by the very tick that notices it. If
         // the stored job book was unreadable the step is skipped and nothing about jobs moves.
-        let (jobs, all_leases, job_events, creates) = if durable.jobs_off {
+        let (jobs, mut all_leases, job_events, creates) = if durable.jobs_off {
             (
                 durable.jobs.clone(),
                 durable.leases.clone(),
@@ -732,6 +775,30 @@ impl Shared {
             );
             (s.book, s.leases, s.events, s.creates)
         };
+        // Hosts found running are taken to be held by the user: a manual host lease is minted
+        // for each (before the planner looks, so this very tick sees it), and one that was
+        // minted for a host now seen down is dropped (it must not wake the host again). Both
+        // follow from the previous state and fresh readings alone. Skipped with the job step,
+        // when the lease book is not written back.
+        let (mut adopted, mut adoptions_ended) = (Vec::new(), Vec::new());
+        if !durable.jobs_off {
+            let gone = sched_sequencer::adopt::gone_down(&config, &snapshot, &all_leases);
+            adoptions_ended = all_leases
+                .iter()
+                .filter(|l| gone.contains(&l.id))
+                .map(|l| l.resource.clone())
+                .collect();
+            all_leases.retain(|l| !gone.contains(&l.id));
+            adopted = sched_sequencer::adopt::found_running(
+                &config,
+                &snapshot,
+                &durable.state,
+                &all_leases,
+            );
+            for r in &adopted {
+                all_leases.push(sched_sequencer::adopt::adopted_lease(r, now));
+            }
+        }
         let (leases, ignored_leases) = leases::effective(&config, &all_leases);
         snapshot.leases = leases.clone();
         // Sources that can never report: nothing observes them in this build and, `observe`
@@ -803,6 +870,7 @@ impl Shared {
         let (power_failed, power_timeouts) = power_report(&durable.state, &state);
         let power_request_failures = self.power_request_failures(&state);
         let (mounts_held, mounts_timeouts) = mounts_report(&durable.state, &state);
+        let drains = drain_report(&state);
         let (kinds, reason) = if error.is_none() {
             reason::with_power(
                 kinds,
@@ -857,6 +925,9 @@ impl Shared {
             min_off_waits,
             inputs: ages.iter().map(InputReport::from).collect(),
             queues,
+            adopted,
+            adoptions_ended,
+            drains,
             job_events,
             jobs: crate::jobs::summaries(&config, &jobs),
             input_changed: changed,
@@ -996,8 +1067,45 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
         unknown_demand = ?ids(&r.unknown_demand),
         unsupported_demand = ?ids(&r.unsupported_demand),
         unpolled_demand = ?ids(&r.unpolled_demand),
+        drains = ?r
+            .drains
+            .iter()
+            .map(|d| format!("{}:{}:{}", d.resource, d.mode, if d.scaled_down { "scaled_down" } else { "running" }))
+            .collect::<Vec<_>>(),
         "tick"
     );
+    for h in &r.adopted {
+        tracing::info!(
+            event = "host_adopted",
+            resource = %h,
+            at_ms = r.at.as_u64(),
+            replayed,
+            "{h} was found running and flowmanager did not power it on: it is held by the user (a manual host lease was minted; switching the host off releases it)"
+        );
+    }
+    for h in &r.adoptions_ended {
+        tracing::info!(
+            event = "host_adoption_ended",
+            resource = %h,
+            at_ms = r.at.as_u64(),
+            replayed,
+            "{h} was seen down: its adopted lease is dropped, so it is not woken again"
+        );
+    }
+    for d in &r.drains {
+        tracing::info!(
+            event = "drain",
+            resource = %d.resource,
+            mode = %d.mode,
+            since_ms = d.since.as_u64(),
+            scaled_down = d.scaled_down,
+            replayed,
+            "drain of {} ({}): {}",
+            d.resource,
+            d.mode,
+            if d.scaled_down { "consumers scaled down, shutting down once nothing holds the host" } else { "in-flight work is still given its drain_timeout" }
+        );
+    }
     // One line per class, so a log query can graph each queue on its own. Not on a replay:
     // the same tick would be counted twice.
     if !replayed {
@@ -2263,6 +2371,222 @@ mod tests {
                 }
             )
             .is_empty()
+        );
+    }
+
+    // ---- adoption of a host found running, and the drain ----
+
+    fn managed_world() -> (Arc<Shared>, Arc<ManualClock>) {
+        shared_with(&sched_model::test_support::example_yaml_managed())
+    }
+
+    fn nfs_probe(s: &Shared, up: bool) {
+        push(
+            s,
+            "basestar-probe",
+            vec![ObservedValue::ResourceUp {
+                resource: "basestar-nfs".into(),
+                up,
+            }],
+        );
+    }
+
+    fn nfs() -> ResourceId {
+        "basestar-nfs".into()
+    }
+
+    /// A new process (managed config, empty cache, its own clock at the same time) with the
+    /// persisted state.
+    fn restart_managed(d: &Durable) -> (Arc<Shared>, Arc<ManualClock>, Durable) {
+        let text = serde_json::to_string(d).unwrap();
+        let (s, clock) = managed_world();
+        (s, clock, serde_json::from_str(&text).unwrap())
+    }
+
+    #[test]
+    fn a_host_found_running_is_adopted_once_and_adopted_again_after_it_went_down_and_came_back() {
+        let (s, clock) = managed_world();
+        let mut d = Durable::default();
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        let adopted: Vec<_> = d.leases.iter().filter(|l| l.is_adopted_host()).collect();
+        assert_eq!(adopted.len(), 1, "{:?}", d.leases);
+        assert_eq!(adopted[0].resource, nfs());
+        assert!(
+            r.leases.iter().any(|l| l.is_adopted_host()),
+            "the planner saw it"
+        );
+        let st = d.state.resource(&nfs()).unwrap();
+        assert!(st.managed && st.is_on(), "{st:?}");
+        // The GPU host is exclusive: never adopted.
+        assert!(
+            d.state
+                .resource(&"cuda-central".into())
+                .is_some_and(|s| !s.managed)
+        );
+        // Once only.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.adopted.is_empty() && r.adoptions_ended.is_empty(),
+            "{r:?}"
+        );
+        assert_eq!(d.leases.len(), 1);
+        // The person switches the host off by hand: the claim ends and it is not woken.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        nfs_probe(&s, false);
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.adoptions_ended, vec![nfs()], "{r:?}");
+        assert!(d.leases.is_empty(), "{:?}", d.leases);
+        assert!(
+            !r.steps.iter().any(|s| matches!(s, Step::PowerOn { .. })),
+            "{r:?}"
+        );
+        assert_eq!(d.state.resource(&nfs()).unwrap().power, PowerPhase::Off);
+        // Brought back: adopted afresh.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        assert!(d.state.resource(&nfs()).unwrap().managed);
+    }
+
+    #[test]
+    fn a_host_flowmanager_powered_on_or_found_again_after_a_restart_is_not_adopted() {
+        let (s, clock) = managed_world();
+        let mut d = Durable::default();
+        let mut st = sched_model::ResourceState::new(PowerPhase::PoweringOn { since: Millis(1) });
+        st.managed = true;
+        d.state.resources.insert(nfs(), st);
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(r.adopted.is_empty(), "{r:?}");
+        assert!(d.leases.is_empty());
+        assert!(d.state.resource(&nfs()).unwrap().managed);
+        // A restart: a new process with the persisted state and an empty cache.
+        let (s2, clock2, d2) = restart_managed(&d);
+        clock2.set(clock.now());
+        let mut d2 = d2;
+        world(&s2, Some(0));
+        let r = s2.tick(clock2.now(), &mut d2);
+        assert!(r.adopted.is_empty(), "{r:?}");
+        assert!(d2.leases.is_empty());
+    }
+
+    #[test]
+    fn under_manual_power_control_nothing_is_adopted() {
+        let (s, clock) = shared();
+        let mut d = Durable::default();
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(r.adopted.is_empty() && d.leases.is_empty(), "{r:?}");
+    }
+
+    /// The managed example, basestar adopted and up, with 5 paperless-ocr items queued and
+    /// no mounting pods; `request` is applied to the stored state as the release handler does.
+    fn adopted_with_work() -> (Arc<Shared>, Arc<ManualClock>, Durable) {
+        let (s, clock) = managed_world();
+        let mut d = Durable::default();
+        world(&s, Some(0));
+        s.tick(clock.now(), &mut d);
+        // The person releases the lease (as the handler would) with the work still queued.
+        d.leases.clear();
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        ocr_demand(&s, 5);
+        (s, clock, d)
+    }
+
+    #[test]
+    fn a_drain_shuts_the_host_down_despite_queued_work_and_is_reported_and_logged() {
+        // The same world without the drain: the queued work keeps the host up.
+        let (s, clock, mut d) = adopted_with_work();
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+            "{r:?}"
+        );
+        assert!(r.drains.is_empty());
+
+        let (s, clock, mut d) = adopted_with_work();
+        let mut core = crate::persist::CoreState {
+            state: d.state.clone(),
+            ..Default::default()
+        };
+        let config = s.config.current();
+        let rec = crate::drain::request(
+            &mut core,
+            &config,
+            &nfs(),
+            sched_model::DrainMode::Immediate,
+            clock.now(),
+        );
+        assert_eq!(rec, crate::drain::Requested::Recorded);
+        d.state = core.state;
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.steps.contains(&Step::PowerOff { resource: nfs() }),
+            "{r:?}"
+        );
+        assert_eq!(r.drains.len(), 1, "{r:?}");
+        assert!(r.drains[0].scaled_down && r.drains[0].mode == "immediate");
+        let nfs_consumers: Vec<_> = r
+            .allowed_classes
+            .iter()
+            .filter(|c| {
+                config
+                    .class(c)
+                    .is_some_and(|c| c.requires.iter().any(|q| q.resource == nfs()))
+            })
+            .collect();
+        assert!(nfs_consumers.is_empty(), "{nfs_consumers:?}");
+        // The drain survives a restart (it is in the persisted state) until the host is off.
+        let (s2, clock2, d2) = restart_managed(&d);
+        clock2.set(clock.now());
+        let mut d2 = d2;
+        assert!(d2.state.resource(&nfs()).unwrap().drain.is_some());
+        clock2.advance(Millis(60_000));
+        world(&s2, Some(0));
+        nfs_probe(&s2, false);
+        let r = s2.tick(clock2.now(), &mut d2);
+        assert_eq!(d2.state.resource(&nfs()).unwrap().power, PowerPhase::Off);
+        assert!(r.drains.is_empty(), "{r:?}");
+        assert_eq!(d2.state.resource(&nfs()).unwrap().drain, None);
+    }
+
+    #[test]
+    fn a_manual_lease_taken_during_a_drain_cancels_it() {
+        let (s, clock, mut d) = adopted_with_work();
+        let mut core = crate::persist::CoreState {
+            state: d.state.clone(),
+            ..Default::default()
+        };
+        let config = s.config.current();
+        crate::drain::request(
+            &mut core,
+            &config,
+            &nfs(),
+            sched_model::DrainMode::Graceful,
+            clock.now(),
+        );
+        d.state = core.state;
+        // Work is queued, nothing in flight: the graceful drain would scale down at once,
+        // but a manual lease arrives first.
+        d.leases.push(Lease {
+            id: "manual-host-1".into(),
+            resource: nfs(),
+            kind: sched_model::LeaseKind::ManualHost,
+            granted_at: clock.now(),
+        });
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(d.state.resource(&nfs()).unwrap().drain, None);
+        assert!(r.drains.is_empty());
+        assert!(
+            !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+            "{r:?}"
         );
     }
 }

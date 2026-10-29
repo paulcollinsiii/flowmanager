@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use restate_sdk::errors::{HandlerError, TerminalError};
-use sched_model::{Config, Lease, LeaseId, Millis, ModelId, ResourceId};
+use sched_model::{Config, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::drain;
 use crate::leases::{LeaseBook, LeaseError, LeaseGrant};
 use crate::persist::{self, CoreState, LEASES_KEY, STATE_KEY, StateError};
 use crate::power::PowerAction;
@@ -420,13 +421,71 @@ async fn release_resource_lease<C: ObjectCtx>(
     Ok(lease)
 }
 
-/// Releases the manual host lease on a resource.
+/// `release_host_lease` request: the host, and optionally how to take it down.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseHostLease {
+    pub resource: ResourceId,
+    /// Absent: only the lease is released and the host goes down when nothing holds it (idle
+    /// grace, the mount check). `graceful` or `immediate`: also a drain (see `drain`).
+    #[serde(default)]
+    pub drain: Option<DrainMode>,
+}
+
+/// Releases the manual host lease on a resource, and with `drain` records the request to
+/// take the host down (see `drain`). The release and the drain are stored together when the
+/// invocation completes, so one cannot be seen without the other.
 pub async fn release_host_lease<C: ObjectCtx>(
     shared: &Arc<Shared>,
     ctx: &C,
-    req: ResourceRequest,
+    req: ReleaseHostLease,
 ) -> Result<Lease, HandlerError> {
-    release_resource_lease(shared, ctx, req, LeaseBook::release_manual_host).await
+    let mut book = read_leases(ctx)
+        .await?
+        .map_err(|e| unreadable(shared, &e))?;
+    let lease = book
+        .release_manual_host(&req.resource)
+        .map_err(|e| lease_refused(&e))?;
+    let mut drain_mode = None;
+    if let Some(mode) = req.drain {
+        let core = persist::decode_state(ctx.get_raw(STATE_KEY).await?.as_deref())
+            .map_err(|e| unreadable(shared, &e))?;
+        let (s, resource) = (Arc::clone(shared), req.resource.clone());
+        let (core, recorded) = ctx
+            .run_journaled("release_host_lease", move || {
+                let mut core = core;
+                let config = s.config.current();
+                let now = s.clock.now();
+                let r = drain::request(&mut core, &config, &resource, mode, now);
+                (core, r == drain::Requested::Recorded)
+            })
+            .await?;
+        if recorded {
+            ctx.set_raw(STATE_KEY, persist::encode_state(&core));
+            drain_mode = Some(mode);
+        } else {
+            tracing::info!(
+                resource = %req.resource,
+                "drain requested but not recorded: the host is not up under managed power control"
+            );
+        }
+    }
+    ctx.set_raw(LEASES_KEY, persist::encode_leases(&book));
+    ctx.request_tick();
+    match drain_mode {
+        Some(mode) => tracing::info!(
+            event = "drain_requested",
+            lease = %lease.id,
+            resource = %lease.resource,
+            mode = mode.as_str(),
+            "lease released with a drain ({}): queued and in-flight work no longer holds the host",
+            mode.as_str()
+        ),
+        None => {
+            tracing::info!(lease = %lease.id, resource = %lease.resource, "lease released")
+        }
+    }
+    Ok(lease)
 }
 
 /// Releases the reclaim on a resource.
@@ -1301,6 +1360,12 @@ mod tests {
             resource: resource.into(),
         }
     }
+    fn release(resource: &str, drain: Option<DrainMode>) -> ReleaseHostLease {
+        ReleaseHostLease {
+            resource: resource.into(),
+            drain,
+        }
+    }
 
     fn refused(e: &HandlerError) -> String {
         format!("{e:?}")
@@ -1344,7 +1409,7 @@ mod tests {
         assert!(!again.created && again.lease == g.lease);
         assert_eq!(ctx.ticks(), 1);
         // Released by resource: stored, a tick asked for, and a second release is a 404.
-        let released = release_host_lease(&s, &ctx, req("basestar-nfs"))
+        let released = release_host_lease(&s, &ctx, release("basestar-nfs", None))
             .await
             .unwrap();
         ctx.commit();
@@ -1355,7 +1420,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(ctx.ticks(), 2);
-        let e = release_host_lease(&s, &ctx, req("basestar-nfs"))
+        let e = release_host_lease(&s, &ctx, release("basestar-nfs", None))
             .await
             .unwrap_err();
         assert!(
@@ -1404,7 +1469,14 @@ mod tests {
         assert!(!again.created && again.lease == g.lease);
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
-        assert_eq!(r.leases, vec![g.lease.clone()]);
+        // (The NFS host was up in this world, so it is adopted: its lease is listed too.)
+        let own: Vec<_> = r
+            .leases
+            .iter()
+            .filter(|l| !l.is_adopted_host())
+            .cloned()
+            .collect();
+        assert_eq!(own, vec![g.lease.clone()]);
         // Work is waiting (3 OCR items) but the reclaimed resource allows no model, and a
         // managed host is shut down (the one power request of the tick).
         assert!(r.allowed_models.is_empty(), "{r:?}");
@@ -1418,12 +1490,91 @@ mod tests {
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
         // The lease is gone; the host is still going down, so nothing is allowed on it yet.
-        assert!(r.leases.is_empty() && r.allowed_models.is_empty(), "{r:?}");
+        assert!(
+            r.leases.iter().all(|l| l.is_adopted_host()) && r.allowed_models.is_empty(),
+            "{r:?}"
+        );
         let e = unreclaim(&s, &ctx, req("cuda-central")).await.unwrap_err();
         assert!(
             refused(&e).contains("holds no reclaim lease"),
             "{}",
             refused(&e)
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_a_host_lease_with_a_drain_stores_it_with_the_release_and_a_retry_reuses_the_journal()
+     {
+        let (s, clock) = process_managed();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        // The host is found running and adopted; the person's switch-off releases that lease.
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.adopted.len(), 1, "{r:?}");
+        let drain_of = |ctx: &FakeCtx| {
+            persist::decode_state(ctx.stored(STATE_KEY).as_deref())
+                .unwrap()
+                .state
+                .resource(&"basestar-nfs".into())
+                .and_then(|st| st.drain)
+        };
+        assert_eq!(drain_of(&ctx), None);
+        clock.set(Millis(T0 + 7_000));
+        let released =
+            release_host_lease(&s, &ctx, release("basestar-nfs", Some(DrainMode::Graceful)))
+                .await
+                .unwrap();
+        assert!(released.is_adopted_host());
+        // A crash after the handler ran: the retry gets the recorded decision, not a new time.
+        ctx.crash_and_retry();
+        clock.set(Millis(T0 + 9_000));
+        release_host_lease(&s, &ctx, release("basestar-nfs", Some(DrainMode::Graceful)))
+            .await
+            .unwrap();
+        assert!(ctx.ran().is_empty());
+        ctx.commit();
+        assert_eq!(
+            drain_of(&ctx),
+            Some(sched_model::Drain {
+                mode: DrainMode::Graceful,
+                since: Millis(T0 + 7_000),
+                scaled_down: false
+            })
+        );
+        assert!(
+            list_leases(&s, ctx.stored(LEASES_KEY).as_deref())
+                .unwrap()
+                .is_empty()
+        );
+        // The next tick reports it and does not adopt the host again.
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.drains.len(), 1, "{r:?}");
+        assert!(r.adopted.is_empty(), "{r:?}");
+        // Without a drain mode nothing is recorded; a second release is a 404.
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        acquire_host_lease(&s, &ctx, req("basestar-nfs"))
+            .await
+            .unwrap();
+        ctx.commit();
+        tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        release_host_lease(&s, &ctx, release("basestar-nfs", None))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert_eq!(drain_of(&ctx), None);
+        assert!(
+            release_host_lease(
+                &s,
+                &ctx,
+                release("basestar-nfs", Some(DrainMode::Immediate))
+            )
+            .await
+            .is_err()
         );
     }
 

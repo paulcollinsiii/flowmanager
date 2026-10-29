@@ -53,8 +53,8 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::JobSummary;
 use crate::leases::LeaseGrant;
 use crate::object::{
-    self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseLease,
-    ResourceRequest, TickAck, TriggerJob,
+    self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseHostLease,
+    ReleaseLease, ResourceRequest, TickAck, TriggerJob,
 };
 use crate::persist::{EPOCH_KEY, JOBS_KEY, LEASES_KEY, POWER_KEY, RECOVERY_KEY};
 use crate::power::{self, PowerAck, PowerAction, PowerRecord, PowerRequest};
@@ -324,12 +324,15 @@ impl Scheduler {
 
     /// Releases the manual host lease on a resource and returns it; none held is refused
     /// (404). The host is then shut down only once nothing holds it, idle grace has passed and
-    /// no pod mounts it.
+    /// no pod mounts it. With `"drain": "graceful"` or `"immediate"` the host is taken down
+    /// even though work is queued or in flight: its consumers are scaled down (at once, or
+    /// after at most `drain_timeout` for graceful) and it is shut down once no lease holds it
+    /// and no pod mounts it; a new manual host lease cancels the drain.
     #[handler]
     async fn release_host_lease(
         &self,
         ctx: ObjectContext<'_>,
-        Json(req): Json<ResourceRequest>,
+        Json(req): Json<ReleaseHostLease>,
     ) -> Result<Json<Lease>, HandlerError> {
         Ok(Json(
             object::release_host_lease(&self.shared, &Rctx(&ctx), req).await?,

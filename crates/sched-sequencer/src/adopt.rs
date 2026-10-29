@@ -26,8 +26,13 @@ pub fn adopted_id(resource: &ResourceId) -> LeaseId {
 }
 
 /// The hosts to adopt at `snapshot.now`: found running (see the module) and holding no
-/// manual host lease yet.
-pub fn found_running(config: &Config, snapshot: &Snapshot, prev: &SchedState) -> Vec<ResourceId> {
+/// manual host lease yet (`leases` is the book the tick is about to use).
+pub fn found_running(
+    config: &Config,
+    snapshot: &Snapshot,
+    prev: &SchedState,
+    leases: &[Lease],
+) -> Vec<ResourceId> {
     let max_age = config.policy().host_reading_stale_after;
     config
         .resources()
@@ -44,8 +49,7 @@ pub fn found_running(config: &Config, snapshot: &Snapshot, prev: &SchedState) ->
             Some(_) => false,
         })
         .filter(|r| {
-            !snapshot
-                .leases
+            !leases
                 .iter()
                 .any(|l| l.resource == r.id && l.kind == LeaseKind::ManualHost)
         })
