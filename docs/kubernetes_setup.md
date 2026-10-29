@@ -240,10 +240,10 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/acquire_model_lease` | `{"model": "<id>"}` | **Pins a model on its GPU**: batch work is cut short (its classes leave the allowed set at once, in-flight work gets `drain_timeout`, or a class's `kill_timeout`, then is stopped) and the model stays allowed however much other work waits, until the lease is released. Asking again for the leased model returns the existing lease; another model of the same resource is `409`; an unknown model is `400`. | an operator (a person); later Open WebUI's service account. |
 | `Scheduler/main/release_lease` | `{"id": "manual-model-<n>"}` | Releases a lease and returns it; unknown id `404`. Whoever can release can end somebody's pin. | an operator; the same identity that acquired it. |
 | `Scheduler/main/acquire_host_lease` | `{"resource": "<id>"}` | **Holds a shared host up** (the NFS server): a `managed` host that is off is powered on, and while the lease is held everything gated on the host is allowed even with no work queued. Asking again returns the lease; an exclusive resource, one without a power section or an unknown one is `400`. Ids `manual-host-<n>`. | an operator. |
-| `Scheduler/main/release_host_lease` | `{"resource": "<id>"}` | Releases the manual host lease of a resource; none held is `404`. The host is then shut down once nothing else holds it, `idle_grace` has passed and no pod mounts it. | an operator. |
+| `Scheduler/main/release_host_lease` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` (`drain` optional) | Releases the manual host lease of a resource (also the one flowmanager minted for a host it found running); none held is `404`. Without `drain` the host is shut down once nothing else holds it (queued or in-flight work of its consumers included), `idle_grace` has passed and no pod mounts it. With `drain` the request is recorded in the host's state: queued and in-flight work stops holding the host, its consumers are scaled down (`immediate`: at once; `graceful`: when nothing is in flight or after `policy.drain_timeout`), and the host is shut down once no lease holds it (a job's hold is waited for, never overridden) and no pod mounts it (`mounts_timeout` still applies). A new `acquire_host_lease` cancels the drain. The drain is in the tick report (`drains`) and the logs (`drain_requested`, `drain`). | an operator. |
 | `Scheduler/main/reclaim` | `{"resource": "<id>"}` | **Takes an exclusive host back despite pending work**: intake stops, in-flight work gets `reclaim_timeout` and is then cut off, a `managed` host is shut down and not woken until `unreclaim`. Only for an exclusive resource with a power section (`400` otherwise). Ids `reclaim-<n>`. | an operator. |
 | `Scheduler/main/unreclaim` | `{"resource": "<id>"}` | Releases the reclaim; none held is `404`. | an operator. |
-| `Scheduler/main/resume` | `{"resource": "<id>"}` | After a host was fixed by hand: clears a failed power transition, or a shutdown stopped by mounting pods, for that one resource, which then follows observation (found running means up and not managed). Powers nothing; other resources and the leases are untouched. Not stopped: `409`. | an operator. |
+| `Scheduler/main/resume` | `{"resource": "<id>"}` | After a host was fixed by hand: clears a failed power transition, or a shutdown stopped by mounting pods, for that one resource, which then follows observation (found running means up and not managed; a shared `managed` host is then adopted at the next tick). Powers nothing; other resources and the leases are untouched. Not stopped: `409`. | an operator. |
 | `Scheduler/main/jobs` | none | Read only. Every configured scheduled job with its state: next time, the run in progress (phase, attempt, Job name, retry time), the last outcome and the last success, and a Job past its deadline that may still be active. | operators, monitoring. |
 | `Scheduler/main/trigger_job` | `{"id": "<job id>"}` | **Starts a run of a scheduled job now** (it waits for the job's needs, then the Job is created). Refused with `409` while the previous instance is pending or running, never queued; unknown id `404`. | an operator. |
 | `Scheduler/main/discard_state` | `{"key": "scheduler_state"\|"lease_book"\|"job_book", "force": bool}` | **Destructive**: deletes a persisted document so the next tick starts it afresh. Without `force` only a document that cannot be read (`409` otherwise). `lease_book` drops every lease; `scheduler_state` drops the sequencer state; `job_book` forgets every run, lingering mark and next time (a Job still running is then unknown to the next run, which can start beside it). Returns what was stored. | operators only. |
@@ -363,7 +363,7 @@ tick's report in the process (so a status is absent until this process has ticke
 | `GET /v1/leases` | Every model, powered resource and reclaimable resource with its state, and a top-level `needs_attention`. |
 | `GET /v1/models/{model}` | A manual model lease (on = the lease is held, **not** that the model is loaded). |
 | `POST /v1/models/{model}/on`, `/off` | Take or release it. Idempotent: on when held returns the same state; off when not held is a success. |
-| `GET /v1/resources/{resource}`, `POST .../on`, `.../off` | The manual host lease of a shared host with a power section (the NFS server): powers a managed host on and keeps it up. |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now` | The manual host lease of a shared host with a power section (the NFS server): powers a managed host on and keeps it up. A host found running (power button, Wake-on-LAN, first start) reads **on**: flowmanager holds it for you with an adopted lease, and switching it off releases it. `off` releases with a **graceful drain** (queued work no longer keeps the host up; in-flight work gets `drain_timeout`, then the consumers are scaled down and the host is shut down once nothing else holds it), `off-now` with an **immediate** drain (consumers scaled down at once). Neither overrides a job's hold: the host stays up until it ends. A later `on` cancels a drain. |
 | `POST /v1/resources/{resource}/resume` | Clears a failed power phase (or a shutdown stopped by mounting pods) after a person fixed the host. `409` if the resource is not stopped. |
 | `GET /v1/reclaims/{resource}`, `POST .../on`, `.../off` | `reclaim` / `unreclaim` of an exclusive resource with a power section ("this GPU is mine"): intake stops, work is cut off after the reclaim timeout, the host is shut down if its power is managed, and it is not woken until released. |
 
@@ -390,7 +390,8 @@ derived from the last tick's report and are **left out when they cannot be said*
   model is still allowed and the report gives no more);
 - host lease (`GET /v1/resources/..`): `power` (the phase as the sequencer holds it, with `since`
   and, when failed, `during`), `wait` (a list: `min_off` with the seconds left, or
-  `shutdown_held_by_mounts` with `stopped`), `needs_attention`;
+  `shutdown_held_by_mounts` with `stopped`), `drain` (present while a drain is under way: `mode`,
+  `since_ms`, `scaled_down`), `needs_attention`;
 - reclaim: `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_for_person` (the host
   is up and its power is `control: manual`, so flowmanager never shuts it down: power it off
   yourself), `pending`, the `power`
@@ -507,7 +508,8 @@ switch:
     headers:
       Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"   # the value is "Bearer <token>"
     timeout: 20
-  - platform: rest                  # one host: the NFS server kept up
+  - platform: rest                  # one host: the NFS server. On = held (also for a host found running);
+                                    # off = a graceful drain: the host is taken down even with work queued
     name: Flowmanager NFS host lease
     unique_id: flowmanager_lease_basestar
     resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/basestar-nfs
@@ -549,6 +551,11 @@ binary_sensor:
       Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
 
 rest_command:
+  flowmanager_nfs_off_now:           # the same, with an immediate drain: consumers scaled down at once
+    url: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/basestar-nfs/off-now
+    method: post
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
   flowmanager_resume_basestar:      # after fixing the host by hand
     url: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/basestar-nfs/resume
     method: post
