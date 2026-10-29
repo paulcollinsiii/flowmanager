@@ -496,8 +496,27 @@ pub fn check(
                             "invariant 3: powered off {resource} while a lease holds it"
                         ));
                     }
-                    // A drain (a person asked for the host to go down) ignores work, never a lease.
-                    let draining = before.is_some_and(|s| s.drain.is_some());
+                    // A drain (a person asked for the host to go down) ignores queued work, never
+                    // a lease, and only once its consumers are scaled down: `immediate`, or the
+                    // scale-down already happened, or `drain_timeout` has passed, or every class
+                    // that needs the host is known to have nothing in flight.
+                    let drain = before.and_then(|s| s.drain);
+                    let draining = drain.is_some();
+                    if let Some(d) = drain {
+                        let scaled = d.mode == sched_model::DrainMode::Immediate
+                            || d.scaled_down
+                            || now.saturating_sub(d.since) >= policy.drain_timeout
+                            || config
+                                .classes()
+                                .iter()
+                                .filter(|c| c.demand.is_some() && needs(c, resource))
+                                .all(|c| demand(config, snapshot, c).is_some_and(|x| !x.1));
+                        if !scaled {
+                            out.push(format!(
+                                "invariant 3: powered off {resource} on a graceful drain before its consumers were scaled down"
+                            ));
+                        }
+                    }
                     for class in config
                         .classes()
                         .iter()

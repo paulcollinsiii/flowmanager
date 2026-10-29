@@ -45,11 +45,11 @@ impl Backend for Stub {
     fn acquire_host(&self, _: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
         refused()
     }
-    fn release_host(
+    fn drain_host(
         &self,
         _: &ResourceId,
-        _: Option<sched_model::DrainMode>,
-    ) -> BoxFut<'_, Result<Lease, ApiError>> {
+        _: sched_model::DrainMode,
+    ) -> BoxFut<'_, Result<sched_service::object::DrainAck, ApiError>> {
         refused()
     }
     fn resume(&self, _: &ResourceId) -> BoxFut<'_, Result<ResumeAck, ApiError>> {

@@ -53,8 +53,8 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::JobSummary;
 use crate::leases::LeaseGrant;
 use crate::object::{
-    self, AcquireModelLease, BoxFut, DiscardState, Discarded, ObjectCtx, ReleaseHostLease,
-    ReleaseLease, ResourceRequest, TickAck, TriggerJob,
+    self, AcquireModelLease, BoxFut, DiscardState, Discarded, DrainAck, DrainHost, ObjectCtx,
+    ReleaseHostLease, ReleaseLease, ResourceRequest, TickAck, TriggerJob,
 };
 use crate::persist::{EPOCH_KEY, JOBS_KEY, LEASES_KEY, POWER_KEY, RECOVERY_KEY};
 use crate::power::{self, PowerAck, PowerAction, PowerRecord, PowerRequest};
@@ -339,6 +339,22 @@ impl Scheduler {
         ))
     }
 
+    /// Takes a shared host down on request, with or without a manual lease held: releases
+    /// the lease if there is one and records a drain (`graceful` or `immediate`; see
+    /// `release_host_lease`). Asking again changes the mode of the drain under way
+    /// (`immediate` escalates, `graceful` leaves an immediate one). Answers the drain recorded,
+    /// absent when the host is not up under managed control.
+    #[handler]
+    async fn drain_host(
+        &self,
+        ctx: ObjectContext<'_>,
+        Json(req): Json<DrainHost>,
+    ) -> Result<Json<DrainAck>, HandlerError> {
+        Ok(Json(
+            object::drain_host(&self.shared, &Rctx(&ctx), req).await?,
+        ))
+    }
+
     /// Reclaims an exclusive resource with a power section: intake stops, its work is cut
     /// off after the reclaim timeout, the host is shut down (if its power is managed) and it
     /// is not woken until `unreclaim`. Asking again returns the same lease; a resource that
@@ -611,6 +627,7 @@ mod tests {
                 ("arm_backstop".to_string(), None),
                 ("backstop".to_string(), None),
                 ("discard_state".to_string(), None),
+                ("drain_host".to_string(), None),
                 ("jobs".to_string(), None),
                 ("last_decision".to_string(), None),
                 ("leases".to_string(), None),

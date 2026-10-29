@@ -21,7 +21,8 @@
 //!   and `POST /v1/resources/{resource}/resume`: the manual host lease of a shared host. A host
 //!   found running reads on (flowmanager holds it for the user, see `adopt`). `off` releases
 //!   the lease with a **graceful drain** (queued work no longer keeps the host up; in-flight
-//!   work gets `drain_timeout`), and `POST /v1/resources/{resource}/off-now` with an
+//!   work gets `drain_timeout`; also with no lease held, through `drain_host`), and
+//!   `POST /v1/resources/{resource}/off-now` with an
 //!   **immediate** one (the consumers are scaled down at once). Neither overrides a job's hold.
 //! - `GET  /v1/reclaims/{resource}` and `POST /v1/reclaims/{resource}[/on|/off]`: the
 //!   reclaim of an exclusive resource with a power section ("this GPU is mine"): `reclaim`
@@ -51,7 +52,7 @@ use tokio::net::TcpListener;
 use crate::leases::LeaseGrant;
 pub use crate::listener::{Limits, Reply, constant_time_eq};
 use crate::listener::{LogLimiter, bearer, read_body, read_token};
-use crate::object::BoxFut;
+use crate::object::{BoxFut, DrainAck};
 use crate::resume::ResumeAck;
 use crate::runtime::OBJECT;
 use crate::scheduler::KEY;
@@ -83,11 +84,12 @@ pub trait Backend: Send + Sync {
     fn acquire_model(&self, model: &ModelId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
     fn release_lease(&self, id: &LeaseId) -> BoxFut<'_, Result<Lease, ApiError>>;
     fn acquire_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
-    fn release_host(
+    /// Takes the host down: releases its manual lease if one is held and records a drain.
+    fn drain_host(
         &self,
         resource: &ResourceId,
-        drain: Option<DrainMode>,
-    ) -> BoxFut<'_, Result<Lease, ApiError>>;
+        mode: DrainMode,
+    ) -> BoxFut<'_, Result<DrainAck, ApiError>>;
     fn resume(&self, resource: &ResourceId) -> BoxFut<'_, Result<ResumeAck, ApiError>>;
     fn reclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
     fn unreclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>>;
@@ -181,16 +183,13 @@ impl Backend for RestateIngress {
         Box::pin(self.call("acquire_host_lease", Some(body)))
     }
 
-    fn release_host(
+    fn drain_host(
         &self,
         resource: &ResourceId,
-        drain: Option<DrainMode>,
-    ) -> BoxFut<'_, Result<Lease, ApiError>> {
-        let mut body = json!({ "resource": resource });
-        if let Some(mode) = drain {
-            body["drain"] = json!(mode);
-        }
-        Box::pin(self.call("release_host_lease", Some(body)))
+        mode: DrainMode,
+    ) -> BoxFut<'_, Result<DrainAck, ApiError>> {
+        let body = json!({ "resource": resource, "drain": mode });
+        Box::pin(self.call("drain_host", Some(body)))
     }
 
     fn resume(&self, resource: &ResourceId) -> BoxFut<'_, Result<ResumeAck, ApiError>> {
@@ -610,7 +609,16 @@ impl Toggle {
             .resources()
             .iter()
             .filter(|r| r.power.is_some())
-            .map(|r| resource_state(&config, &r.id, find_host(&leases, &r.id), &report, now))
+            .map(|r| {
+                resource_state(
+                    &config,
+                    &r.id,
+                    find_host(&leases, &r.id),
+                    None,
+                    &report,
+                    now,
+                )
+            })
             .collect();
         let reclaims: Vec<Value> = config
             .resources()
@@ -685,11 +693,12 @@ impl Toggle {
         ))
     }
 
-    /// A host switch. Off releases the manual host lease and asks for a drain (`drain`: the
-    /// host's switch is `graceful`, `off-now` is `immediate`): queued and in-flight work no
-    /// longer keeps the host up. A lease that is not held is not an error, but while a drain
-    /// is under way a second request changes its mode, so that `off-now` after `off` ends
-    /// the wait (the lease is taken and released again, which merges into the drain).
+    /// A host switch. Off takes the host down with a drain (`drain`: the host's switch is
+    /// `graceful`, `off-now` is `immediate`), whether or not a lease is held: it releases the
+    /// manual lease if there is one and records the drain, so queued and in-flight work no
+    /// longer keeps the host up. A drain already under way is changed in place (immediate
+    /// escalates, graceful leaves an immediate one). The answer is not "off" while the host is
+    /// up and draining: `state` is `draining` and `drain` says how far it is. `held` is false.
     async fn resource(
         &self,
         name: &str,
@@ -698,37 +707,19 @@ impl Toggle {
     ) -> Result<Value, ApiError> {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
-        let held = match set {
-            None => find_host(&self.backend.leases().await?, &id).cloned(),
-            Some(true) => Some(self.backend.acquire_host(&id).await?.lease),
-            Some(false) => {
-                let l = self.backend.leases().await?;
-                let mut lease = find_host(&l, &id).cloned();
-                if lease.is_none() && self.draining(&id) {
-                    lease = Some(self.backend.acquire_host(&id).await?.lease);
-                }
-                if let Some(lease) = lease
-                    && let Err(e) = self.backend.release_host(&id, Some(drain)).await
-                {
-                    self.gone_after(e, &lease.id).await?;
-                }
-                None
-            }
+        let (held, ack) = match set {
+            None => (find_host(&self.backend.leases().await?, &id).cloned(), None),
+            Some(true) => (Some(self.backend.acquire_host(&id).await?.lease), None),
+            Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?)),
         };
         Ok(resource_state(
             &config,
             &id,
             held.as_ref(),
+            ack.as_ref().and_then(|a| a.drain),
             &self.shared.last_report(),
             self.shared.clock.now(),
         ))
-    }
-
-    /// Whether the last tick of this process shows a drain under way on `id`.
-    fn draining(&self, id: &ResourceId) -> bool {
-        self.shared
-            .last_report()
-            .is_some_and(|r| r.drains.iter().any(|d| &d.resource == id))
     }
 
     async fn reclaim(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
@@ -1050,11 +1041,14 @@ fn reclaim_status(
 /// report of this process and are absent before the first tick; `wait` names why the
 /// scheduler holds something back (`min_off`, `shutdown_held_by_mounts`). `drain` is present while
 /// a drain is under way (a switch-off asked for the host to go down): its mode and whether
-/// the consumers are already scaled down.
+/// the consumers are already scaled down. `requested` is the drain a request has just recorded
+/// (the last tick has not seen it yet); while one is under way the switch is not off: `held` is
+/// false and `state` is `draining`.
 pub fn resource_state(
     config: &Config,
     resource: &ResourceId,
     held: Option<&Lease>,
+    requested: Option<sched_model::Drain>,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
@@ -1071,6 +1065,23 @@ pub fn resource_state(
         "lease_supported".into(),
         json!(kind == Some(ResourceKind::Shared)),
     );
+    let draining = requested
+        .map(|d| (d.mode.as_str().to_string(), d.since, d.scaled_down))
+        .or_else(|| {
+            report.as_ref().and_then(|r| {
+                let d = r.drains.iter().find(|d| &d.resource == resource)?;
+                Some((d.mode.clone(), d.since, d.scaled_down))
+            })
+        });
+    if let Some((mode, since, scaled_down)) = draining {
+        m.insert(
+            "drain".into(),
+            json!({ "mode": mode, "since_ms": since.as_u64(), "scaled_down": scaled_down }),
+        );
+        if held.is_none() {
+            m.insert("state".into(), json!("draining"));
+        }
+    }
     if let Some(r) = report
         && let Some(st) = r.state.resource(resource)
     {
@@ -1078,16 +1089,6 @@ pub fn resource_state(
             "power".into(),
             serde_json::to_value(st.power).unwrap_or(Value::Null),
         );
-        if let Some(d) = r.drains.iter().find(|d| &d.resource == resource) {
-            m.insert(
-                "drain".into(),
-                json!({
-                    "mode": d.mode,
-                    "since_ms": d.since.as_u64(),
-                    "scaled_down": d.scaled_down,
-                }),
-            );
-        }
         let mounts = r.mounts_held.iter().find(|h| &h.resource == resource);
         let mut waits = Vec::new();
         if let Some(h) = mounts {
@@ -1224,17 +1225,17 @@ mod tests {
             })
         }
 
-        fn release_host(
+        fn drain_host(
             &self,
             resource: &ResourceId,
-            drain: Option<DrainMode>,
-        ) -> BoxFut<'_, Result<Lease, ApiError>> {
-            let req = crate::object::ReleaseHostLease {
+            mode: DrainMode,
+        ) -> BoxFut<'_, Result<DrainAck, ApiError>> {
+            let req = crate::object::DrainHost {
                 resource: resource.clone(),
-                drain,
+                drain: mode,
             };
             Box::pin(async move {
-                let r = object::release_host_lease(&self.shared, &self.ctx, req).await;
+                let r = object::drain_host(&self.shared, &self.ctx, req).await;
                 self.ctx.commit();
                 r.map_err(api)
             })
@@ -1664,9 +1665,9 @@ mod tests {
         assert_eq!(s, 409, "{v}");
         assert!(v["error"].is_string());
     }
-
     #[tokio::test]
-    async fn an_adopted_host_reads_on_and_off_drains_it_gracefully_and_off_now_immediately() {
+
+    async fn an_adopted_host_reads_on_and_off_and_off_now_start_a_drain_with_or_without_a_lease() {
         let r = rig(&example_yaml_managed());
         r.hosts_up(true);
         r.tick().await;
@@ -1686,9 +1687,14 @@ mod tests {
                 .resource(&"basestar-nfs".into())
                 .and_then(|st| st.drain)
         };
-        // Off: the lease is released and a graceful drain is recorded.
+        // Off: the lease is released and a graceful drain starts. The host is up, so the
+        // answer says draining, not off.
         let (s, v) = r.post("/v1/resources/basestar-nfs/off", "").await;
-        assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
+        assert_eq!(
+            (s, &v["held"], &v["state"], &v["drain"]["mode"]),
+            (200, &json!(false), &json!("draining"), &json!("graceful")),
+            "{v}"
+        );
         assert_eq!(r.lease_count(), 0);
         assert_eq!(
             drain(&r).map(|d| d.mode),
@@ -1696,35 +1702,73 @@ mod tests {
         );
         r.tick().await;
         let (_, v) = r.get("/v1/resources/basestar-nfs").await;
-        assert_eq!(v["drain"]["mode"], "graceful", "{v}");
-        // Off-now while the drain is under way, with no lease held: the drain is made
-        // immediate (and keeps its start).
+        assert_eq!(
+            (&v["state"], &v["drain"]["mode"]),
+            (&json!("draining"), &json!("graceful")),
+            "{v}"
+        );
+        // Off-now with no lease held: the drain under way is made immediate in place, keeping
+        // its start (nothing is taken or released, and no report is consulted).
         let since = drain(&r).map(|d| d.since);
         let (s, v) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
-        assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
+        assert_eq!((s, &v["drain"]["mode"]), (200, &json!("immediate")), "{v}");
         let d = drain(&r).unwrap();
         assert_eq!(d.mode, sched_model::DrainMode::Immediate);
         assert_eq!(Some(d.since), since);
-        // Off-now from a held lease starts an immediate drain; a body naming the wish works too.
-        r.post("/v1/resources/basestar-nfs/on", "").await;
-        assert_eq!(r.lease_count(), 1);
-        r.tick().await;
-        assert_eq!(drain(&r), None, "the new lease cancelled it");
-        let (s, _) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
-        assert_eq!(s, 200);
+        assert_eq!(r.lease_count(), 0);
+        // Graceful asked of an immediate drain leaves it immediate.
+        r.post("/v1/resources/basestar-nfs/off", "").await;
         assert_eq!(
             drain(&r).map(|d| d.mode),
             Some(sched_model::DrainMode::Immediate)
         );
-        // Off with nothing held and no drain under way is still a success that does nothing.
-        r.tick().await;
+        // A new lease cancels it (the tick sees the lease); off-now from a held lease drains.
         r.post("/v1/resources/basestar-nfs/on", "").await;
         r.tick().await;
-        assert_eq!(r.post("/v1/resources/basestar-nfs", "off").await.0, 200);
+        assert_eq!(drain(&r), None, "the new lease cancelled it");
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
+        assert_eq!((s, &v["state"]), (200, &json!("draining")), "{v}");
         assert_eq!(
             drain(&r).map(|d| d.mode),
-            Some(sched_model::DrainMode::Graceful)
+            Some(sched_model::DrainMode::Immediate)
         );
+        assert_eq!(r.lease_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn off_on_a_host_that_is_up_with_no_lease_held_starts_the_drain() {
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        r.tick().await;
+        // The adopted lease goes (released by id, as a person with the API could); the host
+        // is up and held only by whatever work is queued.
+        let lease = r.backend.leases().await.unwrap().remove(0);
+        r.backend.release_lease(&lease.id).await.unwrap();
+        r.tick().await;
+        assert_eq!(r.lease_count(), 0);
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off", "").await;
+        assert_eq!(
+            (s, &v["state"], &v["drain"]["mode"]),
+            (200, &json!("draining"), &json!("graceful")),
+            "{v}"
+        );
+        // A host that is not up has nothing to drain: a plain off.
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        r.push(
+            "basestar-probe",
+            vec![ObservedValue::ResourceUp {
+                resource: "basestar-nfs".into(),
+                up: false,
+            }],
+        );
+        r.tick().await;
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
+        assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
+        assert!(v.get("drain").is_none(), "{v}");
+        // An exclusive resource cannot be drained.
+        let (s, _) = r.post("/v1/resources/cuda-central/off", "").await;
+        assert_eq!(s, 400);
     }
 
     #[tokio::test]
@@ -1916,10 +1960,7 @@ mod tests {
             "/Scheduler/main/acquire_host_lease",
             ingress_reply(409, r#"{"code":409,"message":"held by another"}"#),
         );
-        server.set(
-            "/Scheduler/main/release_host_lease",
-            ingress_reply(500, "boom"),
-        );
+        server.set("/Scheduler/main/drain_host", ingress_reply(500, "boom"));
         server.set(
             "/Scheduler/main/resume",
             ingress_reply(400, "not json, still carried"),
@@ -1937,7 +1978,10 @@ mod tests {
         );
         let e = ingress.acquire_host(&"nfs".into()).await.unwrap_err();
         assert_eq!((e.status, e.message.as_str()), (409, "held by another"));
-        let e = ingress.release_host(&"nfs".into(), None).await.unwrap_err();
+        let e = ingress
+            .drain_host(&"nfs".into(), DrainMode::Graceful)
+            .await
+            .unwrap_err();
         assert_eq!(e.status, 502, "{e:?}");
         assert!(e.message.contains("500") && e.message.contains("boom"));
         let e = ingress.resume(&"nfs".into()).await.unwrap_err();
@@ -2083,14 +2127,14 @@ mod tests {
             nfs.clone(),
             ResourceState::new(PowerPhase::On { since: Millis(1) }),
         );
-        let v = resource_state(&config, &nfs, None, &Some(rep.clone()), Millis(5_000));
+        let v = resource_state(&config, &nfs, None, None, &Some(rep.clone()), Millis(5_000));
         assert_eq!(v["needs_attention"], false);
         rep.mounts_held.push(crate::tick::MountsHeld {
             resource: nfs.clone(),
             since: Millis(1),
             stopped: true,
         });
-        let v = resource_state(&config, &nfs, None, &Some(rep), Millis(5_000));
+        let v = resource_state(&config, &nfs, None, None, &Some(rep), Millis(5_000));
         assert_eq!(v["needs_attention"], true);
         assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_mounts");
         let _ = MountsVeto::Waiting { since: Millis(0) };
@@ -2178,8 +2222,6 @@ mod tests {
         (r.status, serde_json::from_str(&r.body).unwrap())
     }
 
-    const NFS_LEASE: &str = r#"{"id":"manual-host-1","resource":"basestar-nfs","kind":{"type":"manual_host"},"granted_at":5}"#;
-
     #[tokio::test]
     async fn a_scheduler_that_is_not_registered_is_an_error_never_an_answer() {
         let r = rig(&example_yaml_managed());
@@ -2189,7 +2231,7 @@ mod tests {
             "acquire_model_lease",
             "release_lease",
             "acquire_host_lease",
-            "release_host_lease",
+            "drain_host",
             "reclaim",
             "unreclaim",
             "resume",
@@ -2224,40 +2266,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_release_counts_only_when_the_lease_is_gone_afterwards() {
+    async fn a_failed_drain_request_is_the_answer_and_a_refusal_keeps_its_status() {
         let r = rig(&example_yaml_managed());
         let server = TestServer::start().await;
-        let still_listed = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let flag = Arc::clone(&still_listed);
-        let lease = NFS_LEASE.to_string();
-        server.set_dynamic("/Scheduler/main/leases", move |_| {
-            if flag.load(std::sync::atomic::Ordering::SeqCst) {
-                TestReply::json(&format!("[{lease}]"))
-            } else {
-                TestReply::json("[]")
-            }
-        });
-        // The release answers 404, but only because someone else released it just before.
-        let flag = Arc::clone(&still_listed);
-        server.set_dynamic("/Scheduler/main/release_host_lease", move |_| {
-            flag.store(false, std::sync::atomic::Ordering::SeqCst);
-            ingress_reply(
-                404,
-                r#"{"code":404,"message":"holds no manual host lease"}"#,
-            )
-        });
+        server.set_dynamic("/Scheduler/main/drain_host", |_| ingress_reply(500, "boom"));
         let t = over(&r, Arc::new(RestateIngress::new(&server.url(""))));
-        let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/off").await;
-        assert_eq!((s, &v["held"]), (200, &json!(false)), "{v}");
-
-        // A release that fails while the lease is still listed is the answer.
-        still_listed.store(true, std::sync::atomic::Ordering::SeqCst);
-        server.set_dynamic("/Scheduler/main/release_host_lease", |_| {
-            ingress_reply(500, "boom")
-        });
         let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/off").await;
         assert_eq!(s, 502, "{v}");
         assert!(v["error"].as_str().unwrap().contains("boom"));
+        // The handler's own 400 is relayed.
+        server.set_dynamic("/Scheduler/main/drain_host", |_| {
+            ingress_reply(400, r#"{"code":400,"message":"not a shared resource"}"#)
+        });
+        let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/off-now").await;
+        assert_eq!(s, 400, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("shared"));
     }
 
     #[tokio::test]

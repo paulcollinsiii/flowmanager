@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use restate_sdk::errors::{HandlerError, TerminalError};
-use sched_model::{Config, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId};
+use sched_model::{Config, Drain, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -486,6 +486,85 @@ pub async fn release_host_lease<C: ObjectCtx>(
         }
     }
     Ok(lease)
+}
+
+/// `drain_host` request: take a shared host down, with or without a lease held.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainHost {
+    pub resource: ResourceId,
+    pub drain: DrainMode,
+}
+
+/// What `drain_host` did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainAck {
+    pub resource: ResourceId,
+    /// Whether a manual host lease was held and released.
+    pub released: bool,
+    /// The drain now under way, `None` if none was recorded (the host is not up, or its power
+    /// is under `control: manual`, so there is nothing for flowmanager to take down).
+    pub drain: Option<Drain>,
+}
+
+/// Takes a shared host down on a person's request, whether or not a manual lease is held:
+/// releases the manual host lease if there is one and records a drain (see `drain`). A drain
+/// already under way keeps its start: `immediate` escalates a graceful one, `graceful` leaves
+/// an immediate one as it is. Everything is read from the stored state, so it works at any
+/// time, also right after a restart. The lease book and the state are stored together.
+pub async fn drain_host<C: ObjectCtx>(
+    shared: &Arc<Shared>,
+    ctx: &C,
+    req: DrainHost,
+) -> Result<DrainAck, HandlerError> {
+    let book = read_leases(ctx)
+        .await?
+        .map_err(|e| unreadable(shared, &e))?;
+    let core = persist::decode_state(ctx.get_raw(STATE_KEY).await?.as_deref())
+        .map_err(|e| unreadable(shared, &e))?;
+    let s = Arc::clone(shared);
+    let result = ctx
+        .run_journaled("drain_host", move || {
+            let (mut book, mut core) = (book, core);
+            let config = s.config.current();
+            let now = s.clock.now();
+            LeaseBook::check_host(&config, &req.resource)?;
+            let released = book.release_manual_host(&req.resource).is_ok();
+            drain::request(&mut core, &config, &req.resource, req.drain, now);
+            let drain = core.state.resource(&req.resource).and_then(|st| st.drain);
+            let ack = DrainAck {
+                resource: req.resource.clone(),
+                released,
+                drain,
+            };
+            Ok::<_, LeaseError>((ack, book, core))
+        })
+        .await?;
+    let (ack, book, core) = result.map_err(|e| lease_refused(&e))?;
+    if ack.released {
+        ctx.set_raw(LEASES_KEY, persist::encode_leases(&book));
+    }
+    if let Some(d) = ack.drain {
+        ctx.set_raw(STATE_KEY, persist::encode_state(&core));
+        tracing::info!(
+            event = "drain_requested",
+            resource = %ack.resource,
+            mode = d.mode.as_str(),
+            lease_released = ack.released,
+            "host taken down on request ({}): queued and in-flight work no longer holds it",
+            d.mode.as_str()
+        );
+    } else {
+        tracing::info!(
+            resource = %ack.resource,
+            lease_released = ack.released,
+            "drain requested but not recorded: the host is not up under managed power control"
+        );
+    }
+    if ack.released || ack.drain.is_some() {
+        ctx.request_tick();
+    }
+    Ok(ack)
 }
 
 /// Releases the reclaim on a resource.
@@ -1576,6 +1655,65 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn drain_host_works_with_or_without_a_lease_changes_the_mode_in_place_and_refuses_what_cannot_drain()
+     {
+        let (s, clock) = process_managed();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        let ask = |mode| DrainHost {
+            resource: "basestar-nfs".into(),
+            drain: mode,
+        };
+        // The adopted lease is released and a graceful drain recorded.
+        clock.set(Millis(T0 + 1_000));
+        let a = drain_host(&s, &ctx, ask(DrainMode::Graceful))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert!(a.released);
+        assert_eq!(a.drain.map(|d| d.mode), Some(DrainMode::Graceful));
+        assert!(
+            list_leases(&s, ctx.stored(LEASES_KEY).as_deref())
+                .unwrap()
+                .is_empty()
+        );
+        // No lease held, a new process (nothing but the stored state): immediate escalates in
+        // place, keeping the start; graceful after it leaves it immediate.
+        clock.set(Millis(T0 + 9_000));
+        let a = drain_host(&s, &ctx, ask(DrainMode::Immediate))
+            .await
+            .unwrap();
+        ctx.commit();
+        let d = a.drain.unwrap();
+        assert!(!a.released);
+        assert_eq!(
+            (d.mode, d.since),
+            (DrainMode::Immediate, Millis(T0 + 1_000))
+        );
+        let a = drain_host(&s, &ctx, ask(DrainMode::Graceful))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert_eq!(a.drain.map(|d| d.mode), Some(DrainMode::Immediate));
+        // The exclusive host and an unknown one are refused, nothing stored.
+        for name in ["cuda-central", "nope"] {
+            let e = drain_host(
+                &s,
+                &ctx,
+                DrainHost {
+                    resource: name.into(),
+                    drain: DrainMode::Immediate,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{e:?}").contains("code: 400"), "{e:?}");
+        }
     }
 
     #[tokio::test]

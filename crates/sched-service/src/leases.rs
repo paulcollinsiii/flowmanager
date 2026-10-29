@@ -213,15 +213,9 @@ impl LeaseBook {
         })
     }
 
-    /// Acquires a manual lease on a shared host (an NFS server, say): the host is powered on
-    /// if it is off (when its power is managed) and kept up until the lease is released.
-    /// Asking again returns the lease already held.
-    pub fn acquire_manual_host(
-        &mut self,
-        config: &Config,
-        resource: &ResourceId,
-        now: Millis,
-    ) -> Result<LeaseGrant, LeaseError> {
+    /// Whether `resource` can have a manual host lease (or a drain): a shared resource with a
+    /// power section.
+    pub fn check_host(config: &Config, resource: &ResourceId) -> Result<(), LeaseError> {
         let spec = known_resource(config, resource)?;
         if spec.kind != ResourceKind::Shared {
             return Err(LeaseError::NotShared {
@@ -233,6 +227,19 @@ impl LeaseBook {
                 resource: resource.clone(),
             });
         }
+        Ok(())
+    }
+
+    /// Acquires a manual lease on a shared host (an NFS server, say): the host is powered on
+    /// if it is off (when its power is managed) and kept up until the lease is released.
+    /// Asking again returns the lease already held.
+    pub fn acquire_manual_host(
+        &mut self,
+        config: &Config,
+        resource: &ResourceId,
+        now: Millis,
+    ) -> Result<LeaseGrant, LeaseError> {
+        Self::check_host(config, resource)?;
         Ok(self.acquire_unique(resource, LeaseKind::ManualHost, MANUAL_HOST_PREFIX, now))
     }
 

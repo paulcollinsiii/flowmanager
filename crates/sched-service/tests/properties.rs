@@ -278,4 +278,47 @@ proptest! {
             prop_assert_eq!(&x.decision, &y.decision);
         }
     }
+
+    /// The same worlds with a drain already under way on the NFS host (managed, up): no
+    /// invariant is violated (a power-off needs the consumers scaled down first, and no lease
+    /// is overridden), and once scaled down no consumer of the host is allowed.
+    #[test]
+    fn a_drain_under_way_violates_no_invariant(
+        frames in prop::collection::vec(raw(), 1..40),
+        immediate in any::<bool>(),
+        scaled_down in any::<bool>(),
+        ago in 0u64..1_500_000,
+    ) {
+        let config = example_config_managed();
+        let mut sc = scenario(&frames);
+        let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1) });
+        st.managed = true;
+        st.drain = Some(sched_model::Drain {
+            mode: if immediate { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful },
+            since: Millis(50_000_000 - ago),
+            scaled_down,
+        });
+        sc.initial_state.resources.insert("basestar-nfs".into(), st);
+        let results = run(&config, &sc).unwrap();
+        for (i, r) in results.iter().enumerate() {
+            prop_assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
+            let draining = r
+                .decision
+                .state
+                .resource(&"basestar-nfs".into())
+                .and_then(|s| s.drain)
+                .is_some_and(|d| d.scaled_down);
+            if draining {
+                for class in &r.decision.allowed.classes {
+                    let needs = config
+                        .class(class)
+                        .unwrap()
+                        .requires
+                        .iter()
+                        .any(|q| q.resource.as_str() == "basestar-nfs");
+                    prop_assert!(!needs, "frame {}: {} allowed during a scaled-down drain", i, class);
+                }
+            }
+        }
+    }
 }

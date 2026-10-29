@@ -28,8 +28,8 @@ pub enum Requested {
 /// The person is taking the host down, so the scheduler may shut it down: the host becomes
 /// managed, and a shutdown it had stopped at (pods still mounting after `mounts_timeout`) is
 /// tried afresh, as a new manual request would. A drain already under way keeps its start and
-/// its scale-down: a second request only changes the mode, so `immediate` after `graceful`
-/// ends the wait.
+/// its scale-down: a second request only changes the mode: `immediate` after `graceful`
+/// ends the wait, and `graceful` after `immediate` leaves it immediate.
 pub fn request(
     core: &mut CoreState,
     config: &Config,
@@ -48,7 +48,12 @@ pub fn request(
     }
     let before = st.drain;
     st.drain = Some(Drain {
-        mode,
+        // Immediate escalates; graceful asked of an immediate drain leaves it immediate.
+        mode: if before.is_some_and(|d| d.mode == DrainMode::Immediate) {
+            DrainMode::Immediate
+        } else {
+            mode
+        },
         since: before.map_or(now, |d| d.since),
         scaled_down: before.is_some_and(|d| d.scaled_down),
     });
@@ -126,6 +131,12 @@ mod tests {
                 since: Millis(9),
                 scaled_down: true
             })
+        );
+        // Graceful asked of an immediate drain leaves it immediate.
+        request(&mut c, &config, &nfs(), DrainMode::Graceful, Millis(60));
+        assert_eq!(
+            c.state.resource(&nfs()).unwrap().drain.map(|d| d.mode),
+            Some(DrainMode::Immediate)
         );
     }
 
