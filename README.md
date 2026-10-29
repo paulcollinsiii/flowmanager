@@ -785,8 +785,11 @@ trusted network.
   previous state: no state (first start, discarded state), `on` and not managed (what an
   older build stored for a host it found running, or what a tick that skipped adoption left;
   not when a mount veto stopped the shutdown, a drain is under way or a job holds the host),
-  `off` (a power button, a manual
-  Wake-on-LAN, a host that went down and came back, adopted afresh each time), or a failed
+  `off` and not managed (a power button, a manual
+  Wake-on-LAN, a host flowmanager shut down or one that went down by itself and came back,
+  adopted afresh each time; a host flowmanager powered on that blips down and back keeps its
+  `managed` flag and is *not* adopted, and an adopted host the person switched off by hand
+  loses it, so their next power-on is adopted), or a failed
   power-on that a reading has now cleared. A host flowmanager powered on itself (a backup
   job's hold, a lease acquired through the API) is `powering_on` and is not adopted, and a
   restart with the persisted state adopts nothing (the host is already `on`). The lease is
@@ -880,7 +883,7 @@ CA); the token and the network policy are the controls. Open WebUI itself is not
 | --- | --- |
 | `GET /v1/leases` | every model, powered resource and reclaimable resource with its state, and `needs_attention` |
 | `GET /v1/models/{model}`, `POST .../on`, `.../off` | the manual model lease (on = held, not "loaded") |
-| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `POST .../resume` | the manual host lease (a host found running reads on, see *adopted*); `off` releases it with a graceful drain, `off-now` with an immediate one; `resume` clears a stopped power phase |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release`, `POST .../resume` | the manual host lease (a host found running reads on, see *adopted*); `off` releases it with a graceful drain, `off-now` with an immediate one, `release` plainly with no drain (`404` if none is held; the reply reads `on` while the host is up); `resume` clears a stopped power phase |
 | `GET /v1/reclaims/{resource}`, `POST .../on`, `.../off` | `reclaim` / `unreclaim` of an exclusive resource with a power section |
 
 `POST /v1/<kind>/{name}` with the body `ON` or `OFF` is the same as `/on` and `/off`. On and

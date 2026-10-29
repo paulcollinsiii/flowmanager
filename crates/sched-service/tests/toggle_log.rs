@@ -45,6 +45,9 @@ impl Backend for Stub {
     fn acquire_host(&self, _: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
         refused()
     }
+    fn release_host(&self, _: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
+        refused()
+    }
     fn drain_host(
         &self,
         _: &ResourceId,

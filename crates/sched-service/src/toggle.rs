@@ -24,6 +24,9 @@
 //!   work gets `drain_timeout`; also with no lease held, through `drain_host`), and
 //!   `POST /v1/resources/{resource}/off-now` with an
 //!   **immediate** one (the consumers are scaled down at once). Neither overrides a job's hold.
+//!   `POST /v1/resources/{resource}/release` is a plain release of the lease (an adopted one
+//!   too) with **no drain**: the host goes down only when nothing holds it, as before; `404`
+//!   if no lease is held, and the reply reads `on` while the host is up.
 //! - `GET  /v1/reclaims/{resource}` and `POST /v1/reclaims/{resource}[/on|/off]`: the
 //!   reclaim of an exclusive resource with a power section ("this GPU is mine"): `reclaim`
 //!   and `unreclaim`.
@@ -84,6 +87,8 @@ pub trait Backend: Send + Sync {
     fn acquire_model(&self, model: &ModelId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
     fn release_lease(&self, id: &LeaseId) -> BoxFut<'_, Result<Lease, ApiError>>;
     fn acquire_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
+    /// Releases the manual host lease with no drain (`release_host_lease`).
+    fn release_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>>;
     /// Takes the host down: releases its manual lease if one is held and records a drain.
     fn drain_host(
         &self,
@@ -183,6 +188,11 @@ impl Backend for RestateIngress {
         Box::pin(self.call("acquire_host_lease", Some(body)))
     }
 
+    fn release_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
+        let body = json!({ "resource": resource });
+        Box::pin(self.call("release_host_lease", Some(body)))
+    }
+
     fn drain_host(
         &self,
         resource: &ResourceId,
@@ -234,6 +244,8 @@ pub enum Act {
     Resume,
     /// A host switched off with an immediate drain (`POST /v1/resources/{resource}/off-now`).
     OffNow,
+    /// A plain release of the manual host lease, no drain (`POST /v1/resources/{resource}/release`).
+    Release,
 }
 
 /// Decodes `%XX` escapes; `None` for a malformed escape or a result that is not UTF-8.
@@ -275,7 +287,7 @@ pub fn route(method: &Method, path: &str) -> Route {
             "v1",
             k @ ("models" | "resources" | "reclaims"),
             n,
-            t @ ("on" | "off" | "resume" | "off-now"),
+            t @ ("on" | "off" | "resume" | "off-now" | "release"),
         ] => (*k, *n, Some(*t)),
         _ => return Route::NotFound,
     };
@@ -294,6 +306,8 @@ pub fn route(method: &Method, path: &str) -> Route {
         (Some("off"), m) if m == Method::POST => Act::Set(Some(false)),
         (Some("resume"), m) if m == Method::POST && kind == Kind::Host => Act::Resume,
         (Some("off-now"), m) if m == Method::POST && kind == Kind::Host => Act::OffNow,
+        (Some("release"), m) if m == Method::POST && kind == Kind::Host => Act::Release,
+        (Some("release"), _) if kind != Kind::Host => return Route::NotFound,
         (Some("resume"), _) if kind != Kind::Host => return Route::NotFound,
         (Some("off-now"), _) if kind != Kind::Host => return Route::NotFound,
         _ => {
@@ -311,12 +325,13 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
             _ => "unmatched",
         };
     };
-    let labels: [&'static str; 6] = match kind {
+    let labels: [&'static str; 7] = match kind {
         Kind::Model => [
             "model_get",
             "model_on",
             "model_off",
             "model_set",
+            "unmatched",
             "unmatched",
             "unmatched",
         ],
@@ -327,6 +342,7 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
             "resource_set",
             "resource_resume",
             "resource_off_now",
+            "resource_release",
         ],
         Kind::Reclaim => [
             "reclaim_get",
@@ -335,12 +351,14 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
             "reclaim_set",
             "unmatched",
             "unmatched",
+            "unmatched",
         ],
     };
     match act {
         Act::Get => labels[0],
         Act::Resume => labels[4],
         Act::OffNow => labels[5],
+        Act::Release => labels[6],
         Act::Set(w) => match w.or(want.flatten()) {
             Some(true) => labels[1],
             Some(false) => labels[2],
@@ -386,6 +404,7 @@ impl ToggleLog {
                     (Act::Get, _) => "get",
                     (Act::Resume, _) => "resume",
                     (Act::OffNow, _) => "off_now",
+                    (Act::Release, _) => "release",
                     (_, Some(true)) => "on",
                     (_, Some(false)) => "off",
                     _ => "unknown",
@@ -577,6 +596,7 @@ impl Toggle {
             Route::Switch(_, name, Act::OffNow) => {
                 self.resource(name, Some(false), DrainMode::Immediate).await
             }
+            Route::Switch(_, name, Act::Release) => self.release(name).await,
         };
         match result {
             Ok(v) => Reply::json(200, v),
@@ -709,17 +729,58 @@ impl Toggle {
         let id = known_resource(&config, name)?;
         let (held, ack) = match set {
             None => (find_host(&self.backend.leases().await?, &id).cloned(), None),
-            Some(true) => (Some(self.backend.acquire_host(&id).await?.lease), None),
-            Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?)),
+            // A new lease cancels any drain at the next tick; the reply shows none.
+            Some(true) => (
+                Some(self.backend.acquire_host(&id).await?.lease),
+                Some(None),
+            ),
+            Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?.drain)),
         };
         Ok(resource_state(
             &config,
             &id,
             held.as_ref(),
-            ack.as_ref().and_then(|a| a.drain),
+            ack,
             &self.shared.last_report(),
             self.shared.clock.now(),
         ))
+    }
+
+    /// A plain release of the manual host lease (an adopted one included), with no drain: the
+    /// host is shut down only when nothing holds it, as for `release_host_lease` without
+    /// `drain`. No lease held is a `404` (the listener's own: Restate's 404 is never relayed),
+    /// a release that fails counts only if the lease is gone afterwards. The reply is the
+    /// host's state, which reads `on` while the last report shows the host up (`held` is false).
+    async fn release(&self, name: &str) -> Result<Value, ApiError> {
+        let config = self.shared.config.current();
+        let id = known_resource(&config, name)?;
+        let leases = self.backend.leases().await?;
+        let Some(lease) = find_host(&leases, &id).cloned() else {
+            return Err(ApiError::new(
+                404,
+                format!("resource {name:?} holds no manual host lease"),
+            ));
+        };
+        if let Err(e) = self.backend.release_host(&id).await {
+            self.gone_after(e, &lease.id).await?;
+        }
+        let report = self.shared.last_report();
+        let mut v = resource_state(
+            &config,
+            &id,
+            None,
+            Some(None),
+            &report,
+            self.shared.clock.now(),
+        );
+        let up = report
+            .as_ref()
+            .and_then(|r| r.state.resource(&id))
+            .is_some_and(|st| st.is_on());
+        if up {
+            v["state"] = json!("on");
+        }
+        Ok(v)
     }
 
     async fn reclaim(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
@@ -1048,7 +1109,7 @@ pub fn resource_state(
     config: &Config,
     resource: &ResourceId,
     held: Option<&Lease>,
-    requested: Option<sched_model::Drain>,
+    requested: Option<Option<sched_model::Drain>>,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
@@ -1065,14 +1126,14 @@ pub fn resource_state(
         "lease_supported".into(),
         json!(kind == Some(ResourceKind::Shared)),
     );
-    let draining = requested
-        .map(|d| (d.mode.as_str().to_string(), d.since, d.scaled_down))
-        .or_else(|| {
-            report.as_ref().and_then(|r| {
-                let d = r.drains.iter().find(|d| &d.resource == resource)?;
-                Some((d.mode.clone(), d.since, d.scaled_down))
-            })
-        });
+    let draining = match requested {
+        Some(d) => d.map(|d| (d.mode.as_str().to_string(), d.since, d.scaled_down)),
+        None => report.as_ref().and_then(|r| {
+            r.state.resource(resource).filter(|st| st.is_on())?;
+            let d = r.drains.iter().find(|d| &d.resource == resource)?;
+            Some((d.mode.clone(), d.since, d.scaled_down))
+        }),
+    };
     if let Some((mode, since, scaled_down)) = draining {
         m.insert(
             "drain".into(),
@@ -1220,6 +1281,18 @@ mod tests {
             };
             Box::pin(async move {
                 let r = object::acquire_host_lease(&self.shared, &self.ctx, req).await;
+                self.ctx.commit();
+                r.map_err(api)
+            })
+        }
+
+        fn release_host(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
+            let req = crate::object::ReleaseHostLease {
+                resource: resource.clone(),
+                drain: None,
+            };
+            Box::pin(async move {
+                let r = object::release_host_lease(&self.shared, &self.ctx, req).await;
                 self.ctx.commit();
                 r.map_err(api)
             })
@@ -1408,6 +1481,16 @@ mod tests {
             route(&p, "/v1/resources/nfs/off-now"),
             Route::Switch(Kind::Host, "nfs".into(), Act::OffNow)
         );
+        assert_eq!(
+            route(&p, "/v1/resources/nfs/release"),
+            Route::Switch(Kind::Host, "nfs".into(), Act::Release)
+        );
+        assert_eq!(
+            route(&g, "/v1/resources/nfs/release"),
+            Route::MethodNotAllowed("POST")
+        );
+        assert_eq!(route(&p, "/v1/models/llm/release"), Route::NotFound);
+        assert_eq!(route(&p, "/v1/reclaims/gpu/release"), Route::NotFound);
         assert_eq!(route(&p, "/v1/models/llm/off-now"), Route::NotFound);
         assert_eq!(route(&p, "/v1/reclaims/gpu/off-now"), Route::NotFound);
         assert_eq!(
@@ -1733,6 +1816,157 @@ mod tests {
             Some(sched_model::DrainMode::Immediate)
         );
         assert_eq!(r.lease_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_reflects_the_handlers_answer_and_the_current_phase_not_a_stale_report() {
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        r.tick().await;
+        r.post("/v1/resources/basestar-nfs/off", "").await;
+        r.tick().await;
+        // The report now holds the drain. /on answers on, with no drain object.
+        let (s, v) = r.post("/v1/resources/basestar-nfs/on", "").await;
+        assert_eq!(
+            (s, &v["state"], &v["held"]),
+            (200, &json!("on"), &json!(true)),
+            "{v}"
+        );
+        assert!(v.get("drain").is_none(), "{v}");
+        // The host goes down and the tick sees it: the drain is over; a repeated off is plain off.
+        r.tick().await;
+        r.push(
+            "basestar-probe",
+            vec![ObservedValue::ResourceUp {
+                resource: "basestar-nfs".into(),
+                up: false,
+            }],
+        );
+        r.tick().await;
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off", "").await;
+        assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
+        assert!(v.get("drain").is_none(), "{v}");
+
+        // The view itself: a report that holds a drain for a host no longer up shows none,
+        // and a handler answer without a drain wins over the report's.
+        let config = r.shared.config.current();
+        let nfs: ResourceId = "basestar-nfs".into();
+        let mut rep = r.shared.last_report().unwrap();
+        rep.drains = vec![crate::tick::DrainReport {
+            resource: nfs.clone(),
+            mode: "graceful".into(),
+            since: Millis(1),
+            scaled_down: false,
+        }];
+        let mut st = sched_model::ResourceState::new(PowerPhase::ShuttingDown { since: Millis(2) });
+        rep.state.resources.insert(nfs.clone(), st.clone());
+        let v = resource_state(&config, &nfs, None, None, &Some(rep.clone()), Millis(9));
+        assert_eq!(v["state"], "off", "{v}");
+        assert!(v.get("drain").is_none(), "{v}");
+        st.power = PowerPhase::On { since: Millis(2) };
+        rep.state.resources.insert(nfs.clone(), st);
+        let v = resource_state(&config, &nfs, None, None, &Some(rep.clone()), Millis(9));
+        assert_eq!(
+            (&v["state"], &v["drain"]["mode"]),
+            (&json!("draining"), &json!("graceful")),
+            "{v}"
+        );
+        let v = resource_state(&config, &nfs, None, Some(None), &Some(rep), Millis(9));
+        assert_eq!(v["state"], "off", "{v}");
+        assert!(v.get("drain").is_none(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn release_is_a_plain_release_with_no_drain_that_reports_the_real_state() {
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        r.tick().await;
+        // The adopted lease is released; the host is up, so the reply still reads on.
+        assert_eq!(r.lease_count(), 1);
+        let (s, v) = r.post("/v1/resources/basestar-nfs/release", "").await;
+        assert_eq!(
+            (s, &v["held"], &v["state"]),
+            (200, &json!(false), &json!("on")),
+            "{v}"
+        );
+        assert!(v.get("drain").is_none(), "{v}");
+        assert_eq!(r.lease_count(), 0);
+        let core = crate::persist::decode_state(
+            r.backend.ctx.stored(crate::persist::STATE_KEY).as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            core.state.resource(&"basestar-nfs".into()).unwrap().drain,
+            None
+        );
+        // Nothing held: the listener's 404.
+        let (s, v) = r.post("/v1/resources/basestar-nfs/release", "").await;
+        assert_eq!(s, 404, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("no manual host lease"),
+            "{v}"
+        );
+        // A lease taken through the API is released the same way.
+        r.post("/v1/resources/basestar-nfs/on", "").await;
+        assert_eq!(
+            r.post("/v1/resources/basestar-nfs/release", "").await.0,
+            200
+        );
+        assert_eq!(r.lease_count(), 0);
+        // An unknown host is 404, the exclusive host 404 (nothing to release), a GET 405.
+        assert_eq!(r.post("/v1/resources/nope/release", "").await.0, 404);
+        assert_eq!(
+            r.post("/v1/resources/cuda-central/release", "").await.0,
+            404
+        );
+        assert_eq!(r.get("/v1/resources/basestar-nfs/release").await.0, 405);
+        assert_eq!(r.post("/v1/models/llm/release", "").await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn release_relays_upstream_errors_and_counts_a_failed_release_only_if_the_lease_is_gone()
+    {
+        let r = rig(&example_yaml_managed());
+        let server = TestServer::start().await;
+        let listed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = Arc::clone(&listed);
+        server.set_dynamic("/Scheduler/main/leases", move |_| {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                TestReply::json(
+                    r#"[{"id":"manual-host-1","resource":"basestar-nfs","kind":{"type":"manual_host"},"granted_at":5}]"#,
+                )
+            } else {
+                TestReply::json("[]")
+            }
+        });
+        let t = over(&r, Arc::new(RestateIngress::new(&server.url(""))));
+        // The release fails and the lease is still listed: the error is the answer.
+        server.set_dynamic("/Scheduler/main/release_host_lease", |_| {
+            ingress_reply(500, "boom")
+        });
+        let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/release").await;
+        assert_eq!(s, 502, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("boom"));
+        // The handler's own 409 is relayed.
+        server.set_dynamic("/Scheduler/main/release_host_lease", |_| {
+            ingress_reply(409, r#"{"code":409,"message":"busy"}"#)
+        });
+        let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/release").await;
+        assert_eq!((s, v["error"].as_str()), (409, Some("busy")), "{v}");
+        // It fails (404) only because someone released the lease just before: a success.
+        let flag = Arc::clone(&listed);
+        server.set_dynamic("/Scheduler/main/release_host_lease", move |_| {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            ingress_reply(
+                404,
+                r#"{"code":404,"message":"holds no manual host lease"}"#,
+            )
+        });
+        let (s, v) = ask(&t, Method::POST, "/v1/resources/basestar-nfs/release").await;
+        assert_eq!((s, &v["held"]), (200, &json!(false)), "{v}");
     }
 
     #[tokio::test]
