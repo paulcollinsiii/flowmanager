@@ -246,3 +246,38 @@ The homesvr agent owns these; each phase adds what it changed.
 - HA: expose `off` / `off-now` / `release` / lockout for cuda-central like basestar; update
   the stale "cuda-central is powered by hand" dashboard note.
 - Grafana and alerts: every breaking log, reason or metric change listed in phase reports (D5).
+- **Phase 2 and 3 output changes (breaking, D5).** Phase 4 and 5 will add theirs here.
+  - *Persisted state.* `scheduler_state` is version 2. A state of an older version is
+    discarded on read and the sequencer starts afresh from observation (leases and the job
+    book are kept); nothing to migrate. Its shape changed in version 2: per resource `drain`,
+    `mounts_veto`, `host_idle_since` and `shutdown_confirmed_at` are gone, replaced by
+    `shutdown { cause, since, withdrawal, veto }` and `off_since`. Phase 3 changed the stored
+    `shutdown` again (`stage` and the `withdrawn` flags became `withdrawal` and `veto`), still
+    version 2 because nothing was deployed at version 2 before it.
+  - *Config.* `resources[].power.mounts_timeout` is renamed `veto_timeout` (same default 30m
+    and bounds; no alias). New `models[].namespaces`: required, for a managed exclusive host
+    whose models are covered by a `pods` source, to list the namespaces of each model's
+    workloads, all watched by that source; otherwise the config is refused at load.
+  - *Wait reasons* (`TickReport.steps`, scenario YAML, `reason` text): `pods_mounted` is
+    `veto_in_use`, `mounts_unknown` is `veto_unknown`; `shutdown_stopped` is unchanged.
+  - *TickReport.* `mounts_held` is `veto_held` and `mounts_timeouts` is `veto_timeouts`.
+    Entries carry `readings` (those that apply: `mounts`, `pods`) and `blocking` (the readings
+    holding the shutdown now, each with `state` `in_use` or `unknown`).
+  - *Metrics.* `sched_resource_mounts_veto{resource,state}` is
+    `sched_resource_veto{resource,reading,state}`, one series per applicable reading
+    (`waiting` is 1 on the blocking reading(s), `stopped` is 1 on every reading of the host);
+    `sched_mounts_timeouts_total{resource}` is `sched_veto_timeouts_total{resource,reading}`,
+    one count per blocking reading. cuda-central now has series too.
+  - *Log events.* `shutdown_mounts_timeout` is `shutdown_veto_timeout` (and `..._replayed`),
+    with `readings` and `blocking` fields.
+  - *HTTP JSON* (toggle listener): the wait `shutdown_held_by_mounts` is
+    `shutdown_held_by_veto` with `readings` and `blocking`; resume's `cleared`
+    `shutdown_stopped_by_mounts` is `shutdown_stopped_by_veto`.
+  - *New GPU behaviour.* cuda-central's power-off now waits for zero pods of every model
+    (`wait ... veto_in_use` or `veto_unknown`), up to `veto_timeout`, then stops and alerts
+    (`shutdown_veto_timeout`, `sched_resource_veto{state="stopped"} == 1`). cuda-central
+    therefore belongs in the stopped and needs-attention alerts that already cover basestar
+    (`sched_resource_veto{state="stopped"} == 1`, and `needs_attention` in the toggle JSON),
+    and the "shutdown stopped" Home Assistant sensor must not assume the host is basestar.
+  - *Requested shutdown on an exclusive host* exists in the sequencer only; the API and
+    toggle listener still refuse it until phase 4.

@@ -675,7 +675,7 @@ harmless to repeat).
     `resources[].power.veto_timeout` (default 30m, above `host_reading_stale_after`, at most
     1d). When it runs out flowmanager **alerts and stops**: `event="shutdown_veto_timeout"`
     at error level once (a replayed tick logs `shutdown_veto_timeout_replayed` at info),
-    `sched_veto_timeouts_total{resource,reading}`, a `veto_timeouts` entry in that tick's report,
+    `sched_veto_timeouts_total{resource,reading}`, a `veto_timeouts` entry in that tick's report (`readings`: those that apply; `blocking`: those still holding it, each `in_use` or `unknown`),
     then `veto_held` lists the resource with `stopped: true`, the kind
     `shutdown_stopped`, the step `wait ... shutdown_stopped` and
     `sched_resource_veto{state="stopped"} == 1` (alert on it). The host is **not** shut
@@ -688,6 +688,10 @@ harmless to repeat).
   - *GPU host (the wind-down and the pods veto).* A `pods` source that covers its models adds the
     pods veto to the same wait: a fresh reading of zero pods for every model of the host, or it
     waits like the mount veto (`reading` `pods`; a `mounts` source naming it adds that too).
+    **Covers** means the model lists the namespaces its workloads run in (`models[].namespaces`)
+    and every one is in `params.namespaces` of a source observing `pods` (with `list`/`watch`
+    RBAC on pods there): the observer sees pods of those namespaces only, so a workload elsewhere
+    would read as zero pods unseen. A managed host with an uncovered model is refused at load.
     Its shutdown is already preceded by the bounded wind-down of the model: a managed
     exclusive host is powered off only when its mode is idle, so a model that is allowed, or
     being wound down, blocks it. The wind-down gives in-flight work `drain_timeout` (a class's
@@ -1161,9 +1165,10 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
 - `sched_resource_veto{resource,reading,state}`: 1 while a shutdown of the resource is held back
   by the veto: a pod mounts its NFS server or runs its models, or the reading is unknown (`waiting`, bounded by
   `veto_timeout`), or because that wait timed out and flowmanager stopped (`stopped`; alert
-  on `== 1`), else 0. `reading` is the readings the veto uses: `mounts`, `pods` or `mounts+pods`.
+  on `== 1`), else 0. One series per `reading` that applies (`mounts`, `pods`): `waiting` is 1
+  on the reading(s) still blocking, `stopped` is 1 on every reading of the host.
   Only resources with a veto reading have the series.
-- `sched_veto_timeouts_total{resource,reading}`: shutdown waits that timed out (alert on any
+- `sched_veto_timeouts_total{resource,reading}`: shutdown waits that timed out, one count per reading still blocking (alert on any
   increase; the host stays up until a person acts).
 - `sched_job_events_total{scheduled_job,event}`: scheduled-job events by configured job: `started` (a Job
   was created), `succeeded`, `failed` (after its retries, past its deadline, or deleted;

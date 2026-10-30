@@ -777,10 +777,19 @@ nothing else (no ConfigMaps, no Secrets), with one exception, the scheduled jobs
   down.
 - **pods**: `Api::<Pod>::namespaced` per entry of `params.namespaces`: `list` and `watch`
   on `pods` in **each** of those namespaces, only when the source declares `observe: [pods]`.
-  Pod counts are kept for information only (`sched_observation_age_seconds{capability="pods"}`);
-  no decision reads them. A config whose kube source observes only `[reachability]`
-  (and needs no `namespaces`) validates and starts (checked), which removes the pod
-  permissions entirely.
+  Two decisions read the counts (`sched_observation_age_seconds{capability="pods"}`):
+  recovery (it waits for a ready pod), and the veto before a managed GPU host is powered
+  off, which needs a fresh zero for every model of the host. **A model's pods count only
+  where the source can see its workloads**: the model names the namespaces its workloads run
+  in (`models[].namespaces`) and every one must be listed in `params.namespaces` of a source
+  that observes `pods` (that is what "covered" means). The observer lists the pods of those
+  namespaces, so a workload anywhere else would read as zero pods without anyone having
+  looked, and a managed host with an uncovered model is refused at load. The RBAC `list` and
+  `watch` on `pods` in each of those namespaces is therefore required, and a `Role` that
+  misses one leaves the namespace unsynced, so the readings go stale and the veto holds
+  (then stops and alerts after `veto_timeout`). A config whose kube source observes only
+  `[reachability]` (and needs no `namespaces`) validates and starts (checked), which removes
+  the pod permissions entirely and leaves the GPU host with no pods veto.
 - **scheduled jobs** (a `kubernetes_watch` source that declares `observe: [jobs]` and
   `job_namespaces`, the example's `scheduled-jobs`; and the jobs themselves): the one place
   flowmanager *writes* to Kubernetes. In each namespace of a job's `cronjob.namespace`
@@ -1156,7 +1165,7 @@ event):
   `sched_recovery_requeues_total{class,outcome}` (`attempted`, `queued`, `failed`,
   `skipped_cap`, `skipped_not_allowed`, `deferred`).
 - `sched_resource_veto{resource,reading,state}` (`waiting`, `stopped`; only resources with a
-  veto reading: `mounts`, `pods` or `mounts+pods`) and `sched_veto_timeouts_total{resource,reading}`: a shutdown held back by
+  veto reading, one series per reading: `mounts`, `pods`) and `sched_veto_timeouts_total{resource,reading}`: a shutdown held back by
   pods still using the host, and the waits that timed out. `sched_resource_min_off_remaining_seconds{resource}`:
   seconds left of the `min_off` wait before a host that flowmanager shut down may be powered on
   again by itself (0 outside it). The power metrics (`sched_resource_power_failed`,

@@ -77,10 +77,14 @@ resources:
       # min_off: 10m
 
 models:
-  - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru] }
-  - { id: llm, resource: cuda-central, load_time: 90s, workloads: [ollama] }
-  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx] }
-  - { id: immich-ml, resource: cuda-central, load_time: 45s, workloads: [immich-machine-learning-gpu] }
+  # `namespaces`: where the model's workloads run. Before cuda-central is powered off the pods
+  # source must see zero pods of every model, and it sees only the namespaces it watches
+  # (cluster-pods below); a namespace it does not watch is refused for a managed host, since
+  # the workloads there would read as zero pods unseen.
+  - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru], namespaces: [ai] }
+  - { id: llm, resource: cuda-central, load_time: 90s, workloads: [ollama], namespaces: [ai] }
+  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx], namespaces: [ai] }
+  - { id: immich-ml, resource: cuda-central, load_time: 45s, workloads: [immich-machine-learning-gpu], namespaces: [media] }
 
 classes:
   - id: paperless-ocr
