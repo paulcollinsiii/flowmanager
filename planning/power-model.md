@@ -1,4 +1,4 @@
-# Host power model: plan (draft v0)
+# Host power model: plan
 
 Status: **decisions complete, awaiting phase 1**, branch `refactor/power-model`, based on main @ 689ab82.
 All decisions are recorded in section 3 (2026-10-30).
