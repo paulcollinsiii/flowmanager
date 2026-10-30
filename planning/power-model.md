@@ -204,9 +204,28 @@ this document and checks the phase against it ("does this still fit the model").
    table. `managed` stays until phase 4: two of the cases it still covers (a host found
    running under a job hold, adoption skipped with an unreadable job book) go only with
    D6 and the `jobs_off` decoupling.
-3. **One withdrawal, one veto.** The shared drain and the exclusive wind-down share the
-   Withdrawing stage; the mount veto becomes a veto with a per-host reading (adds the GPU
-   pod veto, D2).
+3. **One withdrawal, one veto.** Behaviour changes on purpose here (GPU veto; requested
+   shutdown supported on exclusive hosts in the sequencer); everything else is preserved.
+   - *Two axes.* `Shutdown { cause, since, withdrawal, veto }`: `withdrawal` is the progress
+     of taking the consumers away (pending, done, not needed), `veto` is `None`,
+     `Vetoing{since}` or `Stopped{since}`. Replaces phase 2's stage plus `withdrawn` booleans,
+     so the combinations the phase 2 review listed as impossible cannot be built. Test fixtures
+     that hand-build impossible states are rewritten to reachable ones.
+   - *Withdrawal, both kinds.* Shared host: the classes that need it leave the allowed set
+     (today's drain). Exclusive host: the mode machine withdraws the model, as for a reclaim;
+     a requested `graceful` shutdown gives in-flight work up to `drain_timeout`, `immediate`
+     cuts it off at once (both forced: a busy unpreemptible class does not hold it). An idle
+     shutdown of an exclusive host has nothing to withdraw (the model is already gone). The
+     sequencer supports a requested shutdown on an exclusive host; the API and listener keep
+     refusing it until phase 4.
+   - *One veto.* Before any power-off (idle, requested, reclaim) a fresh reading must show the
+     host unused: no pod mounts it (NFS, where a mounts source names it) and no pod of its
+     models exists (GPU, where a pods source covers its models) (D2). Unknown counts as in
+     use; the wait is bounded by `power.veto_timeout` (renamed from `mounts_timeout`) and then
+     stops (`Stopped`, alert, no retry, `resume` clears it). A host with neither reading has
+     no veto.
+   - Metric and log names that say "mounts" for the veto are renamed to the general veto,
+     with the reading (`mounts`, `pods`) as a label or field; listed for hand-off.
 4. **Vocabulary and adoption.** `off`/`off-now` on both kinds; reclaim renamed to lockout
    and accepted on any managed host (D1: lease kind, handlers, `/v1/lockouts` route,
    `lockout_timeout`, metrics, docs); adoption in the sequencer with typed origin (D3, D6);
