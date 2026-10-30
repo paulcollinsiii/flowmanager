@@ -1,4 +1,4 @@
-//! Invariant 9 in the loop: a bad config never replaces the good one, and a tick pinned to
+//! Invariant 20 in the loop: a bad config never replaces the good one, and a tick pinned to
 //! an old generation is refused rather than run against the new config.
 
 use sched_model::test_support::EXAMPLE_CONFIG;

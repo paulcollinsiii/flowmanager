@@ -107,7 +107,7 @@ fn a_reclaim_does_not_excuse_powering_off_a_held_shared_host() {
     );
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 3") && m.contains("lease holds")),
+            .any(|m| m.contains("invariant 10") && m.contains("lease holds")),
         "{v:?}"
     );
 }
@@ -368,7 +368,7 @@ fn a_switch_must_withdraw_the_old_model_in_the_same_decision() {
     );
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 2") && m.contains("mineru stays allowed")),
+            .any(|m| m.contains("invariant 1") && m.contains("mineru stays allowed")),
         "{v:?}"
     );
     // Two allows on one resource.
@@ -408,7 +408,7 @@ fn allowing_on_a_host_that_is_not_freshly_up_is_a_violation() {
         let v = check_with(&snap(obs, vec![]), &prev(GPU_ON_IDLE), &d);
         assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
     }
-    // Observed down: invariant 2 (nothing is allowed on a host observed off) and 5.
+    // Observed down: invariant 3 (nothing is allowed on a host observed off) and 5.
     let v = check_with(
         &snap(vec![up_at(NOW, false)], vec![]),
         &prev(GPU_ON_IDLE),
@@ -416,7 +416,7 @@ fn allowing_on_a_host_that_is_not_freshly_up_is_a_violation() {
     );
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 2") && m.contains("observed down")),
+            .any(|m| m.contains("invariant 3") && m.contains("observed down")),
         "{v:?}"
     );
     // Pods are not part of it: any pod reading leaves the verdict as it was.
@@ -554,7 +554,7 @@ fn powering_off_a_host_with_a_model_allowed_is_a_violation() {
     );
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 3") && m.contains("mineru is allowed")),
+            .any(|m| m.contains("invariant 10") && m.contains("mineru is allowed")),
         "{v:?}"
     );
 }
@@ -631,7 +631,7 @@ fn recovery_for_a_class_that_is_not_allowed_or_has_no_failed_items_is_a_violatio
             &d,
         )
         .into_iter()
-        .filter(|m| m.contains("invariant 9"))
+        .filter(|m| m.contains("invariant 17"))
         .collect::<Vec<_>>()
     };
     // The class is in the allowed set and failed items are reported: no violation.
@@ -641,7 +641,7 @@ fn recovery_for_a_class_that_is_not_allowed_or_has_no_failed_items_is_a_violatio
     let v = with(failed_transcriptions(2, NOW), false);
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 9") && m.contains("not in the allowed set")),
+            .any(|m| m.contains("invariant 17") && m.contains("not in the allowed set")),
         "{v:?}"
     );
     // No failed items.
@@ -670,7 +670,7 @@ fn recovery_for_a_class_that_is_not_allowed_or_has_no_failed_items_is_a_violatio
     );
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 9") && m.contains("declares none")),
+            .any(|m| m.contains("invariant 17") && m.contains("declares none")),
         "{v:?}"
     );
 }
@@ -705,7 +705,7 @@ fn a_power_step_or_a_silent_exit_from_the_failed_power_state_is_a_violation() {
     );
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 11") && m.contains("failed power state")),
+            .any(|m| m.contains("invariant 9") && m.contains("failed power state")),
         "{v:?}"
     );
     let mut d = decision(vec![]);
@@ -715,16 +715,16 @@ fn a_power_step_or_a_silent_exit_from_the_failed_power_state_is_a_violation() {
     let v = check_with(&down, &failed, &d);
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 11") && m.contains("left the failed power state")),
+            .any(|m| m.contains("invariant 9") && m.contains("left the failed power state")),
         "{v:?}"
     );
     // Observed up (what a power-on was after), leaving it is fine.
     let up = snap(zero_pods_and_up(&["cuda-central"]), vec![]);
     let v = check_with(&up, &failed, &d);
-    assert!(!v.iter().any(|m| m.contains("invariant 11")), "{v:?}");
+    assert!(!v.iter().any(|m| m.contains("invariant 9")), "{v:?}");
 }
 
-// Invariant 4b: no automatic power-on within `min_off` of a confirmed shutdown.
+// Invariant 8: no automatic power-on within `min_off` of a confirmed shutdown.
 
 fn min_off_config() -> sched_model::Config {
     let y = sched_model::test_support::example_yaml_managed().replacen(
@@ -785,16 +785,16 @@ fn run_min_off(snap: &Snapshot, prev: &SchedState, steps: Vec<Step>) -> Vec<Stri
 fn powering_on_within_min_off_of_a_confirmed_shutdown_is_a_violation() {
     let s = snap(nfs_down(), job_hold());
     let v = run_min_off(&s, &off_since(9 * MIN), vec![power_on("basestar-nfs")]);
-    assert!(v.iter().any(|m| m.contains("invariant 4b")), "{v:?}");
+    assert!(v.iter().any(|m| m.contains("invariant 8")), "{v:?}");
     // The same tick that sees the shutdown finish counts as confirmed now.
     let shutting = prev(
         "    basestar-nfs: { power: { phase: shutting_down, since: 1 }, mode: { phase: idle } }\n",
     );
     let v = run_min_off(&s, &shutting, vec![power_on("basestar-nfs")]);
-    assert!(v.iter().any(|m| m.contains("invariant 4b")), "{v:?}");
+    assert!(v.iter().any(|m| m.contains("invariant 8")), "{v:?}");
     // A stamp in the future is within the wait too.
     let v = run_min_off(&s, &off_since(0), vec![power_on("basestar-nfs")]);
-    assert!(v.iter().any(|m| m.contains("invariant 4b")), "{v:?}");
+    assert!(v.iter().any(|m| m.contains("invariant 8")), "{v:?}");
 }
 
 #[test]

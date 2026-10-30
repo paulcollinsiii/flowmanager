@@ -231,7 +231,7 @@ pub fn check(
         }
     }
 
-    // 2. Only a configured model, on a host that is up and not reclaimed, is allowed; one
+    // 3. Only a configured model, on a host that is up and not reclaimed, is allowed; one
     // that was not allowed before needs an allow step in this decision.
     let before_allowed: BTreeSet<&ModelId> = prev
         .resources
@@ -241,19 +241,19 @@ pub fn check(
     for model in &decision.allowed.models {
         let Some(spec) = config.models().iter().find(|m| &m.id == model) else {
             out.push(format!(
-                "invariant 2: allowed {model}, which is not configured"
+                "invariant 3: allowed {model}, which is not configured"
             ));
             continue;
         };
         let res = &spec.resource;
         if host_seen_down(config, snapshot, res, safety) {
             out.push(format!(
-                "invariant 2: {model} allowed on {res}, which is observed down"
+                "invariant 3: {model} allowed on {res}, which is observed down"
             ));
         }
         if !decision.state.resource(res).is_some_and(|s| s.is_on()) {
             out.push(format!(
-                "invariant 2: {model} allowed on {res}, which is not on"
+                "invariant 3: {model} allowed on {res}, which is not on"
             ));
         }
         let allowed_now = decision.steps.iter().any(
@@ -267,12 +267,12 @@ pub fn check(
         );
         if reclaimed(config, snapshot, res) && (allowed_now || !winding_down) {
             out.push(format!(
-                "invariant 2: {model} allowed on reclaimed {res} without winding down"
+                "invariant 3: {model} allowed on reclaimed {res} without winding down"
             ));
         }
         if !before_allowed.contains(model) && !allowed_now {
             out.push(format!(
-                "invariant 2: {model} entered the allowed set without an allow step"
+                "invariant 3: {model} entered the allowed set without an allow step"
             ));
         }
     }
@@ -282,7 +282,9 @@ pub fn check(
     // down and not reclaimed (a gate class, on an exclusive host without a model, included).
     for class in &decision.allowed.classes {
         let Some(spec) = config.class(class) else {
-            out.push(format!("allowed class {class}, which is not configured"));
+            out.push(format!(
+                "invariant 3: allowed class {class}, which is not configured"
+            ));
             continue;
         };
         for req in &spec.requires {
@@ -290,14 +292,20 @@ pub fn check(
             if host_seen_down(config, snapshot, r, safety)
                 || !decision.state.resource(r).is_some_and(|s| s.is_on())
             {
-                out.push(format!("allowed class {class} while {r} is not up"));
+                out.push(format!(
+                    "invariant 3: allowed class {class} while {r} is not up"
+                ));
             }
             if reclaimed(config, snapshot, r) {
-                out.push(format!("allowed class {class} on reclaimed {r}"));
+                out.push(format!(
+                    "invariant 3: allowed class {class} on reclaimed {r}"
+                ));
             }
             if let Some(m) = &req.model {
                 if !decision.allowed.models.contains(m) {
-                    out.push(format!("allowed class {class} while {m} is not allowed"));
+                    out.push(format!(
+                        "invariant 3: allowed class {class} while {m} is not allowed"
+                    ));
                 }
                 let winding = matches!(
                     decision.state.resource(r).map(|s| &s.mode),
@@ -308,7 +316,7 @@ pub fn check(
                 );
                 if winding {
                     out.push(format!(
-                        "allowed class {class} while {m} is being wound down"
+                        "invariant 3: allowed class {class} while {m} is being wound down"
                     ));
                 }
             }
@@ -318,11 +326,13 @@ pub fn check(
             .iter()
             .any(|s| matches!(s, Step::PauseIntake { class: c } if c == class))
         {
-            out.push(format!("allowed class {class} whose intake is paused"));
+            out.push(format!(
+                "invariant 3: allowed class {class} whose intake is paused"
+            ));
         }
     }
 
-    // 14. An idle drain (the scheduler's own) ends the moment anything holds the host: a lease
+    // 12. An idle drain (the scheduler's own) ends the moment anything holds the host: a lease
     // that holds it, or work for a class that needs it. Unknown demand is not work.
     for (id, st) in &decision.state.resources {
         if !st
@@ -343,12 +353,12 @@ pub fn check(
             .any(|c| demand(config, snapshot, c).is_some_and(|d| d.0));
         if leased || busy {
             out.push(format!(
-                "invariant 14: idle drain of {id} still set while something holds the host"
+                "invariant 12: idle drain of {id} still set while something holds the host"
             ));
         }
     }
 
-    // 11. A resource whose power transition timed out is never acted on again by the
+    // 9. A resource whose power transition timed out is never acted on again by the
     // scheduler for that reason: unless a fresh reading shows what the transition was after
     // (up after a power-on, down after a shutdown) or its control is manual (a person is in
     // charge), it stays failed, with no power step and nothing allowed on it.
@@ -367,14 +377,14 @@ pub fn check(
             matches!(s, Step::PowerOn { resource } | Step::PowerOff { resource } if resource == id)
         }) {
             out.push(format!(
-                "invariant 11: {step:?} for {id}, which is in the failed power state"
+                "invariant 9: {step:?} for {id}, which is in the failed power state"
             ));
         }
         if let Some(after) = decision.state.resource(id)
             && !matches!(after.power, PowerPhase::Failed { .. })
         {
             out.push(format!(
-                "invariant 11: {id} left the failed power state ({during:?}) to {:?} without what the transition was after",
+                "invariant 9: {id} left the failed power state ({during:?}) to {:?} without what the transition was after",
                 after.power
             ));
         }
@@ -398,18 +408,20 @@ pub fn check(
                 if a != b
         );
         if list.len() > 1 && !switch {
-            out.push(format!("more than one acting step for {r}: {list:?}"));
+            out.push(format!(
+                "invariant 4: more than one acting step for {r}: {list:?}"
+            ));
         }
     }
 
     for step in &decision.steps {
         match step {
-            // 2, 5. Allowing a model: configured on the resource, on a host freshly observed
+            // 1, 3, 5. Allowing a model: configured on the resource, on a host freshly observed
             // up, and the model allowed before (if another) leaves in the same decision.
             Step::AllowModel { resource, model } => {
                 if !model_of(config, resource, model) {
                     out.push(format!(
-                        "invariant 2: allowed {model}, which is not a configured model of {resource}"
+                        "invariant 3: allowed {model}, which is not a configured model of {resource}"
                     ));
                 }
                 let powered = config.resource(resource).is_some_and(|r| r.power.is_some());
@@ -425,15 +437,15 @@ pub fn check(
                     })
                 {
                     out.push(format!(
-                        "invariant 2: allowed {model} on {resource} while {old} stays allowed"
+                        "invariant 1: allowed {model} on {resource} while {old} stays allowed"
                     ));
                 }
             }
-            // 4. Power-on needs a manual request, a power-changing class with work or a job's hold.
+            // 6. Power-on needs a manual request, a power-changing class with work or a job's hold.
             Step::PowerOn { resource } => {
                 if !managed_power(config, resource) {
                     out.push(format!(
-                        "invariant 4: powered on {resource}, whose power is under manual control"
+                        "invariant 6: powered on {resource}, whose power is under manual control"
                     ));
                 }
                 let manual = snapshot.leases.iter().any(|l| {
@@ -458,10 +470,10 @@ pub fn check(
                 });
                 if !manual && !workload && !held {
                     out.push(format!(
-                        "invariant 4: powered on {resource} without a manual or workload reason"
+                        "invariant 6: powered on {resource} without a manual or workload reason"
                     ));
                 }
-                // 4b. No automatic power-on within `min_off` of a shutdown flowmanager
+                // 8. No automatic power-on within `min_off` of a shutdown flowmanager
                 // started and saw confirmed; a manual lease is the only exception. The
                 // confirmation is the stamp the previous state carries, or a shutdown that
                 // this snapshot shows complete (the host freshly read down).
@@ -488,31 +500,31 @@ pub fn check(
                         && now.saturating_sub(at) < min_off
                     {
                         out.push(format!(
-                            "invariant 4b: powered on {resource} {}ms after a confirmed shutdown, within its min_off of {min_off}, with no manual lease",
+                            "invariant 8: powered on {resource} {}ms after a confirmed shutdown, within its min_off of {min_off}, with no manual lease",
                             now.saturating_sub(at).as_u64()
                         ));
                     }
                 }
                 if reclaimed(config, snapshot, resource) {
-                    out.push(format!("powered on reclaimed {resource}"));
+                    out.push(format!("invariant 14: powered on reclaimed {resource}"));
                 }
             }
-            // 3, 4, 5. Power-off needs no holds (a reclaim of an exclusive powered resource
+            // 5, 6, 7, 10, 11, 13. Power-off needs no holds (a reclaim of an exclusive powered resource
             // is the only exception), idle grace, management, and fresh observations.
             Step::PowerOff { resource } => {
                 if !managed_power(config, resource) {
                     out.push(format!(
-                        "invariant 4: powered off {resource}, whose power is under manual control"
+                        "invariant 6: powered off {resource}, whose power is under manual control"
                     ));
                 }
                 let before = prev.resource(resource);
                 if !reclaimed(config, snapshot, resource) {
                     if !before.is_some_and(|s| s.managed) {
                         out.push(format!(
-                            "invariant 4: powered off unmanaged host {resource}"
+                            "invariant 7: powered off unmanaged host {resource}"
                         ));
                     }
-                    // 13. A shared host's consumers are scaled down before it is shut down: by a
+                    // 11. A shared host's consumers are scaled down before it is shut down: by a
                     // drain a person asked for or, when it merely went idle, by its own idle drain.
                     if config
                         .resource(resource)
@@ -523,7 +535,7 @@ pub fn check(
                             .is_some_and(|s| s.shutdown.is_some_and(|x| x.is_drain()))
                     {
                         out.push(format!(
-                            "invariant 13: powered off shared {resource} with no drain scaling its consumers down first"
+                            "invariant 11: powered off shared {resource} with no drain scaling its consumers down first"
                         ));
                     }
                     let held = snapshot.leases.iter().any(|l| {
@@ -533,7 +545,7 @@ pub fn check(
                     });
                     if held {
                         out.push(format!(
-                            "invariant 3: powered off {resource} while a lease holds it"
+                            "invariant 10: powered off {resource} while a lease holds it"
                         ));
                     }
                     // A drain (a person asked for the host to go down) ignores queued work, never
@@ -558,7 +570,7 @@ pub fn check(
                                 .all(|c| demand(config, snapshot, c).is_some_and(|x| !x.1));
                         if !scaled {
                             out.push(format!(
-                                "invariant 3: powered off {resource} on a graceful drain before its consumers were scaled down"
+                                "invariant 11: powered off {resource} on a graceful drain before its consumers were scaled down"
                             ));
                         }
                     }
@@ -569,7 +581,7 @@ pub fn check(
                     {
                         if demand(config, snapshot, class).is_none_or(|d| d.0) {
                             out.push(format!(
-                                "invariant 3: powered off {resource} while {} has or may have work",
+                                "invariant 10: powered off {resource} while {} has or may have work",
                                 class.id
                             ));
                         }
@@ -582,7 +594,7 @@ pub fn check(
                         });
                     if !grace_ok {
                         out.push(format!(
-                            "invariant 3: powered off {resource} before idle grace ended"
+                            "invariant 10: powered off {resource} before idle grace ended"
                         ));
                     }
                 }
@@ -591,7 +603,7 @@ pub fn check(
                         "invariant 5: powered off {resource} without a fresh up observation"
                     ));
                 }
-                // 12. A host whose mounts are checked is powered off only on fresh readings
+                // 13. A host whose mounts are checked is powered off only on fresh readings
                 // that all say no pod mounts it; an unknown count is as good as a mounted one.
                 if config.mounts_checked(resource) {
                     let clear = newest(config, Capability::Mounts, snapshot, safety, |v| {
@@ -603,20 +615,20 @@ pub fn check(
                     });
                     if !clear {
                         out.push(format!(
-                            "invariant 12: powered off {resource} without a fresh reading of no mounting pods"
+                            "invariant 13: powered off {resource} without a fresh reading of no mounting pods"
                         ));
                     }
                 }
                 for m in config.models_of(resource) {
                     if decision.allowed.models.contains(&m.id) {
                         out.push(format!(
-                            "invariant 3: powered off {resource} while {} is allowed on it",
+                            "invariant 10: powered off {resource} while {} is allowed on it",
                             m.id
                         ));
                     }
                 }
             }
-            // 8. Stopping in-flight work is allowed only per class, after that class's own
+            // 16. Stopping in-flight work is allowed only per class, after that class's own
             // timeout (`kill_timeout`, else the cause's: `reclaim_timeout` under a reclaim,
             // `drain_timeout` otherwise) has run out within a running wind-down.
             Step::KillInFlight { class } => {
@@ -630,12 +642,14 @@ pub fn check(
                     .map(|r| &r.resource)
                 else {
                     out.push(format!(
-                        "invariant 8: stopped in-flight work of {class}, which requires no model"
+                        "invariant 16: stopped in-flight work of {class}, which requires no model"
                     ));
                     continue;
                 };
                 if demand(config, snapshot, spec).is_some_and(|d| !d.1) {
-                    out.push(format!("stopped {class} though nothing of it is in flight"));
+                    out.push(format!(
+                        "invariant 16: stopped {class} though nothing of it is in flight"
+                    ));
                 }
                 let reclaim = reclaimed(config, snapshot, res);
                 let base = if reclaim {
@@ -654,17 +668,17 @@ pub fn check(
                             .saturating_add(spec.kill_timeout.unwrap_or(base).as_u64());
                         if now.as_u64() < due {
                             out.push(format!(
-                                "invariant 8: stopped {class} {}ms early",
+                                "invariant 16: stopped {class} {}ms early",
                                 due - now.as_u64()
                             ));
                         }
                     }
                     _ => out.push(format!(
-                        "invariant 8: stopped {class} without a running wind-down on the current cause"
+                        "invariant 16: stopped {class} without a running wind-down on the current cause"
                     )),
                 }
             }
-            // 8. Withdrawing a serving model needs a settled model or a declared-safe class.
+            // 16. Withdrawing a serving model needs a settled model or a declared-safe class.
             // A model the config no longer has on the resource is withdrawn at once: none of
             // its work is known any more.
             Step::DrainModel { resource, model } => {
@@ -679,7 +693,7 @@ pub fn check(
                     .filter(|m| m.allowed_model() == Some(model))
                 else {
                     out.push(format!(
-                        "withdrew {model} on {resource}, which was not allowed"
+                        "invariant 1: withdrew {model} on {resource}, which was not allowed"
                     ));
                     continue;
                 };
@@ -688,7 +702,7 @@ pub fn check(
                 if !forced
                     && now.as_u64() - since.as_u64().min(now.as_u64()) < policy.min_dwell.as_u64()
                 {
-                    out.push(format!("drained {model} before min_dwell"));
+                    out.push(format!("invariant 16: drained {model} before min_dwell"));
                 }
                 let killed: BTreeSet<ClassId> = wind_down
                     .iter()
@@ -703,7 +717,7 @@ pub fn check(
                     let unsure = class.demand.is_some() && d.is_none_or(|d| d.1);
                     if unsure && !killed.contains(&class.id) {
                         out.push(format!(
-                            "invariant 8: drained {model} with possible in-flight work of {}",
+                            "invariant 16: drained {model} with possible in-flight work of {}",
                             class.id
                         ));
                     }
@@ -711,13 +725,13 @@ pub fn check(
                     if !forced && busy && class.preemptibility == sched_model::Preemptibility::None
                     {
                         out.push(format!(
-                            "invariant 8: switched away early from unpreemptible {}",
+                            "invariant 16: switched away early from unpreemptible {}",
                             class.id
                         ));
                     }
                 }
             }
-            // 9. A recovery runs only for a class in the allowed set (its model serving, not
+            // 17. A recovery runs only for a class in the allowed set (its model serving, not
             // winding down) that has a recovery action, and only for failed items that a
             // fresh reading reports. Recovery never runs for a model that is not allowed.
             Step::RunRecovery { class } => {
@@ -726,17 +740,17 @@ pub fn check(
                 };
                 if spec.recovery.is_none() {
                     out.push(format!(
-                        "invariant 9: ran recovery for {class}, which declares none"
+                        "invariant 17: ran recovery for {class}, which declares none"
                     ));
                 }
                 if !decision.allowed.classes.contains(class) {
                     out.push(format!(
-                        "invariant 9: ran recovery for {class}, which is not in the allowed set"
+                        "invariant 17: ran recovery for {class}, which is not in the allowed set"
                     ));
                 }
                 if failed_items(config, snapshot, spec).is_none_or(|n| n == 0) {
                     out.push(format!(
-                        "invariant 9: ran recovery for {class} without fresh failed items"
+                        "invariant 17: ran recovery for {class} without fresh failed items"
                     ));
                 }
             }

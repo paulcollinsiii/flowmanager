@@ -6,48 +6,11 @@
 //! no scheduling policy beyond hysteresis guards (minimum dwell, idle grace); which model
 //! to prefer is the planner's job.
 //!
-//! Safety rules enforced here, regardless of the intent it is given:
-//! 1. At most one model of an exclusive resource is in the allowed set at a time. A switch
-//!    withdraws the old model and allows the new one in the same tick.
-//! 2. No decision is gated on pod state (but see 7: a shutdown veto, and recovery, which waits
-//!    for a ready pod). GPU exclusivity is enforced by Kubernetes (every
-//!    GPU workload requests the one GPU the node exposes), so the new model's pod stays
-//!    pending until the old one has released the GPU. A model is allowed only on a host
-//!    that is up, and a model the config does not have is never allowed (one removed while
-//!    allowed leaves the set at the next tick).
-//! 3. A host is powered down only when no lease holds it and no queued or in-flight work
-//!    needs it, after `idle_grace`; the overrides are a reclaim and a drain. A drain (a person
-//!    released the host's manual lease asking for the host to go down) ignores queued and
-//!    in-flight work, never a lease: its consumers leave the allowed set at once (`immediate`)
-//!    or when their in-flight work is done or `drain_timeout` has passed (`graceful`), and the
-//!    host is shut down once no lease holds it and the mount veto (7) is clear.
-//! 4. Power changes come only from the intent's `power_up` (manual requests, or classes
-//!    that may change power), and a host is powered down only if the scheduler took
-//!    responsibility for it. A host under `power.control: manual` never gets a power step
-//!    and the scheduler never takes responsibility for it: its phase follows observation.
-//!    A reclaim lease applies only to an exclusive resource with a power section; on any
-//!    other resource it is ignored and reported as a wait.
-//! 5. Safety-critical steps (allowing a model, powering a host off) need a fresh "up"
-//!    reading of the host; otherwise the sequencer waits.
-//! 6. A power transition (powering on, shutting down) is bounded by the resource's
-//!    `power_on_timeout` / `shutdown_timeout`. On expiry the resource enters the failed phase:
-//!    nothing is allowed on it, no power step is ever emitted for it again, and it leaves that
-//!    phase only when a fresh reading shows the state the transition was after (or its
-//!    control is manual). Other resources are unaffected.
-//! 7. A host whose NFS mounts are checked (a `mounts` source names it) is powered off only
-//!    on a fresh reading of zero mounting pods. A reading that is missing, stale or failed is
-//!    unknown and counts as mounted: the shutdown waits, bounded by `power.mounts_timeout`,
-//!    and on expiry the scheduler stops (the host stays up, the managed flag is dropped, no
-//!    retry) until the host is seen down, a person resets it, or a new manual request takes it
-//!    over. This is the only place a pod reading holds anything back, and it only ever vetoes.
-//! 8. Early switching happens only away from classes that declare it safe, or when forced,
-//!    and forced switches still give in-flight work its timeout. In-flight work is stopped
-//!    only on a forced switch (reclaim or manual model lease), class by class, each when
-//!    its own timeout has run out. In-flight work is what the queues report, not pods.
-//! 9. After a shutdown flowmanager started and saw confirmed (the host observed down), an
-//!    automatic power-on (a workload, a scheduled job's hold) waits for `power.min_off`
-//!    (default 0: no wait); a manual lease does not wait. A host found down, or gone down by
-//!    itself, is not penalised. The wait only delays a fresh decision; it is never a retry.
+//! Safety rules enforced here, regardless of the intent it is given: the numbered invariants
+//! of `planning/architecture.md` (*Safety invariants*), the one canonical list. The host
+//! power ones follow the model in `planning/power-model.md`. The checker that tests them
+//! against every decision is `sched-service/src/invariants.rs`; its messages carry the same
+//! numbers.
 
 pub mod adopt;
 mod exclusive;
