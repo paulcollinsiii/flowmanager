@@ -860,3 +860,63 @@ fn failed_items_never_hold_the_model_that_is_serving() {
     );
     assert_eq!(target(&f), Some("whisperx".into()));
 }
+
+#[test]
+fn an_exclusive_host_is_wanted_up_only_by_a_manual_host_or_model_lease() {
+    let gpu = ResourceId::new(G);
+    let nfs = ResourceId::new("basestar-nfs");
+    let work = [ocr(5, T - MIN), failed_transcription(2)];
+    // Queued work and failed items alone never power the GPU host on.
+    let f = fixture(&work, &[], None);
+    assert!(run(&f).power_up.is_empty());
+    // Nor does an interactive session.
+    let live = format!(
+        "{{ id: i, resource: {G}, granted_at: 0, kind: {{ type: interactive, model: llm, expires_at: {} }} }}",
+        T + 1
+    );
+    let f = fixture(&work, &[&live], None);
+    assert!(run(&f).power_up.is_empty());
+    // Nor a job whose needs are only on the shared host: the NFS host is wanted, the GPU is not.
+    let hold = "{ id: s, resource: basestar-nfs, granted_at: 0, kind: { type: shared_hold, holder: \"job:x\" } }";
+    let f = fixture(&work, &[hold], None);
+    let i = run(&f);
+    assert_eq!(i.power_up.get(&nfs), Some(&PowerWant::Workload));
+    assert!(!i.power_up.contains_key(&gpu), "{:?}", i.power_up);
+    let f = batch_fixture(&[batch(3), ocr(5, T - MIN)], &[]);
+    let i = run_batch(&f);
+    assert_eq!(i.power_up.get(&nfs), Some(&PowerWant::Workload));
+    assert!(!i.power_up.contains_key(&gpu), "{:?}", i.power_up);
+    // A manual host lease does.
+    let host = format!("{{ id: h, resource: {G}, granted_at: 0, kind: {{ type: manual_host }} }}");
+    let f = fixture(&work, &[&host], None);
+    assert_eq!(run(&f).power_up.get(&gpu), Some(&PowerWant::Manual));
+    // A reclaim wins over it.
+    let reclaim = format!("{{ id: r, resource: {G}, granted_at: 1, kind: {{ type: reclaim }} }}");
+    let f = fixture(&work, &[&host, &reclaim], None);
+    assert!(!run(&f).power_up.contains_key(&gpu));
+}
+
+#[test]
+fn a_host_lease_on_an_exclusive_host_does_not_pin_the_model() {
+    let gpu = ResourceId::new(G);
+    let host = format!("{{ id: h, resource: {G}, granted_at: 0, kind: {{ type: manual_host }} }}");
+    // The queues choose the model, as without the lease, and nothing is forced.
+    let f = fixture(&[ocr(5, T - MIN)], &[&host], None);
+    let i = run(&f);
+    assert_eq!(i.models[&gpu], Some(ModelId::new("mineru")));
+    assert!(!i.forced.contains(&gpu));
+    let f = fixture(&[transcription(5, T - MIN)], &[&host], None);
+    assert_eq!(run(&f).models[&gpu], Some(ModelId::new("whisperx")));
+    // Idle queues: no model, the host stays up on the lease alone.
+    let f = fixture(&[], &[&host], None);
+    let i = run(&f);
+    assert_eq!(i.models[&gpu], None);
+    assert_eq!(i.power_up.get(&gpu), Some(&PowerWant::Manual));
+    // A model that is serving and idle gives way to the queue after the grace, as ever.
+    let f = fixture(
+        &[transcription(5, T - MIN), ocr(0, T)],
+        &[&host],
+        Some(("mineru", 0, Some(0))),
+    );
+    assert_eq!(run(&f).models[&gpu], Some(ModelId::new("whisperx")));
+}

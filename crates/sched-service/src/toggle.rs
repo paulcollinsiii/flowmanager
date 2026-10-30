@@ -18,8 +18,13 @@
 //!   of `on` or `off` (also `true`/`false`, or JSON `{"state": "on"}` / `{"held": true}`),
 //!   which is the shape Home Assistant's REST switch sends.
 //! - `GET  /v1/resources/{resource}`, `POST /v1/resources/{resource}/on|off` (or a body),
-//!   and `POST /v1/resources/{resource}/resume`: the manual host lease of a shared host. A host
-//!   found running reads on (flowmanager holds it for the user, see `adopt`). `off` releases
+//!   and `POST /v1/resources/{resource}/resume`: the manual host lease of a host with a power
+//!   section. A host found running reads on (flowmanager holds it for the user, see `adopt`).
+//!   On an **exclusive** host (a GPU) `on` powers it and keeps it up while the queues keep
+//!   choosing the model, `off` is a plain release (the same as `release`: queued work holds the
+//!   host until idle, then `idle_grace` later it shuts down; no lease held is still a success),
+//!   and `off-now` is refused (`400`: an exclusive host is never drained; a reclaim is the
+//!   forced "off now"). On a **shared** host `off` releases
 //!   the lease with a **graceful drain** (queued work no longer keeps the host up; in-flight
 //!   work gets `drain_timeout`; also with no lease held, through `drain_host`), and
 //!   `POST /v1/resources/{resource}/off-now` with an
@@ -734,6 +739,28 @@ impl Toggle {
                 Some(self.backend.acquire_host(&id).await?.lease),
                 Some(None),
             ),
+            // An exclusive host is never drained: its switch is a plain release (queued work
+            // holds it until idle, then `idle_grace` later it shuts down). `off-now` on it goes
+            // to the handler, which refuses.
+            Some(false)
+                if drain == DrainMode::Graceful
+                    && config
+                        .resource(&id)
+                        .is_some_and(|r| r.kind == ResourceKind::Exclusive) =>
+            {
+                let leases = self.backend.leases().await?;
+                return match find_host(&leases, &id).cloned() {
+                    Some(lease) => self.release_held(&config, &id, &lease).await,
+                    None => Ok(resource_state(
+                        &config,
+                        &id,
+                        None,
+                        Some(None),
+                        &self.shared.last_report(),
+                        self.shared.clock.now(),
+                    )),
+                };
+            }
             Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?.drain)),
         };
         Ok(resource_state(
@@ -761,13 +788,24 @@ impl Toggle {
                 format!("resource {name:?} holds no manual host lease"),
             ));
         };
-        if let Err(e) = self.backend.release_host(&id).await {
+        self.release_held(&config, &id, &lease).await
+    }
+
+    /// Releases `lease`, the manual host lease of `id`, with no drain, and answers with the
+    /// host's state (see `release`).
+    async fn release_held(
+        &self,
+        config: &Config,
+        id: &ResourceId,
+        lease: &Lease,
+    ) -> Result<Value, ApiError> {
+        if let Err(e) = self.backend.release_host(id).await {
             self.gone_after(e, &lease.id).await?;
         }
         let report = self.shared.last_report();
         let mut v = resource_state(
-            &config,
-            &id,
+            config,
+            id,
             None,
             Some(None),
             &report,
@@ -775,7 +813,7 @@ impl Toggle {
         );
         let up = report
             .as_ref()
-            .and_then(|r| r.state.resource(&id))
+            .and_then(|r| r.state.resource(id))
             .is_some_and(|st| st.is_on());
         if up {
             v["state"] = json!("on");
@@ -1124,7 +1162,7 @@ pub fn resource_state(
     );
     m.insert(
         "lease_supported".into(),
-        json!(kind == Some(ResourceKind::Shared)),
+        json!(config.resource(resource).is_some_and(|r| r.power.is_some())),
     );
     let draining = match requested {
         Some(d) => d.map(|d| {
@@ -1230,7 +1268,9 @@ mod tests {
     use crate::persist::LEASES_KEY;
     use crate::resume::Resume;
     use restate_sdk::errors::HandlerError;
-    use sched_model::test_support::{EXAMPLE_CONFIG, example_yaml_managed};
+    use sched_model::test_support::{
+        EXAMPLE_CONFIG, example_yaml_managed, example_yaml_managed_nfs_only,
+    };
     use sched_model::{Fidelity, ObservedValue};
     use sched_observe::Report;
     use sched_observe::testserver::{Reply as TestReply, TestServer};
@@ -1716,7 +1756,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_switch_leases_a_shared_host_and_refuses_an_exclusive_one() {
+    async fn a_host_switch_leases_a_shared_host_and_an_exclusive_one_with_a_plain_release_as_its_off()
+     {
         let r = rig(&example_yaml_managed());
         let (s, v) = r.get("/v1/resources/basestar-nfs").await;
         assert_eq!(
@@ -1738,9 +1779,26 @@ mod tests {
         let (s, v) = r.post("/v1/resources/basestar-nfs/off", "").await;
         assert_eq!((s, &v["held"]), (200, &json!(false)));
         assert_eq!(r.lease_count(), 0);
-        // The GPU host is exclusive: leased through its models; the handler says so.
+        // The GPU host is exclusive: the same switch, with a plain release as its off.
+        let (s, v) = r.get("/v1/resources/cuda-central").await;
+        assert_eq!(
+            (s, &v["held"], &v["lease_supported"], &v["resource_kind"]),
+            (200, &json!(false), &json!(true), &json!("exclusive"))
+        );
         let (s, v) = r.post("/v1/resources/cuda-central/on", "").await;
-        assert_eq!(s, 400);
+        assert_eq!((s, &v["held"]), (200, &json!(true)), "{v}");
+        assert_eq!(r.lease_count(), 1);
+        let (s, v) = r.get("/v1/leases").await;
+        let gpu = v["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == "cuda-central")
+            .unwrap_or_else(|| panic!("the listing has the GPU host: {v}"));
+        assert_eq!((s, &gpu["held"]), (200, &json!(true)));
+        // off-now is refused for an exclusive host, and does not release the lease.
+        let (s, v) = r.post("/v1/resources/cuda-central/off-now", "").await;
+        assert_eq!(s, 400, "{v}");
         assert!(
             v["error"]
                 .as_str()
@@ -1748,8 +1806,24 @@ mod tests {
                 .contains("not a shared resource"),
             "{v}"
         );
-        let (s, v) = r.get("/v1/resources/cuda-central").await;
-        assert_eq!((s, &v["lease_supported"]), (200, &json!(false)));
+        assert_eq!(r.lease_count(), 1);
+        // off is a plain release (no drain is ever recorded), and again with nothing held.
+        let (s, v) = r.post("/v1/resources/cuda-central/off", "").await;
+        assert_eq!((s, &v["held"]), (200, &json!(false)), "{v}");
+        assert!(v.get("drain").is_none(), "{v}");
+        assert_eq!(r.lease_count(), 0);
+        assert_eq!(r.post("/v1/resources/cuda-central/off", "").await.0, 200);
+        // release answers 404 when nothing is held, as for a shared host.
+        assert_eq!(
+            r.post("/v1/resources/cuda-central/release", "").await.0,
+            404
+        );
+        r.post("/v1/resources/cuda-central/on", "").await;
+        assert_eq!(
+            r.post("/v1/resources/cuda-central/release", "").await.0,
+            200
+        );
+        assert_eq!(r.lease_count(), 0);
         // Resume of a host that is not stopped: the handler's 409.
         let (s, v) = r.post("/v1/resources/basestar-nfs/resume", "").await;
         assert_eq!(s, 409, "{v}");
@@ -1758,7 +1832,7 @@ mod tests {
     #[tokio::test]
 
     async fn an_adopted_host_reads_on_and_off_and_off_now_start_a_drain_with_or_without_a_lease() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         r.hosts_up(true);
         r.tick().await;
         // Found running: the adopted lease is a manual host lease, so the switch reads on.
@@ -1827,7 +1901,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reply_reflects_the_handlers_answer_and_the_current_phase_not_a_stale_report() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         r.hosts_up(true);
         r.tick().await;
         r.post("/v1/resources/basestar-nfs/off", "").await;
@@ -1886,7 +1960,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_is_a_plain_release_with_no_drain_that_reports_the_real_state() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         r.hosts_up(true);
         r.tick().await;
         // The adopted lease is released; the host is up, so the reply still reads on.
@@ -1937,7 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn release_relays_upstream_errors_and_counts_a_failed_release_only_if_the_lease_is_gone()
     {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         let server = TestServer::start().await;
         let listed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let flag = Arc::clone(&listed);
@@ -1979,7 +2053,7 @@ mod tests {
 
     #[tokio::test]
     async fn off_on_a_host_that_is_up_with_no_lease_held_starts_the_drain() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         r.hosts_up(true);
         r.tick().await;
         // The adopted lease goes (released by id, as a person with the API could); the host
@@ -1995,7 +2069,7 @@ mod tests {
             "{v}"
         );
         // A host that is not up has nothing to drain: a plain off.
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         r.hosts_up(true);
         r.push(
             "basestar-probe",
@@ -2008,9 +2082,11 @@ mod tests {
         let (s, v) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
         assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
         assert!(v.get("drain").is_none(), "{v}");
-        // An exclusive resource cannot be drained.
-        let (s, _) = r.post("/v1/resources/cuda-central/off", "").await;
+        // An exclusive resource cannot be drained; its off is a plain release.
+        let (s, _) = r.post("/v1/resources/cuda-central/off-now", "").await;
         assert_eq!(s, 400);
+        let (s, v) = r.post("/v1/resources/cuda-central/off", "").await;
+        assert_eq!((s, v.get("drain").is_none()), (200, true), "{v}");
     }
 
     #[tokio::test]
@@ -2254,7 +2330,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reclaim_switch_is_idempotent_and_refuses_what_cannot_be_reclaimed() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         let (s, v) = r.get("/v1/reclaims/cuda-central").await;
         assert_eq!(
             (s, &v["held"], &v["supported"]),
@@ -2466,7 +2542,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_scheduler_that_is_not_registered_is_an_error_never_an_answer() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         let server = TestServer::start().await;
         for h in [
             "leases",
@@ -2509,7 +2585,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_drain_request_is_the_answer_and_a_refusal_keeps_its_status() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         let server = TestServer::start().await;
         server.set_dynamic("/Scheduler/main/drain_host", |_| ingress_reply(500, "boom"));
         let t = over(&r, Arc::new(RestateIngress::new(&server.url(""))));
@@ -2730,7 +2806,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_model_lease_on_a_reclaimed_resource_says_it_is_reclaimed() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         r.hosts_up(true);
         assert_eq!(r.post("/v1/models/llm/on", "").await.0, 200);
         assert_eq!(r.post("/v1/reclaims/cuda-central/on", "").await.0, 200);
@@ -2813,7 +2889,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_resume_and_conflict_labels_are_counted() {
-        let r = rig(&example_yaml_managed());
+        let r = rig(&example_yaml_managed_nfs_only());
         assert_eq!(r.post("/v1/resources/basestar-nfs/resume", "").await.0, 409);
         r.post("/v1/models/llm/on", "").await;
         assert_eq!(r.post("/v1/models/mineru/on", "").await.0, 409);

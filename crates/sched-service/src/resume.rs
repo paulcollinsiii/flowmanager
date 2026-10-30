@@ -6,7 +6,7 @@
 //! Resuming forgets the resource's state, so the sequencer starts it afresh from what is
 //! observed (the same as a resource it has never seen): found running means up and not
 //! managed (it is never powered off by flowmanager on account of an earlier action; a shared
-//! host under `control: managed` is then adopted at the next tick, like any host found
+//! host (shared or exclusive) under `control: managed` is then adopted at the next tick, like any host found
 //! running, so a person holds it until they switch it off), found
 //! down means off. Nothing is powered on or off by the request itself, and no other
 //! resource's state, nor the lease book, is touched. What the resource's own state held

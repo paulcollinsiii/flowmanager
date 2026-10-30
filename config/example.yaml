@@ -36,6 +36,12 @@ resources:
       # manual: a person powers the host; the scheduler never emits power steps for it and
       # follows its observed reachability. managed: the scheduler powers it on and off
       # (both sections above are then required) and never retries a failed power action.
+      # Under managed control this exclusive host is powered on only by a manual host lease
+      # (acquire_host_lease), a manual model lease, or a class with may_change_power: queued
+      # work never wakes it. A host lease keeps it up and pins no model (the queues still
+      # choose); releasing it is a plain release (no drain): once idle the model is withdrawn
+      # and idle_grace later the host is shut down. A reclaim is the forced "off now". A host
+      # found running is adopted like a shared one (held by the user until released).
       control: manual
       # Under managed control, how long the host may take to be observed up after a
       # power-on (default 10m) or down after a shutdown (default 15m). On expiry the

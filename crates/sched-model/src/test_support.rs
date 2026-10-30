@@ -94,6 +94,21 @@ pub fn example_yaml_managed() -> String {
     managed_power(EXAMPLE_CONFIG)
 }
 
+/// The example with managed power on the shared NFS host only: the exclusive GPU host
+/// (the first power section) stays under `control: manual`, so a GPU host reading "up" is
+/// never adopted and tests of the shared-host machinery are not about it.
+pub fn example_yaml_managed_nfs_only() -> String {
+    let out =
+        example_yaml_managed().replacen("      control: managed\n", "      control: manual\n", 1);
+    let config = Config::from_yaml(&out).expect("nfs-only managed example config is valid");
+    assert!(
+        !config.power_managed(&"cuda-central".into())
+            && config.power_managed(&"basestar-nfs".into()),
+        "the first power section of the example is no longer the GPU host's"
+    );
+    out
+}
+
 /// The example config with managed power.
 pub fn example_config_managed() -> Config {
     Config::from_yaml(&example_yaml_managed()).expect("managed example config is valid")

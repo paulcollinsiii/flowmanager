@@ -8,7 +8,7 @@
 //! - At most one manual model lease is held per exclusive resource. Asking again for the
 //!   model already leased returns that lease; asking for another model of the same
 //!   resource is refused until the first is released.
-//! - A manual host lease is for a shared resource with a power section, a reclaim for an
+//! - A manual host lease is for a resource (shared or exclusive) with a power section, a reclaim for an
 //!   exclusive resource with a power section (`Config::supports_reclaim`); each is held at
 //!   most once per resource, and asking again returns the lease held.
 //! - Lease ids come from a counter kept in the book, so they are deterministic under
@@ -63,8 +63,8 @@ pub enum LeaseError {
         resource: ResourceId,
         known: Vec<ResourceId>,
     },
-    /// A manual host lease is for a shared resource; an exclusive one is leased through its
-    /// models.
+    /// A drain is for a shared resource; an exclusive host is taken down by releasing its
+    /// host lease.
     NotShared { resource: ResourceId },
     /// The resource has no power section: it is always on, so a lease on it would do nothing.
     NoPowerSection { resource: ResourceId },
@@ -135,7 +135,7 @@ impl fmt::Display for LeaseError {
             }
             LeaseError::NotShared { resource } => write!(
                 f,
-                "resource {:?} is not a shared resource; a manual host lease is for shared hosts such as an NFS server (an exclusive resource is leased through one of its models)",
+                "resource {:?} is not a shared resource; a drain is for shared hosts such as an NFS server (an exclusive host is taken down by releasing its host lease, or by a reclaim)",
                 resource.as_str()
             ),
             LeaseError::NoPowerSection { resource } => write!(
@@ -213,15 +213,10 @@ impl LeaseBook {
         })
     }
 
-    /// Whether `resource` can have a manual host lease (or a drain): a shared resource with a
-    /// power section.
+    /// Whether `resource` can have a manual host lease: a resource (shared or exclusive) with
+    /// a power section.
     pub fn check_host(config: &Config, resource: &ResourceId) -> Result<(), LeaseError> {
         let spec = known_resource(config, resource)?;
-        if spec.kind != ResourceKind::Shared {
-            return Err(LeaseError::NotShared {
-                resource: resource.clone(),
-            });
-        }
         if spec.power.is_none() {
             return Err(LeaseError::NoPowerSection {
                 resource: resource.clone(),
@@ -230,9 +225,22 @@ impl LeaseBook {
         Ok(())
     }
 
-    /// Acquires a manual lease on a shared host (an NFS server, say): the host is powered on
-    /// if it is off (when its power is managed) and kept up until the lease is released.
-    /// Asking again returns the lease already held.
+    /// Whether `resource` can be drained: a shared resource with a power section. An
+    /// exclusive host is taken down by releasing its host lease (a plain release) or by a
+    /// reclaim, never by a drain.
+    pub fn check_drain(config: &Config, resource: &ResourceId) -> Result<(), LeaseError> {
+        Self::check_host(config, resource)?;
+        if known_resource(config, resource)?.kind != ResourceKind::Shared {
+            return Err(LeaseError::NotShared {
+                resource: resource.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Acquires a manual lease on a host with a power section (an NFS server, or an exclusive
+    /// GPU host): the host is powered on if it is off (when its power is managed) and kept up
+    /// until the lease is released. Asking again returns the lease already held.
     pub fn acquire_manual_host(
         &mut self,
         config: &Config,
@@ -508,11 +516,27 @@ mod tests {
             .acquire_manual_model(&c, &"llm".into(), Millis(4))
             .unwrap();
         assert_eq!(m.lease.id.as_str(), "manual-model-2");
-        let e = b
+        // An exclusive host with a power section can be leased too, and listed; a drain of it
+        // is refused.
+        let x = b
             .acquire_manual_host(&c, &"cuda-central".into(), Millis(1))
-            .unwrap_err();
+            .unwrap();
+        assert!(x.created);
+        assert_eq!(x.lease.kind, LeaseKind::ManualHost);
+        assert_eq!(x.lease.resource.as_str(), "cuda-central");
+        assert!(
+            !b.acquire_manual_host(&c, &"cuda-central".into(), Millis(2))
+                .unwrap()
+                .created
+        );
+        assert_eq!(
+            b.release_manual_host(&"cuda-central".into()).unwrap(),
+            x.lease
+        );
+        let e = LeaseBook::check_drain(&c, &"cuda-central".into()).unwrap_err();
         assert_eq!(e.status(), 400);
         assert!(e.to_string().contains("not a shared resource"), "{e}");
+        assert!(LeaseBook::check_drain(&c, &"basestar-nfs".into()).is_ok());
         let e = b
             .acquire_manual_host(&c, &"nowhere".into(), Millis(1))
             .unwrap_err();

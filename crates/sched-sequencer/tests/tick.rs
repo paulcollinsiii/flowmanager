@@ -3372,3 +3372,94 @@ fn an_exclusive_host_is_shut_down_without_an_idle_drain() {
     );
     assert_eq!(d.state.resource(&rid(G)).unwrap().drain, None);
 }
+
+fn gpu_off() -> String {
+    "{ power: { phase: off }, mode: { phase: idle } }".into()
+}
+
+#[test]
+fn a_managed_exclusive_host_that_is_off_is_powered_on_only_for_a_manual_want() {
+    // Queued work wants a model but states no power want: the host is waited for, never woken.
+    let c = Case::new()
+        .gpu_state(&gpu_off())
+        .obs(up(G, false, 0))
+        .target(Some("whisperx"));
+    let d = c.run();
+    assert!(no_power_step(&d), "{:?}", d.steps);
+    assert!(
+        d.steps.contains(&wait(G, WaitReason::HostNotUp)),
+        "{:?}",
+        d.steps
+    );
+    assert_eq!(power_of(&d, G), PowerPhase::Off);
+    // The same with a host lease held: the planner states a manual want and the host is woken.
+    let d = c.clone().want(G, PowerWant::Manual).run();
+    assert!(
+        d.steps.contains(&Step::PowerOn { resource: rid(G) }),
+        "{:?}",
+        d.steps
+    );
+    assert!(d.state.resource(&rid(G)).unwrap().managed);
+}
+
+#[test]
+fn an_exclusive_host_held_by_a_host_lease_stays_up_idle_and_goes_down_after_the_lease_and_the_grace()
+ {
+    let host = lease_on("h", G, "{ type: manual_host }");
+    let gpu = format!(
+        "{{ power: {}, mode: {}, managed: true }}",
+        on(),
+        serving("llm", 60 * MIN)
+    );
+    // With the lease: the idle model is withdrawn (target none) and the host stays up, however
+    // long it idles.
+    let c = Case::new()
+        .gpu_state(&gpu)
+        .target(None)
+        .want(G, PowerWant::Manual)
+        .lease(host);
+    let mut d = c.run();
+    assert!(
+        d.steps.contains(&Step::DrainModel {
+            resource: rid(G),
+            model: mid("llm")
+        }),
+        "{:?}",
+        d.steps
+    );
+    for hours in 1..=4u64 {
+        d = c.run_fresh_at(&d.state, T + hours * 60 * MIN);
+        assert!(no_power_step(&d), "{hours}h: {:?}", d.steps);
+    }
+    // Released: no lease, no want. The model is withdrawn first (mode idle), the host's idle
+    // clock starts only then, and the shutdown comes one idle_grace (10m) later, never in the
+    // tick that withdrew the model.
+    let mut c = Case::new().gpu_state(&gpu).target(None);
+    let mut d = c.run();
+    assert!(
+        d.steps.contains(&Step::DrainModel {
+            resource: rid(G),
+            model: mid("llm")
+        }) && no_power_step(&d),
+        "{:?}",
+        d.steps
+    );
+    assert_eq!(d.state.resource(&rid(G)).unwrap().mode, ModePhase::Idle);
+    d = c.run_fresh_at(&d.state, T + MIN);
+    assert!(no_power_step(&d), "{:?}", d.steps);
+    d = c.run_fresh_at(&d.state, T + 5 * MIN);
+    assert!(no_power_step(&d), "{:?}", d.steps);
+    d = c.run_fresh_at(&d.state, T + 12 * MIN);
+    assert!(
+        d.steps.contains(&Step::PowerOff { resource: rid(G) }),
+        "{:?}",
+        d.steps
+    );
+    // Queued work holds the host too: with work for a class that needs the GPU, no shutdown.
+    c = Case::new()
+        .gpu_state(&managed_idle(60 * MIN))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 3, 0, 0))
+        .target(Some("mineru"));
+    let d = c.run();
+    assert!(!d.steps.contains(&Step::PowerOff { resource: rid(G) }));
+}

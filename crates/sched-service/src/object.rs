@@ -440,6 +440,17 @@ pub async fn release_host_lease<C: ObjectCtx>(
     ctx: &C,
     req: ReleaseHostLease,
 ) -> Result<Lease, HandlerError> {
+    if req.drain.is_some() {
+        // A drain is for shared hosts; read the config inside a journaled step so a replay
+        // gets the same answer.
+        let (s, resource) = (Arc::clone(shared), req.resource.clone());
+        let checked = ctx
+            .run_journaled("release_host_lease_check", move || {
+                LeaseBook::check_drain(&s.config.current(), &resource)
+            })
+            .await?;
+        checked.map_err(|e| lease_refused(&e))?;
+    }
     let mut book = read_leases(ctx)
         .await?
         .map_err(|e| unreadable(shared, &e))?;
@@ -528,7 +539,7 @@ pub async fn drain_host<C: ObjectCtx>(
             let (mut book, mut core) = (book, core);
             let config = s.config.current();
             let now = s.clock.now();
-            LeaseBook::check_host(&config, &req.resource)?;
+            LeaseBook::check_drain(&config, &req.resource)?;
             let released = book.release_manual_host(&req.resource).is_ok();
             drain::request(&mut core, &config, &req.resource, req.drain, now);
             let drain = core.state.resource(&req.resource).and_then(|st| st.drain);
@@ -1443,6 +1454,17 @@ mod tests {
         );
     }
 
+    /// The managed example with the GPU host left under manual control, so a GPU host reading
+    /// "up" is not adopted (tests of the shared-host machinery).
+    fn process_managed_nfs() -> (Arc<Shared>, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(Millis(T0)));
+        let holder = Arc::new(
+            ConfigHolder::new(&sched_model::test_support::example_yaml_managed_nfs_only()).unwrap(),
+        );
+        let s = Arc::new(Shared::new(holder, Arc::new(Metrics::new()), clock.clone()));
+        (s, clock)
+    }
+
     fn process_managed() -> (Arc<Shared>, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(Millis(T0)));
         let holder = Arc::new(
@@ -1470,7 +1492,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_manual_host_lease_is_stored_idempotent_and_wakes_a_managed_host() {
-        let (s, _) = process_managed();
+        let (s, _) = process_managed_nfs();
         let ctx = FakeCtx::default();
         world(&s, 0);
         // basestar is observed down: the lease asks for it to be powered on.
@@ -1528,13 +1550,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_exclusive_host_can_be_leased_and_woken_but_not_drained() {
+        let (s, _) = process_managed();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        // The GPU host is observed down: the lease asks for it to be powered on.
+        push(
+            &s,
+            "cluster-pods",
+            vec![ObservedValue::ResourceUp {
+                resource: "cuda-central".into(),
+                up: false,
+            }],
+        );
+        let g = acquire_host_lease(&s, &ctx, req("cuda-central"))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert!(g.created);
+        assert_eq!(g.lease.kind, sched_model::LeaseKind::ManualHost);
+        assert_eq!(g.lease.resource.as_str(), "cuda-central");
+        let listed = list_leases(&s, ctx.stored(LEASES_KEY).as_deref()).unwrap();
+        assert_eq!(listed, vec![g.lease.clone()]);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert!(r.kinds.contains(&"power_on".to_string()), "{r:?}");
+        assert_eq!(
+            *ctx.powers.lock().unwrap(),
+            [("cuda-central".to_string(), PowerAction::On)]
+        );
+        // A drain is refused, with a request to release the lease instead; nothing changes.
+        let e = release_host_lease(&s, &ctx, release("cuda-central", Some(DrainMode::Graceful)))
+            .await
+            .unwrap_err();
+        assert!(
+            refused(&e).contains("not a shared resource")
+                && refused(&e).contains("releasing its host lease"),
+            "{}",
+            refused(&e)
+        );
+        let e = drain_host(
+            &s,
+            &ctx,
+            DrainHost {
+                resource: "cuda-central".into(),
+                drain: DrainMode::Immediate,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(refused(&e).contains("not a shared resource"), "{e:?}");
+        ctx.commit();
+        let gpu_leases = |ctx: &FakeCtx| {
+            list_leases(&s, ctx.stored(LEASES_KEY).as_deref())
+                .unwrap()
+                .into_iter()
+                .filter(|l| l.resource.as_str() == "cuda-central")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(gpu_leases(&ctx), vec![g.lease.clone()]);
+        // A plain release is stored.
+        let released = release_host_lease(&s, &ctx, release("cuda-central", None))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert_eq!(released, g.lease);
+        assert!(gpu_leases(&ctx).is_empty());
+    }
+
+    #[tokio::test]
     async fn host_lease_and_reclaim_requests_are_validated_against_the_active_config() {
         let (s, _) = process_managed();
         let ctx = FakeCtx::default();
-        for (resource, text) in [
-            ("nowhere", "unknown resource"),
-            ("cuda-central", "not a shared resource"),
-        ] {
+        for (resource, text) in [("nowhere", "unknown resource")] {
             let e = acquire_host_lease(&s, &ctx, req(resource))
                 .await
                 .unwrap_err();
@@ -1602,7 +1690,7 @@ mod tests {
     #[tokio::test]
     async fn releasing_a_host_lease_with_a_drain_stores_it_with_the_release_and_a_retry_reuses_the_journal()
      {
-        let (s, clock) = process_managed();
+        let (s, clock) = process_managed_nfs();
         let ctx = FakeCtx::default();
         world(&s, 0);
         // The host is found running and adopted; the person's switch-off releases that lease.
@@ -1679,7 +1767,7 @@ mod tests {
     #[tokio::test]
     async fn drain_host_works_with_or_without_a_lease_changes_the_mode_in_place_and_refuses_what_cannot_drain()
      {
-        let (s, clock) = process_managed();
+        let (s, clock) = process_managed_nfs();
         let ctx = FakeCtx::default();
         world(&s, 0);
         tick(&s, &ctx).await.unwrap();
@@ -1803,13 +1891,15 @@ mod tests {
             "another resource's state is untouched"
         );
         assert_eq!(after.reported, before.reported);
-        // The next tick finds it running: up, and not ours to power off.
+        // The next tick finds it running: up, and adopted like any managed host found running
+        // (an exclusive one too), which holds it up for the person who fixed it.
         world(&s, 0);
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
         assert!(r.power_failed.is_empty(), "{r:?}");
+        assert!(r.adopted.contains(&"cuda-central".into()), "{r:?}");
         let gpu = r.state.resource(&"cuda-central".into()).unwrap();
-        assert!(gpu.is_on() && !gpu.managed, "{gpu:?}");
+        assert!(gpu.is_on() && gpu.managed, "{gpu:?}");
         assert!(
             ctx.powers.lock().unwrap().is_empty(),
             "resuming powers nothing by itself"

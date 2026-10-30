@@ -1,0 +1,64 @@
+description: "A managed exclusive GPU host is powered on only by a manual host lease; with the lease held the queues still choose the model, and after the release the host goes down once idle."
+# The power machine as under managed control (M4).
+power_control: managed
+frames:
+  # Queued OCR work, the GPU host down, no lease: nothing wakes it.
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: false } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 3, in_flight: 0, oldest_ready_at: 99000000 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    expect:
+      steps: [{ type: wait, resource: cuda-central, reason: host_not_up }]
+  # A host lease: the host is powered on.
+  - at: 100010000
+    refresh: true
+    leases:
+      - { id: user-gpu, resource: cuda-central, granted_at: 100010000, kind: { type: manual_host } }
+    expect:
+      steps: [{ type: power_on, resource: cuda-central }]
+  # Observed up: the queue (OCR) chooses mineru; the lease pins nothing.
+  - at: 100040000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+    expect:
+      steps: [{ type: allow_model, resource: cuda-central, model: mineru }]
+      allowed: { models: [mineru], classes: [immich-server, paperless-gpt, paperless-ngx, paperless-ocr] }
+  # The work is done: the model is released after idle_grace, the host stays up on the lease.
+  - at: 100050000
+    refresh: true
+    observe:
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+    expect:
+      steps: []
+  - at: 100700000
+    refresh: true
+    expect:
+      steps:
+        - { type: drain_model, resource: cuda-central, model: mineru }
+        - { type: pause_intake, class: paperless-ocr }
+  - at: 103000000
+    refresh: true
+    expect:
+      steps: []
+  # Released (a plain release): the host's idle clock starts, and idle_grace later it goes down.
+  - at: 103010000
+    refresh: true
+    leases: []
+    expect:
+      steps: []
+  - at: 103700000
+    refresh: true
+    expect:
+      steps: [{ type: power_off, resource: cuda-central }]

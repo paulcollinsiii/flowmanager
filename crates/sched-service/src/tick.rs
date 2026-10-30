@@ -2396,7 +2396,7 @@ mod tests {
     // ---- adoption of a host found running, and the drain ----
 
     fn managed_world() -> (Arc<Shared>, Arc<ManualClock>) {
-        shared_with(&sched_model::test_support::example_yaml_managed())
+        shared_with(&sched_model::test_support::example_yaml_managed_nfs_only())
     }
 
     fn nfs_probe(s: &Shared, up: bool) {
@@ -2493,6 +2493,150 @@ mod tests {
         let r = s2.tick(clock2.now(), &mut d2);
         assert!(r.adopted.is_empty(), "{r:?}");
         assert!(d2.leases.is_empty());
+    }
+
+    // ---- a managed exclusive host: adoption, and only a host lease wakes it ----
+
+    /// The example with both hosts under managed control.
+    fn managed_world_all() -> (Arc<Shared>, Arc<ManualClock>) {
+        shared_with(&sched_model::test_support::example_yaml_managed())
+    }
+
+    fn gpu() -> ResourceId {
+        "cuda-central".into()
+    }
+
+    /// The pods source's reading of the GPU host (and the models, with no pods).
+    fn gpu_reading(s: &Shared, up: bool) {
+        let mut v: Vec<ObservedValue> = ["mineru", "llm", "whisperx", "immich-ml"]
+            .iter()
+            .map(|m| ObservedValue::ModelPods {
+                model: (*m).into(),
+                pods: 0,
+                ready_pods: 0,
+            })
+            .collect();
+        v.push(ObservedValue::ResourceUp {
+            resource: "cuda-central".into(),
+            up,
+        });
+        push(s, "cluster-pods", v);
+    }
+
+    #[test]
+    fn an_exclusive_managed_host_found_running_is_adopted_once_and_not_again_after_a_blip() {
+        let (s, clock) = managed_world_all();
+        let mut d = Durable::default();
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.adopted.contains(&gpu()) && r.adopted.contains(&nfs()),
+            "{r:?}"
+        );
+        let host_lease = |d: &Durable| {
+            d.leases
+                .iter()
+                .filter(|l| l.resource == gpu() && l.is_adopted_host())
+                .count()
+        };
+        assert_eq!(host_lease(&d), 1, "{:?}", d.leases);
+        let st = d.state.resource(&gpu()).unwrap();
+        assert!(st.managed && st.is_on(), "{st:?}");
+        // Once only.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.adopted.is_empty() && r.adoptions_ended.is_empty(),
+            "{r:?}"
+        );
+        // Seen down by hand: the claim ends and the host is not woken.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        gpu_reading(&s, false);
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.adoptions_ended, vec![gpu()], "{r:?}");
+        assert_eq!(host_lease(&d), 0);
+        assert!(
+            !r.steps.iter().any(|s| matches!(s, Step::PowerOn { .. })),
+            "{r:?}"
+        );
+        // Back up: found running again, adopted afresh.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(r.adopted.contains(&gpu()), "{r:?}");
+        // A host flowmanager powered on that is read down for a moment and then up again
+        // is not adopted (its `managed` flag is still set).
+        d.leases.retain(|l| l.resource != gpu());
+        let st = d.state.resources.get_mut(&gpu()).unwrap();
+        st.power = PowerPhase::Off;
+        st.managed = true;
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(!r.adopted.contains(&gpu()), "{r:?}");
+        assert_eq!(host_lease(&d), 0);
+    }
+
+    #[test]
+    fn only_a_host_lease_powers_an_exclusive_managed_host_on_and_the_queues_still_choose_the_model()
+    {
+        let (s, clock) = managed_world_all();
+        let mut d = Durable::default();
+        // The GPU host is down: queued work, a failed item and an interactive session do not
+        // wake it.
+        let off = || {
+            let mut st = sched_model::ResourceState::new(PowerPhase::Off);
+            st.managed = false;
+            st
+        };
+        d.state.resources.insert(gpu(), off());
+        let down = |s: &Shared| {
+            world(s, Some(0));
+            gpu_reading(s, false);
+            ocr_demand(s, 5);
+        };
+        down(&s);
+        d.leases.push(Lease {
+            id: "interactive-1".into(),
+            resource: gpu(),
+            kind: sched_model::LeaseKind::Interactive {
+                model: "llm".into(),
+                expires_at: Millis(clock.now().as_u64() + 3_600_000),
+            },
+            granted_at: clock.now(),
+        });
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            !r.steps
+                .iter()
+                .any(|s| matches!(s, Step::PowerOn { resource } if *resource == gpu())),
+            "{r:?}"
+        );
+        assert!(r.allowed_models.is_empty(), "{r:?}");
+        d.leases.retain(|l| l.resource != gpu());
+        // A host lease: the host is powered on, and then the queued work (ocr: mineru) picks
+        // the model; the lease pins nothing.
+        d.leases.push(Lease {
+            id: "manual-host-1".into(),
+            resource: gpu(),
+            kind: sched_model::LeaseKind::ManualHost,
+            granted_at: clock.now(),
+        });
+        clock.advance(Millis(10_000));
+        down(&s);
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.steps.contains(&Step::PowerOn { resource: gpu() }),
+            "{r:?}"
+        );
+        clock.advance(Millis(10_000));
+        world(&s, Some(0));
+        ocr_demand(&s, 5);
+        let r = s.tick(clock.now(), &mut d);
+        assert!(r.forced.is_empty(), "{r:?}");
+        assert_eq!(r.allowed_models, vec!["mineru".into()], "{r:?}");
     }
 
     #[test]

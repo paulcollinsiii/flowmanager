@@ -6,7 +6,7 @@
 //! adopt and which adopted leases to drop. The service applies them before the tick, so the
 //! tick's planner and sequencer see the result and a replayed tick sees the same.
 //!
-//! A host is found running when it is shared, has a power section under `control: managed`,
+//! A host is found running when it (shared or exclusive) has a power section under `control: managed`,
 //! a fresh reading says it is up, and flowmanager did not power it on: the previous state
 //! has no entry for it (first start, discarded state), has it off (a power button, a manual
 //! Wake-on-LAN, a host that went down and came back), has it in a failed power-on that
@@ -19,7 +19,7 @@
 
 use sched_model::{
     ADOPTED_HOST_PREFIX, Config, Lease, LeaseId, LeaseKind, Millis, PowerPhase, ResourceId,
-    ResourceKind, SchedState, Snapshot,
+    SchedState, Snapshot,
 };
 
 /// The id of the adopted lease of `resource`.
@@ -39,7 +39,7 @@ pub fn found_running(
     config
         .resources()
         .iter()
-        .filter(|r| r.kind == ResourceKind::Shared && r.power.is_some())
+        .filter(|r| r.power.is_some())
         .filter(|r| config.power_managed(&r.id))
         .filter(|r| snapshot.fresh_resource_up(config, &r.id, max_age) == Some(true))
         .filter(|r| match prev.resource(&r.id) {

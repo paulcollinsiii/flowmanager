@@ -136,7 +136,7 @@ What is carried out and what is not:
   it on, including a manual model lease. A powering-on or shutting-down phase left in the
   persisted state by managed control (including a failed one, see *Power actions*) converges to the observed phase. `managed` (the
   scheduler powers hosts on and off) is described under *Power actions* below. Under
-  `managed`, a shared host found running is adopted: held by the user through a manual host
+  `managed`, a host found running (shared or exclusive) is adopted: held by the user through a manual host
   lease until they switch it off (see *Host leases, reclaim and resume*).
 - **Stopping in-flight work has no actuator.** The
   sequencer still takes these steps (its state moves on as if they happened), and each one
@@ -588,7 +588,7 @@ harmless to repeat).
   resume*). A host that comes back down to `off` while work is queued is then
   treated like any off host (a manual lease or a power-changing class may wake it, as before).
   A host that comes back up out of a failed power-on is treated like a host found running,
-  not as one flowmanager powered on: the recovery itself never powers it off. For a shared
+  not as one flowmanager powered on: the recovery itself never powers it off. For a host (shared or exclusive)
   host under `control: managed` that means it is **adopted** (see *Host leases, reclaim and
   resume*): a manual host lease is minted, which takes responsibility for the host, and
   releasing it (plus the idle grace) powers the host off. Any other found-running host is
@@ -707,8 +707,8 @@ counted under `unknown`).
 | `last_decision` | yes (shared) | The latest tick report this process published (`null` until its first tick), without waiting behind a tick. |
 | `acquire_model_lease` | yes | Acquires a manual model lease. |
 | `release_lease` | yes | Releases a lease by id. |
-| `acquire_host_lease` | yes | Acquires a manual lease on a shared host (`{"resource": "basestar-nfs"}`). |
-| `release_host_lease` | yes | Releases the manual host lease of a resource (`{"resource": ...}`); with `"drain": "graceful"` or `"immediate"` it also takes the host down despite queued work (see *Host leases*). |
+| `acquire_host_lease` | yes | Acquires a manual lease on a host with a power section, shared or exclusive (`{"resource": "basestar-nfs"}`). |
+| `release_host_lease` | yes | Releases the manual host lease of a resource (`{"resource": ...}`); with `"drain": "graceful"` or `"immediate"` it also takes a shared host down despite queued work (see *Host leases*; refused for an exclusive host, whose release is always plain). |
 | `reclaim` | yes | Reclaims an exclusive resource with a power section (`{"resource": "cuda-central"}`). |
 | `jobs` | yes (shared) | Every configured scheduled job with its state (see *Scheduled jobs*). |
 | `trigger_job` | yes | Starts a run of a scheduled job now (`{"id": "backup"}`); `409` while the previous instance is pending or running, `404` for an unknown job. |
@@ -773,18 +773,28 @@ a release with nothing to release and `409` for a `resume` with nothing to resum
 a tick. Like the other lease handlers they are public on the Restate ingress: keep it on a
 trusted network.
 
-- **Manual host lease** (`acquire_host_lease` / `release_host_lease`): a hold on a *shared*
-  resource with a `power` section, typically the NFS host. It wakes the host when it is off
+- **Manual host lease** (`acquire_host_lease` / `release_host_lease`): a hold on a resource with
+  a `power` section, typically the NFS host (shared) or a GPU host (exclusive). It wakes the host when it is off
   (under `managed`; under `manual` it waits for a person to power it on), keeps it up until it
   is released, and, because the host is up, allows everything gated on it (the NFS-only
   consumers and the gate classes that require it) even with no work queued, so their queues
-  become visible. Asking again returns the lease (`"created": false`); an exclusive resource
-  is refused (lease its models instead). Ids are `manual-host-<n>`. Released, the host is
+  become visible. Asking again returns the lease (`"created": false`). Ids are `manual-host-<n>`.
+  Released, the host is
   shut down only when nothing else holds it (a shared hold, another lease, queued or
   in-flight work of a class that needs it), `idle_grace` has passed and the mount check above
   passes; two holders keep it up until both are gone.
+  **On an exclusive host** (a GPU, `cuda-central`) the lease only powers the host on and keeps
+  it up: the queues still choose the model, nothing is pinned (a manual *model* lease pins one).
+  Nothing else powers an exclusive managed host on except a manual host or model lease or a class
+  with `may_change_power`: queued work, failed items, an interactive session and a job whose needs
+  are on a shared host leave it down. Releasing is always a plain release: there is no drain on an
+  exclusive host (`release_host_lease` with `drain`, and `drain_host`, are refused with `400`),
+  queued or in-flight work holds the host until it is idle, and `idle_grace` after the model is
+  withdrawn it is shut down. The forced "off now" for a GPU is the reclaim. The shutdown happens
+  only with the mode idle (the model already withdrawn, so KEDA is scaling its pods down), and
+  there is no further wait for the pods to be gone: the only delay between the two is `idle_grace`.
 - **A host found running is adopted** (a changed default: it used to be left alone for ever,
-  so a host switched on by hand stayed up until a person shut it down). For a shared host with
+  so a host switched on by hand stayed up until a person shut it down). For a host (shared or exclusive) with
   `power.control: managed`, when a fresh reading shows it up and flowmanager did not power it
   on, it counts as held by the user and the tick mints the same manual host lease for it
   (id `adopted-host-<resource>`, listed by `leases`). "Did not power it on" is read from the
@@ -808,7 +818,9 @@ trusted network.
   lease nobody asked for. The tick report lists `adopted` and `adoptions_ended`, and the log
   has `event="host_adopted"` and `event="host_adoption_ended"`. Under `control: manual`
   nothing changes: the host is never adopted and never powered off. After a `resume` the
-  host is found running again and is adopted at the next tick.
+  host is found running again and is adopted at the next tick. An exclusive host found running
+  (the GPU box switched on by hand) is adopted too, so it stays up until its lease is released
+  (or it is seen down); only then does the idle shutdown apply.
 - **Drain on release** (`release_host_lease` with `"drain": "graceful"` or `"immediate"`;
   absent means the behaviour above). A person who switches a host off does not want queued
   work to hold it up. A drain releases the manual lease and records the request in the host's
@@ -835,7 +847,7 @@ trusted network.
   queued work can be taken down too. Asked again, it changes the drain under way in place,
   from the stored state (also right after a restart): `immediate` escalates, `graceful` leaves
   an immediate drain as it is, the start and the scale-down are kept. Only a shared host with a
-  power section is accepted (`400` otherwise).
+  power section is accepted (`400` otherwise: an exclusive host has no drain, see below).
   **Rollback caveat:** a state holding a drain has a field an older build cannot decode (the
   state version was not bumped, as the field is absent when unset), so a rollback while a drain
   is under way makes the older build report the persisted state unreadable until the drain
@@ -883,7 +895,7 @@ trusted network.
   failed power phase, or whose shutdown was stopped by mounting pods, and forgets that
   resource's state so the sequencer starts it afresh from observation, as for a resource it
   has not seen: found running is up and *not managed* (flowmanager will not power it off on
-  account of an earlier action; a shared host under `control: managed` is then adopted, see
+  account of an earlier action; a host under `control: managed`, shared or exclusive, is then adopted, see
   above), found down is off. It powers nothing on or off itself, does
   not touch any other resource's state or the leases, and is logged at warn level
   (`event="power_resumed"`). `409` if the resource is not stopped (including a host that is
@@ -921,7 +933,7 @@ CA); the token and the network policy are the controls. Open WebUI itself is not
 | --- | --- |
 | `GET /v1/leases` | every model, powered resource and reclaimable resource with its state, and `needs_attention` |
 | `GET /v1/models/{model}`, `POST .../on`, `.../off` | the manual model lease (on = held, not "loaded") |
-| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release`, `POST .../resume` | the manual host lease (a host found running reads on, see *adopted*); `off` releases it with a graceful drain, `off-now` with an immediate one, `release` plainly with no drain (`404` if none is held; the reply reads `on` while the host is up); `resume` clears a stopped power phase |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release`, `POST .../resume` | the manual host lease (a host found running reads on, see *adopted*); on a shared host `off` releases it with a graceful drain and `off-now` with an immediate one; on an exclusive host `off` is a plain release and `off-now` is refused (`400`); `release` plainly with no drain (`404` if none is held; the reply reads `on` while the host is up); `resume` clears a stopped power phase |
 | `GET /v1/reclaims/{resource}`, `POST .../on`, `.../off` | `reclaim` / `unreclaim` of an exclusive resource with a power section |
 
 `POST /v1/<kind>/{name}` with the body `ON` or `OFF` is the same as `/on` and `/off`. On and

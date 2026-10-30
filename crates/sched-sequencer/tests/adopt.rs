@@ -54,8 +54,8 @@ fn found_with(
 #[test]
 fn a_shared_host_found_up_without_having_been_powered_on_by_us_is_adopted() {
     let config = example_config_managed();
-    let up = snapshot(Some(true), Some(true), &[]);
-    // First start, or discarded state: no entry. Only the shared host; the GPU host is exclusive.
+    let up = snapshot(Some(true), None, &[]);
+    // First start, or discarded state: no entry. The shared host.
     assert_eq!(found(&config, &up, &SchedState::default()), vec![N]);
     // A host that was off (a power button, Wake-on-LAN, or it went down and came back).
     let off = state("{ power: { phase: off }, mode: { phase: idle } }");
@@ -178,4 +178,79 @@ fn a_host_we_powered_on_that_went_down_for_a_moment_is_not_found_running_when_it
     // Off after our own shutdown, or found down: adopted when it comes back.
     let after = state("{ power: { phase: off }, mode: { phase: idle } }");
     assert_eq!(found(&config, &up, &after), vec![N]);
+}
+
+fn gpu_state(gpu: &str) -> SchedState {
+    let y =
+        format!("description: t\nsnapshot: {{ now: 0 }}\nstate:\n  resources:\n    {G}: {gpu}\n");
+    Fixture::from_yaml(&y).unwrap().state
+}
+
+#[test]
+fn an_exclusive_managed_host_found_up_is_adopted_like_a_shared_one() {
+    let config = example_config_managed();
+    let up = snapshot(Some(true), Some(true), &[]);
+    assert_eq!(
+        found(&config, &up, &SchedState::default()),
+        vec![G, N],
+        "first start: both hosts are found running"
+    );
+    let gpu_up = snapshot(None, Some(true), &[]);
+    assert_eq!(found(&config, &gpu_up, &SchedState::default()), vec![G]);
+    // Off after a shutdown we started (not managed), or a power-on that failed: adopted.
+    let off = gpu_state("{ power: { phase: off }, mode: { phase: idle } }");
+    assert_eq!(found(&config, &gpu_up, &off), vec![G]);
+    let failed = gpu_state(
+        "{ power: { phase: failed, since: 5, during: powering_on }, mode: { phase: idle } }",
+    );
+    assert_eq!(found(&config, &gpu_up, &failed), vec![G]);
+    // Down, or no reading: nothing.
+    assert!(
+        found(
+            &config,
+            &snapshot(None, Some(false), &[]),
+            &SchedState::default()
+        )
+        .is_empty()
+    );
+    assert!(found(&config, &snapshot(None, None, &[]), &SchedState::default()).is_empty());
+    // A manual host lease already held: not adopted again.
+    let lease = "{ id: m, resource: cuda-central, granted_at: 1, kind: { type: manual_host } }";
+    let leased = snapshot(None, Some(true), &[lease]);
+    assert!(found_with(&config, &leased, &SchedState::default(), &leased.leases).is_empty());
+}
+
+#[test]
+fn an_exclusive_host_flowmanager_powered_on_or_that_blipped_down_and_back_is_not_adopted() {
+    let config = example_config_managed();
+    let up = snapshot(None, Some(true), &[]);
+    for (name, s) in [
+        (
+            "we powered it on",
+            "{ power: { phase: powering_on, since: 5 }, mode: { phase: idle }, managed: true }",
+        ),
+        (
+            "restart with persisted state",
+            "{ power: { phase: \"on\", since: 5 }, mode: { phase: serving, model: llm, since: 5 }, managed: true }",
+        ),
+        (
+            "down for a moment with the flag still set",
+            "{ power: { phase: off }, mode: { phase: idle }, managed: true }",
+        ),
+        (
+            "shutting down",
+            "{ power: { phase: shutting_down, since: 5 }, mode: { phase: idle } }",
+        ),
+    ] {
+        assert!(found(&config, &up, &gpu_state(s)).is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn an_exclusive_host_under_manual_control_is_never_adopted() {
+    // The GPU host is `control: manual` while the NFS host is managed.
+    let config = Config::from_yaml(&sched_model::test_support::example_yaml_managed_nfs_only())
+        .expect("valid");
+    let up = snapshot(Some(true), Some(true), &[]);
+    assert_eq!(found(&config, &up, &SchedState::default()), vec![N]);
 }

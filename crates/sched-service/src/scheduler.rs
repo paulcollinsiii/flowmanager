@@ -16,8 +16,8 @@
 //!   re-schedules itself with a delayed send to itself; `arm_backstop` starts a new chain
 //!   and bumps an epoch kept in the object's state, so a chain started earlier (before a
 //!   restart, say) sees a stale epoch and ends instead of doubling the ticks.
-//! - `acquire_host_lease` / `release_host_lease`: a manual lease on a shared host (an NFS
-//!   server): it powers a managed host on and keeps it up. `reclaim` / `unreclaim`: take an
+//! - `acquire_host_lease` / `release_host_lease`: a manual lease on a host with a power section (an NFS
+//!   server, or a GPU host): it powers a managed host on and keeps it up. `reclaim` / `unreclaim`: take an
 //!   exclusive resource with a power section back, and give it up again. `resume`: for a
 //!   person who fixed a host by hand, clears what flowmanager stopped at on one resource (a
 //!   failed power transition, or a shutdown stopped by mounting pods) so it follows
@@ -307,10 +307,11 @@ impl Scheduler {
         ))
     }
 
-    /// Acquires a manual lease on a shared host (an NFS server): a managed host that is off
-    /// is powered on and everything gated on it is allowed once it is up; the host is kept up
-    /// until the lease is released. Asking again returns the same lease; an exclusive
-    /// resource, one without a power section or an unknown one is refused (400).
+    /// Acquires a manual lease on a host with a power section, shared (an NFS server) or
+    /// exclusive (a GPU): a managed host that is off is powered on and everything gated on it
+    /// is allowed once it is up; the host is kept up until the lease is released (on an
+    /// exclusive host the queues still choose the model). Asking again returns the same
+    /// lease; a resource without a power section or an unknown one is refused (400).
     #[handler]
     async fn acquire_host_lease(
         &self,
@@ -324,7 +325,8 @@ impl Scheduler {
 
     /// Releases the manual host lease on a resource and returns it; none held is refused
     /// (404). The host is then shut down only once nothing holds it, idle grace has passed and
-    /// no pod mounts it. With `"drain": "graceful"` or `"immediate"` the host is taken down
+    /// no pod mounts it. With `"drain": "graceful"` or `"immediate"` (a shared host only; an
+    /// exclusive host has no drain: its release is always plain) the host is taken down
     /// even though work is queued or in flight: its consumers are scaled down (at once, or
     /// after at most `drain_timeout` for graceful) and it is shut down once no lease holds it
     /// and no pod mounts it; a new manual host lease cancels the drain.
@@ -339,7 +341,7 @@ impl Scheduler {
         ))
     }
 
-    /// Takes a shared host down on request, with or without a manual lease held: releases
+    /// Takes a shared host down on request (an exclusive one is refused: release its host lease), with or without a manual lease held: releases
     /// the lease if there is one and records a drain (`graceful` or `immediate`; see
     /// `release_host_lease`). Asking again changes the mode of the drain under way
     /// (`immediate` escalates, `graceful` leaves an immediate one). Answers the drain recorded,
