@@ -1,7 +1,7 @@
 # Host power model: plan (draft v0)
 
-Status: **draft for discussion**, branch `refactor/power-model`, based on main @ 689ab82.
-Nothing here is decided until the open decisions at the end are answered.
+Status: **decisions complete, awaiting phase 1**, branch `refactor/power-model`, based on main @ 689ab82.
+All decisions are recorded in section 3 (2026-10-30).
 
 This document is the single description of how flowmanager owns and changes a host's
 power. It exists because five features (adoption, drain on release, `drain_host`, idle
