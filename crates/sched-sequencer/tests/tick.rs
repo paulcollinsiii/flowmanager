@@ -585,8 +585,7 @@ fn a_switch_withdraws_the_old_model_and_allows_the_new_one_in_the_same_tick() {
 /// The example config without the whisperx model and the class that needs it.
 fn without_whisperx() -> Config {
     let yaml = managed_yaml();
-    let line =
-        "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx] }\n";
+    let line = "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx], namespaces: [ai] }\n";
     let start = yaml.find("  - id: speakr-transcription\n").unwrap();
     let end = start + yaml[start..].find("\n\n").unwrap() + 2;
     let y = format!("{}{}", &yaml[..start], &yaml[end..]).replace(line, "");

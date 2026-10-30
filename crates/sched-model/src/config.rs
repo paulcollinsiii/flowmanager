@@ -121,6 +121,14 @@ pub struct ModelSpec {
     pub load_time: Millis,
     /// Names of the scaled workloads that implement this model.
     pub workloads: Vec<String>,
+    /// The namespaces the model's workloads run in. The pods veto before a power-off counts
+    /// the model as unused only when every one of them is watched by a `pods` source (its
+    /// `namespaces`): the observer sees pods of the watched namespaces only, and a workload
+    /// elsewhere would read as zero pods without anyone having looked. Without them (or with
+    /// one unwatched) the model's pods are unknown to the veto. A managed host whose models are
+    /// not covered is refused at load.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,8 +247,10 @@ impl SourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Pod counts of models (`model_pods`). Information only: no decision reads them
-    /// (Kubernetes enforces GPU exclusivity).
+    /// Pod counts of models (`model_pods`). Two decisions read them and no others: recovery
+    /// waits for a ready pod, and the veto before a power-off of the host waits for zero pods
+    /// of every model of the host (Kubernetes enforces GPU exclusivity, so no model switch
+    /// waits for pods). A model counts as seen only where its `namespaces` are watched.
     Pods,
     /// Whether a powered host is reachable and up (`resource_up`): kubelet/node readiness
     /// for cluster nodes, a TCP connect probe (or a probe read through Prometheus) for hosts
@@ -275,15 +285,6 @@ impl VetoReading {
             VetoReading::Mounts => "mounts",
             VetoReading::Pods => "pods",
         }
-    }
-
-    /// The readings joined for a label: `mounts`, `pods` or `mounts+pods`.
-    pub fn label(readings: &[VetoReading]) -> String {
-        readings
-            .iter()
-            .map(|r| r.as_str())
-            .collect::<Vec<_>>()
-            .join("+")
     }
 }
 
@@ -513,6 +514,23 @@ impl Config {
                 .sources
                 .iter()
                 .any(|s| s.observe.contains(&Capability::Pods))
+    }
+
+    /// Whether the pods of `model` can be seen by a `pods` source: the model names the
+    /// namespaces its workloads run in, and every one of them is listed in the `namespaces`
+    /// of some source declaring `pods`. "Covered" means this and nothing less; a model that is
+    /// not covered reads as unknown to the veto, never as zero pods.
+    pub fn model_pods_covered(&self, model: &ModelSpec) -> bool {
+        !model.namespaces.is_empty()
+            && model.namespaces.iter().all(|ns| {
+                self.sources.iter().any(|s| {
+                    s.observe.contains(&Capability::Pods)
+                        && s.kube_watch_params()
+                            .ok()
+                            .flatten()
+                            .is_some_and(|p| p.namespaces.contains(ns))
+                })
+            })
     }
 
     /// The readings the veto before a power-off of `id` needs, in a fixed order. Empty: the

@@ -300,7 +300,12 @@ impl Snapshot {
             let counts: Vec<Option<u32>> = config
                 .models_of(resource)
                 .map(|m| {
-                    self.fresh_model_pods(config, &m.id, max_age)
+                    // A model whose workloads the pods source cannot see reads as zero pods
+                    // there without anyone having looked: unknown, not zero.
+                    config
+                        .model_pods_covered(m)
+                        .then(|| self.fresh_model_pods(config, &m.id, max_age))
+                        .flatten()
                         .map(|(pods, _)| pods)
                 })
                 .collect();
@@ -433,6 +438,19 @@ impl HostUse {
         self.applying().all(|u| u == ReadingUse::Unused)
     }
 
+    /// The readings that are not showing the host unused, with what they show (`InUse` or
+    /// `Unknown`), in the order mounts, pods. Empty exactly when the host `is_unused`.
+    pub fn blocking(&self) -> Vec<(crate::config::VetoReading, ReadingUse)> {
+        use crate::config::VetoReading;
+        [
+            (VetoReading::Mounts, self.mounts),
+            (VetoReading::Pods, self.pods),
+        ]
+        .into_iter()
+        .filter_map(|(r, u)| u.filter(|u| *u != ReadingUse::Unused).map(|u| (r, u)))
+        .collect()
+    }
+
     /// Whether a fresh reading shows the host in use. Otherwise a host that is not unused has
     /// an unknown reading.
     pub fn is_in_use(&self) -> bool {
@@ -544,6 +562,20 @@ mod tests {
         let u = use_of(busy);
         assert_eq!(u.pods, Some(ReadingUse::InUse));
         assert!(u.is_in_use());
+        assert_eq!(
+            u.blocking(),
+            vec![(crate::config::VetoReading::Pods, ReadingUse::InUse)]
+        );
+        // A model whose workloads no pods source watches reads as zero pods without anyone
+        // having looked: unknown to the veto, however fresh its zero.
+        let uncovered = Config::from_yaml(&crate::test_support::EXAMPLE_CONFIG.replace(
+            "workloads: [mineru], namespaces: [ai]",
+            "workloads: [mineru], namespaces: [elsewhere]",
+        ))
+        .unwrap();
+        let u = snap(all(900, 0)).host_use(&uncovered, &gpu, Millis(500));
+        assert_eq!(u.pods, Some(ReadingUse::Unknown));
+        assert!(!u.is_unused());
         // No readings at all: unknown, never unused.
         assert_eq!(use_of(vec![]).pods, Some(ReadingUse::Unknown));
         // The NFS host has no models: only its mounts reading applies, and unknown is not

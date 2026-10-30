@@ -218,7 +218,7 @@ impl Metrics {
         let veto_timeouts = IntCounterVec::new(
             Opts::new(
                 "sched_veto_timeouts_total",
-                "Shutdowns that waited longer than the resource's veto_timeout for the veto to clear (pods still mounting its NFS server or running its models, or the reading unknown), by resource and reading (mounts, pods, or mounts+pods). Each one raised the shutdown_veto_timeout alert and the scheduler stopped: the host stays up and is not shut down by flowmanager again until a person acts or a new manual request takes it over",
+                "Shutdowns that waited longer than the resource's veto_timeout for the veto to clear (pods still mounting its NFS server or running its models, or the reading unknown), by resource and the reading still blocking (mounts or pods; one count per blocking reading). Each one raised the shutdown_veto_timeout alert and the scheduler stopped: the host stays up and is not shut down by flowmanager again until a person acts or a new manual request takes it over",
             ),
             &["resource", "reading"],
         )
@@ -226,7 +226,7 @@ impl Metrics {
         let veto_gauge = GaugeVec::new(
             Opts::new(
                 "sched_resource_veto",
-                "1 while a shutdown of the resource is held back by the veto (a pod still mounts its NFS server or runs its models, or the reading is unknown; state waiting, bounded by veto_timeout), or because that wait timed out and flowmanager stopped (state stopped; a person must act), else 0, by resource, reading (mounts, pods, or mounts+pods) and state. Only resources with a veto reading have a series. Alert on stopped being 1",
+                "1 while a shutdown of the resource is held back by the veto (a pod still mounts its NFS server or runs its models, or the reading is unknown; state waiting, bounded by veto_timeout), or because that wait timed out and flowmanager stopped (state stopped; a person must act), else 0, by resource, reading (mounts or pods) and state: waiting is 1 on the reading(s) still blocking, stopped is 1 on every reading of the host. Only resources with a veto reading have series. Alert on stopped being 1",
             ),
             &["resource", "reading", "state"],
         )
@@ -605,23 +605,34 @@ impl Metrics {
             .inc();
     }
 
-    /// Sets `sched_resource_veto` from the state: per resource for which `reading` gives a
-    /// label (its veto readings, see `VetoReading::label`; `None` for a host with no veto),
-    /// 1 for the state it is in (waiting or stopped) and 0 for the other; resources that no
-    /// longer have a veto, or a different set of readings, lose their old series.
-    pub fn set_veto(&self, state: &SchedState, reading: impl Fn(&ResourceId) -> Option<String>) {
+    /// Sets `sched_resource_veto` from the state: one series per reading that applies to a
+    /// resource (`readings`: `mounts`, `pods`; none for a host with no veto) and state.
+    /// `waiting` is 1 while the shutdown waits and that reading is one of the blockers
+    /// (`blocking`); `stopped` is 1 on every reading of a host whose veto stopped (the stop is
+    /// the host's, whichever reading held it). Readings that no longer apply lose their series.
+    pub fn set_veto(
+        &self,
+        state: &SchedState,
+        readings: impl Fn(&ResourceId) -> Vec<&'static str>,
+        blocking: impl Fn(&ResourceId, &str) -> bool,
+    ) {
         let mut known = self.veto_labels.lock().unwrap_or_else(|e| e.into_inner());
         let mut now_known = HashSet::new();
         for (id, st) in state.resources.iter() {
-            let Some(label) = reading(id) else { continue };
             let waiting = st.shutdown.is_some_and(|s| s.vetoing_since().is_some());
             let stopped = st.shutdown.is_some_and(|s| s.stopped_since().is_some());
-            for (name, on) in [("waiting", waiting), ("stopped", stopped)] {
-                self.veto_gauge
-                    .with_label_values(&[id.as_str(), label.as_str(), name])
-                    .set(if on { 1.0 } else { 0.0 });
+            for reading in readings(id) {
+                let on = [
+                    ("waiting", waiting && blocking(id, reading)),
+                    ("stopped", stopped),
+                ];
+                for (name, on) in on {
+                    self.veto_gauge
+                        .with_label_values(&[id.as_str(), reading, name])
+                        .set(if on { 1.0 } else { 0.0 });
+                }
+                now_known.insert((id.to_string(), reading.to_string()));
             }
-            now_known.insert((id.to_string(), label));
         }
         for (id, label) in known.difference(&now_known) {
             for name in ["waiting", "stopped"] {
@@ -746,6 +757,59 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_veto_has_one_series_per_reading_with_waiting_only_on_the_blocking_one() {
+        use sched_model::{PowerPhase, ResourceState, Shutdown};
+        let m = Metrics::new();
+        let mut st = ResourceState::new(PowerPhase::On { since: Millis(1) });
+        st.shutdown = Some(Shutdown::idle_without_consumers(Millis(2)).vetoing(Millis(3)));
+        let mut state = SchedState::default();
+        state.resources.insert("gpu".into(), st);
+        m.set_veto(
+            &state,
+            |_| vec!["mounts", "pods"],
+            |_, reading| reading == "pods",
+        );
+        let text = m.render();
+        let line = |reading: &str, s: &str| {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("sched_resource_veto{")
+                        && l.contains(&format!("reading=\"{reading}\""))
+                        && l.contains(&format!("state=\"{s}\""))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .unwrap_or("absent")
+                .to_string()
+        };
+        assert_eq!(line("pods", "waiting"), "1", "{text}");
+        assert_eq!(line("mounts", "waiting"), "0", "{text}");
+        assert_eq!(line("pods", "stopped"), "0", "{text}");
+        // The reading that no longer applies loses its series.
+        m.set_veto(&state, |_| vec!["pods"], |_, _| true);
+        let text = m.render();
+        assert!(!text.contains("reading=\"mounts\""), "{text}");
+        assert!(!text.contains("mounts+pods"), "{text}");
+        // And a stopped host shows stopped on every reading, blocking or not.
+        let mut st = ResourceState::new(PowerPhase::On { since: Millis(1) });
+        st.shutdown = Some(
+            Shutdown::idle_without_consumers(Millis(2))
+                .vetoing(Millis(3))
+                .stopped(Millis(4)),
+        );
+        state.resources.insert("gpu".into(), st);
+        m.set_veto(&state, |_| vec!["mounts", "pods"], |_, _| false);
+        let text = m.render();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("sched_resource_veto{")
+                    && l.contains("state=\"stopped\"")
+                    && l.ends_with(" 1"))
+                .count(),
+            2,
+            "{text}"
+        );
+    }
 
     #[test]
     fn manual_lease_ages_count_up_and_a_released_lease_loses_its_series() {

@@ -549,7 +549,7 @@ fn sources(c: &Config, p: &mut Problems) {
     let declared = |cap: Capability| c.sources().iter().any(|s| s.observe.contains(&cap));
     // Without a declared source the safety-critical readings would never exist and every
     // decision on the host would wait on stale observations, so refuse such a config at
-    // load. Pod counts are not checked: no decision reads them.
+    // load.
     for r in c.resources().iter().filter(|r| r.power.is_some()) {
         if !declared(Capability::Reachability) {
             p.add(
@@ -566,6 +566,22 @@ fn sources(c: &Config, p: &mut Problems) {
                 format!("resources[{}]", r.id),
                 "control is managed but no source declares the mounts capability (observe: [mounts]) with nfs_servers for it, so the scheduler could not tell whether pods still mount it before powering it off",
             );
+        }
+    }
+    // The pods veto of a managed exclusive host trusts a model's pod count only where a pods
+    // source watches the namespaces of the model's workloads: refuse a config that leaves one
+    // uncovered, since the host could then never be powered off (the veto would stop it).
+    for r in c.resources() {
+        if r.kind == ResourceKind::Exclusive && c.power_managed(&r.id) && c.pods_checked(&r.id) {
+            for m in c.models_of(&r.id).filter(|m| !c.model_pods_covered(m)) {
+                p.add(
+                    format!("models[{}]", m.id),
+                    format!(
+                        "resource {:?} is managed and a pods source exists, so the model's pods are checked before the host is powered off, but namespaces is empty or names a namespace no pods source watches (sources[].params.namespaces), so its workloads could not be seen",
+                        r.id.as_str()
+                    ),
+                );
+            }
         }
     }
     for s in c.sources() {
@@ -675,7 +691,7 @@ resources:
   - { id: nfs, kind: shared, power: { control: manual } }
   - { id: gpu2, kind: exclusive }
 models:
-  - { id: m1, resource: gpu, load_time: 60s, workloads: [w1] }
+  - { id: m1, resource: gpu, load_time: 60s, workloads: [w1], namespaces: [ai] }
   - { id: m2, resource: gpu2, load_time: 60s, workloads: [w2] }
 classes:
   - id: c1
@@ -686,7 +702,7 @@ classes:
     recovery: { action: requeue_failed, params: { list: { url: 'http://x/l', items: /i, id: /id }, requeue: { url: 'http://x/{id}' } } }
 sources:
   - { id: s1, kind: http_json, resync: 30s, observe: [demand] }
-  - { id: k8s, kind: kubernetes_watch, resync: 10s, observe: [pods, reachability] }
+  - { id: k8s, kind: kubernetes_watch, resync: 10s, observe: [pods, reachability], params: { namespaces: [ai], nodes: { gpu: node1 } } }
   - { id: hook, kind: webhook, resync: 30s }
 "#;
 
@@ -995,6 +1011,52 @@ sources:
         assert!(Config::from_yaml(&ok).is_ok());
         let empty = VALID.replace("action: requeue_failed, params", "action: \"\", params");
         assert!(has(&problems(&empty), "action must not be empty"));
+    }
+
+    #[test]
+    fn a_managed_gpu_host_needs_its_models_namespaces_watched_by_a_pods_source() {
+        let managed = crate::test_support::example_yaml_managed();
+        let c = Config::from_yaml(&managed).unwrap();
+        let gpu: crate::ResourceId = "cuda-central".into();
+        assert!(c.models_of(&gpu).all(|m| c.model_pods_covered(m)));
+        // A model without namespaces, or in one no pods source watches, is refused.
+        for (from, to) in [
+            (
+                "workloads: [mineru], namespaces: [ai]",
+                "workloads: [mineru]",
+            ),
+            (
+                "workloads: [mineru], namespaces: [ai]",
+                "workloads: [mineru], namespaces: [ai, elsewhere]",
+            ),
+            (
+                "workloads: [mineru], namespaces: [ai]",
+                "workloads: [mineru], namespaces: [elsewhere]",
+            ),
+        ] {
+            let ps = problems(&managed.replace(from, to));
+            assert!(
+                has(
+                    &ps,
+                    "models[mineru]: resource \"cuda-central\" is managed and a pods source exists"
+                ),
+                "{to}: {ps:?}"
+            );
+        }
+        // Under manual control nothing is powered off, so nothing is refused (the model just
+        // reads as unknown to a veto that never runs); and without a pods source there is no
+        // pods veto to cover.
+        let manual = crate::test_support::EXAMPLE_CONFIG.replace(
+            "workloads: [mineru], namespaces: [ai]",
+            "workloads: [mineru]",
+        );
+        let c = Config::from_yaml(&manual).unwrap();
+        let m = c
+            .models()
+            .iter()
+            .find(|m| m.id.as_str() == "mineru")
+            .unwrap();
+        assert!(!c.model_pods_covered(m));
     }
 
     #[test]
@@ -1600,7 +1662,7 @@ sources:
     }
 
     #[test]
-    fn the_mounts_timeout_is_bounded_and_longer_than_the_staleness_bound() {
+    fn the_veto_timeout_is_bounded_and_longer_than_the_staleness_bound() {
         let ps = problems(&managed_example_with(
             "veto_timeout: 30m",
             "veto_timeout: 1s",

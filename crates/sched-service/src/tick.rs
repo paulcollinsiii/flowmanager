@@ -24,8 +24,9 @@ use std::time::Instant;
 
 use sched_model::{
     AllowedSet, Capability, ClassId, Config, CreateJob, DrainMode, JobBook, JobEvent, Lease,
-    LeaseId, Millis, ModelId, PowerPhase, PowerTransition, PublishedAllowed, ResourceId,
-    SchedState, Shutdown, ShutdownCause, SourceId, Step, WaitReason, class_work,
+    LeaseId, Millis, ModelId, PowerPhase, PowerTransition, PublishedAllowed, ReadingUse,
+    ResourceId, SchedState, Shutdown, ShutdownCause, Snapshot, SourceId, Step, WaitReason,
+    class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
@@ -158,6 +159,30 @@ fn power_report(prev: &SchedState, next: &SchedState) -> (Vec<PowerFailed>, Vec<
     (failed, timeouts)
 }
 
+/// A reading of the veto that is not showing the host unused, in a [`TickReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VetoBlocker {
+    /// `mounts` (pods mounting the host's NFS server) or `pods` (pods of its models).
+    pub reading: String,
+    /// `in_use` (a fresh reading shows a pod) or `unknown` (no fresh reading; counts as in use).
+    pub state: String,
+}
+
+impl VetoBlocker {
+    /// `mounts:in_use`, `pods:unknown`, as joined in logs and reasons.
+    fn label(&self) -> String {
+        format!("{}:{}", self.reading, self.state)
+    }
+}
+
+pub fn blockers_label(blocking: &[VetoBlocker]) -> String {
+    blocking
+        .iter()
+        .map(VetoBlocker::label)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// A resource whose shutdown is held back by the veto (a pod still uses the host, or the
 /// reading is unknown), in a [`TickReport`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +191,9 @@ pub struct VetoHeld {
     /// The readings the veto of this resource consults: `mounts` (pods mounting its NFS
     /// server), `pods` (pods of its models).
     pub readings: Vec<String>,
+    /// The readings that are not showing the host unused as of this tick's snapshot (empty
+    /// for a stopped host once the pods are gone: it stays stopped all the same).
+    pub blocking: Vec<VetoBlocker>,
     /// When the wait began (`stopped` false), or when flowmanager gave up (`stopped` true).
     pub since: Millis,
     /// The wait outlasted `veto_timeout`: flowmanager stopped, the host stays up, and a
@@ -180,15 +208,19 @@ pub struct VetoTimeout {
     pub resource: ResourceId,
     /// The readings the veto of this resource consults (see [`VetoHeld::readings`]).
     pub readings: Vec<String>,
+    /// The readings that were still blocking when the wait ran out.
+    pub blocking: Vec<VetoBlocker>,
     /// When the wait began, if the previous state said.
     pub waiting_since: Option<Millis>,
     pub at: Millis,
 }
 
 /// The resources whose shutdown is held back in `next`, and those that were stopped in this
-/// tick (they were not in `prev`).
+/// tick (they were not in `prev`). `snapshot` is the one the tick decided on: it says which
+/// readings are blocking.
 fn veto_report(
     config: &Config,
+    snapshot: &Snapshot,
     prev: &SchedState,
     next: &SchedState,
 ) -> (Vec<VetoHeld>, Vec<VetoTimeout>) {
@@ -201,6 +233,20 @@ fn veto_report(
             .map(|r| r.as_str().to_string())
             .collect()
     };
+    let blocking = |id: &ResourceId| -> Vec<VetoBlocker> {
+        snapshot
+            .host_use(config, id, config.policy().host_reading_stale_after)
+            .blocking()
+            .into_iter()
+            .map(|(reading, state)| VetoBlocker {
+                reading: reading.as_str().to_string(),
+                state: match state {
+                    ReadingUse::InUse => "in_use".to_string(),
+                    _ => "unknown".to_string(),
+                },
+            })
+            .collect()
+    };
     for (id, st) in &next.resources {
         let Some(shutdown) = st.shutdown else {
             continue;
@@ -209,6 +255,7 @@ fn veto_report(
             held.push(VetoHeld {
                 resource: id.clone(),
                 readings: readings(id),
+                blocking: blocking(id),
                 since,
                 stopped: false,
             });
@@ -216,6 +263,7 @@ fn veto_report(
             held.push(VetoHeld {
                 resource: id.clone(),
                 readings: readings(id),
+                blocking: blocking(id),
                 since,
                 stopped: true,
             });
@@ -224,6 +272,7 @@ fn veto_report(
                 timeouts.push(VetoTimeout {
                     resource: id.clone(),
                     readings: readings(id),
+                    blocking: blocking(id),
                     waiting_since: before.and_then(|b| b.vetoing_since()),
                     at: since,
                 });
@@ -902,7 +951,7 @@ impl Shared {
             };
         let (power_failed, power_timeouts) = power_report(&durable.state, &state);
         let power_request_failures = self.power_request_failures(&state);
-        let (veto_held, veto_timeouts) = veto_report(&config, &durable.state, &state);
+        let (veto_held, veto_timeouts) = veto_report(&config, &snapshot, &durable.state, &state);
         let drains = drain_report(&state);
         let (kinds, reason) = if error.is_none() {
             reason::with_power(
@@ -1002,10 +1051,21 @@ impl Shared {
         self.metrics.set_power_failed(&r.state, |id| {
             config.resource(id).is_some_and(|res| res.power.is_some())
         });
-        self.metrics.set_veto(&r.state, |id| {
-            let readings = config.veto_readings(id);
-            (!readings.is_empty()).then(|| sched_model::VetoReading::label(&readings))
-        });
+        self.metrics.set_veto(
+            &r.state,
+            |id| {
+                config
+                    .veto_readings(id)
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect()
+            },
+            |id, reading| {
+                r.veto_held
+                    .iter()
+                    .any(|h| &h.resource == id && h.blocking.iter().any(|b| b.reading == reading))
+            },
+        );
         self.metrics.set_min_off_remaining(&r.state, r.at, |id| {
             config
                 .resource(id)
@@ -1016,8 +1076,16 @@ impl Shared {
         });
         if !replayed {
             for t in &r.veto_timeouts {
-                self.metrics
-                    .veto_timeout(t.resource.as_str(), &t.readings.join("+"));
+                // One count per reading that was still blocking (all that apply if the
+                // snapshot shows none, which a timeout never does).
+                let readings = if t.blocking.is_empty() {
+                    t.readings.clone()
+                } else {
+                    t.blocking.iter().map(|b| b.reading.clone()).collect()
+                };
+                for reading in readings {
+                    self.metrics.veto_timeout(t.resource.as_str(), &reading);
+                }
             }
         }
         if !replayed {
@@ -1205,7 +1273,8 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
             tracing::info!(
                 event = "shutdown_veto_timeout_replayed",
                 resource = %t.resource,
-                reading = %t.readings.join("+"),
+                readings = %t.readings.join("+"),
+                blocking = %blockers_label(&t.blocking),
                 waiting_since_ms = ?t.waiting_since.map(Millis::as_u64),
                 at_ms = t.at.as_u64(),
                 "replayed tick: the shutdown of {} timed out waiting for the veto to clear (alerted when first decided); it is not retried",
@@ -1215,7 +1284,8 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
             tracing::error!(
                 event = "shutdown_veto_timeout",
                 resource = %t.resource,
-                reading = %t.readings.join("+"),
+                readings = %t.readings.join("+"),
+                blocking = %blockers_label(&t.blocking),
                 waiting_since_ms = ?t.waiting_since.map(Millis::as_u64),
                 at_ms = t.at.as_u64(),
                 "ALERT: {} was still in use (or its use was unknown) after veto_timeout; flowmanager did NOT shut it down and stops here: it will not retry by itself, the host stays up until a person acts (or a new manual request takes it over)",
@@ -2211,6 +2281,10 @@ mod tests {
             vec![VetoHeld {
                 resource: "basestar-nfs".into(),
                 readings: vec!["mounts".to_string()],
+                blocking: vec![VetoBlocker {
+                    reading: "mounts".to_string(),
+                    state: "in_use".to_string()
+                }],
                 since: Millis(T0 + 1_000),
                 stopped: false
             }]
@@ -2344,6 +2418,10 @@ mod tests {
             vec![VetoHeld {
                 resource: "cuda-central".into(),
                 readings: vec!["pods".to_string()],
+                blocking: vec![VetoBlocker {
+                    reading: "pods".to_string(),
+                    state: "in_use".to_string()
+                }],
                 since: Millis(T0 + 1_000),
                 stopped: false
             }]
@@ -2396,6 +2474,14 @@ mod tests {
             r.steps
         );
         assert!(!r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })));
+        assert_eq!(
+            r.veto_held[0].blocking,
+            vec![VetoBlocker {
+                reading: "pods".to_string(),
+                state: "unknown".to_string()
+            }]
+        );
+        assert!(r.reason.contains("pods:unknown"), "{}", r.reason);
         gpu_world(&s, Some(0));
         let r = s.tick(Millis(T0 + 2_000), &mut d);
         assert!(

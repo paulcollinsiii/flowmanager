@@ -123,7 +123,7 @@ pub fn with_veto(
         reason.push_str(&format!(
             "; ALERT: the shutdown of {} waited for the veto ({}) to clear until veto_timeout ran out in this tick",
             t.resource,
-            t.readings.join("+")
+            crate::tick::blockers_label(&t.blocking)
         ));
     }
     for h in held {
@@ -139,7 +139,7 @@ pub fn with_veto(
                 "; the shutdown of {} is held back since {}ms by the veto ({}): a pod mounts its NFS server or runs its models, or the reading is unknown (unknown counts as in use)",
                 h.resource,
                 h.since.as_u64(),
-                h.readings.join("+")
+                crate::tick::blockers_label(&h.blocking)
             ));
         }
     }

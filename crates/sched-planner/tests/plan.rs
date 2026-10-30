@@ -653,8 +653,7 @@ fn a_reclaim_removes_the_power_wants_of_the_reclaimed_host_only() {
 
 /// The example config without the whisperx model and the class that needs it.
 fn without_whisperx() -> Config {
-    let line =
-        "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx] }\n";
+    let line = "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx], namespaces: [ai] }\n";
     let start = EXAMPLE_CONFIG
         .find("  - id: speakr-transcription\n")
         .unwrap();

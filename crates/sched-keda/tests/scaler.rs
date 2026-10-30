@@ -42,7 +42,7 @@ fn example_with_additions(generation: u64) -> Arc<Config> {
     let text = replaced(
         EXAMPLE_CONFIG,
         "models:\n",
-        "models:\n  - { id: extra, resource: cuda-central, load_time: 30s, workloads: [extra] }\n",
+        "models:\n  - { id: extra, resource: cuda-central, load_time: 30s, workloads: [extra], namespaces: [ai] }\n",
     );
     let text = replaced(
         &text,

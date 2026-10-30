@@ -482,7 +482,7 @@ mod tests {
         // A config without whisperx (and without the class that needs it).
         let y = EXAMPLE_CONFIG
             .replace(
-                "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx] }\n",
+                "  - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx], namespaces: [ai] }\n",
                 "",
             )
             .replace("model: whisperx }", "model: llm }");

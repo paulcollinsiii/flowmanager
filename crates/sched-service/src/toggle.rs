@@ -1201,6 +1201,7 @@ pub fn resource_state(
             waits.push(json!({
                 "reason": "shutdown_held_by_veto",
                 "readings": h.readings,
+                "blocking": h.blocking,
                 "stopped": h.stopped,
             }));
         }
@@ -2453,6 +2454,7 @@ mod tests {
         assert_eq!(v["needs_attention"], false);
         rep.veto_held.push(crate::tick::VetoHeld {
             readings: vec!["mounts".to_string()],
+            blocking: vec![],
             resource: nfs.clone(),
             since: Millis(1),
             stopped: true,
