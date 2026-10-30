@@ -174,23 +174,7 @@ impl ModePhase {
     }
 }
 
-/// The veto on shutting a host down while pods may still mount it (see the `mounts`
-/// capability). Only an On host that the scheduler is about to power off has one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
-pub enum MountsVeto {
-    /// The shutdown is held back: pods mount the host, or the count is unknown (a missing,
-    /// stale or failed reading is never read as "no mounts"). `since` is when the wait began.
-    Waiting { since: Millis },
-    /// The wait outlasted the resource's `mounts_timeout`. The scheduler stops: no shutdown,
-    /// an alert, no retry, and the host is no longer managed (as after a failed power
-    /// transition). It clears only when the host is seen down or its state is reset by a
-    /// person (`resume`), or when a new manual request takes the host over again. `since` is
-    /// when the scheduler gave up.
-    Stopped { since: Millis },
-}
-
-/// How a drain treats in-flight work (see [`Drain`]).
+/// How a drain treats in-flight work (see [`ShutdownCause::Requested`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DrainMode {
@@ -211,53 +195,132 @@ impl DrainMode {
     }
 }
 
-/// Who started a drain (see [`Drain`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DrainOrigin {
-    /// A person asked (a manual host lease released with a drain, or `drain_host`). The
-    /// default, so a stored drain without the field reads as requested.
-    #[default]
-    Requested,
-    /// The scheduler started it: a managed shared host reached the point where it would be
-    /// powered off (nothing holds it, `idle_grace` over), so its consumers are scaled down
-    /// first. Any hold arriving cancels it.
+/// Why a host is being shut down (see [`Shutdown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShutdownCause {
+    /// The scheduler's own: nothing holds the host and `idle_grace` is over. Any hold arriving
+    /// cancels it. On a shared host the consumers are scaled down first (the shutdown starts
+    /// at [`ShutdownStage::Withdrawn`], as an immediate drain); an exclusive host has
+    /// already withdrawn its model, so its shutdown starts at the veto.
     Idle,
+    /// A person asked (a manual host lease released with a drain, or `drain_host`; shared
+    /// hosts only). It ignores queued and in-flight work, never a lease, and is cancelled
+    /// only by a new manual host lease (or the host no longer being up). `mode` is how
+    /// in-flight work is treated before the consumers are scaled down.
+    Requested { mode: DrainMode },
+    /// A reclaim lease on an exclusive host forced the shutdown (the model was wound down
+    /// first, see `ModePhase`).
+    Reclaim,
 }
 
-impl DrainOrigin {
-    /// The label used in logs and reports.
-    pub fn as_str(self) -> &'static str {
+impl ShutdownCause {
+    /// The label used in logs and reports for who started a drain: `requested` or `idle`.
+    /// A reclaim is not a drain and has no label.
+    pub fn origin(self) -> Option<&'static str> {
         match self {
-            DrainOrigin::Requested => "requested",
-            DrainOrigin::Idle => "idle",
+            ShutdownCause::Requested { .. } => Some("requested"),
+            ShutdownCause::Idle => Some("idle"),
+            ShutdownCause::Reclaim => None,
+        }
+    }
+}
+
+/// Where a shutdown has got to (see [`Shutdown`]).
+///
+/// `withdrawn` says whether the classes that need the host are out of the allowed set (their
+/// consumers are scaled down). The stages after the withdrawal carry it because it is not
+/// the same for every shutdown that reaches them: it is false for the shutdown of an
+/// exclusive host, which has no consumers of this kind, and for a stopped idle shutdown
+/// (nobody asked for the consumers to stay down: they come back). A requested shutdown keeps
+/// them down when it stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShutdownStage {
+    /// A graceful drain: the consumers still run; in-flight work is given `drain_timeout`
+    /// from the shutdown's `since` (less if it finishes).
+    Withdrawing,
+    /// The consumers are scaled down; the shutdown waits for every lease that holds the host,
+    /// then starts the veto.
+    Withdrawn,
+    /// The shutdown is held back: pods mount the host, or the count is unknown (a missing,
+    /// stale or failed reading is never read as "no mounts"; see the `mounts` capability).
+    /// `since` is when the wait began.
+    Vetoing { since: Millis, withdrawn: bool },
+    /// The wait outlasted the resource's `mounts_timeout`. The scheduler stops: no shutdown,
+    /// an alert, no retry, and the host is no longer managed (as after a failed power
+    /// transition). It clears only when the host is seen down or its state is reset by a
+    /// person (`resume`), or when a new manual request takes the host over again. `since` is
+    /// when the scheduler gave up.
+    Stopped { since: Millis, withdrawn: bool },
+}
+
+/// A shutdown of an up host under managed control, from the decision to take it down to the
+/// power-off, as one value: absent while the host is not on its way down. The whole value is
+/// cleared at once when the host is no longer up, when it is cancelled (see
+/// [`ShutdownCause`]), or when a new manual host lease takes the host over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shutdown {
+    pub cause: ShutdownCause,
+    pub stage: ShutdownStage,
+    /// When the shutdown was requested (or, for an idle one, started); for a graceful drain
+    /// the start of its `drain_timeout`.
+    pub since: Millis,
+}
+
+impl Shutdown {
+    /// Whether the consumers that need the host are scaled down (left the allowed set).
+    pub fn consumers_withdrawn(&self) -> bool {
+        match self.stage {
+            ShutdownStage::Withdrawing => false,
+            ShutdownStage::Withdrawn => true,
+            ShutdownStage::Vetoing { withdrawn, .. } | ShutdownStage::Stopped { withdrawn, .. } => {
+                withdrawn
+            }
         }
     }
 
-    fn is_requested(&self) -> bool {
-        *self == DrainOrigin::Requested
+    /// Whether this shutdown is a drain of a shared host: asked for by a person, or withdrawing
+    /// the consumers of an idle host. (The shutdown of an exclusive host, or a stopped idle
+    /// one whose consumers came back, is not.)
+    pub fn is_drain(&self) -> bool {
+        self.is_requested() || self.consumers_withdrawn()
     }
-}
 
-/// A drain of a shared host: the classes that need it are scaled down and the host is then
-/// shut down. A person's request (a manual host lease released with a drain, or `drain_host`)
-/// is kept in the host's state so it survives a restart, and cleared once the host is no
-/// longer up or a new manual host lease cancels it; it ignores queued and in-flight work,
-/// never leases. An idle drain (see [`DrainOrigin`]) ignores nothing: any hold cancels it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Drain {
-    pub mode: DrainMode,
-    /// When the drain was requested (or, for an idle drain, started).
-    pub since: Millis,
-    /// Whether the classes that need the host have been taken out of the allowed set (their
-    /// consumers are scaled down). Once set it stays set for as long as the drain does.
-    #[serde(default)]
-    pub scaled_down: bool,
-    /// Who started it. Absent from the stored form when requested, so a requested drain is
-    /// stored exactly as before this field existed.
-    #[serde(default, skip_serializing_if = "DrainOrigin::is_requested")]
-    pub origin: DrainOrigin,
+    /// Whether a person asked for this shutdown.
+    pub fn is_requested(&self) -> bool {
+        matches!(self.cause, ShutdownCause::Requested { .. })
+    }
+
+    /// When the veto wait began, while it is waiting.
+    pub fn vetoing_since(&self) -> Option<Millis> {
+        match self.stage {
+            ShutdownStage::Vetoing { since, .. } => Some(since),
+            _ => None,
+        }
+    }
+
+    /// When the scheduler gave up, once it has stopped.
+    pub fn stopped_since(&self) -> Option<Millis> {
+        match self.stage {
+            ShutdownStage::Stopped { since, .. } => Some(since),
+            _ => None,
+        }
+    }
+
+    /// The shutdown after a veto wait that is over (the pods are gone) or no longer due:
+    /// back to waiting before the veto if the consumers were withdrawn, and no shutdown at
+    /// all for one that never withdrew any (an exclusive host's). Other stages are unchanged.
+    pub fn without_veto(self) -> Option<Shutdown> {
+        match self.stage {
+            ShutdownStage::Vetoing { withdrawn, .. } => withdrawn.then_some(Shutdown {
+                stage: ShutdownStage::Withdrawn,
+                ..self
+            }),
+            _ => Some(self),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,29 +335,18 @@ pub struct ResourceState {
     /// a host it only found.)
     #[serde(default)]
     pub managed: bool,
-    /// When the host last had nothing holding it.
-    #[serde(default)]
-    pub host_idle_since: Option<Millis>,
+    /// When the host last had nothing holding it (the start of the `idle_grace` clock).
+    pub idle_since: Option<Millis>,
     /// Classes whose in-flight work was stopped and whose recovery action has not run.
     #[serde(default)]
     pub pending_recovery: BTreeSet<ClassId>,
-    /// Whether a shutdown of the host is held back by pods that may mount it. Absent from the
-    /// stored state while there is no veto, so a state without one reads and writes as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mounts_veto: Option<MountsVeto>,
+    /// The host's shutdown, while it is up and on its way down (or stopped on the way).
+    pub shutdown: Option<Shutdown>,
     /// When the host was observed down after flowmanager shut it down (the instant the phase
     /// became `off` from `shutting_down`, or from a failed shutdown). It starts the `min_off`
     /// wait before the next automatic power-on. Absent for a host found down, one that went down
-    /// by itself, once the phase leaves `off`, and for a resource without a `min_off`; absent
-    /// from the stored state then, so a state
-    /// without it reads and writes as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shutdown_confirmed_at: Option<Millis>,
-    /// A person's request to take the host down (a manual host lease released with a drain
-    /// mode). Absent from the stored state while there is none, so a state without one reads
-    /// and writes as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drain: Option<Drain>,
+    /// by itself, once the phase leaves `off`, and for a resource without a `min_off`.
+    pub off_since: Option<Millis>,
 }
 
 impl ResourceState {
@@ -303,11 +355,10 @@ impl ResourceState {
             power,
             mode: ModePhase::Idle,
             managed: false,
-            host_idle_since: None,
+            idle_since: None,
             pending_recovery: BTreeSet::new(),
-            mounts_veto: None,
-            shutdown_confirmed_at: None,
-            drain: None,
+            shutdown: None,
+            off_since: None,
         }
     }
 
@@ -321,7 +372,7 @@ impl ResourceState {
     /// it has passed. A stamp in the future (the clock went back) counts as just made, so the
     /// wait never exceeds `min_off`.
     pub fn min_off_remaining(&self, min_off: Millis, now: Millis) -> Millis {
-        match (self.power, self.shutdown_confirmed_at) {
+        match (self.power, self.off_since) {
             (PowerPhase::Off, Some(at)) => min_off.saturating_sub(now.saturating_sub(at)),
             _ => Millis::ZERO,
         }
@@ -413,33 +464,77 @@ mod tests {
     }
 
     #[test]
-    fn a_drain_reads_and_writes_and_a_state_without_one_is_unchanged() {
-        let old = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true}"#;
-        let st: ResourceState = serde_json::from_str(old).unwrap();
-        assert_eq!(st.drain, None);
-        assert!(!serde_json::to_string(&st).unwrap().contains("drain"));
-        let drain = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"drain":{"mode":"graceful","since":9}}"#;
-        let st: ResourceState = serde_json::from_str(drain).unwrap();
-        assert_eq!(
-            st.drain,
-            Some(Drain {
-                mode: DrainMode::Graceful,
+    fn a_shutdown_reads_and_writes_in_every_stage() {
+        let none = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"idle_since":null,"pending_recovery":[],"shutdown":null,"off_since":null}"#;
+        let st: ResourceState = serde_json::from_str(none).unwrap();
+        assert_eq!(st.shutdown, None);
+        let cases = [
+            (
+                ShutdownCause::Requested {
+                    mode: DrainMode::Graceful,
+                },
+                ShutdownStage::Withdrawing,
+            ),
+            (ShutdownCause::Idle, ShutdownStage::Withdrawn),
+            (
+                ShutdownCause::Idle,
+                ShutdownStage::Vetoing {
+                    since: Millis(3),
+                    withdrawn: true,
+                },
+            ),
+            (
+                ShutdownCause::Reclaim,
+                ShutdownStage::Stopped {
+                    since: Millis(4),
+                    withdrawn: false,
+                },
+            ),
+        ];
+        for (cause, stage) in cases {
+            let mut st = st.clone();
+            st.shutdown = Some(Shutdown {
+                cause,
+                stage,
                 since: Millis(9),
-                scaled_down: false,
-                origin: DrainOrigin::Requested
-            })
+            });
+            let text = serde_json::to_string(&st).unwrap();
+            assert_eq!(serde_json::from_str::<ResourceState>(&text).unwrap(), st);
+        }
+        let text = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"idle_since":null,"pending_recovery":[],"shutdown":{"cause":{"kind":"requested","mode":"immediate"},"stage":{"phase":"vetoing","since":5,"withdrawn":true},"since":2},"off_since":null}"#;
+        let st: ResourceState = serde_json::from_str(text).unwrap();
+        let sh = st.shutdown.unwrap();
+        assert!(sh.is_drain() && sh.is_requested() && sh.consumers_withdrawn());
+        assert_eq!(sh.vetoing_since(), Some(Millis(5)));
+        // Still strict.
+        let extra = text.replace(r#""since":2}"#, r#""since":2,"x":1}"#);
+        assert!(serde_json::from_str::<ResourceState>(&extra).is_err());
+    }
+
+    #[test]
+    fn ending_a_veto_keeps_what_was_withdrawn_and_drops_what_never_was() {
+        let vetoing = |withdrawn| Shutdown {
+            cause: ShutdownCause::Idle,
+            stage: ShutdownStage::Vetoing {
+                since: Millis(5),
+                withdrawn,
+            },
+            since: Millis(2),
+        };
+        assert_eq!(
+            vetoing(true).without_veto().map(|s| s.stage),
+            Some(ShutdownStage::Withdrawn)
         );
-        let text = serde_json::to_string(&st).unwrap();
-        assert_eq!(serde_json::from_str::<ResourceState>(&text).unwrap(), st);
-        assert!(text.contains(r#""mode":"graceful""#), "{text}");
-        // A requested drain is stored exactly as before the origin existed; an idle one adds it.
-        assert!(!text.contains("origin"), "{text}");
-        let idle = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"drain":{"mode":"immediate","since":9,"scaled_down":true,"origin":"idle"}}"#;
-        let st: ResourceState = serde_json::from_str(idle).unwrap();
-        assert_eq!(st.drain.map(|d| d.origin), Some(DrainOrigin::Idle));
-        let text = serde_json::to_string(&st).unwrap();
-        assert!(text.contains(r#""origin":"idle""#), "{text}");
-        assert_eq!(serde_json::from_str::<ResourceState>(&text).unwrap(), st);
+        assert_eq!(vetoing(false).without_veto(), None);
+        let stopped = Shutdown {
+            stage: ShutdownStage::Stopped {
+                since: Millis(5),
+                withdrawn: false,
+            },
+            ..vetoing(false)
+        };
+        assert_eq!(stopped.without_veto(), Some(stopped));
+        assert!(!stopped.is_drain());
     }
 
     #[test]

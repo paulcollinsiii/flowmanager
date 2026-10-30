@@ -48,8 +48,8 @@ pub use source_params::{
     PrometheusParams, RequestSpec, ResponseCondition, SinceSpec, TcpProbeParams, WebhookParams,
 };
 pub use state::{
-    Drain, DrainMode, DrainOrigin, ModePhase, MountsVeto, PowerPhase, PowerTransition,
-    ResourceState, SchedState, WindDown,
+    DrainMode, ModePhase, PowerPhase, PowerTransition, ResourceState, SchedState, Shutdown,
+    ShutdownCause, ShutdownStage, WindDown,
 };
 pub use store::ConfigStore;
 pub use time::Millis;

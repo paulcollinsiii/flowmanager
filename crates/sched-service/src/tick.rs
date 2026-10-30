@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{
-    AllowedSet, Capability, ClassId, Config, CreateJob, JobBook, JobEvent, Lease, LeaseId, Millis,
-    ModelId, MountsVeto, PowerPhase, PowerTransition, PublishedAllowed, ResourceId, SchedState,
-    SourceId, Step, WaitReason, class_work,
+    AllowedSet, Capability, ClassId, Config, CreateJob, DrainMode, JobBook, JobEvent, Lease,
+    LeaseId, Millis, ModelId, PowerPhase, PowerTransition, PublishedAllowed, ResourceId,
+    SchedState, Shutdown, ShutdownCause, SourceId, Step, WaitReason, class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
 use serde::{Deserialize, Serialize};
@@ -186,31 +186,29 @@ fn mounts_report(prev: &SchedState, next: &SchedState) -> (Vec<MountsHeld>, Vec<
     let mut held = Vec::new();
     let mut timeouts = Vec::new();
     for (id, st) in &next.resources {
-        match st.mounts_veto {
-            Some(MountsVeto::Waiting { since }) => held.push(MountsHeld {
+        let Some(shutdown) = st.shutdown else {
+            continue;
+        };
+        if let Some(since) = shutdown.vetoing_since() {
+            held.push(MountsHeld {
                 resource: id.clone(),
                 since,
                 stopped: false,
-            }),
-            Some(MountsVeto::Stopped { since }) => {
-                held.push(MountsHeld {
+            });
+        } else if let Some(since) = shutdown.stopped_since() {
+            held.push(MountsHeld {
+                resource: id.clone(),
+                since,
+                stopped: true,
+            });
+            let before = prev.resource(id).and_then(|p| p.shutdown);
+            if before.is_none_or(|b| b.stopped_since().is_none()) {
+                timeouts.push(MountsTimeout {
                     resource: id.clone(),
-                    since,
-                    stopped: true,
+                    waiting_since: before.and_then(|b| b.vetoing_since()),
+                    at: since,
                 });
-                let before = prev.resource(id).and_then(|p| p.mounts_veto);
-                if !matches!(before, Some(MountsVeto::Stopped { .. })) {
-                    timeouts.push(MountsTimeout {
-                        resource: id.clone(),
-                        waiting_since: match before {
-                            Some(MountsVeto::Waiting { since }) => Some(since),
-                            _ => None,
-                        },
-                        at: since,
-                    });
-                }
             }
-            None => {}
         }
     }
     (held, timeouts)
@@ -263,7 +261,7 @@ fn min_off_report(
                 let remaining = st.min_off_remaining(min_off, now);
                 Some(MinOffWait {
                     resource: resource.clone(),
-                    since: st.shutdown_confirmed_at?,
+                    since: st.off_since?,
                     until: now.saturating_add(remaining),
                     remaining,
                 })
@@ -294,13 +292,19 @@ fn drain_report(state: &SchedState) -> Vec<DrainReport> {
         .resources
         .iter()
         .filter_map(|(id, st)| {
-            let d = st.drain?;
+            let s = st.shutdown.filter(Shutdown::is_drain)?;
+            // An idle drain scales the consumers down at once.
+            let mode = match s.cause {
+                ShutdownCause::Requested { mode } => mode,
+                ShutdownCause::Idle => DrainMode::Immediate,
+                ShutdownCause::Reclaim => return None,
+            };
             Some(DrainReport {
                 resource: id.clone(),
-                mode: d.mode.as_str().to_string(),
-                since: d.since,
-                scaled_down: d.scaled_down,
-                origin: d.origin.as_str().to_string(),
+                mode: mode.as_str().to_string(),
+                since: s.since,
+                scaled_down: s.consumers_withdrawn(),
+                origin: s.cause.origin()?.to_string(),
             })
         })
         .collect()
@@ -800,7 +804,7 @@ impl Shared {
             for r in &adoptions_ended {
                 if let Some(st) = prev_state.resources.get_mut(r) {
                     st.managed = false;
-                    st.host_idle_since = None;
+                    st.idle_since = None;
                 }
             }
             adopted =
@@ -2106,7 +2110,7 @@ mod tests {
         for (id, managed) in [("cuda-central", false), ("basestar-nfs", true)] {
             let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
             st.managed = managed;
-            st.host_idle_since = managed.then_some(Millis(1));
+            st.idle_since = managed.then_some(Millis(1));
             d.state.resources.insert(ResourceId::new(id), st);
         }
         (s, clock, d)
@@ -2711,14 +2715,14 @@ mod tests {
         let (s2, clock2, d2) = restart_managed(&d);
         clock2.set(clock.now());
         let mut d2 = d2;
-        assert!(d2.state.resource(&nfs()).unwrap().drain.is_some());
+        assert!(d2.state.resource(&nfs()).unwrap().shutdown.is_some());
         clock2.advance(Millis(60_000));
         world(&s2, Some(0));
         nfs_probe(&s2, false);
         let r = s2.tick(clock2.now(), &mut d2);
         assert_eq!(d2.state.resource(&nfs()).unwrap().power, PowerPhase::Off);
         assert!(r.drains.is_empty(), "{r:?}");
-        assert_eq!(d2.state.resource(&nfs()).unwrap().drain, None);
+        assert_eq!(d2.state.resource(&nfs()).unwrap().shutdown, None);
     }
 
     #[test]
@@ -2746,7 +2750,7 @@ mod tests {
             granted_at: clock.now(),
         });
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(d.state.resource(&nfs()).unwrap().drain, None);
+        assert_eq!(d.state.resource(&nfs()).unwrap().shutdown, None);
         assert!(r.drains.is_empty());
         assert!(
             !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
@@ -2757,10 +2761,10 @@ mod tests {
     #[test]
     fn a_host_an_older_build_stored_as_on_and_unmanaged_is_adopted_once_unless_left_so_on_purpose()
     {
-        let stored = |veto: Option<sched_model::MountsVeto>, managed: bool| {
+        let stored = |shutdown: Option<sched_model::Shutdown>, managed: bool| {
             let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
             st.managed = managed;
-            st.mounts_veto = veto;
+            st.shutdown = shutdown;
             let mut d = Durable::default();
             d.state.resources.insert(nfs(), st);
             d
@@ -2785,7 +2789,14 @@ mod tests {
         // A shutdown stopped by mounting pods: left as it is.
         let (s, clock) = managed_world();
         let mut d = stored(
-            Some(sched_model::MountsVeto::Stopped { since: Millis(2) }),
+            Some(sched_model::Shutdown {
+                cause: sched_model::ShutdownCause::Idle,
+                stage: sched_model::ShutdownStage::Stopped {
+                    since: Millis(2),
+                    withdrawn: false,
+                },
+                since: Millis(1),
+            }),
             false,
         );
         world(&s, Some(1));
@@ -2824,11 +2835,12 @@ mod tests {
             let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
             st.managed = true;
             if with_drain {
-                st.drain = Some(sched_model::Drain {
-                    mode: sched_model::DrainMode::Graceful,
+                st.shutdown = Some(sched_model::Shutdown {
+                    cause: sched_model::ShutdownCause::Requested {
+                        mode: sched_model::DrainMode::Graceful,
+                    },
+                    stage: sched_model::ShutdownStage::Withdrawing,
                     since: clock.now(),
-                    scaled_down: false,
-                    origin: sched_model::DrainOrigin::Requested,
                 });
             }
             d.state.resources.insert(nfs(), st);
@@ -2986,7 +2998,7 @@ mod tests {
         nfs_probe(&s2, false);
         let r = s2.tick(clock2.now(), &mut d2);
         assert!(r.drains.is_empty(), "{r:?}");
-        assert_eq!(d2.state.resource(&nfs()).unwrap().drain, None);
+        assert_eq!(d2.state.resource(&nfs()).unwrap().shutdown, None);
     }
 
     #[test]
@@ -3022,9 +3034,9 @@ mod tests {
             }
             let r = s.tick(clock.now(), &mut d);
             assert!(r.drains.is_empty(), "{how}: {r:?}");
-            assert_eq!(d.state.resource(&nfs()).unwrap().drain, None);
+            assert_eq!(d.state.resource(&nfs()).unwrap().shutdown, None);
             assert!(nfs_consumers_allowed(&s, &r), "{how}: consumers are back");
-            assert_eq!(d.state.resource(&nfs()).unwrap().host_idle_since, None);
+            assert_eq!(d.state.resource(&nfs()).unwrap().idle_since, None);
         }
     }
 

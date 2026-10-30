@@ -67,7 +67,7 @@ fn state(yaml: &str) -> SchedState {
 }
 
 const IDLE: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n";
-const MANAGED_NFS: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: 1 }\n";
+const MANAGED_NFS: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 1 }\n";
 
 const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
 const GPU_AND_NFS: [&str; 2] = ["cuda-central", "basestar-nfs"];

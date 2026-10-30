@@ -1147,7 +1147,7 @@ pub fn resource_state(
     config: &Config,
     resource: &ResourceId,
     held: Option<&Lease>,
-    requested: Option<Option<sched_model::Drain>>,
+    requested: Option<Option<crate::drain::RecordedDrain>>,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
@@ -1170,7 +1170,7 @@ pub fn resource_state(
                 d.mode.as_str().to_string(),
                 d.since,
                 d.scaled_down,
-                d.origin.as_str().to_string(),
+                "requested".to_string(),
             )
         }),
         None => report.as_ref().and_then(|r| {
@@ -1849,7 +1849,7 @@ mod tests {
             .unwrap();
             core.state
                 .resource(&"basestar-nfs".into())
-                .and_then(|st| st.drain)
+                .and_then(crate::drain::RecordedDrain::of)
         };
         // Off: the lease is released and a graceful drain starts. The host is up, so the
         // answer says draining, not off.
@@ -1978,7 +1978,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            core.state.resource(&"basestar-nfs".into()).unwrap().drain,
+            core.state
+                .resource(&"basestar-nfs".into())
+                .unwrap()
+                .shutdown,
             None
         );
         // Nothing held: the listener's 404.
@@ -2376,7 +2379,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reclaim_status_and_needs_attention_come_from_the_report() {
-        use sched_model::{MountsVeto, ResourceState};
+        use sched_model::ResourceState;
         let lease = Lease {
             id: "reclaim-1".into(),
             resource: "cuda-central".into(),
@@ -2455,7 +2458,6 @@ mod tests {
         let v = resource_state(&config, &nfs, None, None, &Some(rep), Millis(5_000));
         assert_eq!(v["needs_attention"], true);
         assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_mounts");
-        let _ = MountsVeto::Waiting { since: Millis(0) };
     }
 
     #[test]

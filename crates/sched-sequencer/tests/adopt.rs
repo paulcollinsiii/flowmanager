@@ -81,11 +81,11 @@ fn a_host_flowmanager_powered_on_or_already_held_or_not_read_up_is_not_adopted()
         ),
         (
             "on, not managed, but a drain is under way",
-            "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, drain: { mode: graceful, since: 5 } }",
+            "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, shutdown: { cause: { kind: requested, mode: graceful }, stage: { phase: withdrawing }, since: 5 } }",
         ),
         (
             "on, not managed, shutdown stopped by mounting pods",
-            "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, mounts_veto: { phase: stopped, since: 6 } }",
+            "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, shutdown: { cause: { kind: idle }, stage: { phase: stopped, since: 6, withdrawn: false }, since: 5 } }",
         ),
         (
             "shutting down",

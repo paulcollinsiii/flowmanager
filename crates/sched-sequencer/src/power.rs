@@ -2,8 +2,8 @@
 //! them up. Resources without a power section are always on.
 
 use sched_model::{
-    ClassSpec, Drain, DrainMode, DrainOrigin, Millis, ModePhase, MountsVeto, PowerPhase,
-    PowerTransition, PowerWant, ResourceKind, ResourceState, Step, WaitReason, class_work,
+    ClassSpec, DrainMode, Millis, ModePhase, PowerPhase, PowerTransition, PowerWant, ResourceKind,
+    ResourceState, Shutdown, ShutdownCause, ShutdownStage, Step, WaitReason, class_work,
 };
 
 use crate::Cx;
@@ -42,9 +42,8 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     let was_failed = matches!(st.power, PowerPhase::Failed { .. });
     if manual {
         st.managed = false;
-        st.host_idle_since = None;
-        st.mounts_veto = None;
-        st.drain = None;
+        st.idle_since = None;
+        st.shutdown = None;
     }
     let now = cx.now();
     let before = st.power;
@@ -111,9 +110,9 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     // found down, gone down by itself, or under manual control has none, and the stamp ends
     // with the phase `off`. A stamp from the future (the clock went back) is made again at
     // now, so the wait is never longer than `min_off`. Without a `min_off` (zero, the default)
-    // there is no stamp at all, so the stored state is exactly what it was before the key.
+    // there is no stamp at all.
     let min_off = cx.res.power.as_ref().map_or(Millis::ZERO, |p| p.min_off());
-    st.shutdown_confirmed_at = match (st.power, st.shutdown_confirmed_at) {
+    st.off_since = match (st.power, st.off_since) {
         _ if manual || min_off == Millis::ZERO => None,
         (PowerPhase::Off, _)
             if matches!(
@@ -135,14 +134,13 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     // automatic power-off follows until a new want powers it on through the normal path.
     if was_failed || matches!(st.power, PowerPhase::Failed { .. }) {
         st.managed = false;
-        st.host_idle_since = None;
+        st.idle_since = None;
     }
     if !st.is_on() {
         st.mode = ModePhase::Idle;
-        st.host_idle_since = None;
-        st.mounts_veto = None;
-        // A drain ends when the host is no longer up: seen off, or on its way there.
-        st.drain = None;
+        st.idle_since = None;
+        // A shutdown ends when the host is no longer up: seen off, or on its way there.
+        st.shutdown = None;
     }
 }
 
@@ -231,9 +229,9 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                     resource: cx.res.id.clone(),
                 });
                 st.power = PowerPhase::PoweringOn { since: now };
-                st.shutdown_confirmed_at = None;
+                st.off_since = None;
                 st.managed = true;
-                st.host_idle_since = None;
+                st.idle_since = None;
             } else if cx
                 .intent
                 .models
@@ -268,70 +266,87 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 // No `idle` check: a reclaim exists only for an exclusive resource, whose mode
                 // step has run just before this (the host is on) and always acts while a model
                 // is allowed (`acted`, returned above), so a host that gets here has no model.
-                power_off(cx, st, steps);
+                power_off(cx, st, steps, ShutdownCause::Reclaim);
                 return;
             }
             if want == Some(PowerWant::Manual) {
                 st.managed = true;
                 // A new manual request takes the host over again: an earlier stop (pods
                 // still mounted it) is over, and the next idle period decides afresh.
-                if matches!(st.mounts_veto, Some(MountsVeto::Stopped { .. })) {
-                    st.mounts_veto = None;
+                if st.shutdown.is_some_and(|s| s.stopped_since().is_some()) {
+                    st.shutdown = None;
                 }
             }
             // A requested drain ignores queued and in-flight work; an idle one ignores nothing.
-            let idle_drain = st.drain.is_some_and(|d| d.origin == DrainOrigin::Idle);
-            let h = holds(cx, st.drain.is_some() && !idle_drain);
+            let idle_drain = st
+                .shutdown
+                .is_some_and(|s| s.is_drain() && s.cause == ShutdownCause::Idle);
+            let h = holds(cx, st.shutdown.is_some_and(|s| s.is_drain()) && !idle_drain);
             if idle_drain && h.count > 0 {
                 // Something holds the host again (a lease, or work for a class that needs it):
                 // the consumers are allowed again and the idle clock starts from scratch.
-                st.drain = None;
-                st.host_idle_since = None;
+                st.shutdown = None;
+                st.idle_since = None;
             }
-            if let Some(d) = st.drain
+            if let Some(s) = st.shutdown.filter(Shutdown::is_drain)
                 && st.managed
                 && idle_mode
             {
-                if d.origin == DrainOrigin::Idle && h.unknown {
+                if s.cause == ShutdownCause::Idle && h.unknown {
                     // As for any shutdown: not while a demand reading is unknown (the drain
                     // stays, nothing is shut down).
                     wait(cx, steps, WaitReason::StaleDemand);
                     return;
                 }
-                drain_shutdown(cx, st, steps, d, h.count);
+                drain_shutdown(cx, st, steps, s, h.count);
             } else if st.managed && idle_mode && h.count == 0 {
                 if h.unknown {
                     wait(cx, steps, WaitReason::StaleDemand);
                     return;
                 }
-                let since = *st.host_idle_since.get_or_insert(now);
+                let since = *st.idle_since.get_or_insert(now);
                 if now.saturating_sub(since) >= policy.idle_grace {
                     if cx.res.kind == ResourceKind::Shared {
                         // The consumers go first: an idle drain scales them down (they leave
                         // the allowed set in this very tick), and the shutdown goes on through
                         // the usual mount veto, which waits while pods still mount the host.
-                        let d = Drain {
-                            mode: DrainMode::Immediate,
-                            since: now,
-                            scaled_down: true,
-                            origin: DrainOrigin::Idle,
+                        // A veto the host already carries (a shutdown without consumers to
+                        // withdraw, see `mounts_clear`) carries on: its wait keeps its start,
+                        // and a stop still holds the host.
+                        let stage = match st.shutdown.map(|s| s.stage) {
+                            Some(ShutdownStage::Vetoing { since, .. }) => ShutdownStage::Vetoing {
+                                since,
+                                withdrawn: true,
+                            },
+                            Some(ShutdownStage::Stopped { since, .. }) => ShutdownStage::Stopped {
+                                since,
+                                withdrawn: true,
+                            },
+                            _ => ShutdownStage::Withdrawn,
                         };
-                        st.drain = Some(d);
-                        drain_shutdown(cx, st, steps, d, 0);
+                        let s = Shutdown {
+                            cause: ShutdownCause::Idle,
+                            stage,
+                            since: now,
+                        };
+                        st.shutdown = Some(s);
+                        drain_shutdown(cx, st, steps, s, 0);
                     } else {
-                        power_off(cx, st, steps);
+                        power_off(cx, st, steps, ShutdownCause::Idle);
                     }
                 }
             } else {
-                st.host_idle_since = None;
-                match st.mounts_veto {
-                    // Something holds the host (or it is no longer ours to power off): the
-                    // shutdown this wait was for is not due any more.
-                    Some(MountsVeto::Waiting { .. }) => st.mounts_veto = None,
-                    Some(MountsVeto::Stopped { .. }) => {
-                        wait(cx, steps, WaitReason::ShutdownStopped);
+                st.idle_since = None;
+                if let Some(s) = st.shutdown {
+                    match s.stage {
+                        // Something holds the host (or it is no longer ours to power off):
+                        // the shutdown this wait was for is not due any more.
+                        ShutdownStage::Vetoing { .. } => st.shutdown = s.without_veto(),
+                        ShutdownStage::Stopped { .. } => {
+                            wait(cx, steps, WaitReason::ShutdownStopped);
+                        }
+                        ShutdownStage::Withdrawing | ShutdownStage::Withdrawn => {}
                     }
-                    None => {}
                 }
             }
         }
@@ -365,11 +380,19 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
 /// The pre-shutdown veto: whether no pod mounts the host. This is the one place a pod
 /// reading decides anything, and only to hold a shutdown back. A reading that is missing,
 /// stale or failed is unknown, and unknown counts as mounted. While pods mount (or may mount)
-/// the host the shutdown waits, bounded by the resource's `mounts_timeout`; when that runs
-/// out the scheduler stops (the host stays up, no retry) until the host is seen down, a person
-/// resets it, or a new manual request takes it over.
-fn mounts_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool {
-    if matches!(st.mounts_veto, Some(MountsVeto::Stopped { .. })) {
+/// the host the shutdown waits (stage `Vetoing`), bounded by the resource's `mounts_timeout`;
+/// when that runs out the scheduler stops (stage `Stopped`: the host stays up, no retry)
+/// until the host is seen down, a person resets it, or a new manual request takes it over.
+///
+/// A shutdown with no value yet (an exclusive host's, which has no drain) starts here, with
+/// `cause`.
+fn mounts_clear(
+    cx: &Cx,
+    st: &mut ResourceState,
+    steps: &mut Vec<Step>,
+    cause: ShutdownCause,
+) -> bool {
+    if st.shutdown.is_some_and(|s| s.stopped_since().is_some()) {
         wait(cx, steps, WaitReason::ShutdownStopped);
         return false;
     }
@@ -380,13 +403,10 @@ fn mounts_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool 
         cx.config.policy().host_reading_stale_after,
     );
     if reading == Some(0) {
-        st.mounts_veto = None;
+        st.shutdown = st.shutdown.and_then(Shutdown::without_veto);
         return true;
     }
-    let since = match st.mounts_veto {
-        Some(MountsVeto::Waiting { since }) => since,
-        _ => now,
-    };
+    let since = st.shutdown.and_then(|s| s.vetoing_since()).unwrap_or(now);
     let timeout = cx
         .res
         .power
@@ -394,19 +414,30 @@ fn mounts_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool 
         .map_or(sched_model::config::DEFAULT_MOUNTS_TIMEOUT, |p| {
             p.mounts_timeout()
         });
+    let (cause, started, withdrawn) = st.shutdown.map_or((cause, now, false), |s| {
+        (s.cause, s.since, s.consumers_withdrawn())
+    });
     if now.saturating_sub(since) >= timeout {
-        st.mounts_veto = Some(MountsVeto::Stopped { since: now });
+        // Nobody asked for the consumers of an idle shutdown to stay down: they come back,
+        // and the stopped state holds the host as for any shutdown (no longer managed, so no
+        // idle drain starts again). A requested drain keeps its consumers down.
+        st.shutdown = Some(Shutdown {
+            cause,
+            stage: ShutdownStage::Stopped {
+                since: now,
+                withdrawn: withdrawn && matches!(cause, ShutdownCause::Requested { .. }),
+            },
+            since: started,
+        });
         st.managed = false;
-        st.host_idle_since = None;
-        // Nobody asked for the consumers to stay down: an idle drain ends, they come back, and
-        // the stopped state holds the host as for any shutdown (no longer managed, so no idle
-        // drain starts again). A requested drain is kept.
-        if st.drain.is_some_and(|d| d.origin == DrainOrigin::Idle) {
-            st.drain = None;
-        }
+        st.idle_since = None;
         wait(cx, steps, WaitReason::ShutdownStopped);
     } else {
-        st.mounts_veto = Some(MountsVeto::Waiting { since });
+        st.shutdown = Some(Shutdown {
+            cause,
+            stage: ShutdownStage::Vetoing { since, withdrawn },
+            since: started,
+        });
         let why = if reading.is_none() {
             WaitReason::MountsUnknown
         } else {
@@ -419,8 +450,8 @@ fn mounts_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool 
 
 /// Shuts the host down, provided a fresh reading shows it up and (for a host whose mounts
 /// are checked) no pod mounts it. It is only reached with no model allowed (mode idle);
-/// pod counts of models are not consulted.
-fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
+/// pod counts of models are not consulted. `cause` is for a shutdown that has no value yet.
+fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, cause: ShutdownCause) {
     let max_age = cx.config.policy().host_reading_stale_after;
     if cx
         .snapshot
@@ -430,7 +461,7 @@ fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
         wait(cx, steps, WaitReason::StaleObservation);
         return;
     }
-    if cx.config.mounts_checked(&cx.res.id) && !mounts_clear(cx, st, steps) {
+    if cx.config.mounts_checked(&cx.res.id) && !mounts_clear(cx, st, steps, cause) {
         return;
     }
     steps.push(Step::PowerOff {
@@ -438,7 +469,7 @@ fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
     });
     st.power = PowerPhase::ShuttingDown { since: cx.now() };
     st.managed = false;
-    st.host_idle_since = None;
+    st.idle_since = None;
     st.mode = ModePhase::Idle;
 }
 
@@ -461,28 +492,34 @@ fn no_work_in_flight(cx: &Cx) -> bool {
 /// `graceful` when their in-flight work is done or `policy.drain_timeout` has passed since the
 /// request, whichever is first. Once scaled down it stays so until the drain ends.
 pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
-    let Some(mut d) = st.drain else {
+    let Some(mut s) = st.shutdown.filter(Shutdown::is_drain) else {
         return;
     };
     if !st.is_on() || !cx.config.power_managed(&cx.res.id) {
-        st.drain = None;
+        st.shutdown = None;
         return;
     }
     if cx.intent.power_up.get(&cx.res.id) == Some(&PowerWant::Manual) {
-        st.drain = None;
+        st.shutdown = None;
         return;
     }
     // An idle drain exists only for a host that is ours to power off.
-    if d.origin == DrainOrigin::Idle && !st.managed {
-        st.drain = None;
+    if s.cause == ShutdownCause::Idle && !st.managed {
+        st.shutdown = None;
         return;
     }
-    if !d.scaled_down {
-        let waited = cx.now().saturating_sub(d.since);
-        d.scaled_down = d.mode == DrainMode::Immediate
-            || waited >= cx.config.policy().drain_timeout
-            || no_work_in_flight(cx);
-        st.drain = Some(d);
+    if s.stage == ShutdownStage::Withdrawing {
+        let waited = cx.now().saturating_sub(s.since);
+        let immediate = matches!(
+            s.cause,
+            ShutdownCause::Requested {
+                mode: DrainMode::Immediate
+            }
+        );
+        if immediate || waited >= cx.config.policy().drain_timeout || no_work_in_flight(cx) {
+            s.stage = ShutdownStage::Withdrawn;
+            st.shutdown = Some(s);
+        }
     }
 }
 
@@ -494,18 +531,18 @@ fn drain_shutdown(
     cx: &Cx,
     st: &mut ResourceState,
     steps: &mut Vec<Step>,
-    d: Drain,
+    s: Shutdown,
     lease_holds: usize,
 ) {
-    if !d.scaled_down {
-        st.host_idle_since = None;
+    if s.stage == ShutdownStage::Withdrawing {
+        st.idle_since = None;
         wait(cx, steps, WaitReason::Draining);
         return;
     }
     if lease_holds > 0 {
-        st.host_idle_since = None;
+        st.idle_since = None;
         wait(cx, steps, WaitReason::DrainHeld);
         return;
     }
-    power_off(cx, st, steps);
+    power_off(cx, st, steps, s.cause);
 }

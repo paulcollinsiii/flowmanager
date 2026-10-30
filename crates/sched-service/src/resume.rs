@@ -1,7 +1,7 @@
 //! `resume`: a person acts on one resource flowmanager stopped at, after fixing the host by
 //! hand. Two things stop flowmanager and leave it waiting for a person: a power transition
 //! that timed out (`PowerPhase::Failed`) and a shutdown that waited for mounting pods until
-//! `mounts_timeout` ran out (`MountsVeto::Stopped`).
+//! `mounts_timeout` ran out (`ShutdownStage::Stopped`).
 //!
 //! Resuming forgets the resource's state, so the sequencer starts it afresh from what is
 //! observed (the same as a resource it has never seen): found running means up and not
@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use sched_model::{Config, MountsVeto, PowerPhase, PowerTransition, ResourceId};
+use sched_model::{Config, PowerPhase, PowerTransition, ResourceId};
 use serde::{Deserialize, Serialize};
 
 use crate::persist::CoreState;
@@ -118,7 +118,7 @@ pub fn resume(
     let Some(st) = core.state.resources.get(resource) else {
         return Err(not_stopped("it has no state yet".to_string()));
     };
-    let cleared = match (st.power, st.mounts_veto) {
+    let cleared = match (st.power, st.shutdown.and_then(|s| s.stopped_since())) {
         (
             PowerPhase::Failed {
                 during: PowerTransition::PoweringOn,
@@ -133,7 +133,7 @@ pub fn resume(
             },
             _,
         ) => "shutdown_failed",
-        (_, Some(MountsVeto::Stopped { .. })) => "shutdown_stopped_by_mounts",
+        (_, Some(_)) => "shutdown_stopped_by_mounts",
         (power, _) => return Err(not_stopped(format!("its power phase is {}", phase(power)))),
     };
     core.state.resources.remove(resource);
@@ -157,7 +157,15 @@ fn phase(p: PowerPhase) -> &'static str {
 mod tests {
     use super::*;
     use sched_model::test_support::example_config_managed;
-    use sched_model::{Millis, ResourceState};
+    use sched_model::{Millis, ResourceState, Shutdown, ShutdownCause, ShutdownStage};
+
+    fn stage(stage: ShutdownStage) -> Shutdown {
+        Shutdown {
+            cause: ShutdownCause::Idle,
+            stage,
+            since: Millis(1),
+        }
+    }
 
     fn core(entries: &[(&str, ResourceState)]) -> CoreState {
         let mut c = CoreState::default();
@@ -208,7 +216,10 @@ mod tests {
     fn a_shutdown_stopped_by_mounting_pods_is_forgotten_too() {
         let c = example_config_managed();
         let mut st = on();
-        st.mounts_veto = Some(MountsVeto::Stopped { since: Millis(9) });
+        st.shutdown = Some(stage(ShutdownStage::Stopped {
+            since: Millis(9),
+            withdrawn: false,
+        }));
         let mut s = core(&[("basestar-nfs", st)]);
         let ack = resume(&mut s, &c, &"basestar-nfs".into()).unwrap();
         assert_eq!(ack.cleared, "shutdown_stopped_by_mounts");
@@ -219,7 +230,10 @@ mod tests {
     fn a_resource_that_is_not_stopped_is_refused_and_left_alone() {
         let c = example_config_managed();
         let mut waiting = on();
-        waiting.mounts_veto = Some(MountsVeto::Waiting { since: Millis(9) });
+        waiting.shutdown = Some(stage(ShutdownStage::Vetoing {
+            since: Millis(9),
+            withdrawn: true,
+        }));
         for (st, text) in [
             (on(), "its power phase is on"),
             (

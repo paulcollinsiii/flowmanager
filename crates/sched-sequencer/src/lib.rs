@@ -247,7 +247,7 @@ fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent:
         };
         if !st.is_on()
             // A drain has scaled the consumers of this host down.
-            || st.drain.is_some_and(|d| d.scaled_down)
+            || st.shutdown.is_some_and(|s| s.consumers_withdrawn())
             || (intent.reclaim.contains(&req.resource) && config.supports_reclaim(&req.resource))
         {
             return false;

@@ -1036,7 +1036,8 @@ fn a_host_that_vanishes_resets_its_mode() {
 
 #[test]
 fn power_down_rules() {
-    let managed = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: ";
+    let managed =
+        "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: ";
     let nfs_idle = |since: u64| format!("{managed}{since} }}");
     let c = |since: u64| Case::new().nfs_state(&nfs_idle(since));
 
@@ -1060,7 +1061,7 @@ fn power_down_rules() {
     );
     let d = c(T - 99 * MIN).lease(hold).run();
     assert_steps(&d, vec![], "a shared hold keeps it up");
-    assert_eq!(d.state.resource(&rid(N)).unwrap().host_idle_since, None);
+    assert_eq!(d.state.resource(&rid(N)).unwrap().idle_since, None);
 
     let manual =
         format!("{{ id: m, resource: {N}, granted_at: 0, kind: {{ type: manual_host }} }}");
@@ -1133,7 +1134,11 @@ fn power_down_rules() {
     );
 
     let d = Case::new()
-        .gpu_state(&format!("{{ power: {{ phase: \"on\", since: 0 }}, mode: {}, managed: true, host_idle_since: {} }}", serving("mineru", 99 * MIN), T - 99 * MIN))
+        .gpu_state(&format!(
+            "{{ power: {{ phase: \"on\", since: 0 }}, mode: {}, managed: true, idle_since: {} }}",
+            serving("mineru", 99 * MIN),
+            T - 99 * MIN
+        ))
         .obs(pods("mineru", 1, 1, 0))
         .target(Some("mineru"))
         .run();
@@ -1250,7 +1255,7 @@ fn ticks_are_deterministic() {
 
 fn managed_idle(since_ago: u64) -> String {
     format!(
-        "{{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }}, managed: true, host_idle_since: {} }}",
+        "{{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }}, managed: true, idle_since: {} }}",
         T - since_ago
     )
 }
@@ -1917,7 +1922,7 @@ fn manual_control_never_powers_a_host_off_however_long_it_is_idle() {
             );
             for r in [G, N] {
                 let rs = d.state.resource(&rid(r)).unwrap();
-                assert!(rs.is_on() && !rs.managed && rs.host_idle_since.is_none());
+                assert!(rs.is_on() && !rs.managed && rs.idle_since.is_none());
             }
             st = d.state;
         }
@@ -2405,10 +2410,10 @@ fn other_resources_keep_scheduling_while_one_is_failed() {
 /// The NFS host managed and idle since `idle` ms ago, with a veto (`veto` is YAML) if any.
 fn nfs_due(idle: u64, veto: Option<&str>) -> String {
     let veto = veto
-        .map(|v| format!(", mounts_veto: {v}"))
+        .map(|v| format!(", shutdown: {{ cause: {{ kind: idle }}, stage: {v}, since: 1 }}"))
         .unwrap_or_default();
     format!(
-        "{{ power: {}, mode: {}, managed: true, host_idle_since: {}{veto} }}",
+        "{{ power: {}, mode: {}, managed: true, idle_since: {}{veto} }}",
         on(),
         mode_idle(),
         T - idle
@@ -2416,11 +2421,23 @@ fn nfs_due(idle: u64, veto: Option<&str>) -> String {
 }
 
 fn waiting_since(ago: u64) -> String {
-    format!("{{ phase: waiting, since: {} }}", T - ago)
+    format!("{{ phase: vetoing, since: {}, withdrawn: false }}", T - ago)
 }
 
-fn veto_of(d: &Decision) -> Option<sched_model::MountsVeto> {
-    d.state.resource(&rid(N)).unwrap().mounts_veto
+/// The mount veto of the NFS host in the decision's state, as the stage of its shutdown shows it.
+#[derive(Debug, PartialEq)]
+enum Veto {
+    Waiting { since: sched_model::Millis },
+    Stopped { since: sched_model::Millis },
+}
+
+fn veto_of(d: &Decision) -> Option<Veto> {
+    let s = d.state.resource(&rid(N)).unwrap().shutdown?;
+    match s.stage {
+        sched_model::ShutdownStage::Vetoing { since, .. } => Some(Veto::Waiting { since }),
+        sched_model::ShutdownStage::Stopped { since, .. } => Some(Veto::Stopped { since }),
+        _ => None,
+    }
 }
 
 #[test]
@@ -2430,7 +2447,7 @@ fn a_host_that_pods_mount_is_not_powered_off_and_the_wait_begins_when_it_is_due(
     assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
     assert_eq!(
         veto_of(&d),
-        Some(sched_model::MountsVeto::Waiting {
+        Some(Veto::Waiting {
             since: sched_model::Millis(T)
         })
     );
@@ -2438,11 +2455,7 @@ fn a_host_that_pods_mount_is_not_powered_off_and_the_wait_begins_when_it_is_due(
     assert!(n.managed && n.is_on(), "still ours and still up");
     // An idle drain scaled its consumers down so their pods stop mounting it.
     assert!(d.allowed.classes.is_empty(), "{:?}", d.allowed);
-    assert_eq!(
-        n.drain.map(|x| x.origin),
-        Some(sched_model::DrainOrigin::Idle),
-        "the scheduler's own drain"
-    );
+    assert!(is_idle_drain(&d), "the scheduler's own drain");
     // Not yet due (grace not over): no veto, no wait.
     let d = Case::new()
         .nfs_state(&nfs_due(10 * MIN - 1, None))
@@ -2511,7 +2524,7 @@ fn the_wait_ends_in_the_shutdown_when_the_pods_are_gone() {
     assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "still mounted");
     assert_eq!(
         veto_of(&d),
-        Some(sched_model::MountsVeto::Waiting {
+        Some(Veto::Waiting {
             since: sched_model::Millis(T - 5 * MIN)
         }),
         "the wait keeps its start"
@@ -2536,7 +2549,7 @@ fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retr
     assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], "timed out");
     assert_eq!(
         veto_of(&d),
-        Some(sched_model::MountsVeto::Stopped {
+        Some(Veto::Stopped {
             since: sched_model::Millis(T)
         })
     );
@@ -2559,9 +2572,9 @@ fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retr
     let stopped = |pods: u32| {
         Case::new()
             .nfs_state(
-                &nfs_due(0, Some("{ phase: stopped, since: 1 }"))
+                &nfs_due(0, Some("{ phase: stopped, since: 1, withdrawn: false }"))
                     .replace("managed: true", "managed: false")
-                    .replace(&format!("host_idle_since: {}", T), "host_idle_since: null"),
+                    .replace(&format!("idle_since: {}", T), "idle_since: null"),
             )
             .obs(mounts(pods, 0))
     };
@@ -2575,10 +2588,7 @@ fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retr
             d.steps.contains(&wait(N, WaitReason::ShutdownStopped)),
             "{d:?}"
         );
-        assert!(matches!(
-            veto_of(&d),
-            Some(sched_model::MountsVeto::Stopped { .. })
-        ));
+        assert!(matches!(veto_of(&d), Some(Veto::Stopped { .. })));
     }
 }
 
@@ -2589,7 +2599,7 @@ fn a_stopped_host_is_never_shut_down_even_if_a_state_says_it_is_managed_and_noth
     // hand: the check itself must still refuse, whatever the reading says, rather than rely on
     // the caller having cleared the flag.
     let managed_stopped = format!(
-        "{{ power: {}, mode: {}, managed: true, host_idle_since: {}, mounts_veto: {{ phase: stopped, since: 1 }} }}",
+        "{{ power: {}, mode: {}, managed: true, idle_since: {}, shutdown: {{ cause: {{ kind: idle }}, stage: {{ phase: stopped, since: 1, withdrawn: false }}, since: 1 }} }}",
         on(),
         mode_idle(),
         T - 20 * MIN
@@ -2601,16 +2611,13 @@ fn a_stopped_host_is_never_shut_down_even_if_a_state_says_it_is_managed_and_noth
         let d = case.nfs_state(&managed_stopped).run();
         assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], name);
         assert!(matches!(power_of(&d, N), PowerPhase::On { .. }), "{name}");
-        assert!(matches!(
-            veto_of(&d),
-            Some(sched_model::MountsVeto::Stopped { .. })
-        ));
+        assert!(matches!(veto_of(&d), Some(Veto::Stopped { .. })));
     }
 }
 
 #[test]
 fn a_new_manual_request_takes_a_stopped_host_over_and_the_next_idle_period_decides_afresh() {
-    let stopped = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: false, mounts_veto: { phase: stopped, since: 1 } }";
+    let stopped = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: false, shutdown: { cause: { kind: idle }, stage: { phase: stopped, since: 1, withdrawn: false }, since: 1 } }";
     let d = Case::new()
         .nfs_state(stopped)
         .want(N, PowerWant::Manual)
@@ -2625,10 +2632,7 @@ fn a_new_manual_request_takes_a_stopped_host_over_and_the_next_idle_period_decid
         .want(N, PowerWant::Workload)
         .obs(mounts(4, 0))
         .run();
-    assert!(matches!(
-        veto_of(&d),
-        Some(sched_model::MountsVeto::Stopped { .. })
-    ));
+    assert!(matches!(veto_of(&d), Some(Veto::Stopped { .. })));
     assert!(!d.state.resource(&rid(N)).unwrap().managed);
 }
 
@@ -2646,8 +2650,8 @@ fn something_holding_the_host_ends_the_wait_and_a_host_seen_down_ends_a_stop() {
     assert_steps(&d, vec![], "kept up");
     // The host went down by itself (a person, a power cut): nothing left to veto.
     for veto in [
-        "{ phase: waiting, since: 1 }",
-        "{ phase: stopped, since: 1 }",
+        "{ phase: vetoing, since: 1, withdrawn: false }",
+        "{ phase: stopped, since: 1, withdrawn: false }",
     ] {
         let d = Case::new()
             .nfs_state(&nfs_due(60 * MIN, Some(veto)))
@@ -2662,7 +2666,8 @@ fn something_holding_the_host_ends_the_wait_and_a_host_seen_down_ends_a_stop() {
 fn an_unchecked_host_is_powered_off_without_a_mount_reading() {
     // The GPU host has no mounts source: the veto does not apply to it (its drain is the
     // model wind-down), and a mount reading is not needed.
-    let managed = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: ";
+    let managed =
+        "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: ";
     let d = Case::new()
         .gpu_state(&format!("{managed}{} }}", T - 10 * MIN))
         .run();
@@ -2690,7 +2695,7 @@ fn a_managed_gpu_host_is_never_powered_off_while_a_model_is_allowed_and_only_aft
         "{d:?}"
     );
     assert_eq!(mode_of(&d, G), ModePhase::Idle);
-    assert_eq!(d.state.resource(&rid(G)).unwrap().host_idle_since, None);
+    assert_eq!(d.state.resource(&rid(G)).unwrap().idle_since, None);
     // A model that is still allowed blocks the shutdown, however long the host was idle.
     let still = Case::new().gpu_state(&state).target(Some("mineru")).run();
     assert!(
@@ -2772,7 +2777,7 @@ fn with_min_off(c: Case) -> Case {
 
 fn nfs_off(confirmed_ago: Option<u64>) -> String {
     let stamp = confirmed_ago
-        .map(|a| format!(", shutdown_confirmed_at: {}", T - a))
+        .map(|a| format!(", off_since: {}", T - a))
         .unwrap_or_default();
     format!("{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}{stamp} }}")
 }
@@ -2782,7 +2787,7 @@ fn nfs_down(c: Case) -> Case {
 }
 
 fn stamp_of(d: &Decision, r: &str) -> Option<sched_model::Millis> {
-    d.state.resource(&rid(r)).unwrap().shutdown_confirmed_at
+    d.state.resource(&rid(r)).unwrap().off_since
 }
 
 fn powers_on(d: &Decision, r: &str) -> bool {
@@ -2913,7 +2918,7 @@ fn the_default_of_zero_changes_nothing() {
 fn a_clock_that_goes_back_never_lengthens_the_wait_beyond_min_off() {
     // The stamp is five minutes in the future.
     let future = format!(
-        "{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, shutdown_confirmed_at: {} }}",
+        "{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, off_since: {} }}",
         T + 5 * MIN
     );
     let c = nfs_down(with_min_off(Case::new()).nfs_state(&future)).want(N, PowerWant::Workload);
@@ -2958,7 +2963,7 @@ fn the_wait_is_a_delay_of_a_fresh_decision_never_a_retry() {
 #[test]
 fn min_off_also_holds_back_an_exclusive_host_and_a_reclaim_is_not_delayed() {
     let off = format!(
-        "{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, shutdown_confirmed_at: {} }}",
+        "{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, off_since: {} }}",
         T - MIN
     );
     let c = with_min_off(Case::new())
@@ -3036,15 +3041,38 @@ fn without_a_min_off_no_stamp_is_ever_written_and_a_leftover_one_is_dropped() {
 /// The NFS host managed and up with a drain `mode` requested `ago` ms before the tick.
 fn nfs_draining(mode: &str, ago: u64) -> String {
     format!(
-        "{{ power: {}, mode: {}, managed: true, drain: {{ mode: {mode}, since: {} }} }}",
+        "{{ power: {}, mode: {}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, stage: {{ phase: withdrawing }}, since: {} }} }}",
         on(),
         mode_idle(),
         T - ago
     )
 }
 
-fn nfs_drain_of(d: &Decision) -> Option<sched_model::Drain> {
-    d.state.resource(&rid(N)).unwrap().drain
+/// The drain of the NFS host as its shutdown shows it: asked for by a person, or the
+/// scheduler's own (`idle`, always immediate).
+#[derive(Debug, PartialEq)]
+struct DrainView {
+    mode: sched_model::DrainMode,
+    scaled_down: bool,
+    idle: bool,
+}
+
+fn nfs_drain_of(d: &Decision) -> Option<DrainView> {
+    let s = d
+        .state
+        .resource(&rid(N))
+        .unwrap()
+        .shutdown
+        .filter(sched_model::Shutdown::is_drain)?;
+    let (mode, idle) = match s.cause {
+        sched_model::ShutdownCause::Requested { mode } => (mode, false),
+        _ => (sched_model::DrainMode::Immediate, true),
+    };
+    Some(DrainView {
+        mode,
+        scaled_down: s.consumers_withdrawn(),
+        idle,
+    })
 }
 
 /// Whether the gate class of paperless-gpt (which needs basestar-nfs and the GPU host) is allowed.
@@ -3146,10 +3174,7 @@ fn the_mount_veto_and_its_timeout_still_apply_after_the_scale_down() {
     let d = c.run();
     assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
     assert!(!gate_allowed(&d));
-    assert!(matches!(
-        veto_of(&d),
-        Some(sched_model::MountsVeto::Waiting { .. })
-    ));
+    assert!(matches!(veto_of(&d), Some(Veto::Waiting { .. })));
     // The pods are gone: the shutdown goes ahead.
     let d2 = Case::new().run_fresh_at(&d.state, T + MIN);
     assert_steps(&d2, vec![Step::PowerOff { resource: rid(N) }], "unmounted");
@@ -3179,25 +3204,27 @@ fn a_new_manual_lease_cancels_a_drain_and_a_host_seen_off_ends_it() {
 }
 
 #[test]
-fn a_drain_state_reads_and_writes_without_changing_a_state_that_has_none() {
+fn a_shutdown_state_reads_and_writes_and_a_state_that_has_none_stores_none() {
     let d = Case::new().nfs_state(&nfs_draining("graceful", 0)).run();
     let text = serde_json::to_string(&d.state).unwrap();
-    assert_eq!(text.matches("\"drain\"").count(), 1, "{text}");
+    assert_eq!(text.matches("\"shutdown\":{").count(), 1, "{text}");
     let back: SchedState = serde_json::from_str(&text).unwrap();
     assert_eq!(back, d.state);
     let none = serde_json::to_string(&Case::new().run().state).unwrap();
-    assert!(!none.contains("drain"), "{none}");
+    assert!(!none.contains("\"shutdown\":{"), "{none}");
 }
 
 // ---- idle drain: a managed shared host that would be powered off scales its consumers down first ----
 
 /// The NFS host managed, idle since `idle` ms ago, with an idle drain started `ago` ms ago.
 fn nfs_idle_drain(idle: u64, ago: u64, veto: Option<&str>) -> String {
-    let veto = veto
-        .map(|v| format!(", mounts_veto: {v}"))
-        .unwrap_or_default();
+    // With a veto (`veto` is the YAML of its stage) the idle drain is at that stage; the
+    // consumers were scaled down before it began.
+    let stage = veto.map_or("{ phase: withdrawn }".to_string(), |v| {
+        v.replace("withdrawn: false", "withdrawn: true")
+    });
     format!(
-        "{{ power: {}, mode: {}, managed: true, host_idle_since: {}, drain: {{ mode: immediate, since: {}, scaled_down: true, origin: idle }}{veto} }}",
+        "{{ power: {}, mode: {}, managed: true, idle_since: {}, shutdown: {{ cause: {{ kind: idle }}, stage: {stage}, since: {} }} }}",
         on(),
         mode_idle(),
         T - idle,
@@ -3210,7 +3237,7 @@ fn nfs_state_of(d: &Decision) -> sched_model::ResourceState {
 }
 
 fn is_idle_drain(d: &Decision) -> bool {
-    nfs_drain_of(d).is_some_and(|x| x.origin == sched_model::DrainOrigin::Idle)
+    nfs_drain_of(d).is_some_and(|x| x.idle)
 }
 
 #[test]
@@ -3276,16 +3303,13 @@ fn any_hold_cancels_an_idle_drain_and_the_idle_clock_starts_again() {
             !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
             "{name}"
         );
-        assert_eq!(nfs_state_of(&d).host_idle_since, None, "{name}");
+        assert_eq!(nfs_state_of(&d).idle_since, None, "{name}");
     }
     // Once the hold is gone the clock starts from scratch: no new idle drain until a full
     // idle_grace has passed again.
     let d = Case::new().nfs_state(&nfs_due(0, None)).run();
     assert_eq!(nfs_drain_of(&d), None);
-    assert_eq!(
-        nfs_state_of(&d).host_idle_since,
-        Some(sched_model::Millis(T))
-    );
+    assert_eq!(nfs_state_of(&d).idle_since, Some(sched_model::Millis(T)));
     let d = Case::new().run_fresh_at(&d.state, T + 10 * MIN - 1);
     assert_eq!(nfs_drain_of(&d), None);
     let d = Case::new().run_fresh_at(&d.state, T + 10 * MIN);
@@ -3316,10 +3340,7 @@ fn a_stopped_mount_veto_ends_the_idle_drain_and_it_does_not_start_again() {
         .obs(mounts(2, 0));
     let d = c.run();
     assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], "stopped");
-    assert!(matches!(
-        veto_of(&d),
-        Some(sched_model::MountsVeto::Stopped { .. })
-    ));
+    assert!(matches!(veto_of(&d), Some(Veto::Stopped { .. })));
     assert_eq!(nfs_drain_of(&d), None, "the idle drain ends");
     assert!(gate_allowed(&d), "the consumers come back");
     assert!(!nfs_state_of(&d).managed);
@@ -3359,7 +3380,7 @@ fn a_host_seen_down_ends_an_idle_drain_and_manual_control_never_starts_one() {
 #[test]
 fn an_exclusive_host_is_shut_down_without_an_idle_drain() {
     let gpu = format!(
-        "{{ power: {}, mode: {}, managed: true, host_idle_since: {} }}",
+        "{{ power: {}, mode: {}, managed: true, idle_since: {} }}",
         on(),
         mode_idle(),
         T - 60 * MIN
@@ -3370,7 +3391,7 @@ fn an_exclusive_host_is_shut_down_without_an_idle_drain() {
         "{:?}",
         d.steps
     );
-    assert_eq!(d.state.resource(&rid(G)).unwrap().drain, None);
+    assert_eq!(d.state.resource(&rid(G)).unwrap().shutdown, None);
 }
 
 fn gpu_off() -> String {

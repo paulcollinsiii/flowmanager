@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 
 use sched_model::{
     Config, CreateJob, HolderId, JobBook, JobEvent, JobId, LastRun, Lease, LeaseId, LeaseKind,
-    Millis, MountsVeto, Run, RunPhase, SchedState, Snapshot, Trigger, host_is_up,
+    Millis, Run, RunPhase, SchedState, Snapshot, Trigger, host_is_up,
 };
 use sched_sequencer::jobs::{Inputs, Reading, advance};
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,7 @@ pub fn needs_up(
         host_is_up(config, snapshot, state, r)
             && !state
                 .resource(r)
-                .is_some_and(|s| matches!(s.mounts_veto, Some(MountsVeto::Stopped { .. })))
+                .is_some_and(|s| s.shutdown.is_some_and(|x| x.stopped_since().is_some()))
     })
 }
 
@@ -231,7 +231,7 @@ mod scenarios;
 mod tests {
     use super::*;
     use sched_model::test_support::example_config;
-    use sched_model::{PowerPhase, ResourceState};
+    use sched_model::{PowerPhase, ResourceState, Shutdown, ShutdownCause, ShutdownStage};
 
     #[test]
     fn a_host_that_is_on_but_whose_shutdown_flowmanager_gave_up_on_is_not_up_for_a_job() {
@@ -244,11 +244,25 @@ mod tests {
         state.resources.insert(nfs.clone(), st.clone());
         assert!(needs_up(&config, &snapshot, &state, &spec), "on: up");
         // Waiting for the mounts to go away is still up (a shutdown is merely held back).
-        st.mounts_veto = Some(MountsVeto::Waiting { since: Millis(2) });
+        st.shutdown = Some(Shutdown {
+            cause: ShutdownCause::Idle,
+            stage: ShutdownStage::Vetoing {
+                since: Millis(2),
+                withdrawn: false,
+            },
+            since: Millis(2),
+        });
         state.resources.insert(nfs.clone(), st.clone());
         assert!(needs_up(&config, &snapshot, &state, &spec));
         // Stopped: the host is On, but flowmanager stopped managing it; a job does not start.
-        st.mounts_veto = Some(MountsVeto::Stopped { since: Millis(3) });
+        st.shutdown = Some(Shutdown {
+            cause: ShutdownCause::Idle,
+            stage: ShutdownStage::Stopped {
+                since: Millis(3),
+                withdrawn: false,
+            },
+            since: Millis(2),
+        });
         state.resources.insert(nfs, st);
         assert!(!needs_up(&config, &snapshot, &state, &spec));
     }

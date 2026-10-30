@@ -1,7 +1,7 @@
 //! `release_host_lease` with a drain: a person releases the manual lease of a shared host and
 //! asks for it to go down, even though queued or in-flight work would otherwise keep it up.
 //!
-//! The request is recorded in the host's sequencer state (`ResourceState::drain`, persisted
+//! The request is recorded in the host's sequencer state (`ResourceState::shutdown`, persisted
 //! with it, so it survives a restart); the sequencer does the rest (see `sched_sequencer`:
 //! scale the consumers down, wait for the leases that hold the host, apply the mount veto,
 //! shut the host down). A new manual host lease cancels it; the host being seen down ends it.
@@ -9,9 +9,37 @@
 //! The rules are pure, so they are tested without Restate; `object::release_host_lease`
 //! journals them.
 
-use sched_model::{Config, Drain, DrainMode, DrainOrigin, Millis, MountsVeto, ResourceId};
+use sched_model::{
+    Config, DrainMode, Millis, ResourceId, ResourceState, Shutdown, ShutdownCause, ShutdownStage,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::persist::CoreState;
+
+/// What `drain_host` and the switch report of the drain a person requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedDrain {
+    pub mode: DrainMode,
+    /// When the drain was requested.
+    pub since: Millis,
+    /// Whether the classes that need the host have been taken out of the allowed set.
+    pub scaled_down: bool,
+}
+
+impl RecordedDrain {
+    /// The drain a person requested of the host, if its shutdown is one.
+    pub fn of(st: &ResourceState) -> Option<RecordedDrain> {
+        let s = st.shutdown?;
+        let ShutdownCause::Requested { mode } = s.cause else {
+            return None;
+        };
+        Some(RecordedDrain {
+            mode,
+            since: s.since,
+            scaled_down: s.consumers_withdrawn(),
+        })
+    }
+}
 
 /// What a drain request did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +57,9 @@ pub enum Requested {
 /// managed, and a shutdown it had stopped at (pods still mounting after `mounts_timeout`) is
 /// tried afresh, as a new manual request would. A drain already under way keeps its start and
 /// its scale-down: a second request only changes the mode: `immediate` after `graceful`
-/// ends the wait, and `graceful` after `immediate` leaves it immediate.
+/// ends the wait, and `graceful` after `immediate` leaves it immediate. A person's request
+/// takes over an idle drain: it is a requested drain from now on (immediate, as the idle
+/// one was), with the start and the scale-down kept.
 pub fn request(
     core: &mut CoreState,
     config: &Config,
@@ -46,28 +76,40 @@ pub fn request(
     if !st.is_on() {
         return Requested::NotApplicable;
     }
-    let before = st.drain;
-    st.drain = Some(Drain {
-        // Immediate escalates; graceful asked of an immediate drain leaves it immediate.
-        mode: if before.is_some_and(|d| d.mode == DrainMode::Immediate) {
-            DrainMode::Immediate
-        } else {
-            mode
+    st.shutdown = Some(match st.shutdown.filter(Shutdown::is_drain) {
+        Some(before) => {
+            let before_mode = match before.cause {
+                ShutdownCause::Requested { mode } => mode,
+                ShutdownCause::Idle | ShutdownCause::Reclaim => DrainMode::Immediate,
+            };
+            Shutdown {
+                // Immediate escalates; graceful asked of an immediate drain leaves it immediate.
+                cause: ShutdownCause::Requested {
+                    mode: if before_mode == DrainMode::Immediate {
+                        DrainMode::Immediate
+                    } else {
+                        mode
+                    },
+                },
+                stage: match before.stage {
+                    // A stop is tried afresh, as for a new manual request.
+                    ShutdownStage::Stopped { .. } => ShutdownStage::Withdrawn,
+                    stage => stage,
+                },
+                since: before.since,
+            }
+        }
+        // No drain yet; a stopped shutdown of another kind is tried afresh, as above.
+        None => Shutdown {
+            cause: ShutdownCause::Requested { mode },
+            stage: ShutdownStage::Withdrawing,
+            since: now,
         },
-        since: before.map_or(now, |d| d.since),
-        scaled_down: before.is_some_and(|d| d.scaled_down),
-        // A person's request takes over an idle drain: it is a requested drain from now on, with
-        // the start and the scale-down kept.
-        origin: DrainOrigin::Requested,
     });
     st.managed = true;
-    st.host_idle_since = None;
-    if matches!(st.mounts_veto, Some(MountsVeto::Stopped { .. })) {
-        st.mounts_veto = None;
-    }
+    st.idle_since = None;
     Requested::Recorded
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,11 +129,26 @@ mod tests {
         "basestar-nfs".into()
     }
 
+    fn state(c: &CoreState) -> &ResourceState {
+        c.state.resource(&nfs()).unwrap()
+    }
+
+    fn drain(st: &ResourceState) -> Option<RecordedDrain> {
+        RecordedDrain::of(st)
+    }
+
     #[test]
     fn a_drain_is_recorded_on_a_host_that_is_up_and_takes_it_over() {
         let mut c = core(PowerPhase::On { since: Millis(1) });
-        c.state.resources.get_mut(&nfs()).unwrap().mounts_veto =
-            Some(MountsVeto::Stopped { since: Millis(2) });
+        // An idle shutdown the scheduler gave up on (pods still mounted): tried afresh.
+        c.state.resources.get_mut(&nfs()).unwrap().shutdown = Some(Shutdown {
+            cause: ShutdownCause::Idle,
+            stage: ShutdownStage::Stopped {
+                since: Millis(2),
+                withdrawn: false,
+            },
+            since: Millis(1),
+        });
         let r = request(
             &mut c,
             &example_config_managed(),
@@ -100,18 +157,17 @@ mod tests {
             Millis(9),
         );
         assert_eq!(r, Requested::Recorded);
-        let st = c.state.resource(&nfs()).unwrap();
+        let st = state(&c);
         assert_eq!(
-            st.drain,
-            Some(Drain {
+            drain(st),
+            Some(RecordedDrain {
                 mode: DrainMode::Graceful,
                 since: Millis(9),
                 scaled_down: false,
-                origin: DrainOrigin::Requested
             })
         );
         assert!(st.managed);
-        assert_eq!(st.mounts_veto, None);
+        assert_eq!(st.shutdown.unwrap().stage, ShutdownStage::Withdrawing);
     }
 
     #[test]
@@ -123,36 +179,31 @@ mod tests {
             .resources
             .get_mut(&nfs())
             .unwrap()
-            .drain
+            .shutdown
             .as_mut()
             .unwrap()
-            .scaled_down = true;
+            .stage = ShutdownStage::Withdrawn;
         request(&mut c, &config, &nfs(), DrainMode::Immediate, Millis(50));
         assert_eq!(
-            c.state.resource(&nfs()).unwrap().drain,
-            Some(Drain {
+            drain(state(&c)),
+            Some(RecordedDrain {
                 mode: DrainMode::Immediate,
                 since: Millis(9),
                 scaled_down: true,
-                origin: DrainOrigin::Requested
             })
         );
         // Graceful asked of an immediate drain leaves it immediate.
         request(&mut c, &config, &nfs(), DrainMode::Graceful, Millis(60));
-        assert_eq!(
-            c.state.resource(&nfs()).unwrap().drain.map(|d| d.mode),
-            Some(DrainMode::Immediate)
-        );
+        assert_eq!(drain(state(&c)).map(|d| d.mode), Some(DrainMode::Immediate));
     }
 
     #[test]
     fn a_request_takes_over_an_idle_drain_keeping_its_start_and_scale_down() {
         let mut c = core(PowerPhase::On { since: Millis(1) });
-        c.state.resources.get_mut(&nfs()).unwrap().drain = Some(Drain {
-            mode: DrainMode::Immediate,
+        c.state.resources.get_mut(&nfs()).unwrap().shutdown = Some(Shutdown {
+            cause: ShutdownCause::Idle,
+            stage: ShutdownStage::Withdrawn,
             since: Millis(4),
-            scaled_down: true,
-            origin: DrainOrigin::Idle,
         });
         request(
             &mut c,
@@ -162,14 +213,37 @@ mod tests {
             Millis(50),
         );
         assert_eq!(
-            c.state.resource(&nfs()).unwrap().drain,
-            Some(Drain {
+            drain(state(&c)),
+            Some(RecordedDrain {
                 mode: DrainMode::Immediate,
                 since: Millis(4),
                 scaled_down: true,
-                origin: DrainOrigin::Requested
             })
         );
+    }
+
+    #[test]
+    fn a_request_after_a_stopped_requested_drain_keeps_it_withdrawn_and_tries_again() {
+        let mut c = core(PowerPhase::On { since: Millis(1) });
+        c.state.resources.get_mut(&nfs()).unwrap().shutdown = Some(Shutdown {
+            cause: ShutdownCause::Requested {
+                mode: DrainMode::Graceful,
+            },
+            stage: ShutdownStage::Stopped {
+                since: Millis(8),
+                withdrawn: true,
+            },
+            since: Millis(4),
+        });
+        request(
+            &mut c,
+            &example_config_managed(),
+            &nfs(),
+            DrainMode::Graceful,
+            Millis(50),
+        );
+        assert_eq!(state(&c).shutdown.unwrap().stage, ShutdownStage::Withdrawn);
+        assert_eq!(drain(state(&c)).map(|d| d.since), Some(Millis(4)));
     }
 
     #[test]
@@ -185,7 +259,7 @@ mod tests {
             ),
             Requested::NotApplicable
         );
-        assert_eq!(up.state.resource(&nfs()).unwrap().drain, None);
+        assert_eq!(state(&up).shutdown, None);
         let mut none = CoreState::default();
         assert_eq!(
             request(

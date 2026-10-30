@@ -307,11 +307,16 @@ proptest! {
         let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1) });
         st.managed = true;
         // An idle drain (the scheduler's own) is always immediate and already scaled down.
-        st.drain = Some(sched_model::Drain {
-            mode: if immediate || idle { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful },
+        st.shutdown = Some(sched_model::Shutdown {
+            cause: if idle {
+                sched_model::ShutdownCause::Idle
+            } else {
+                sched_model::ShutdownCause::Requested {
+                    mode: if immediate { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful },
+                }
+            },
+            stage: if scaled_down || idle { sched_model::ShutdownStage::Withdrawn } else { sched_model::ShutdownStage::Withdrawing },
             since: Millis(50_000_000 - ago),
-            scaled_down: scaled_down || idle,
-            origin: if idle { sched_model::DrainOrigin::Idle } else { sched_model::DrainOrigin::Requested },
         });
         sc.initial_state.resources.insert("basestar-nfs".into(), st);
         let results = run(&config, &sc).unwrap();
@@ -321,8 +326,8 @@ proptest! {
                 .decision
                 .state
                 .resource(&"basestar-nfs".into())
-                .and_then(|s| s.drain)
-                .is_some_and(|d| d.scaled_down);
+                .and_then(|s| s.shutdown)
+                .is_some_and(|s| s.consumers_withdrawn());
             if draining {
                 for class in &r.decision.allowed.classes {
                     let needs = config

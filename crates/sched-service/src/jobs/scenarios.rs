@@ -899,7 +899,7 @@ async fn a_job_hold_during_min_off_waits_and_a_catch_up_run_alerts_at_the_window
     // The host is seen down a minute before the job is due: the minimum off time starts.
     let r = w.tick(DUE - MIN, false, false).await;
     let st = r.state.resource(&"basestar-nfs".into()).unwrap();
-    assert_eq!(st.shutdown_confirmed_at, Some(Millis(DUE - MIN)));
+    assert_eq!(st.off_since, Some(Millis(DUE - MIN)));
     // Due: the hold exists, the host is wanted, and it is reported waiting, not silent.
     let r = w.tick(DUE, false, false).await;
     assert_eq!(w.holds(), vec![hold()]);

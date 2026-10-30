@@ -36,12 +36,11 @@ pub const EPOCH_KEY: &str = "backstop_epoch";
 
 /// Version of the [`CoreState`] document this build reads and writes.
 ///
-/// Not bumped by the queue-only change (no pod gating): the build before it wrote mode
-/// phases `loading` and `draining`, which this build still reads and maps (`loading` to
-/// serving since the same instant, `draining` to idle; see `sched_model::ModePhase`), and
-/// everything this build writes (`idle`, `serving`) the build before it reads too. A bump
-/// would have made both directions an error tick until the document was discarded.
-pub const STATE_VERSION: u32 = 1;
+/// Version 2 replaced the per-resource `drain`, `mounts_veto`, `host_idle_since` and
+/// `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`. There is no
+/// migration: a document of version 1 is an error (see [`decode`]) until it is discarded, and
+/// the sequencer then starts from observation.
+pub const STATE_VERSION: u32 = 2;
 /// Version of the [`LeaseBook`] document this build reads and writes.
 pub const LEASES_VERSION: u32 = 1;
 
@@ -176,35 +175,48 @@ mod tests {
         assert_eq!(decode_state(None).unwrap(), CoreState::default());
         assert_eq!(decode_leases(None).unwrap(), LeaseBook::default());
         let text = String::from_utf8(encode_state(&s)).unwrap();
-        assert!(text.starts_with("{\"version\":1,\"data\":"), "{text}");
+        assert!(text.starts_with("{\"version\":2,\"data\":"), "{text}");
     }
 
     #[test]
-    fn the_shutdown_stamp_survives_a_restart_and_is_absent_when_unset() {
+    fn the_off_stamp_and_a_shutdown_survive_a_restart() {
         use sched_model::{Millis, PowerPhase, ResourceState};
         let mut s = CoreState::default();
         let mut off = ResourceState::new(PowerPhase::Off);
-        off.shutdown_confirmed_at = Some(Millis(4_000));
+        off.off_since = Some(Millis(4_000));
         s.state.resources.insert("basestar-nfs".into(), off);
         s.state
             .resources
             .insert("cuda-central".into(), ResourceState::new(PowerPhase::Off));
         let bytes = encode_state(&s);
         assert_eq!(decode_state(Some(&bytes)).unwrap(), s);
-        // The version is unchanged, the key is written only where it is set, and a state
-        // written before the field existed reads as "no stamp".
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.starts_with("{\"version\":1,\"data\":"), "{text}");
-        assert_eq!(text.matches("shutdown_confirmed_at").count(), 1, "{text}");
+        assert!(text.starts_with("{\"version\":2,\"data\":"), "{text}");
+        assert_eq!(text.matches("\"off_since\":4000").count(), 1, "{text}");
+        // A shutdown, in the stage it has reached, is part of the stored state.
+        s.state
+            .resources
+            .get_mut(&"basestar-nfs".into())
+            .unwrap()
+            .shutdown = Some(sched_model::Shutdown {
+            cause: sched_model::ShutdownCause::Idle,
+            stage: sched_model::ShutdownStage::Vetoing {
+                since: Millis(5_000),
+                withdrawn: true,
+            },
+            since: Millis(4_500),
+        });
+        assert_eq!(decode_state(Some(&encode_state(&s))).unwrap(), s);
+    }
+
+    #[test]
+    fn a_state_of_the_previous_version_is_an_error_and_is_not_migrated() {
+        // Version 1 stored `drain`, `mounts_veto`, `host_idle_since` and
+        // `shutdown_confirmed_at`; this build neither reads nor converts them.
         let old = br#"{"version":1,"data":{"state":{"resources":{"b":{"power":{"phase":"off"},"mode":{"phase":"idle"}}}},"reported":[]}}"#;
-        let got = decode_state(Some(old)).unwrap();
-        assert_eq!(
-            got.state
-                .resource(&"b".into())
-                .unwrap()
-                .shutdown_confirmed_at,
-            None
-        );
+        let e = decode_state(Some(old)).unwrap_err();
+        assert_eq!(e.key, STATE_KEY);
+        assert!(e.problem.contains("version 1"), "{e}");
     }
 
     #[test]
@@ -223,17 +235,17 @@ mod tests {
 
     #[test]
     fn unknown_versions_garbage_and_unversioned_values_are_errors_not_resets() {
-        let newer = br#"{"version":2,"data":{"state":{},"reported":[],"later_field":1}}"#;
+        let newer = br#"{"version":3,"data":{"state":{},"reported":[],"later_field":1}}"#;
         let e = decode_state(Some(newer)).unwrap_err();
         assert_eq!(e.key, STATE_KEY);
-        assert!(e.problem.contains("version 2"), "{e}");
+        assert!(e.problem.contains("version 3"), "{e}");
         let e = decode_state(Some(b"not json")).unwrap_err();
         assert!(e.problem.contains("not a versioned document"), "{e}");
         // What the unversioned first cut stored.
         let e = decode_leases(Some(br#"{"next":1,"leases":[]}"#)).unwrap_err();
         assert!(e.problem.contains("no version"), "{e}");
         // The right version with a field this build does not know.
-        let e = decode_state(Some(br#"{"version":1,"data":{"surprise":true}}"#)).unwrap_err();
-        assert!(e.problem.contains("cannot decode version 1"), "{e}");
+        let e = decode_state(Some(br#"{"version":2,"data":{"surprise":true}}"#)).unwrap_err();
+        assert!(e.problem.contains("cannot decode version 2"), "{e}");
     }
 }

@@ -88,7 +88,7 @@ fn power_off(res: &str) -> Step {
     }
 }
 
-const MANAGED_NFS: &str = "    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: 1 }\n";
+const MANAGED_NFS: &str = "    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 1 }\n";
 
 #[test]
 fn a_reclaim_does_not_excuse_powering_off_a_held_shared_host() {
@@ -766,7 +766,7 @@ fn job_hold() -> Vec<Lease> {
 
 fn off_since(ago: u64) -> SchedState {
     prev(&format!(
-        "    basestar-nfs: {{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, shutdown_confirmed_at: {} }}\n",
+        "    basestar-nfs: {{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, off_since: {} }}\n",
         NOW - ago
     ))
 }

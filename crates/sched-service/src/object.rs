@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use restate_sdk::errors::{HandlerError, TerminalError};
-use sched_model::{Config, Drain, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId};
+use sched_model::{Config, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -515,7 +515,7 @@ pub struct DrainAck {
     pub released: bool,
     /// The drain now under way, `None` if none was recorded (the host is not up, or its power
     /// is under `control: manual`, so there is nothing for flowmanager to take down).
-    pub drain: Option<Drain>,
+    pub drain: Option<drain::RecordedDrain>,
 }
 
 /// Takes a shared host down on a person's request, whether or not a manual lease is held:
@@ -542,7 +542,10 @@ pub async fn drain_host<C: ObjectCtx>(
             LeaseBook::check_drain(&config, &req.resource)?;
             let released = book.release_manual_host(&req.resource).is_ok();
             drain::request(&mut core, &config, &req.resource, req.drain, now);
-            let drain = core.state.resource(&req.resource).and_then(|st| st.drain);
+            let drain = core
+                .state
+                .resource(&req.resource)
+                .and_then(drain::RecordedDrain::of);
             let ack = DrainAck {
                 resource: req.resource.clone(),
                 released,
@@ -1239,11 +1242,11 @@ mod tests {
         assert_eq!(ctx.recoveries.lock().unwrap().len(), before + 1);
     }
 
-    /// `scheduler_state` as the build before the queue-only change stored it: version 1,
-    /// with the `loading` and `draining` phases it no longer writes.
+    /// `scheduler_state` as the build before the queue-only change stored its modes: with the
+    /// `loading` and `draining` phases it no longer writes (in the current document version).
     fn legacy_state(mode: &str) -> Vec<u8> {
         format!(
-            r#"{{"version":1,"data":{{"state":{{"resources":{{"cuda-central":{{"power":{{"phase":"on","since":1}},"mode":{mode},"managed":false,"host_idle_since":null,"pending_recovery":[]}},"basestar-nfs":{{"power":{{"phase":"on","since":1}},"mode":{{"phase":"idle"}},"managed":false,"host_idle_since":null,"pending_recovery":[]}}}}}},"reported":["cluster-pods"]}}}}"#
+            r#"{{"version":2,"data":{{"state":{{"resources":{{"cuda-central":{{"power":{{"phase":"on","since":1}},"mode":{mode},"managed":false,"idle_since":null,"pending_recovery":[]}},"basestar-nfs":{{"power":{{"phase":"on","since":1}},"mode":{{"phase":"idle"}},"managed":false,"idle_since":null,"pending_recovery":[]}}}}}},"reported":["cluster-pods"]}}}}"#
         )
         .into_bytes()
     }
@@ -1275,7 +1278,7 @@ mod tests {
         assert_eq!(r.error, None, "{r:?}");
         assert_eq!(r.allowed_models, vec![ModelId::from("whisperx")], "{r:?}");
         let text = String::from_utf8(ctx.stored(STATE_KEY).unwrap()).unwrap();
-        assert!(text.starts_with("{\"version\":1,"), "{text}");
+        assert!(text.starts_with("{\"version\":2,"), "{text}");
         assert!(
             !text.contains("draining") && !text.contains("loading"),
             "{text}"
@@ -1702,7 +1705,7 @@ mod tests {
                 .unwrap()
                 .state
                 .resource(&"basestar-nfs".into())
-                .and_then(|st| st.drain)
+                .and_then(crate::drain::RecordedDrain::of)
         };
         assert_eq!(drain_of(&ctx), None);
         clock.set(Millis(T0 + 7_000));
@@ -1721,11 +1724,10 @@ mod tests {
         ctx.commit();
         assert_eq!(
             drain_of(&ctx),
-            Some(sched_model::Drain {
+            Some(crate::drain::RecordedDrain {
                 mode: DrainMode::Graceful,
                 since: Millis(T0 + 7_000),
                 scaled_down: false,
-                origin: sched_model::DrainOrigin::Requested
             })
         );
         assert!(
@@ -1854,7 +1856,7 @@ mod tests {
     /// cuda-central failed in a shutdown, basestar up and managed: what a person finds after
     /// a shutdown that never completed and a host fixed by hand.
     fn failed_gpu_state() -> Vec<u8> {
-        br#"{"version":1,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"failed","since":5,"during":"shutting_down"},"mode":{"phase":"idle"}},"basestar-nfs":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"host_idle_since":null}}},"reported":["cluster-pods"]}}"#.to_vec()
+        br#"{"version":2,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"failed","since":5,"during":"shutting_down"},"mode":{"phase":"idle"}},"basestar-nfs":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"idle_since":null}}},"reported":["cluster-pods"]}}"#.to_vec()
     }
 
     #[tokio::test]

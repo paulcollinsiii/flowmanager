@@ -548,7 +548,7 @@ mod tests {
         // basestar-nfs is up and managed, idle since long before the grace period.
         ctx.put(
             STATE_KEY,
-            br#"{"version":1,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":false,"host_idle_since":null,"pending_recovery":[]},"basestar-nfs":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"host_idle_since":1,"pending_recovery":[]}}},"reported":["cluster-pods"]}}"#,
+            br#"{"version":2,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":false,"idle_since":null,"pending_recovery":[]},"basestar-nfs":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"idle_since":1,"pending_recovery":[]}}},"reported":["cluster-pods"]}}"#,
         );
         for (source, resource) in [
             ("cluster-pods", "cuda-central"),

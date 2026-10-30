@@ -8,9 +8,7 @@ use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Opts, Registry, TextEncoder,
 };
-use sched_model::{
-    Millis, ModePhase, MountsVeto, PowerPhase, PowerTransition, ResourceId, SchedState,
-};
+use sched_model::{Millis, ModePhase, PowerPhase, PowerTransition, ResourceId, SchedState};
 
 use sched_observe::ObserverState;
 
@@ -615,8 +613,8 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for (id, st) in state.resources.iter().filter(|(id, _)| checked(id)) {
-            let waiting = matches!(st.mounts_veto, Some(MountsVeto::Waiting { .. }));
-            let stopped = matches!(st.mounts_veto, Some(MountsVeto::Stopped { .. }));
+            let waiting = st.shutdown.is_some_and(|s| s.vetoing_since().is_some());
+            let stopped = st.shutdown.is_some_and(|s| s.stopped_since().is_some());
             for (name, on) in [("waiting", waiting), ("stopped", stopped)] {
                 self.mounts_veto
                     .with_label_values(&[id.as_str(), name])
@@ -809,7 +807,7 @@ mod tests {
         use sched_model::{PowerPhase, ResourceState};
         let m = Metrics::new();
         let mut off = ResourceState::new(PowerPhase::Off);
-        off.shutdown_confirmed_at = Some(Millis(1_000));
+        off.off_since = Some(Millis(1_000));
         let mut s = SchedState::default();
         s.resources.insert("a".into(), off);
         s.resources

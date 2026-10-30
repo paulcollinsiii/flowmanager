@@ -56,13 +56,12 @@ pub fn found_running(
                 // Up, not ours, and nothing says the scheduler left it so on purpose: a state
                 // an older build stored for a host found running, or one whose adoption was
                 // skipped (an unreadable job book). Not a host we powered on (managed), one
-                // whose shutdown was stopped by mounting pods (veto), one being drained, or
+                // whose shutdown is under way or was stopped by mounting pods (a shutdown), or
                 // one a job holds (a hold never takes a host over; it is adopted once the
                 // hold ends).
                 PowerPhase::On { .. } => {
                     !st.managed
-                        && st.drain.is_none()
-                        && st.mounts_veto.is_none()
+                        && st.shutdown.is_none()
                         && !leases.iter().any(|l| {
                             l.resource == r.id && matches!(l.kind, LeaseKind::SharedHold { .. })
                         })

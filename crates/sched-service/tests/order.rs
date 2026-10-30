@@ -205,7 +205,7 @@ fn equal_timestamp_reachability_of_the_gpu_host_blocks_allowing_in_either_order(
 
 #[test]
 fn equal_timestamp_reachability_reads_as_not_up_in_either_order() {
-    let managed = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: 1 }\n";
+    let managed = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 1 }\n";
     // Everything that lets a managed, idle, held-by-nothing NFS host power down is in place.
     let mut fixed = base_zero_pods(&[]);
     fixed.push(up("cuda-central", NOW, true));
@@ -475,7 +475,7 @@ proptest! {
         let config = example_config();
         observations.extend(base_zero_pods(&[]));
         let st = state(if serving {
-            "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, host_idle_since: 5 }\n"
+            "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 5 }\n"
         } else { IDLE });
         let snap = |o: Vec<Observation>, l: Vec<Lease>| Snapshot { config_generation: 0, now: Millis(NOW), observations: o, leases: l, unobservable: Default::default() };
         let a = decide(&config, &snap(observations.clone(), leases.clone()), &st).unwrap();

@@ -326,8 +326,8 @@ pub fn check(
     // that holds it, or work for a class that needs it. Unknown demand is not work.
     for (id, st) in &decision.state.resources {
         if !st
-            .drain
-            .is_some_and(|d| d.origin == sched_model::DrainOrigin::Idle)
+            .shutdown
+            .is_some_and(|s| s.is_drain() && s.cause == sched_model::ShutdownCause::Idle)
         {
             continue;
         }
@@ -472,7 +472,7 @@ pub fn check(
                     .unwrap_or(Millis::ZERO);
                 if !manual && min_off > Millis::ZERO {
                     let before = prev.resource(resource);
-                    let confirmed = match before.map(|s| (s.power, s.shutdown_confirmed_at)) {
+                    let confirmed = match before.map(|s| (s.power, s.off_since)) {
                         Some((PowerPhase::Off, Some(at))) => Some(at),
                         Some((
                             PowerPhase::ShuttingDown { .. }
@@ -520,7 +520,7 @@ pub fn check(
                         && !decision
                             .state
                             .resource(resource)
-                            .is_some_and(|s| s.drain.is_some())
+                            .is_some_and(|s| s.shutdown.is_some_and(|x| x.is_drain()))
                     {
                         out.push(format!(
                             "invariant 13: powered off shared {resource} with no drain scaling its consumers down first"
@@ -541,13 +541,15 @@ pub fn check(
                     // scale-down already happened, or `drain_timeout` has passed, or every class
                     // that needs the host is known to have nothing in flight.
                     // Only a requested drain waives work and grace: an idle drain ignores nothing.
-                    let drain = before
-                        .and_then(|s| s.drain)
-                        .filter(|d| d.origin == sched_model::DrainOrigin::Requested);
+                    let drain = before.and_then(|s| s.shutdown).filter(|s| s.is_requested());
                     let draining = drain.is_some();
                     if let Some(d) = drain {
-                        let scaled = d.mode == sched_model::DrainMode::Immediate
-                            || d.scaled_down
+                        let scaled = matches!(
+                            d.cause,
+                            sched_model::ShutdownCause::Requested {
+                                mode: sched_model::DrainMode::Immediate
+                            }
+                        ) || d.consumers_withdrawn()
                             || now.saturating_sub(d.since) >= policy.drain_timeout
                             || config
                                 .classes()
@@ -574,7 +576,7 @@ pub fn check(
                     }
                     let grace_ok = policy.idle_grace == Millis::ZERO
                         || (draining && config.mounts_checked(resource))
-                        || before.and_then(|s| s.host_idle_since).is_some_and(|t| {
+                        || before.and_then(|s| s.idle_since).is_some_and(|t| {
                             now.as_u64() - t.as_u64().min(now.as_u64())
                                 >= policy.idle_grace.as_u64()
                         });
