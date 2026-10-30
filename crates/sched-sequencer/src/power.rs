@@ -503,11 +503,6 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
         st.shutdown = None;
         return;
     }
-    // An idle drain exists only for a host that is ours to power off.
-    if s.cause == ShutdownCause::Idle && !st.managed {
-        st.shutdown = None;
-        return;
-    }
     if s.stage == ShutdownStage::Withdrawing {
         let waited = cx.now().saturating_sub(s.since);
         let immediate = matches!(

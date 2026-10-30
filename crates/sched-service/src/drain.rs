@@ -110,6 +110,7 @@ pub fn request(
     st.idle_since = None;
     Requested::Recorded
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
