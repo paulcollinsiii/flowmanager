@@ -240,7 +240,7 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/acquire_model_lease` | `{"model": "<id>"}` | **Pins a model on its GPU**: batch work is cut short (its classes leave the allowed set at once, in-flight work gets `drain_timeout`, or a class's `kill_timeout`, then is stopped) and the model stays allowed however much other work waits, until the lease is released. Asking again for the leased model returns the existing lease; another model of the same resource is `409`; an unknown model is `400`. | an operator (a person); later Open WebUI's service account. |
 | `Scheduler/main/release_lease` | `{"id": "manual-model-<n>"}` | Releases a lease and returns it; unknown id `404`. Whoever can release can end somebody's pin. | an operator; the same identity that acquired it. |
 | `Scheduler/main/acquire_host_lease` | `{"resource": "<id>"}` | **Holds a host with a power section up**, shared (the NFS server) or exclusive (a GPU): a `managed` host that is off is powered on, and while the lease is held everything gated on the host is allowed even with no work queued. On an exclusive host it pins no model (the queues keep choosing); with no host or model lease, and no `may_change_power` class, nothing powers an exclusive managed host on. Asking again returns the lease; a resource without a power section or an unknown one is `400`. Ids `manual-host-<n>`. | an operator. |
-| `Scheduler/main/release_host_lease` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` (`drain` optional) | Releases the manual host lease of a resource (also the one flowmanager minted for a host it found running); none held is `404`. Without `drain` the host is shut down once nothing else holds it (queued or in-flight work of its consumers included), `idle_grace` has passed and no pod mounts it. On an exclusive host the release is always plain: queued or in-flight work holds the host until it is idle, then `idle_grace` after the model is withdrawn it is shut down (the reclaim is the forced "off now"), and `drain` is `400`. With `drain` (shared hosts) the request is recorded in the host's state: queued and in-flight work stops holding the host, its consumers are scaled down (`immediate`: at once; `graceful`: when nothing is in flight or after `policy.drain_timeout`), and the host is shut down once no lease holds it (a job's hold is waited for, never overridden) and no pod mounts it (`mounts_timeout` still applies). A new `acquire_host_lease` cancels the drain. The drain is in the tick report (`drains`) and the logs (`drain_requested`, `drain`). | an operator. |
+| `Scheduler/main/release_host_lease` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` (`drain` optional) | Releases the manual host lease of a resource (also the one flowmanager minted for a host it found running); none held is `404`. Without `drain` the host is shut down once nothing else holds it (queued or in-flight work of its consumers included), `idle_grace` has passed and no pod mounts it. On an exclusive host the release is always plain: queued or in-flight work holds the host until it is idle, then `idle_grace` after the model is withdrawn it is shut down (the reclaim is the forced "off now"), and `drain` is `400`. With `drain` (shared hosts) the request is recorded in the host's state: queued and in-flight work stops holding the host, its consumers are scaled down (`immediate`: at once; `graceful`: when nothing is in flight or after `policy.drain_timeout`), and the host is shut down once no lease holds it (a job's hold is waited for, never overridden) and no pod mounts it (`veto_timeout` still applies). A new `acquire_host_lease` cancels the drain. The drain is in the tick report (`drains`) and the logs (`drain_requested`, `drain`). | an operator. |
 | `Scheduler/main/drain_host` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` | Takes a shared host down whether or not a manual lease is held (the Home Assistant switch-off): releases the lease if there is one and records the drain as `release_host_lease` does. Asked again it changes the drain under way in place (`immediate` escalates, `graceful` leaves an immediate one), from the stored state. Answers `{resource, released, drain}`; `drain` is absent when the host is not up under managed control. An exclusive resource (switch it off with `release_host_lease`, or reclaim it), one without a power section or an unknown one is `400`. **Rollback:** an older build cannot decode a stored state that holds a drain, so let it finish (or discard the state) before rolling back. | an operator. |
 | `Scheduler/main/reclaim` | `{"resource": "<id>"}` | **Takes an exclusive host back despite pending work**: intake stops, in-flight work gets `reclaim_timeout` and is then cut off, a `managed` host is shut down and not woken until `unreclaim`. Only for an exclusive resource with a power section (`400` otherwise). Ids `reclaim-<n>`. | an operator. |
 | `Scheduler/main/unreclaim` | `{"resource": "<id>"}` | Releases the reclaim; none held is `404`. | an operator. |
@@ -391,7 +391,7 @@ derived from the last tick's report and are **left out when they cannot be said*
   model is still allowed and the report gives no more);
 - host lease (`GET /v1/resources/..`): `power` (the phase as the sequencer holds it, with `since`
   and, when failed, `during`), `wait` (a list: `min_off` with the seconds left, or
-  `shutdown_held_by_mounts` with `stopped`), `drain` (present while a drain is under way: `mode`,
+  `shutdown_held_by_veto` with `stopped`), `drain` (present while a drain is under way: `mode`,
   `since_ms`, `scaled_down`), `needs_attention`;
 - reclaim: `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_for_person` (the host
   is up and its power is `control: manual`, so flowmanager never shuts it down: power it off
@@ -401,7 +401,7 @@ derived from the last tick's report and are **left out when they cannot be said*
 `needs_attention` is true when a person has to act: a resource is in a failed power phase, or
 its shutdown was stopped by mounting pods (`resume` it after fixing the host). It is the same
 condition as the metrics `sched_resource_power_failed == 1` and
-`sched_resource_mounts_veto{state="stopped"} == 1`; the JSON field is derived from the same state,
+`sched_resource_veto{state="stopped"} == 1`; the JSON field is derived from the same state,
 there is no separate metric for it (alert on those two, see the alert list).
 
 Errors are JSON `{"error": "<message>"}`. The handler's own message and status are relayed for
@@ -429,7 +429,7 @@ themselves log as
 before. Metrics: `sched_toggle_requests_total{endpoint,outcome}` (counted per endpoint
 label, never per name), `sched_manual_lease_age_seconds{kind,target}` for each held manual
 model lease, host lease and reclaim (`kind` is `model`, `host` or `reclaim`), and the existing
-`sched_resource_power_failed` / `sched_resource_mounts_veto` for needs-attention.
+`sched_resource_power_failed` / `sched_resource_veto` for needs-attention.
 
 **Limits.** The token is checked before a request's body is read (an oversize or non-UTF-8 body
 of an unauthenticated caller is a `401`, of an authenticated one a `400`; a body is limited to 1024
@@ -893,7 +893,7 @@ a warning in the log); the host's reachability then goes stale and nothing is al
 `scaledobjects` patch, pods/PVs/nodes list) is not needed; drop it.
 A missing permission for the mount check shows up the same way, as errors of the
 `basestar-mounts` source: the NFS host is then never powered off (the step is
-`wait ... mounts_unknown`, and after `mounts_timeout` flowmanager alerts and stops).
+`wait ... veto_unknown`, and after `veto_timeout` flowmanager alerts and stops).
 
 ## 5. Secrets and environment
 
@@ -1112,10 +1112,10 @@ and allowing one needs a fresh "up" reading (`policy.host_reading_stale_after`, 
   write it (`params.nfs_servers: {basestar-nfs: [basestar]}`; add the address too if volumes
   use it). A managed shared host without such a source is refused at load. While pods mount
   it, or the reading is unknown (a failed list, a missing permission, a reading older than
-  `host_reading_stale_after`; unknown counts as mounted), the shutdown waits
-  (`wait ... pods_mounted` / `mounts_unknown`) for at most the resource's `mounts_timeout`
-  (default 30 m); then flowmanager alerts (`event="shutdown_mounts_timeout"`,
-  `sched_mounts_timeouts_total`, `sched_resource_mounts_veto{state="stopped"} == 1`) and
+  `host_reading_stale_after`; unknown counts as in use), the shutdown waits
+  (`wait ... veto_in_use` / `veto_unknown`) for at most the resource's `veto_timeout`
+  (default 30 m); then flowmanager alerts (`event="shutdown_veto_timeout"`,
+  `sched_veto_timeouts_total`, `sched_resource_veto{state="stopped"} == 1`) and
   stops: the host stays up and is not shut down by flowmanager again until a person calls
   `resume`, it is seen down, or a new manual lease takes it over. A GPU host's shutdown
   follows the bounded wind-down of its model (`drain_timeout`, `reclaim_timeout`); see "Power
@@ -1155,9 +1155,9 @@ event):
   `skipped_not_allowed`, `not_wired`, `list_failed`, `state_error`) and
   `sched_recovery_requeues_total{class,outcome}` (`attempted`, `queued`, `failed`,
   `skipped_cap`, `skipped_not_allowed`, `deferred`).
-- `sched_resource_mounts_veto{resource,state}` (`waiting`, `stopped`; only resources a
-  `mounts` source names) and `sched_mounts_timeouts_total{resource}`: a shutdown held back by
-  mounting pods, and the waits that timed out. `sched_resource_min_off_remaining_seconds{resource}`:
+- `sched_resource_veto{resource,reading,state}` (`waiting`, `stopped`; only resources with a
+  veto reading: `mounts`, `pods` or `mounts+pods`) and `sched_veto_timeouts_total{resource,reading}`: a shutdown held back by
+  pods still using the host, and the waits that timed out. `sched_resource_min_off_remaining_seconds{resource}`:
   seconds left of the `min_off` wait before a host that flowmanager shut down may be powered on
   again by itself (0 outside it). The power metrics (`sched_resource_power_failed`,
   `sched_power_timeouts_total`, `sched_power_requests_total`) are in the README.
@@ -1185,13 +1185,13 @@ event):
 - alert: FlowmanagerSourceErrors
   expr: increase(sched_source_errors_total[15m]) > 5
 - alert: FlowmanagerShutdownStopped      # the mounts-stopped case alone; FlowmanagerNeedsAttention below covers it with the failed power phase
-  expr: sched_resource_mounts_veto{state="stopped"} == 1
+  expr: sched_resource_veto{state="stopped"} == 1
 - alert: FlowmanagerJobProblem           # a scheduled job failed for good, was missed, overlapped, started late or could not be created
   expr: sum by (scheduled_job, event) (increase(sched_job_events_total{event=~"failed|missed|skipped_overlap|start_late|create_failed"}[30m])) > 0
 - alert: FlowmanagerBackupStale          # no success for a week and a day (a job that never succeeded has no series: it counts as 0, so this fires at once on a new install; silence it for the first week); tune per job
   expr: time() - (sched_job_last_success_timestamp_seconds{scheduled_job="backup"} or on() vector(0)) > 8 * 86400
 - alert: FlowmanagerNeedsAttention       # a host in a failed power phase, or a shutdown stopped by mounting pods: resume it after fixing it (the toggle listener's needs_attention is these two)
-  expr: sched_resource_power_failed == 1 or sched_resource_mounts_veto{state="stopped"} == 1
+  expr: sched_resource_power_failed == 1 or sched_resource_veto{state="stopped"} == 1
 - alert: FlowmanagerLeaseHeldTooLong     # a forgotten manual lease or reclaim
   expr: sched_manual_lease_age_seconds > 6 * 3600
   for: 10m

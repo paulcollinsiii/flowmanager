@@ -547,7 +547,7 @@ harmless to repeat).
   `wake_on_lan: {router_url, interface (default lan), mac}` and
   `shutdown: {host, port (default 22), user, host_key}`; `router_url` must be a plain
   `https://` base URL, without credentials, a query string or a fragment (the API path is
-  appended to it). `managed` requires both. Optional `power_on_timeout`, `mounts_timeout`, `min_off` and
+  appended to it). `managed` requires both. Optional `power_on_timeout`, `veto_timeout`, `min_off` and
   `shutdown_timeout` (see below). A MAC or
   an SSH target may not be shared by two resources. A reload that turns a host `managed`
   applies like any other change; one that leaves it incomplete is rejected and the previous
@@ -669,23 +669,25 @@ harmless to repeat).
     thing is not counted: a claim not bound to any volume yet, which cannot be mounted.) A
     `managed` shared host must be named by such a source, or the config is refused at load.
     While the shutdown is due (idle, no holds, `idle_grace` over) and pods mount the host
-    (or the count is unknown), the step is `wait ... pods_mounted` (or `mounts_unknown`), the
+    (or the count is unknown), the step is `wait ... veto_in_use` (or `veto_unknown`), the
     `reason` says so, the host stays up and what needs it stays allowed, and
-    `sched_resource_mounts_veto{resource,state="waiting"}` is 1. The wait is bounded by
-    `resources[].power.mounts_timeout` (default 30m, above `host_reading_stale_after`, at most
-    1d). When it runs out flowmanager **alerts and stops**: `event="shutdown_mounts_timeout"`
-    at error level once (a replayed tick logs `shutdown_mounts_timeout_replayed` at info),
-    `sched_mounts_timeouts_total{resource}`, a `mounts_timeouts` entry in that tick's report,
-    then `mounts_held` lists the resource with `stopped: true`, the kind
+    `sched_resource_veto{resource,state="waiting"}` is 1. The wait is bounded by
+    `resources[].power.veto_timeout` (default 30m, above `host_reading_stale_after`, at most
+    1d). When it runs out flowmanager **alerts and stops**: `event="shutdown_veto_timeout"`
+    at error level once (a replayed tick logs `shutdown_veto_timeout_replayed` at info),
+    `sched_veto_timeouts_total{resource,reading}`, a `veto_timeouts` entry in that tick's report,
+    then `veto_held` lists the resource with `stopped: true`, the kind
     `shutdown_stopped`, the step `wait ... shutdown_stopped` and
-    `sched_resource_mounts_veto{state="stopped"} == 1` (alert on it). The host is **not** shut
+    `sched_resource_veto{state="stopped"} == 1` (alert on it). The host is **not** shut
     down, however long it stays like this and even after the pods are gone, and the
     `managed` flag is dropped (as after a failed power transition). It leaves the stopped
     state when the host is observed down (a person shut it down), when a person calls
     `resume` for it, or when a new manual lease takes the host over again (the next idle
     period then decides afresh). The wait counts from the moment the shutdown is due, not
     from when the host went idle, and is cleared at once if something holds the host again.
-  - *GPU host (the wind-down).* No mount check applies unless a `mounts` source names it.
+  - *GPU host (the wind-down and the pods veto).* A `pods` source that covers its models adds the
+    pods veto to the same wait: a fresh reading of zero pods for every model of the host, or it
+    waits like the mount veto (`reading` `pods`; a `mounts` source naming it adds that too).
     Its shutdown is already preceded by the bounded wind-down of the model: a managed
     exclusive host is powered off only when its mode is idle, so a model that is allowed, or
     being wound down, blocks it. The wind-down gives in-flight work `drain_timeout` (a class's
@@ -843,7 +845,7 @@ trusted network.
   mount check above passes. **A drain overrides no lease**: a scheduled job's hold or another
   lease keeps the host up, the step is `wait ... drain_held` and the shutdown follows when
   they are gone. Before the scale-down the step is `wait ... draining`. The mount check and
-  `mounts_timeout` apply after the scale-down as for any shutdown (a managed shared host always
+  `veto_timeout` apply after the scale-down as for any shutdown (a managed shared host always
   has a `mounts` source, so there is no `idle_grace` wait). The drain ends when the host is no longer up, and a **new manual host lease
   cancels it** (the consumers are allowed again). It is visible as `drains` in the tick
   report (and `last_decision`), as `drain` in the Home Assistant state of the host, and as
@@ -871,8 +873,8 @@ trusted network.
   JSON label it `origin: idle`, a label derived from that cause). The
   classes that need the host leave the allowed set in that very tick (KEDA scales them to
   zero), then the shutdown goes through the usual path: the mount check (`wait ...
-  pods_mounted` while their pods still mount it, bounded by `mounts_timeout`), then
-  `PowerOff`. Without it every host a backup woke would sit out `mounts_timeout` (30m) on its
+  veto_in_use` while their pods still mount it, bounded by `veto_timeout`), then
+  `PowerOff`. Without it every host a backup woke would sit out `veto_timeout` (30m) on its
   own consumers' pods and then stop with an alert. An idle drain differs from a requested one:
   **any hold cancels it** and re-allows the consumers at once (a manual or adopted lease, a
   job's lease, work queued or in flight for a class that needs the host), and the idle clock
@@ -921,7 +923,7 @@ curl -X POST localhost:8080/Scheduler/main/unreclaim \
 # After fixing a host that flowmanager stopped at (the answer says what was cleared).
 curl -X POST localhost:8080/Scheduler/main/resume \
   -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
-# {"resource":"basestar-nfs","cleared":"shutdown_stopped_by_mounts"}
+# {"resource":"basestar-nfs","cleared":"shutdown_stopped_by_veto"}
 ```
 
 ### Toggle listener (Home Assistant)
@@ -951,7 +953,7 @@ before a body is read. A state read has `held` and `state`, and, when the last t
 supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draining`, `reclaimed`,
 `host_failed`, `pending`; a reclaim also `left_for_person` on a `control: manual` host), `power`,
 `wait` and `needs_attention` (the failed power phase or mounts-stopped shutdown also seen in
-`sched_resource_power_failed` and `sched_resource_mounts_veto`); a field that cannot be derived is
+`sched_resource_power_failed` and `sched_resource_veto`); a field that cannot be derived is
 left out. Every on/off/resume request and every refused request logs one `event="toggle"` line
 (names escaped, refusals rate limited), is counted in
 `sched_toggle_requests_total{endpoint,outcome}`, and a held lease shows in
@@ -1156,11 +1158,12 @@ registrations in `metrics.rs`; labelled counters appear after their first event)
   after a shutdown flowmanager started (an automatic power-on waits meanwhile, the step is
   `wait ... min_off`; a manual lease does not wait); 0 outside the window. Only managed
   resources with a `min_off` above zero have the series.
-- `sched_resource_mounts_veto{resource,state}`: 1 while a shutdown of the resource is held back
-  because pods mount its NFS server or the count is unknown (`waiting`, bounded by
-  `mounts_timeout`), or because that wait timed out and flowmanager stopped (`stopped`; alert
-  on `== 1`), else 0. Only resources named by a `mounts` source have the series.
-- `sched_mounts_timeouts_total{resource}`: shutdown waits that timed out (alert on any
+- `sched_resource_veto{resource,reading,state}`: 1 while a shutdown of the resource is held back
+  by the veto: a pod mounts its NFS server or runs its models, or the reading is unknown (`waiting`, bounded by
+  `veto_timeout`), or because that wait timed out and flowmanager stopped (`stopped`; alert
+  on `== 1`), else 0. `reading` is the readings the veto uses: `mounts`, `pods` or `mounts+pods`.
+  Only resources with a veto reading have the series.
+- `sched_veto_timeouts_total{resource,reading}`: shutdown waits that timed out (alert on any
   increase; the host stays up until a person acts).
 - `sched_job_events_total{scheduled_job,event}`: scheduled-job events by configured job: `started` (a Job
   was created), `succeeded`, `failed` (after its retries, past its deadline, or deleted;

@@ -51,6 +51,11 @@ resources:
       # at most 1d.
       power_on_timeout: 10m
       shutdown_timeout: 15m
+      # Before the host is powered off, the cluster-pods source (below) must show a fresh
+      # zero pods for every model of this host (the pods veto); a missing or stale reading
+      # counts as in use. The wait is bounded by veto_timeout (default 30m): then the
+      # scheduler alerts and stops, without shutting it down and without retrying.
+      veto_timeout: 30m
   - id: basestar-nfs
     kind: shared
     power:
@@ -63,7 +68,7 @@ resources:
       # Under managed control, how long a shutdown may wait for pods to stop mounting this
       # host (see the basestar-mounts source) before the scheduler alerts and stops, without
       # shutting it down and without retrying (default 30m, at most 1d).
-      mounts_timeout: 30m
+      veto_timeout: 30m
       # Under managed control, the least time flowmanager keeps this host off after a
       # shutdown it started and saw confirmed, before it powers it on again by itself (a
       # workload, a scheduled job's hold); a manual lease does not wait. Default 0 (disabled),
