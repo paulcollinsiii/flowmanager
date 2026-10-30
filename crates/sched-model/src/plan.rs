@@ -38,8 +38,9 @@ pub struct Intent {
     pub reclaim: BTreeSet<ResourceId>,
 }
 
-/// Why the sequencer is not moving a resource this tick. None of these is about pods: the
-/// scheduler never gates a decision on pod state (Kubernetes enforces GPU exclusivity).
+/// Why the sequencer is not moving a resource this tick. Pod readings gate one decision only:
+/// a power-off, through the veto (`VetoInUse`, `VetoUnknown`). Kubernetes enforces GPU
+/// exclusivity, so no model switch waits for pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitReason {
@@ -59,13 +60,14 @@ pub enum WaitReason {
     /// no further power action for the host by itself and allows nothing on it until a
     /// reachability observation shows the state the transition was after, or a person acts.
     PowerFailed,
-    /// The host is idle and due to be powered off, but pods mount its NFS server (a fresh
-    /// reading says so): the shutdown waits, bounded by the resource's `mounts_timeout`.
-    PodsMounted,
-    /// As `PodsMounted`, but the number of mounting pods is unknown (no reading, a stale or
-    /// failed one). Unknown means possibly mounted, never "no mounts".
-    MountsUnknown,
-    /// The wait for the pods to unmount outlasted `mounts_timeout`: the scheduler stopped and
+    /// The host is due to be powered off, but a pod still uses it (a fresh reading shows pods
+    /// mounting its NFS server or running its models): the shutdown waits, bounded by the
+    /// resource's `veto_timeout`.
+    VetoInUse,
+    /// As `VetoInUse`, but a reading the veto needs is unknown (none, or a stale or
+    /// failed one). Unknown means possibly in use, never "unused".
+    VetoUnknown,
+    /// The veto wait outlasted `veto_timeout`: the scheduler stopped and
     /// will not shut the host down by itself (a person acts, or a new manual request takes the
     /// host over again). The host stays up.
     ShutdownStopped,

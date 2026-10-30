@@ -13,7 +13,7 @@
 //! the reading has now cleared (whatever brought it up, the sequencer treats it as found
 //! running), or has it `on` but not managed (stored by a build that did not adopt, or kept
 //! so by a tick that skipped adoption), unless the scheduler left it so on purpose: a stopped
-//! mount veto, a drain, or a job's hold. A host in `powering_on` that is seen up is
+//! veto, a drain, or a job's hold. A host in `powering_on` that is seen up is
 //! flowmanager's own and an `on` host it manages is not found again (a restart with persisted
 //! state adopts nothing), and under `control: manual` nothing is ever adopted.
 
@@ -56,7 +56,7 @@ pub fn found_running(
                 // Up, not ours, and nothing says the scheduler left it so on purpose: a state
                 // an older build stored for a host found running, or one whose adoption was
                 // skipped (an unreadable job book). Not a host we powered on (managed), one
-                // whose shutdown is under way or was stopped by mounting pods (a shutdown), or
+                // whose shutdown is under way or was stopped by the veto (a shutdown), or
                 // one a job holds (a hold never takes a host over; it is adopted once the
                 // hold ends).
                 PowerPhase::On { .. } => {

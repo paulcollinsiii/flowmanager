@@ -1071,10 +1071,10 @@ pub fn reclaim_state(
 }
 
 /// Whether a person has to act on the resource: its power transition failed, or its shutdown
-/// was stopped by mounting pods.
+/// was stopped by the veto.
 fn attention(r: &TickReport, resource: &ResourceId, power: &PowerPhase) -> bool {
     matches!(power, PowerPhase::Failed { .. })
-        || r.mounts_held
+        || r.veto_held
             .iter()
             .any(|h| &h.resource == resource && h.stopped)
 }
@@ -1138,7 +1138,7 @@ fn reclaim_status(
 
 /// A resource (host) switch. `power`, `wait` and `needs_attention` come from the last tick's
 /// report of this process and are absent before the first tick; `wait` names why the
-/// scheduler holds something back (`min_off`, `shutdown_held_by_mounts`). `drain` is present while
+/// scheduler holds something back (`min_off`, `shutdown_held_by_veto`). `drain` is present while
 /// a drain is under way (a switch-off asked for the host to go down): its mode and whether
 /// the consumers are already scaled down. `requested` is the drain a request has just recorded
 /// (the last tick has not seen it yet); while one is under way the switch is not off: `held` is
@@ -1195,11 +1195,12 @@ pub fn resource_state(
             "power".into(),
             serde_json::to_value(st.power).unwrap_or(Value::Null),
         );
-        let mounts = r.mounts_held.iter().find(|h| &h.resource == resource);
+        let veto = r.veto_held.iter().find(|h| &h.resource == resource);
         let mut waits = Vec::new();
-        if let Some(h) = mounts {
+        if let Some(h) = veto {
             waits.push(json!({
-                "reason": "shutdown_held_by_mounts",
+                "reason": "shutdown_held_by_veto",
+                "readings": h.readings,
                 "stopped": h.stopped,
             }));
         }
@@ -2393,7 +2394,7 @@ mod tests {
         r.tick().await;
         let mut rep = r.shared.last_report().unwrap();
         rep.leases.clear();
-        rep.mounts_held.clear();
+        rep.veto_held.clear();
         let at = |rep: &TickReport| {
             reclaim_state(
                 &config,
@@ -2437,27 +2438,28 @@ mod tests {
             (&json!("host_failed"), &json!(true))
         );
 
-        // A shutdown stopped by mounting pods needs a person too (a host resource).
+        // A shutdown stopped by the veto needs a person too (a host resource).
         let nfs: ResourceId = "basestar-nfs".into();
         r.hosts_up(true);
         r.tick().await;
         let mut rep = r.shared.last_report().unwrap();
         rep.leases.clear();
-        rep.mounts_held.clear();
+        rep.veto_held.clear();
         rep.state.resources.insert(
             nfs.clone(),
             ResourceState::new(PowerPhase::On { since: Millis(1) }),
         );
         let v = resource_state(&config, &nfs, None, None, &Some(rep.clone()), Millis(5_000));
         assert_eq!(v["needs_attention"], false);
-        rep.mounts_held.push(crate::tick::MountsHeld {
+        rep.veto_held.push(crate::tick::VetoHeld {
+            readings: vec!["mounts".to_string()],
             resource: nfs.clone(),
             since: Millis(1),
             stopped: true,
         });
         let v = resource_state(&config, &nfs, None, None, &Some(rep), Millis(5_000));
         assert_eq!(v["needs_attention"], true);
-        assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_mounts");
+        assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_veto");
     }
 
     #[test]

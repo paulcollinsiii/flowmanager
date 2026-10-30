@@ -61,12 +61,12 @@ frames:
   - at: 104260000
     refresh: true
     expect:
-      steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
+      steps: [{ type: wait, resource: basestar-nfs, reason: veto_in_use }]
       allowed: { models: [], classes: [] }
   - at: 104560000
     refresh: true
     expect:
-      steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
+      steps: [{ type: wait, resource: basestar-nfs, reason: veto_in_use }]
       allowed: { models: [], classes: [] }
   # The pods are gone: the very next decision shuts the host down.
   - at: 104570000

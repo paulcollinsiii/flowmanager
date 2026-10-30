@@ -37,8 +37,8 @@ pub struct Metrics {
     power_failed: GaugeVec,
     /// Resources with `power_failed` series, to drop those that leave the state.
     power_failed_resources: Mutex<HashSet<String>>,
-    mounts_timeouts: IntCounterVec,
-    mounts_veto: GaugeVec,
+    veto_timeouts: IntCounterVec,
+    veto_gauge: GaugeVec,
     min_off_remaining: GaugeVec,
     toggle_requests: IntCounterVec,
     webhook_requests: IntCounterVec,
@@ -48,8 +48,8 @@ pub struct Metrics {
     manual_lease_labels: Mutex<HashSet<(String, String)>>,
     /// Resources with `min_off_remaining` series, to drop those that leave the set.
     min_off_resources: Mutex<HashSet<String>>,
-    /// Resources with `mounts_veto` series, to drop those that leave the checked set.
-    mounts_veto_resources: Mutex<HashSet<String>>,
+    /// (resource, reading) pairs with `sched_resource_veto` series, to drop those that leave.
+    veto_labels: Mutex<HashSet<(String, String)>>,
     job_events: IntCounterVec,
     job_running: IntGaugeVec,
     job_last_success: GaugeVec,
@@ -215,20 +215,20 @@ impl Metrics {
         registry.register(Box::new(power_requests.clone())).unwrap();
         registry.register(Box::new(power_timeouts.clone())).unwrap();
         registry.register(Box::new(power_failed.clone())).unwrap();
-        let mounts_timeouts = IntCounterVec::new(
+        let veto_timeouts = IntCounterVec::new(
             Opts::new(
-                "sched_mounts_timeouts_total",
-                "Shutdowns that waited longer than the resource's mounts_timeout for pods to stop mounting its NFS server, by resource. Each one raised the shutdown_mounts_timeout alert and the scheduler stopped: the host stays up and is not shut down by flowmanager again until a person acts or a new manual request takes it over",
+                "sched_veto_timeouts_total",
+                "Shutdowns that waited longer than the resource's veto_timeout for the veto to clear (pods still mounting its NFS server or running its models, or the reading unknown), by resource and reading (mounts, pods, or mounts+pods). Each one raised the shutdown_veto_timeout alert and the scheduler stopped: the host stays up and is not shut down by flowmanager again until a person acts or a new manual request takes it over",
             ),
-            &["resource"],
+            &["resource", "reading"],
         )
         .unwrap();
-        let mounts_veto = GaugeVec::new(
+        let veto_gauge = GaugeVec::new(
             Opts::new(
-                "sched_resource_mounts_veto",
-                "1 while a shutdown of the resource is held back because pods mount its NFS server or the count is unknown (state waiting, bounded by mounts_timeout), or because that wait timed out and flowmanager stopped (state stopped; a person must act), else 0, by resource and state. Only resources whose mounts are checked have a series. Alert on stopped being 1",
+                "sched_resource_veto",
+                "1 while a shutdown of the resource is held back by the veto (a pod still mounts its NFS server or runs its models, or the reading is unknown; state waiting, bounded by veto_timeout), or because that wait timed out and flowmanager stopped (state stopped; a person must act), else 0, by resource, reading (mounts, pods, or mounts+pods) and state. Only resources with a veto reading have a series. Alert on stopped being 1",
             ),
-            &["resource", "state"],
+            &["resource", "reading", "state"],
         )
         .unwrap();
         let job_events = IntCounterVec::new(
@@ -269,10 +269,8 @@ impl Metrics {
             .register(Box::new(job_last_success.clone()))
             .unwrap();
         registry.register(Box::new(job_next_due.clone())).unwrap();
-        registry
-            .register(Box::new(mounts_timeouts.clone()))
-            .unwrap();
-        registry.register(Box::new(mounts_veto.clone())).unwrap();
+        registry.register(Box::new(veto_timeouts.clone())).unwrap();
+        registry.register(Box::new(veto_gauge.clone())).unwrap();
         let toggle_requests = IntCounterVec::new(
             Opts::new(
                 "sched_toggle_requests_total",
@@ -368,8 +366,8 @@ impl Metrics {
             power_timeouts,
             power_failed,
             power_failed_resources: Mutex::new(HashSet::new()),
-            mounts_timeouts,
-            mounts_veto,
+            veto_timeouts,
+            veto_gauge,
             min_off_remaining,
             toggle_requests,
             webhook_requests,
@@ -377,7 +375,7 @@ impl Metrics {
             manual_lease_age,
             manual_lease_labels: Mutex::new(HashSet::new()),
             min_off_resources: Mutex::new(HashSet::new()),
-            mounts_veto_resources: Mutex::new(HashSet::new()),
+            veto_labels: Mutex::new(HashSet::new()),
             phases: Mutex::new(HashMap::new()),
             job_events,
             job_running,
@@ -599,47 +597,40 @@ impl Metrics {
         );
     }
 
-    /// Counts a shutdown whose wait for unmounting pods timed out (see the metric's help).
-    pub fn mounts_timeout(&self, resource: &str) {
-        self.mounts_timeouts.with_label_values(&[resource]).inc();
+    /// Counts a shutdown whose veto wait timed out (see the metric's help). `reading` is the
+    /// resource's readings joined for a label (see `VetoReading::label`).
+    pub fn veto_timeout(&self, resource: &str, reading: &str) {
+        self.veto_timeouts
+            .with_label_values(&[resource, reading])
+            .inc();
     }
 
-    /// Sets `sched_resource_mounts_veto` from the state: per resource for which `checked`
-    /// holds (its mounts are checked), 1 for the state it is in (waiting or stopped) and 0
-    /// for the other; resources that are no longer checked lose their series.
-    pub fn set_mounts_veto(&self, state: &SchedState, checked: impl Fn(&ResourceId) -> bool) {
-        let mut known = self
-            .mounts_veto_resources
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for (id, st) in state.resources.iter().filter(|(id, _)| checked(id)) {
+    /// Sets `sched_resource_veto` from the state: per resource for which `reading` gives a
+    /// label (its veto readings, see `VetoReading::label`; `None` for a host with no veto),
+    /// 1 for the state it is in (waiting or stopped) and 0 for the other; resources that no
+    /// longer have a veto, or a different set of readings, lose their old series.
+    pub fn set_veto(&self, state: &SchedState, reading: impl Fn(&ResourceId) -> Option<String>) {
+        let mut known = self.veto_labels.lock().unwrap_or_else(|e| e.into_inner());
+        let mut now_known = HashSet::new();
+        for (id, st) in state.resources.iter() {
+            let Some(label) = reading(id) else { continue };
             let waiting = st.shutdown.is_some_and(|s| s.vetoing_since().is_some());
             let stopped = st.shutdown.is_some_and(|s| s.stopped_since().is_some());
             for (name, on) in [("waiting", waiting), ("stopped", stopped)] {
-                self.mounts_veto
-                    .with_label_values(&[id.as_str(), name])
+                self.veto_gauge
+                    .with_label_values(&[id.as_str(), label.as_str(), name])
                     .set(if on { 1.0 } else { 0.0 });
             }
+            now_known.insert((id.to_string(), label));
         }
-        known.retain(|id| {
-            let keep = state
-                .resources
-                .keys()
-                .any(|k| k.as_str() == id && checked(k));
-            if !keep {
-                for name in ["waiting", "stopped"] {
-                    let _ = self.mounts_veto.remove_label_values(&[id.as_str(), name]);
-                }
+        for (id, label) in known.difference(&now_known) {
+            for name in ["waiting", "stopped"] {
+                let _ = self
+                    .veto_gauge
+                    .remove_label_values(&[id.as_str(), label.as_str(), name]);
             }
-            keep
-        });
-        known.extend(
-            state
-                .resources
-                .keys()
-                .filter(|k| checked(k))
-                .map(|k| k.to_string()),
-        );
+        }
+        *known = now_known;
     }
 
     /// Sets `sched_resource_min_off_remaining_seconds` from the state at `now`: per resource

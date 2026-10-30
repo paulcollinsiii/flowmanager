@@ -257,8 +257,10 @@ proptest! {
     }
 
     #[test]
-    fn pod_observations_only_ever_hold_back_a_recovery(frames in prop::collection::vec(raw(), 1..40), managed in any::<bool>()) {
-        let config = if managed { example_config_managed() } else { example_config() };
+    fn pod_observations_only_ever_hold_back_a_recovery(frames in prop::collection::vec(raw(), 1..40)) {
+        // Without power management: under it a pod reading also holds a power-off back (the
+        // veto), which the sequencer tests cover.
+        let config = example_config();
         let with = run(&config, &scenario(&frames)).unwrap();
         let without = run(&config, &scenario(&without_pods(&frames))).unwrap();
         for (i, (a, b)) in with.iter().zip(&without).enumerate() {

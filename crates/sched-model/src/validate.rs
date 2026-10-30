@@ -377,7 +377,7 @@ fn models(c: &Config, p: &mut Problems) {
             for (name, value) in [
                 ("power_on_timeout", pw.power_on_timeout()),
                 ("shutdown_timeout", pw.shutdown_timeout()),
-                ("mounts_timeout", pw.mounts_timeout()),
+                ("veto_timeout", pw.veto_timeout()),
             ] {
                 if c.power_managed(&r.id) && value <= stale {
                     p.add(
@@ -1602,29 +1602,26 @@ sources:
     #[test]
     fn the_mounts_timeout_is_bounded_and_longer_than_the_staleness_bound() {
         let ps = problems(&managed_example_with(
-            "mounts_timeout: 30m",
-            "mounts_timeout: 1s",
+            "veto_timeout: 30m",
+            "veto_timeout: 1s",
         ));
         assert!(
             has(
                 &ps,
-                "mounts_timeout (1000ms) must be greater than policy.host_reading_stale_after"
+                "veto_timeout (1000ms) must be greater than policy.host_reading_stale_after"
             ),
             "{ps:?}"
         );
         let ps = problems(&managed_example_with(
-            "mounts_timeout: 30m",
-            "mounts_timeout: 2d",
+            "veto_timeout: 30m",
+            "veto_timeout: 2d",
         ));
-        assert!(has(&ps, "mounts_timeout 172800000ms exceeds"), "{ps:?}");
+        assert!(has(&ps, "veto_timeout 172800000ms exceeds"), "{ps:?}");
         let ps = problems(&managed_example_with(
-            "mounts_timeout: 30m",
-            "mounts_timeout: 0",
+            "veto_timeout: 30m",
+            "veto_timeout: 0",
         ));
-        assert!(
-            has(&ps, "mounts_timeout must be greater than zero"),
-            "{ps:?}"
-        );
+        assert!(has(&ps, "veto_timeout must be greater than zero"), "{ps:?}");
     }
 
     #[test]
@@ -1636,10 +1633,7 @@ sources:
                 .map(|p| p.min_off()),
             Some(crate::Millis::ZERO)
         );
-        let ok = managed_example_with(
-            "mounts_timeout: 30m",
-            "mounts_timeout: 30m\n      min_off: 10m",
-        );
+        let ok = managed_example_with("veto_timeout: 30m", "veto_timeout: 30m\n      min_off: 10m");
         let c = Config::from_yaml(&ok).unwrap();
         assert_eq!(
             c.resource(&"basestar-nfs".into())
@@ -1647,10 +1641,10 @@ sources:
                 .map(|p| p.min_off()),
             Some(crate::Millis(600_000))
         );
-        let ps = problems(&managed_example_with("mounts_timeout: 30m", "min_off: 2d"));
+        let ps = problems(&managed_example_with("veto_timeout: 30m", "min_off: 2d"));
         assert!(has(&ps, "min_off 172800000ms exceeds"), "{ps:?}");
         assert!(
-            Config::from_yaml(&managed_example_with("mounts_timeout: 30m", "min_off: 0")).is_ok()
+            Config::from_yaml(&managed_example_with("veto_timeout: 30m", "min_off: 0")).is_ok()
         );
     }
 

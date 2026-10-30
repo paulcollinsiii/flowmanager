@@ -1,4 +1,4 @@
-description: "Pods keep mounting basestar past mounts_timeout (30m): flowmanager alerts and stops, the host stays up and is not shut down even once the pods are gone, until a new manual lease takes it over."
+description: "Pods keep mounting basestar past veto_timeout (30m): flowmanager alerts and stops, the host stays up and is not shut down even once the pods are gone, until a new manual lease takes it over."
 power_control: managed
 frames:
   - at: 100000000
@@ -34,13 +34,13 @@ frames:
   - at: 100660000
     refresh: true
     expect:
-      steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
+      steps: [{ type: wait, resource: basestar-nfs, reason: veto_in_use }]
       allowed: { models: [], classes: [] }
   # One second short of the timeout (30m after it became due).
   - at: 102459000
     refresh: true
     expect:
-      steps: [{ type: wait, resource: basestar-nfs, reason: pods_mounted }]
+      steps: [{ type: wait, resource: basestar-nfs, reason: veto_in_use }]
       allowed: { models: [], classes: [] }
   # Timed out: stopped. Nothing is powered off, the idle drain ends and the consumers are
   # allowed again (nobody asked for them to stay down).

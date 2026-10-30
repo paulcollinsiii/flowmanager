@@ -9,7 +9,7 @@ use sched_observe::ObserverState;
 
 use crate::cache::InputAge;
 use crate::tick::{
-    MinOffWait, MountsHeld, MountsTimeout, PowerFailed, PowerRequestFailure, PowerTimeout,
+    MinOffWait, PowerFailed, PowerRequestFailure, PowerTimeout, VetoHeld, VetoTimeout,
 };
 
 /// The metric label of a step. A fixed set, so label cardinality is bounded.
@@ -106,13 +106,13 @@ pub fn with_power(
 pub const KIND_SHUTDOWN_STOPPED: &str = "shutdown_stopped";
 
 /// Adds the held-back shutdowns to a decision's kinds and reason: each resource waiting for
-/// pods to unmount (or for a reading of them), each wait that timed out in this tick, and
-/// each resource where flowmanager stopped.
-pub fn with_mounts(
+/// the veto to clear (a pod still using the host, or a reading of it missing), each wait that
+/// timed out in this tick, and each resource where flowmanager stopped.
+pub fn with_veto(
     mut kinds: Vec<String>,
     mut reason: String,
-    held: &[MountsHeld],
-    timeouts: &[MountsTimeout],
+    held: &[VetoHeld],
+    timeouts: &[VetoTimeout],
 ) -> (Vec<String>, String) {
     if held.iter().any(|h| h.stopped) {
         kinds.push(KIND_SHUTDOWN_STOPPED.to_string());
@@ -121,22 +121,25 @@ pub fn with_mounts(
     }
     for t in timeouts {
         reason.push_str(&format!(
-            "; ALERT: the shutdown of {} waited for pods to unmount until mounts_timeout ran out in this tick",
-            t.resource
+            "; ALERT: the shutdown of {} waited for the veto ({}) to clear until veto_timeout ran out in this tick",
+            t.resource,
+            t.readings.join("+")
         ));
     }
     for h in held {
         if h.stopped {
             reason.push_str(&format!(
-                "; {} was NOT shut down: pods still mounted it (or the count was unknown) when mounts_timeout ran out at {}ms; flowmanager stopped, the host stays up, and it will not shut it down by itself again until a person acts (resume), it is seen down, or a new manual request takes it over",
+                "; {} was NOT shut down: it was still in use (or its use was unknown; veto {}) when veto_timeout ran out at {}ms; flowmanager stopped, the host stays up, and it will not shut it down by itself again until a person acts (resume), it is seen down, or a new manual request takes it over",
                 h.resource,
+                h.readings.join("+"),
                 h.since.as_u64()
             ));
         } else {
             reason.push_str(&format!(
-                "; the shutdown of {} is held back since {}ms: pods mount its NFS server or the count is unknown (unknown counts as mounted)",
+                "; the shutdown of {} is held back since {}ms by the veto ({}): a pod mounts its NFS server or runs its models, or the reading is unknown (unknown counts as in use)",
                 h.resource,
-                h.since.as_u64()
+                h.since.as_u64(),
+                h.readings.join("+")
             ));
         }
     }
@@ -260,14 +263,14 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::PowerFailed => {
             "the host's power transition timed out and flowmanager stopped (a person must act; it is not retried)"
         }
-        WaitReason::PodsMounted => {
-            "the host is due to be powered off but pods still mount its NFS server (waiting for them to unmount)"
+        WaitReason::VetoInUse => {
+            "the host is due to be powered off but pods still use it (mounting its NFS server or running its models); waiting for them to go"
         }
-        WaitReason::MountsUnknown => {
-            "the host is due to be powered off but which pods mount its NFS server is unknown (no fresh reading; unknown counts as mounted)"
+        WaitReason::VetoUnknown => {
+            "the host is due to be powered off but whether pods still use it is unknown (no fresh reading; unknown counts as in use)"
         }
         WaitReason::ShutdownStopped => {
-            "pods still mounted the host when mounts_timeout ran out and flowmanager stopped (the host stays up; a person must act; it is not retried)"
+            "the host was still in use when veto_timeout ran out and flowmanager stopped (the host stays up; a person must act; it is not retried)"
         }
         WaitReason::MinOff => {
             "the host was shut down by flowmanager and its minimum off time (min_off) has not passed yet"

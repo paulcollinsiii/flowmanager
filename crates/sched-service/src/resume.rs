@@ -1,7 +1,7 @@
 //! `resume`: a person acts on one resource flowmanager stopped at, after fixing the host by
 //! hand. Two things stop flowmanager and leave it waiting for a person: a power transition
-//! that timed out (`PowerPhase::Failed`) and a shutdown that waited for mounting pods until
-//! `mounts_timeout` ran out (`Veto::Stopped`).
+//! that timed out (`PowerPhase::Failed`) and a shutdown that waited for the veto to clear until
+//! `veto_timeout` ran out (`Veto::Stopped`).
 //!
 //! Resuming forgets the resource's state, so the sequencer starts it afresh from what is
 //! observed (the same as a resource it has never seen): found running means up and not
@@ -35,7 +35,7 @@ pub struct Resume {
 pub struct ResumeAck {
     pub resource: ResourceId,
     /// What the resource was stopped at: `power_on_failed`, `shutdown_failed` or
-    /// `shutdown_stopped_by_mounts`.
+    /// `shutdown_stopped_by_veto`.
     pub cleared: String,
 }
 
@@ -133,7 +133,7 @@ pub fn resume(
             },
             _,
         ) => "shutdown_failed",
-        (_, Some(_)) => "shutdown_stopped_by_mounts",
+        (_, Some(_)) => "shutdown_stopped_by_veto",
         (power, _) => return Err(not_stopped(format!("its power phase is {}", phase(power)))),
     };
     core.state.resources.remove(resource);
@@ -216,7 +216,7 @@ mod tests {
         st.shutdown = Some(vetoing(5).stopped(Millis(9)));
         let mut s = core(&[("basestar-nfs", st)]);
         let ack = resume(&mut s, &c, &"basestar-nfs".into()).unwrap();
-        assert_eq!(ack.cleared, "shutdown_stopped_by_mounts");
+        assert_eq!(ack.cleared, "shutdown_stopped_by_veto");
         assert!(s.state.resources.is_empty());
     }
 
@@ -264,7 +264,7 @@ mod tests {
         // A config where basestar has no power section.
         let y = sched_model::test_support::EXAMPLE_CONFIG
             .replace(
-                "    power:\n      wake_on_lan: { router_url: \"https://router.example.internal\", interface: lan, mac: \"02:00:00:00:00:02\" }\n      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n      control: manual\n      # Set per resource: the NFS host boots and stops faster than the GPU host.\n      power_on_timeout: 5m\n      shutdown_timeout: 10m\n      # Under managed control, how long a shutdown may wait for pods to stop mounting this\n      # host (see the basestar-mounts source) before the scheduler alerts and stops, without\n      # shutting it down and without retrying (default 30m, at most 1d).\n      mounts_timeout: 30m\n",
+                "    power:\n      wake_on_lan: { router_url: \"https://router.example.internal\", interface: lan, mac: \"02:00:00:00:00:02\" }\n      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n      control: manual\n      # Set per resource: the NFS host boots and stops faster than the GPU host.\n      power_on_timeout: 5m\n      shutdown_timeout: 10m\n      # Under managed control, how long a shutdown may wait for pods to stop mounting this\n      # host (see the basestar-mounts source) before the scheduler alerts and stops, without\n      # shutting it down and without retrying (default 30m, at most 1d).\n      veto_timeout: 30m\n",
                 "",
             )
             .replace("    may_change_power: true\n", "");

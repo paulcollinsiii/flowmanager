@@ -57,12 +57,13 @@ pub struct PowerSpec {
     /// As `power_on_timeout`, for being observed down after a shutdown. Default 15 minutes.
     #[serde(default)]
     pub shutdown_timeout: Option<Millis>,
-    /// How long a shutdown may wait for pods to stop mounting this host (see the `mounts`
-    /// capability) before the scheduler gives up, raises an alert and stops (it never retries;
-    /// a person acts). Default 30 minutes. Only meaningful under `control: managed`, for a
-    /// resource that a `mounts` source checks.
+    /// How long a shutdown may wait for the veto (see [`VetoReading`]: pods still mounting
+    /// the host, or still running its models, or the reading being unknown) before the
+    /// scheduler gives up, raises an alert and stops (it never retries; a person acts).
+    /// Default 30 minutes. Only meaningful under `control: managed`, for a resource that
+    /// has a veto reading.
     #[serde(default)]
-    pub mounts_timeout: Option<Millis>,
+    pub veto_timeout: Option<Millis>,
     /// The least time flowmanager keeps a host off after it has confirmed a shutdown it
     /// started (the host was observed down) before it powers the host on again by itself, for
     /// a workload, a scheduled job's hold or any other automatic want. A manual lease
@@ -75,8 +76,8 @@ pub struct PowerSpec {
 pub const DEFAULT_POWER_ON_TIMEOUT: Millis = Millis(10 * 60_000);
 /// Default for [`PowerSpec::shutdown_timeout`].
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Millis = Millis(15 * 60_000);
-/// Default for [`PowerSpec::mounts_timeout`].
-pub const DEFAULT_MOUNTS_TIMEOUT: Millis = Millis(30 * 60_000);
+/// Default for [`PowerSpec::veto_timeout`].
+pub const DEFAULT_VETO_TIMEOUT: Millis = Millis(30 * 60_000);
 
 impl PowerSpec {
     /// The effective power-on timeout.
@@ -84,9 +85,9 @@ impl PowerSpec {
         self.power_on_timeout.unwrap_or(DEFAULT_POWER_ON_TIMEOUT)
     }
 
-    /// The effective mounts timeout.
-    pub fn mounts_timeout(&self) -> Millis {
-        self.mounts_timeout.unwrap_or(DEFAULT_MOUNTS_TIMEOUT)
+    /// The effective veto timeout.
+    pub fn veto_timeout(&self) -> Millis {
+        self.veto_timeout.unwrap_or(DEFAULT_VETO_TIMEOUT)
     }
 
     /// The effective shutdown timeout.
@@ -255,6 +256,35 @@ pub enum Capability {
     /// from the Kubernetes API. Whether a job is complete, failed or gone; a reading that is
     /// stale or unavailable is never read as "finished".
     Jobs,
+}
+
+/// A reading the veto before a power-off consults (see `Config::veto_readings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VetoReading {
+    /// No pod mounts the host's NFS server (the `mounts` capability).
+    Mounts,
+    /// No pod of the host's models exists (the `pods` capability).
+    Pods,
+}
+
+impl VetoReading {
+    /// The label used in logs, reports and metrics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VetoReading::Mounts => "mounts",
+            VetoReading::Pods => "pods",
+        }
+    }
+
+    /// The readings joined for a label: `mounts`, `pods` or `mounts+pods`.
+    pub fn label(readings: &[VetoReading]) -> String {
+        readings
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join("+")
+    }
 }
 
 impl std::fmt::Display for Capability {
@@ -472,6 +502,30 @@ impl Config {
                     .flatten()
                     .is_some_and(|p| p.nfs_servers.get(id).is_some_and(|v| !v.is_empty()))
         })
+    }
+
+    /// Whether a source declaring the `pods` capability covers the models of `id`: the host
+    /// has models, and a `pods` source reports one count per configured model. Such a
+    /// resource is never powered off while a pod of its models may still run.
+    pub fn pods_checked(&self, id: &ResourceId) -> bool {
+        self.models_of(id).next().is_some()
+            && self
+                .sources
+                .iter()
+                .any(|s| s.observe.contains(&Capability::Pods))
+    }
+
+    /// The readings the veto before a power-off of `id` needs, in a fixed order. Empty: the
+    /// host has no veto.
+    pub fn veto_readings(&self, id: &ResourceId) -> Vec<VetoReading> {
+        let mut readings = Vec::new();
+        if self.mounts_checked(id) {
+            readings.push(VetoReading::Mounts);
+        }
+        if self.pods_checked(id) {
+            readings.push(VetoReading::Pods);
+        }
+        readings
     }
 
     pub fn resource(&self, id: &ResourceId) -> Option<&ResourceSpec> {

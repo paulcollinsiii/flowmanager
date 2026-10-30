@@ -379,7 +379,7 @@ fn allowing_a_model_never_waits_on_pods_but_needs_the_host_freshly_up() {
 #[test]
 fn pod_observations_never_change_a_decision() {
     // Cases that reach every branch of the mode machine: allow, stay, wind down, switch,
-    // forced switch with a kill, reclaim, and an idle host that may power off.
+    // forced switch with a kill, and reclaim.
     let cases: Vec<(&str, Case)> = vec![
         ("allow", Case::new().target(Some("mineru"))),
         (
@@ -409,7 +409,8 @@ fn pod_observations_never_change_a_decision() {
             "reclaim",
             Case::new().gpu(&serving("mineru", 10 * MIN)).reclaim(),
         ),
-        ("power off", Case::new().gpu_state(&managed_idle(99 * MIN))),
+        // A power-off is not among them: the veto reads the host's models' pods (see
+        // `the_pods_veto_*`).
     ];
     let variants: Vec<(&str, Vec<String>)> = vec![
         ("no pod readings", vec![]),
@@ -931,11 +932,13 @@ fn reclaim_shuts_the_host_down_overriding_holds_and_grace() {
     assert!(matches!(power_of(&d, G), PowerPhase::ShuttingDown { .. }));
     assert!(d.allowed.models.is_empty());
 
+    // The pods veto applies to a reclaim's power-off too: a stale reading is unknown, and
+    // unknown counts as in use.
     let d = Case::new().obs(pods("llm", 2, 2, 31_000)).reclaim().run();
     assert_steps(
         &d,
-        vec![Step::PowerOff { resource: rid(G) }],
-        "pod readings, stale or not, are not consulted",
+        vec![wait(G, WaitReason::VetoUnknown)],
+        "a stale pod reading holds the power-off",
     );
     let d = Case::new().obs(up(G, true, 31_000)).reclaim().run();
     assert_steps(
@@ -1110,18 +1113,18 @@ fn power_down_rules() {
     let d = Case::new().nfs_state(unmanaged).run();
     assert_steps(&d, vec![], "a host found running is never powered down");
 
-    // No model is allowed (mode idle): pod readings, stale or showing pods, are not
-    // consulted. Kubernetes and KEDA have scaled the withdrawn model down.
-    for p in [pods("llm", 0, 0, 31_000), pods("llm", 1, 1, 0)] {
+    // No model is allowed (mode idle): the veto reads the host's models' pods (the pods
+    // source covers them). A stale reading, or any pod, holds the power-off back; fresh zero
+    // pods let it through (the default world has them).
+    for (p, why) in [
+        (pods("llm", 0, 0, 31_000), WaitReason::VetoUnknown),
+        (pods("llm", 1, 1, 0), WaitReason::VetoInUse),
+    ] {
         let d = Case::new()
             .gpu_state(&format!("{managed}{} }}", T - 99 * MIN))
             .obs(p)
             .run();
-        assert_steps(
-            &d,
-            vec![Step::PowerOff { resource: rid(G) }],
-            "pods do not stop the power down",
-        );
+        assert_steps(&d, vec![wait(G, why)], "the pods veto holds the power down");
     }
     let d = Case::new()
         .gpu_state(&format!("{managed}{} }}", T - 99 * MIN))
@@ -2455,7 +2458,7 @@ fn veto_of(d: &Decision) -> Option<Veto> {
 fn a_host_that_pods_mount_is_not_powered_off_and_the_wait_begins_when_it_is_due() {
     let due = || Case::new().nfs_state(&nfs_due(10 * MIN, None));
     let d = due().obs(mounts(2, 0)).run();
-    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
+    assert_steps(&d, vec![wait(N, WaitReason::VetoInUse)], "mounted");
     assert_eq!(
         veto_of(&d),
         Some(Veto::Waiting {
@@ -2484,7 +2487,7 @@ fn an_unknown_mount_count_counts_as_mounted() {
         ("stale", due().obs(mounts(0, 31_000))),
     ] {
         let d = case.run();
-        assert_steps(&d, vec![wait(N, WaitReason::MountsUnknown)], name);
+        assert_steps(&d, vec![wait(N, WaitReason::VetoUnknown)], name);
         assert!(
             !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
             "{name}"
@@ -2521,7 +2524,7 @@ fn a_reading_from_a_source_without_the_capability_does_not_stand_in() {
         },
     });
     let d = tick(&c.config, &snap, &c.state(), &c.intent).unwrap();
-    assert_steps(&d, vec![wait(N, WaitReason::MountsUnknown)], "stray source");
+    assert_steps(&d, vec![wait(N, WaitReason::VetoUnknown)], "stray source");
 }
 
 #[test]
@@ -2532,7 +2535,7 @@ fn the_wait_ends_in_the_shutdown_when_the_pods_are_gone() {
             .obs(mounts(pods, 0))
     };
     let d = case(5 * MIN, 1).run();
-    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "still mounted");
+    assert_steps(&d, vec![wait(N, WaitReason::VetoInUse)], "still mounted");
     assert_eq!(
         veto_of(&d),
         Some(Veto::Waiting {
@@ -2548,14 +2551,14 @@ fn the_wait_ends_in_the_shutdown_when_the_pods_are_gone() {
 
 #[test]
 fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retry() {
-    // mounts_timeout of the example is 30 minutes.
+    // veto_timeout of the example is 30 minutes.
     let case = |ago: u64, pods: u32| {
         Case::new()
             .nfs_state(&nfs_due(60 * MIN, Some(&waiting_since(ago))))
             .obs(mounts(pods, 0))
     };
     let d = case(30 * MIN - 1, 1).run();
-    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "just inside");
+    assert_steps(&d, vec![wait(N, WaitReason::VetoInUse)], "just inside");
     let d = case(30 * MIN, 1).run();
     assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], "timed out");
     assert_eq!(
@@ -2681,8 +2684,8 @@ fn something_holding_the_host_ends_the_wait_and_a_host_seen_down_ends_a_stop() {
 
 #[test]
 fn an_unchecked_host_is_powered_off_without_a_mount_reading() {
-    // The GPU host has no mounts source: the veto does not apply to it (its drain is the
-    // model wind-down), and a mount reading is not needed.
+    // The GPU host has no mounts source; its pods veto is cleared by the default world's
+    // fresh zero pods, and a mount reading is not needed.
     let managed =
         "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: ";
     let d = Case::new()
@@ -2780,7 +2783,7 @@ const MIN_OFF: u64 = 10 * MIN;
 /// The managed example with `min_off: 10m` on both powered resources.
 fn with_min_off(c: Case) -> Case {
     let y = example_yaml_managed();
-    assert!(y.contains("mounts_timeout: 30m"), "the example changed");
+    assert!(y.contains("veto_timeout: 30m"), "the example changed");
     let y = y.replacen(
         "power_on_timeout:",
         "min_off: 10m\n      power_on_timeout:",
@@ -3189,13 +3192,13 @@ fn the_mount_veto_and_its_timeout_still_apply_after_the_scale_down() {
         .obs(mounts(2, 0))
         .nfs_state(&nfs_draining("immediate", 0));
     let d = c.run();
-    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
+    assert_steps(&d, vec![wait(N, WaitReason::VetoInUse)], "mounted");
     assert!(!gate_allowed(&d));
     assert!(matches!(veto_of(&d), Some(Veto::Waiting { .. })));
     // The pods are gone: the shutdown goes ahead.
     let d2 = Case::new().run_fresh_at(&d.state, T + MIN);
     assert_steps(&d2, vec![Step::PowerOff { resource: rid(N) }], "unmounted");
-    // A wait that outlasts mounts_timeout (30m) stops the scheduler.
+    // A wait that outlasts veto_timeout (30m) stops the scheduler.
     let d3 = c.run_fresh_at(&d.state, T + 30 * MIN);
     assert_steps(&d3, vec![wait(N, WaitReason::ShutdownStopped)], "timed out");
 }
@@ -3279,7 +3282,7 @@ fn an_idle_drain_waits_for_the_pods_to_unmount_and_then_shuts_the_host_down() {
         .nfs_state(&nfs_due(10 * MIN, None))
         .obs(mounts(2, 0));
     let d = c.run();
-    assert_steps(&d, vec![wait(N, WaitReason::PodsMounted)], "mounted");
+    assert_steps(&d, vec![wait(N, WaitReason::VetoInUse)], "mounted");
     assert!(is_idle_drain(&d) && !gate_allowed(&d));
     // The state is carried (as persisted): still draining, pods gone, shut down.
     let d2 = Case::new().run_fresh_at(&d.state, T + MIN);
@@ -3345,7 +3348,7 @@ fn unknown_demand_starts_no_idle_drain_and_keeps_one_that_is_set_without_a_shutd
 
 #[test]
 fn a_stopped_mount_veto_ends_the_idle_drain_and_it_does_not_start_again() {
-    // Pods kept mounting past mounts_timeout (30m): the scheduler stops.
+    // Pods kept mounting past veto_timeout (30m): the scheduler stops.
     let c = Case::new()
         .nfs_state(&nfs_idle_drain(
             60 * MIN,
@@ -3720,5 +3723,305 @@ fn a_requested_shutdown_that_stopped_on_the_veto_keeps_the_exclusive_host_withdr
         !d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })),
         "{:?}",
         d.steps
+    );
+}
+
+// ---- the one veto: before any power-off, nothing may still use the host ----
+// The GPU host's pods source reports one count per model: all of its models must show a fresh
+// zero. Missing or stale counts as in use.
+
+/// The GPU host managed and idle since long ago (shutdown due), with `pods` readings of every
+/// model but those in `without` (a missing reading), and `llm_pods` pods of llm.
+fn gpu_due_with(llm_pods: u32, llm_age: u64, without: &[&str]) -> Case {
+    let mut c = Case::new().gpu_state(&managed_idle(99 * MIN));
+    for m in without {
+        c = c.drop_obs(&format!("model: {m},"));
+    }
+    if !without.contains(&"llm") {
+        c = c.obs(pods("llm", llm_pods, llm_pods, llm_age));
+    }
+    c
+}
+
+fn gpu_veto_of(d: &Decision) -> Option<Veto> {
+    let s = d.state.resource(&rid(G)).unwrap().shutdown?;
+    match s.veto() {
+        sched_model::Veto::Vetoing { since } => Some(Veto::Waiting { since }),
+        sched_model::Veto::Stopped { since } => Some(Veto::Stopped { since }),
+        sched_model::Veto::None => None,
+    }
+}
+
+#[test]
+fn the_pods_veto_holds_a_power_off_until_every_model_of_the_host_shows_no_pods() {
+    // Fresh zero for every model: nothing in the way (the default world).
+    let d = gpu_due_with(0, 0, &[]).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(G) }], "all zero");
+    assert_eq!(gpu_veto_of(&d), None);
+    // A pod of any one model.
+    for m in ["mineru", "llm", "whisperx", "immich-ml"] {
+        let d = Case::new()
+            .gpu_state(&managed_idle(99 * MIN))
+            .obs(pods(m, 1, 0, 0))
+            .run();
+        assert_steps(&d, vec![wait(G, WaitReason::VetoInUse)], m);
+        assert_eq!(
+            gpu_veto_of(&d),
+            Some(Veto::Waiting {
+                since: sched_model::Millis(T)
+            }),
+            "{m}: the wait begins when it is due"
+        );
+        let s = d.state.resource(&rid(G)).unwrap().shutdown.unwrap();
+        assert_eq!(
+            (s.cause(), s.withdrawal()),
+            (
+                sched_model::ShutdownCause::Idle,
+                sched_model::Withdrawal::NotNeeded
+            ),
+            "an idle shutdown of an exclusive host has nothing to withdraw"
+        );
+        assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+    }
+    // A model with no reading, or only a stale one, is in use as far as the veto goes; a
+    // pod count of another model does not matter once one is unknown.
+    for (name, c) in [
+        ("missing", gpu_due_with(0, 0, &["whisperx"])),
+        ("stale", gpu_due_with(0, 31_000, &[])),
+        (
+            "future-dated",
+            Case::new()
+                .gpu_state(&managed_idle(99 * MIN))
+                .obs(future(&pods("mineru", 0, 0, 0))),
+        ),
+    ] {
+        let d = c.run();
+        assert_steps(&d, vec![wait(G, WaitReason::VetoUnknown)], name);
+    }
+    // In use outranks unknown in the reason.
+    let d = gpu_due_with(2, 0, &["whisperx"]).run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::VetoInUse)],
+        "in use and unknown",
+    );
+}
+
+#[test]
+fn the_pods_veto_wait_keeps_its_start_ends_when_the_pods_are_gone_and_is_bounded() {
+    // The wait began 5 minutes ago: it keeps its start while pods remain, and the power-off
+    // goes ahead the tick the pods are gone.
+    let waiting = |ago: u64| {
+        format!(
+            "{{ power: {}, mode: {}, managed: true, idle_since: {}, shutdown: {{ cause: {{ kind: idle }}, since: 1, withdrawal: not_needed, veto: {{ phase: vetoing, since: {} }} }} }}",
+            on(),
+            mode_idle(),
+            T - 60 * MIN,
+            T - ago
+        )
+    };
+    let c = |ago: u64, pods_of_llm: u32| {
+        Case::new()
+            .gpu_state(&waiting(ago))
+            .obs(pods("llm", pods_of_llm, pods_of_llm, 0))
+    };
+    let d = c(5 * MIN, 1).run();
+    assert_steps(&d, vec![wait(G, WaitReason::VetoInUse)], "still in use");
+    assert_eq!(
+        gpu_veto_of(&d),
+        Some(Veto::Waiting {
+            since: sched_model::Millis(T - 5 * MIN)
+        })
+    );
+    let d = c(5 * MIN, 0).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(G) }], "gone");
+    assert_eq!(gpu_veto_of(&d), None);
+    // veto_timeout of the example is 30 minutes.
+    let d = c(30 * MIN - 1, 1).run();
+    assert_steps(&d, vec![wait(G, WaitReason::VetoInUse)], "just inside");
+    let d = c(30 * MIN, 1).run();
+    assert_steps(&d, vec![wait(G, WaitReason::ShutdownStopped)], "timed out");
+    assert_eq!(
+        gpu_veto_of(&d),
+        Some(Veto::Stopped {
+            since: sched_model::Millis(T)
+        })
+    );
+    let g = d.state.resource(&rid(G)).unwrap();
+    assert!(!g.managed && g.is_on(), "no automatic power-off follows");
+    // Stopped stays stopped, however long and whatever the pods say: no retry.
+    for pods_of_llm in [0, 3] {
+        let d2 = c(0, pods_of_llm).run_fresh_at(&d.state, T + 99 * MIN);
+        assert_steps(&d2, vec![wait(G, WaitReason::ShutdownStopped)], "no retry");
+        assert!(matches!(gpu_veto_of(&d2), Some(Veto::Stopped { .. })));
+    }
+    // A new manual request takes the host over again, as it does for a stopped mounts veto.
+    let d3 = Case::new()
+        .want(G, PowerWant::Manual)
+        .run_fresh_at(&d.state, T + 99 * MIN);
+    assert_eq!(gpu_veto_of(&d3), None);
+    assert!(d3.state.resource(&rid(G)).unwrap().managed);
+}
+
+#[test]
+fn the_pods_veto_applies_to_a_requested_shutdown_and_a_reclaim_too() {
+    // Requested: withdrawn (the model is gone), then the veto; a stop keeps it withdrawn.
+    let requested = |ago: u64| {
+        Case::new()
+            .gpu_state(&gpu_requested(&mode_idle(), "immediate", ago, "pending"))
+            .obs(pods("whisperx", 1, 1, 0))
+    };
+    let d = requested(0).run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::VetoInUse)],
+        "requested, in use",
+    );
+    let s = d.state.resource(&rid(G)).unwrap().shutdown.unwrap();
+    assert!(s.is_requested() && s.consumers_withdrawn());
+    assert!(matches!(s.veto(), sched_model::Veto::Vetoing { .. }));
+    let d = Case::new()
+        .gpu_state(&gpu_requested(&mode_idle(), "immediate", 0, "pending"))
+        .run();
+    assert_steps(
+        &d,
+        vec![Step::PowerOff { resource: rid(G) }],
+        "requested, clear",
+    );
+    // Reclaim: the same.
+    let d = Case::new().obs(pods("whisperx", 1, 1, 0)).reclaim().run();
+    assert_steps(&d, vec![wait(G, WaitReason::VetoInUse)], "reclaim, in use");
+    let s = d.state.resource(&rid(G)).unwrap().shutdown.unwrap();
+    assert_eq!(s.cause(), sched_model::ShutdownCause::Reclaim);
+    let d = Case::new().reclaim().run();
+    assert_steps(
+        &d,
+        vec![Step::PowerOff { resource: rid(G) }],
+        "reclaim, clear",
+    );
+    // A reclaim's veto is bounded like any other.
+    let stopped = Case::new().obs(pods("whisperx", 1, 1, 0)).reclaim();
+    let first = stopped.run();
+    let d = stopped.run_fresh_at(&first.state, T + 30 * MIN);
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::ShutdownStopped)],
+        "reclaim stops",
+    );
+    assert!(matches!(gpu_veto_of(&d), Some(Veto::Stopped { .. })));
+    let s = d.state.resource(&rid(G)).unwrap().shutdown.unwrap();
+    assert_eq!(s.cause(), sched_model::ShutdownCause::Reclaim);
+}
+
+#[test]
+fn a_requested_shutdown_that_stops_on_the_pods_veto_keeps_its_withdrawal() {
+    let c = Case::new()
+        .gpu_state(&gpu_requested(&mode_idle(), "graceful", 0, "pending"))
+        .obs(pods("llm", 1, 1, 0));
+    let first = c.run();
+    let d = c.run_fresh_at(&first.state, T + 30 * MIN);
+    let s = d.state.resource(&rid(G)).unwrap().shutdown.unwrap();
+    assert_eq!(s.stopped_since(), Some(sched_model::Millis(T + 30 * MIN)));
+    assert!(s.is_requested() && s.consumers_withdrawn());
+    assert!(!d.state.resource(&rid(G)).unwrap().managed);
+}
+
+/// The managed example in which the GPU host's resource is also named by the mounts source
+/// (a host that needs both readings).
+fn both_readings() -> Config {
+    let yaml = managed_yaml().replace(
+        "nfs_servers: { basestar-nfs: [basestar] }",
+        "nfs_servers: { basestar-nfs: [basestar], cuda-central: [cuda-central] }",
+    );
+    assert_ne!(yaml, managed_yaml());
+    Config::from_yaml(&yaml).unwrap()
+}
+
+fn gpu_mounts(pods: u32, age: u64) -> String {
+    format!(
+        "    - {{ source: basestar-mounts, observed_at: {}, fidelity: polled, value: {{ type: resource_mounts, resource: {G}, pods: {pods} }} }}\n",
+        T - age
+    )
+}
+
+#[test]
+fn a_host_with_both_readings_needs_both_to_show_it_unused() {
+    let config = both_readings();
+    assert_eq!(
+        config
+            .veto_readings(&rid(G))
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mounts", "pods"]
+    );
+    let case = |mounts: Option<u32>, llm_pods: u32| {
+        let mut c = Case::new()
+            .gpu_state(&managed_idle(99 * MIN))
+            .obs(pods("llm", llm_pods, llm_pods, 0));
+        c.config = config.clone();
+        if let Some(n) = mounts {
+            c.obs.push(gpu_mounts(n, 0));
+        }
+        c
+    };
+    assert_steps(
+        &case(Some(0), 0).run(),
+        vec![Step::PowerOff { resource: rid(G) }],
+        "both clear",
+    );
+    assert_steps(
+        &case(Some(2), 0).run(),
+        vec![wait(G, WaitReason::VetoInUse)],
+        "mounted, no pods",
+    );
+    assert_steps(
+        &case(Some(0), 1).run(),
+        vec![wait(G, WaitReason::VetoInUse)],
+        "pods, not mounted",
+    );
+    assert_steps(
+        &case(None, 0).run(),
+        vec![wait(G, WaitReason::VetoUnknown)],
+        "mounts never read",
+    );
+    assert_steps(
+        &case(None, 1).run(),
+        vec![wait(G, WaitReason::VetoInUse)],
+        "in use outranks unknown",
+    );
+}
+
+#[test]
+fn a_host_with_no_reading_has_no_veto() {
+    // No source declares pods: the GPU host has nothing to read, so nothing to wait for.
+    let yaml = managed_yaml().replace(
+        "    observe: [pods, reachability]",
+        "    observe: [reachability]",
+    );
+    assert_ne!(yaml, managed_yaml());
+    let config = Config::from_yaml(&yaml).unwrap();
+    assert!(config.veto_readings(&rid(G)).is_empty());
+    let mut c = Case::new()
+        .gpu_state(&managed_idle(99 * MIN))
+        .drop_obs("type: model_pods");
+    c.config = config;
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![Step::PowerOff { resource: rid(G) }],
+        "no reading, no veto",
+    );
+    assert_eq!(gpu_veto_of(&d), None);
+    // With a pods source, a model it has no reading of makes the host unknown: every model
+    // of the host needs a fresh reading.
+    let d = Case::new()
+        .gpu_state(&managed_idle(99 * MIN))
+        .drop_obs("model: mineru,")
+        .run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::VetoUnknown)],
+        "uncovered model",
     );
 }

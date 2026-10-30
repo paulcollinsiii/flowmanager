@@ -587,7 +587,7 @@ pub fn check(
                         }
                     }
                     let grace_ok = policy.idle_grace == Millis::ZERO
-                        || (draining && config.mounts_checked(resource))
+                        || draining
                         || before.and_then(|s| s.idle_since).is_some_and(|t| {
                             now.as_u64() - t.as_u64().min(now.as_u64())
                                 >= policy.idle_grace.as_u64()
@@ -603,8 +603,27 @@ pub fn check(
                         "invariant 5: powered off {resource} without a fresh up observation"
                     ));
                 }
-                // 13. A host whose mounts are checked is powered off only on fresh readings
-                // that all say no pod mounts it; an unknown count is as good as a mounted one.
+                // 13. A host is powered off only on fresh readings that say nothing still uses
+                // it, for every reading that applies to it: no pod mounts its NFS server (where
+                // a mounts source names it), and no pod of any of its models exists (where a
+                // pods source covers them). An unknown count is as good as a used one.
+                if config.pods_checked(resource) {
+                    for m in config.models_of(resource) {
+                        let clear = newest(config, Capability::Pods, snapshot, safety, |v| {
+                            matches!(v, ObservedValue::ModelPods { model, .. } if model == &m.id)
+                        })
+                        .is_some_and(|g| {
+                            g.iter()
+                                .all(|v| matches!(v, ObservedValue::ModelPods { pods: 0, .. }))
+                        });
+                        if !clear {
+                            out.push(format!(
+                                "invariant 13: powered off {resource} without a fresh reading of no pods of model {}",
+                                m.id
+                            ));
+                        }
+                    }
+                }
                 if config.mounts_checked(resource) {
                     let clear = newest(config, Capability::Mounts, snapshot, safety, |v| {
                         matches!(v, ObservedValue::ResourceMounts { resource: r, .. } if r == resource)

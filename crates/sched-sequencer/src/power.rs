@@ -272,7 +272,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
             if want == Some(PowerWant::Manual) {
                 st.managed = true;
                 // A new manual request takes the host over again: an earlier stop (pods
-                // still mounted it) is over, and the next idle period decides afresh.
+                // still used it) is over, and the next idle period decides afresh.
                 if st.shutdown.is_some_and(|s| s.stopped_since().is_some()) {
                     st.shutdown = None;
                 }
@@ -309,7 +309,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                     if cx.res.kind == ResourceKind::Shared {
                         // The consumers go first: an idle drain scales them down (they leave
                         // the allowed set in this very tick), and the shutdown goes on through
-                        // the usual mount veto, which waits while pods still mount the host.
+                        // the usual veto, which waits while pods still mount the host.
                         // A shared host never reaches here carrying a shutdown: one with a
                         // withdrawal took the branch above, and a stopped one is not managed.
                         let s = Shutdown::idle_withdrawn(now);
@@ -361,32 +361,30 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
     }
 }
 
-/// The pre-shutdown veto: whether no pod mounts the host. This is the one place a pod
+/// The pre-shutdown veto: whether nothing still uses the host. Before any power-off (idle,
+/// requested, reclaim) every reading that applies to the host must be fresh and show it
+/// unused: no pod mounts its NFS server (a `mounts` source names it) and no pod of its models
+/// exists (a `pods` source covers them, all of its models). This is the one place a pod
 /// reading decides anything, and only to hold a shutdown back. A reading that is missing,
-/// stale or failed is unknown, and unknown counts as mounted. While pods mount (or may mount)
-/// the host the shutdown waits (veto `Vetoing`), bounded by the resource's `mounts_timeout`;
-/// when that runs out the scheduler stops (veto `Stopped`: the host stays up, no retry)
-/// until the host is seen down, a person resets it, or a new manual request takes it over.
+/// stale or failed is unknown, and unknown counts as in use. While the host is (or may be) in
+/// use the shutdown waits (veto `Vetoing`), bounded by the resource's `veto_timeout`; when
+/// that runs out the scheduler stops (veto `Stopped`: the host stays up, no retry) until the
+/// host is seen down, a person resets it, or a new manual request takes it over.
 ///
 /// `shutdown` is the shutdown this power-off belongs to; it is recorded only when the host
-/// has none yet (an exclusive host's has no drain).
-fn mounts_clear(
-    cx: &Cx,
-    st: &mut ResourceState,
-    steps: &mut Vec<Step>,
-    shutdown: Shutdown,
-) -> bool {
+/// has none yet (an exclusive host's idle or reclaim shutdown starts here).
+fn veto_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, shutdown: Shutdown) -> bool {
     if st.shutdown.is_some_and(|s| s.stopped_since().is_some()) {
         wait(cx, steps, WaitReason::ShutdownStopped);
         return false;
     }
     let now = cx.now();
-    let reading = cx.snapshot.fresh_resource_mounts(
+    let in_use = cx.snapshot.host_use(
         cx.config,
         &cx.res.id,
         cx.config.policy().host_reading_stale_after,
     );
-    if reading == Some(0) {
+    if in_use.is_unused() {
         st.shutdown = st.shutdown.and_then(Shutdown::without_veto);
         return true;
     }
@@ -395,8 +393,8 @@ fn mounts_clear(
         .res
         .power
         .as_ref()
-        .map_or(sched_model::config::DEFAULT_MOUNTS_TIMEOUT, |p| {
-            p.mounts_timeout()
+        .map_or(sched_model::config::DEFAULT_VETO_TIMEOUT, |p| {
+            p.veto_timeout()
         });
     let current = st.shutdown.unwrap_or(shutdown);
     if now.saturating_sub(since) >= timeout {
@@ -408,20 +406,20 @@ fn mounts_clear(
         wait(cx, steps, WaitReason::ShutdownStopped);
     } else {
         st.shutdown = Some(current.vetoing(since));
-        let why = if reading.is_none() {
-            WaitReason::MountsUnknown
+        let why = if in_use.is_in_use() {
+            WaitReason::VetoInUse
         } else {
-            WaitReason::PodsMounted
+            WaitReason::VetoUnknown
         };
         wait(cx, steps, why);
     }
     false
 }
 
-/// Shuts the host down, provided a fresh reading shows it up and (for a host whose mounts
-/// are checked) no pod mounts it. It is only reached with no model allowed (mode idle);
-/// pod counts of models are not consulted. `shutdown` is the shutdown this belongs to, for a
-/// host that has none recorded yet.
+/// Shuts the host down, provided a fresh reading shows it up and the veto allows it (see
+/// `veto_clear`; a host with no reading that applies has none). It is only reached with no
+/// model allowed (mode idle). `shutdown` is the shutdown this belongs to, for a host that has
+/// none recorded yet.
 fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, shutdown: Shutdown) {
     let max_age = cx.config.policy().host_reading_stale_after;
     if cx
@@ -432,7 +430,7 @@ fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, shutdown: S
         wait(cx, steps, WaitReason::StaleObservation);
         return;
     }
-    if cx.config.mounts_checked(&cx.res.id) && !mounts_clear(cx, st, steps, shutdown) {
+    if !cx.config.veto_readings(&cx.res.id).is_empty() && !veto_clear(cx, st, steps, shutdown) {
         return;
     }
     steps.push(Step::PowerOff {
@@ -514,8 +512,8 @@ pub(crate) fn withdrawal_step(cx: &Cx, st: &mut ResourceState) {
 
 /// The shutdown of a host with a drain: it waits for the consumers to be scaled down, for
 /// every lease that holds the host (`lease_holds`: a job's hold, say; the drain overrides
-/// none). Then `power_off` applies the mount veto as for any shutdown (a managed shared host
-/// always has a mounts source, so there is a pod reading to wait for; no `idle_grace` applies).
+/// none). Then `power_off` applies the veto as for any shutdown (a managed shared host
+/// always has a mounts source, so there is a reading to wait for; no `idle_grace` applies).
 fn drain_shutdown(
     cx: &Cx,
     st: &mut ResourceState,

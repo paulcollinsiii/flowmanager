@@ -52,7 +52,7 @@ pub enum Requested {
 /// Records a drain of `resource` requested at `now`.
 ///
 /// The person is taking the host down, so the scheduler may shut it down: the host becomes
-/// managed, and a shutdown it had stopped at (pods still mounting after `mounts_timeout`) is
+/// managed, and a shutdown it had stopped at (pods still mounting after `veto_timeout`) is
 /// tried afresh, as a new manual request would. A drain already under way keeps its start and
 /// its scale-down: a second request only changes the mode: `immediate` after `graceful`
 /// ends the wait, and `graceful` after `immediate` leaves it immediate. A person's request

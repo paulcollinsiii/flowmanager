@@ -283,6 +283,38 @@ impl Snapshot {
         Some(most)
     }
 
+    /// What every reading the veto before a power-off of `resource` needs says about it (see
+    /// `Config::veto_readings`). A reading that does not apply to the host is `None`. For the
+    /// pods reading all of the host's models must show a fresh count of zero pods; a model
+    /// with no reading, or a stale or future-dated one, makes it unknown, and unknown is
+    /// never "unused".
+    pub fn host_use(&self, config: &Config, resource: &ResourceId, max_age: Millis) -> HostUse {
+        let mounts = config.mounts_checked(resource).then(|| {
+            match self.fresh_resource_mounts(config, resource, max_age) {
+                Some(0) => ReadingUse::Unused,
+                Some(_) => ReadingUse::InUse,
+                None => ReadingUse::Unknown,
+            }
+        });
+        let pods = config.pods_checked(resource).then(|| {
+            let counts: Vec<Option<u32>> = config
+                .models_of(resource)
+                .map(|m| {
+                    self.fresh_model_pods(config, &m.id, max_age)
+                        .map(|(pods, _)| pods)
+                })
+                .collect();
+            if counts.iter().any(|c| c.is_some_and(|n| n > 0)) {
+                ReadingUse::InUse
+            } else if counts.iter().any(|c| c.is_none()) {
+                ReadingUse::Unknown
+            } else {
+                ReadingUse::Unused
+            }
+        });
+        HostUse { mounts, pods }
+    }
+
     /// The state of the Jobs of scheduled job `job` and when that reading was taken, or
     /// `None` when it is unknown, with the same source filtering (`jobs` capability) and
     /// freshness rule as `fresh_resource_mounts`. Unknown is never "no Jobs": a missing, stale
@@ -369,6 +401,45 @@ impl Snapshot {
     }
 }
 
+/// What one veto reading says about a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadingUse {
+    /// A fresh reading shows nothing using the host.
+    Unused,
+    /// A fresh reading shows something using it.
+    InUse,
+    /// No fresh reading: counts as in use for whether the host may go down.
+    Unknown,
+}
+
+/// What the readings of the veto say about a host (see `Snapshot::host_use`): `None` where
+/// the reading does not apply to the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostUse {
+    /// Pods mounting the host's NFS server.
+    pub mounts: Option<ReadingUse>,
+    /// Pods of the host's models.
+    pub pods: Option<ReadingUse>,
+}
+
+impl HostUse {
+    fn applying(&self) -> impl Iterator<Item = ReadingUse> {
+        [self.mounts, self.pods].into_iter().flatten()
+    }
+
+    /// Whether the host may be powered off as far as the veto goes: every reading that applies
+    /// is fresh and shows it unused. A host with no reading that applies has no veto.
+    pub fn is_unused(&self) -> bool {
+        self.applying().all(|u| u == ReadingUse::Unused)
+    }
+
+    /// Whether a fresh reading shows the host in use. Otherwise a host that is not unused has
+    /// an unknown reading.
+    pub fn is_in_use(&self) -> bool {
+        self.applying().any(|u| u == ReadingUse::InUse)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +496,64 @@ mod tests {
                 pods,
             },
         }
+    }
+
+    fn model_pods(model: &str, at: u64, p: u32) -> Observation {
+        Observation {
+            source: "cluster-pods".into(),
+            observed_at: Millis(at),
+            fidelity: Fidelity::Event,
+            value: ObservedValue::ModelPods {
+                model: model.into(),
+                pods: p,
+                ready_pods: p,
+            },
+        }
+    }
+
+    #[test]
+    fn host_use_reads_every_model_of_a_gpu_host_and_nothing_for_a_host_without_readings() {
+        let c = cfg();
+        let gpu: ResourceId = "cuda-central".into();
+        let all = |at: u64, p: u32| -> Vec<Observation> {
+            ["mineru", "llm", "whisperx", "immich-ml"]
+                .iter()
+                .map(|m| model_pods(m, at, p))
+                .collect()
+        };
+        assert!(c.pods_checked(&gpu) && !c.mounts_checked(&gpu));
+        let use_of = |obs: Vec<Observation>| snap(obs).host_use(&c, &gpu, Millis(500));
+        // Fresh zero for every model.
+        let u = use_of(all(900, 0));
+        assert_eq!(u.pods, Some(ReadingUse::Unused));
+        assert_eq!(u.mounts, None);
+        assert!(u.is_unused() && !u.is_in_use());
+        // One model missing, or stale: unknown.
+        let mut missing = all(900, 0);
+        missing.pop();
+        assert_eq!(use_of(missing).pods, Some(ReadingUse::Unknown));
+        let mut stale = all(900, 0);
+        stale[0] = model_pods("mineru", 100, 0);
+        let u = use_of(stale);
+        assert_eq!(u.pods, Some(ReadingUse::Unknown));
+        assert!(!u.is_unused() && !u.is_in_use());
+        // A pod of any model: in use, even beside an unknown one.
+        let mut busy = all(900, 0);
+        busy[2] = model_pods("whisperx", 900, 1);
+        busy.pop();
+        let u = use_of(busy);
+        assert_eq!(u.pods, Some(ReadingUse::InUse));
+        assert!(u.is_in_use());
+        // No readings at all: unknown, never unused.
+        assert_eq!(use_of(vec![]).pods, Some(ReadingUse::Unknown));
+        // The NFS host has no models: only its mounts reading applies, and unknown is not
+        // unused. A resource nothing reads has no veto.
+        let nfs: ResourceId = "basestar-nfs".into();
+        let u = snap(vec![]).host_use(&c, &nfs, Millis(500));
+        assert_eq!((u.mounts, u.pods), (Some(ReadingUse::Unknown), None));
+        assert!(!u.is_unused() && !c.pods_checked(&nfs));
+        let none = snap(vec![]).host_use(&c, &"nowhere".into(), Millis(500));
+        assert!(none.is_unused() && none.mounts.is_none() && none.pods.is_none());
     }
 
     #[test]
