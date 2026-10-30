@@ -131,8 +131,30 @@ pub fn decode<T: DeserializeOwned + Default>(
     serde_json::from_value(data).map_err(|e| err(format!("cannot decode version {version}: {e}")))
 }
 
+/// Reads the sequencer state. A document of an *older* version is not migrated: it reads as
+/// an absent one (a fresh start, from observation), with one log line. A newer version (a
+/// rollback) or anything unreadable is an error, as for every document.
 pub fn decode_state(raw: Option<&[u8]>) -> Result<CoreState, StateError> {
+    if let Some(old) = older_version(raw, STATE_VERSION) {
+        tracing::warn!(
+            event = "state_version_discarded",
+            key = STATE_KEY,
+            found = old,
+            current = STATE_VERSION,
+            "scheduler_state is version {old}, this build reads {STATE_VERSION} and does not migrate: discarded, starting from observation (leases and jobs are kept)"
+        );
+        return Ok(CoreState::default());
+    }
     decode(STATE_KEY, STATE_VERSION, raw)
+}
+
+/// The version of a stored document if it is a number below `current`.
+fn older_version(raw: Option<&[u8]>, current: u32) -> Option<u64> {
+    let env: EnvelopeIn = serde_json::from_slice(raw?).ok()?;
+    match env.version {
+        Some(serde_json::Value::Number(n)) => n.as_u64().filter(|v| *v < u64::from(current)),
+        _ => None,
+    }
 }
 
 pub fn decode_leases(raw: Option<&[u8]>) -> Result<LeaseBook, StateError> {
@@ -210,13 +232,21 @@ mod tests {
     }
 
     #[test]
-    fn a_state_of_the_previous_version_is_an_error_and_is_not_migrated() {
+    fn a_state_of_an_older_version_reads_as_a_fresh_start_and_is_not_migrated() {
         // Version 1 stored `drain`, `mounts_veto`, `host_idle_since` and
         // `shutdown_confirmed_at`; this build neither reads nor converts them.
-        let old = br#"{"version":1,"data":{"state":{"resources":{"b":{"power":{"phase":"off"},"mode":{"phase":"idle"}}}},"reported":[]}}"#;
-        let e = decode_state(Some(old)).unwrap_err();
+        let old = br#"{"version":1,"data":{"state":{"resources":{"b":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"drain":{"mode":"graceful","since":9}}}},"reported":["x"]}}"#;
+        assert_eq!(decode_state(Some(old)).unwrap(), CoreState::default());
+        // Only the sequencer state is treated so: the other documents stay strict.
+        assert!(decode_leases(Some(br#"{"version":0,"data":{}}"#)).is_err());
+    }
+
+    #[test]
+    fn a_state_of_a_newer_version_is_still_an_error() {
+        let newer = br#"{"version":3,"data":{"state":{},"reported":[]}}"#;
+        let e = decode_state(Some(newer)).unwrap_err();
         assert_eq!(e.key, STATE_KEY);
-        assert!(e.problem.contains("version 1"), "{e}");
+        assert!(e.problem.contains("version 3"), "{e}");
     }
 
     #[test]

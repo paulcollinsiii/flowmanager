@@ -1980,6 +1980,32 @@ mod tests {
         assert_eq!(ctx.ticks(), 0);
     }
     #[tokio::test]
+    async fn a_state_of_an_older_version_is_dropped_and_the_tick_starts_from_observation() {
+        let (s, _) = process();
+        let ctx = FakeCtx::default();
+        world(&s, 3);
+        let g = acquire_model_lease(
+            &s,
+            &ctx,
+            AcquireModelLease {
+                model: "llm".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.commit();
+        assert!(g.created);
+        let leases = ctx.stored(LEASES_KEY);
+        ctx.put(STATE_KEY, br#"{"version":1,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"host_idle_since":null}}},"reported":[]}}"#);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.error, None, "{r:?}");
+        let text = String::from_utf8(ctx.stored(STATE_KEY).unwrap()).unwrap();
+        assert!(text.starts_with("{\"version\":2,"), "{text}");
+        assert_eq!(ctx.stored(LEASES_KEY), leases, "the lease book is kept");
+    }
+
+    #[tokio::test]
     async fn an_unreadable_state_makes_an_error_tick_that_stores_and_publishes_nothing() {
         let (s, _) = process();
         let ctx = FakeCtx::default();
