@@ -77,6 +77,25 @@ expiry). cuda-central relies on the `idle_grace` margin for its GPU pods to be g
 - **Any hold arriving** during Withdrawing or Vetoing cancels an *idle* shutdown. A
   *requested* shutdown is cancelled only by a new manual lease (as today).
 
+### 2.1b Ownership: who started it decides
+
+- **A host flowmanager powers on is flowmanager's**, whatever wanted it (a scheduled job's
+  hold, a workload, a manual lease). It goes down when nothing holds it any more, after
+  `idle_grace`, through the shutdown stages. A backup that woke basestar therefore lets it
+  power down when the job ends. A short blip down and back does not change this.
+- **A host something else started is adopted**: a power button, a manual Wake-on-LAN, a
+  running host first seen after flowmanager lost its state, or one that came up after
+  flowmanager's own power-on timed out (an alert is already out, so a person decides). An
+  adopted host is held by the user through an adopted lease (D3) until released or switched
+  off.
+- **A manual lease always keeps a host up**, on top of anything else. Taking one while a
+  backup runs keeps basestar up after the job.
+- **Under a lockout nothing is adopted or woken** (2.3).
+
+Tests that must exist after phase 4: a job-woken host shuts down after the job with no
+lease; the same host with a manual lease taken mid-job stays up; a host found running while
+a job holds it is adopted and stays up after the job (D6).
+
 ### 2.2 State as types, not flags
 
 A sketch (names not final):
@@ -141,17 +160,16 @@ say). `off-now` differs in that anything may wake the host again afterwards.
 
 ## 3. Decisions
 
-### Open
-
-- **D6. Adopt a host found running even while a job holds it?** Today adoption waits until
-  the hold ends, so the host has no owner meanwhile and the dashboard shows it not held. The
-  end result is the same either way: once the backup finishes, the host is adopted and stays
-  up held by the user. Adopting at once removes the last lasting `managed = false` case and
-  a special branch in the adoption predicate; the only visible change is that the dashboard
-  shows the host held during the backup. Recommendation: adopt at once.
-
 ### Decided (2026-10-30, user)
 
+- **Ownership rule (2.1b):** a host flowmanager woke is flowmanager's and powers down when
+  the job that wanted it ends; only a manual lease keeps it up afterwards. Already today's
+  behaviour; the refactor must keep it and test it.
+- **D6. A host something else started is adopted at once, even while a job holds it**
+  (assumed from the ownership rule; the user may overrule). Today adoption waits for the hold
+  to end, with the same end state (adopted, stays up). The only visible change is the
+  dashboard showing it held during the backup. A host the backup itself woke is never
+  adopted.
 - **D1. Reclaim becomes `lockout`, on any managed host** (section 2.3). The HA dashboard
   gives it help text, since the intent is clear once explained but not from the name alone.
   homesvr's `power.py` is ignored: it will be dropped once cuda-central's power is managed.
