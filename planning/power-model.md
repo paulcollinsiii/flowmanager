@@ -220,7 +220,7 @@ this document and checks the phase against it ("does this still fit the model").
      refusing it until phase 4.
    - *One veto.* Before any power-off (idle, requested, reclaim) a fresh reading must show the
      host unused: no pod mounts it (NFS, where a mounts source names it) and no pod of its
-     models exists (GPU, where a pods source covers its models) (D2). Unknown counts as in
+     models exists (GPU, where a pods source covers its models, i.e. watches every namespace the model declares in `models[].namespaces`) (D2). Unknown counts as in
      use; the wait is bounded by `power.veto_timeout` (renamed from `mounts_timeout`) and then
      stops (`Stopped`, alert, no retry, `resume` clears it). A host with neither reading has
      no veto.
@@ -281,3 +281,11 @@ The homesvr agent owns these; each phase adds what it changed.
     and the "shutdown stopped" Home Assistant sensor must not assume the host is basestar.
   - *Requested shutdown on an exclusive host* exists in the sequencer only; the API and
     toggle listener still refuse it until phase 4.
+  - *Turning the GPU veto on in the deployed config* (checked read-only against homesvr
+    `kubernetes/apps/flowmanager/config.yaml` on 2026-10-30): no source there observes
+    `pods` today (`cluster-nodes` has `observe: [reachability]` and nodes-only RBAC), so
+    cuda-central has no GPU veto until homesvr (1) adds `pods` to a `kubernetes_watch`
+    source with `namespaces: [ollama, paperless-ngx, speakr]`, (2) grants that service
+    account pods list/watch in those namespaces, and (3) declares `namespaces` on the
+    models: `mineru` -> `paperless-ngx`, `llm` -> `ollama`, `whisperx` -> `speakr`. Until
+    then behaviour is as before (no veto on cuda-central), which is safe.

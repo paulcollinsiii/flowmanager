@@ -1,5 +1,5 @@
 //! Observations are filtered by subject AND by the source the config says supplies them
-//! before any reduction. Pod counts are information only: no source's pod reading changes a
+//! before any reduction. Pod counts decide only recovery readiness and the pre-shutdown veto; no wrong-source pod reading changes a
 //! decision. A stray reading (right subject, wrong source) must neither wedge
 //! the scheduler nor make an unsafe step look safe, and the core and the independent
 //! invariant checker must agree on that.

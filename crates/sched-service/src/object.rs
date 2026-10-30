@@ -1087,7 +1087,7 @@ mod tests {
         });
     }
 
-    /// Both hosts freshly up (and zero pods, which no decision reads), and `ready` OCR items.
+    /// Both hosts freshly up (and zero pods, read only by recovery and the veto), and `ready` OCR items.
     fn world(s: &Shared, ready: u64) {
         let mut v: Vec<ObservedValue> = ["mineru", "llm", "whisperx", "immich-ml"]
             .iter()

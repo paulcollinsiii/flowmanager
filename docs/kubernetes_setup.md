@@ -1311,7 +1311,7 @@ when deploying:
 - the Restate operator's `RestateDeployment`, and Restate server default ports (8080,
   9070) used above;
 - RBAC against a real API server (the observer has only run against a fake API in tests);
-- the pod-label mapping `app.kubernetes.io/name` for pod counts (information only);
+- the pod-label mapping `app.kubernetes.io/name` for pod counts (read for recovery readiness and, where a model's namespaces are watched, the GPU veto);
 - speakr (scopes, user edit permission, `/stats` scoping), paperless-ngx and immich
   (`queue.read`, the immich version, the alpha queue API) as documented upstream; the speakr response
   shapes were checked against its source, not a live instance;

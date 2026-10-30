@@ -1061,8 +1061,8 @@ sources:
 
     #[test]
     fn a_config_where_no_source_declares_pods_is_accepted() {
-        // Pod counts are information only: no decision waits for them, so a config without
-        // a pods source is valid (it used to be refused, since every allow waited on them).
+        // No allow waits on pod counts (only recovery readiness and the GPU veto read them), so a
+        // config without a pods source is valid: its hosts simply have no GPU veto.
         let y = VALID.replace("observe: [pods, reachability]", "observe: [reachability]");
         assert_ne!(y, VALID);
         assert!(Config::from_yaml(&y).is_ok(), "{:?}", problems(&y));

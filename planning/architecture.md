@@ -139,7 +139,7 @@ Observers push into a cache on their own schedules, and a short decision step, t
 **Observation**
 
 - Observers run outside the decision step and push results into the scheduler. A slow source never holds up decisions or lease requests.
-- Kubernetes state (node readiness, and pods per model for information only) comes from watch streams, not polling.
+- Kubernetes state (node readiness, and pods per model, read for recovery readiness and the GPU pre-shutdown veto) comes from watch streams, not polling.
 - Reachability of a host that is not a Kubernetes node (basestar) comes from a TCP connect probe (`tcp_probe`, as the user's `power.py` checks it): one connect per resync to a host and port, connected is up, refused, no answer or "no route to host" is down, anything else is a failed read. The `prometheus` kind remains available for hosts a Prometheus probe covers.
 - Other sources use webhooks where the service offers them, treated as notify-then-fetch: a webhook marks the source dirty, and the observer re-reads the source's current state.
 - Every source also has a slow periodic resync, so a missed event cannot leave the scheduler stuck.
@@ -214,7 +214,7 @@ These hold regardless of policy or configuration, and every milestone's tests sh
 
 **Work and switching**
 
-16. Work is switched away from early only for workload classes that declare it safe, or when the user forces it (a lockout or a manual LLM lease). Every switch, forced or not, gives in-flight jobs only a timeout (`drain_timeout`, a class's `kill_timeout`, or `reclaim_timeout`) to finish, except that a busy `none` class holds an unforced switch without one (and the bound assumes a stable intent; see the example in *Control loop and event model*). In-flight work is stopped only on a forced switch, class by class, each when its own timeout has run out; in-flight work is what the queues report, not pods. A manual model lease pins its model against batch eviction. A model is not withdrawn before `min_dwell` has passed since it was allowed, unless the switch is forced (a lockout or a manual model lease). A class's work is stopped only if it is in flight and only in the class's own running wind-down for the current cause. *Enforced.*
+16. Work is switched away from early only for workload classes that declare it safe, or when it is forced (a lockout, a manual LLM lease, or a requested shutdown of the host). Every switch, forced or not, gives in-flight jobs only a timeout (`drain_timeout`, a class's `kill_timeout`, or `reclaim_timeout`) to finish, except that a busy `none` class holds an unforced switch without one (and the bound assumes a stable intent; see the example in *Control loop and event model*). In-flight work is stopped only on a forced switch, class by class, each when its own timeout has run out; in-flight work is what the queues report, not pods. A manual model lease pins its model against batch eviction. A model is not withdrawn before `min_dwell` has passed since it was allowed, unless the switch is forced (a lockout or a manual model lease). A class's work is stopped only if it is in flight and only in the class's own running wind-down for the current cause. *Enforced.*
 17. A recovery action runs only for a class in the allowed set (its model serving, not winding down) that declares one, and only for failed items a fresh reading reports. *Enforced.*
 
 **Design**
