@@ -226,10 +226,31 @@ this document and checks the phase against it ("does this still fit the model").
      no veto.
    - Metric and log names that say "mounts" for the veto are renamed to the general veto,
      with the reading (`mounts`, `pods`) as a label or field; listed for hand-off.
-4. **Vocabulary and adoption.** `off`/`off-now` on both kinds; reclaim renamed to lockout
-   and accepted on any managed host (D1: lease kind, handlers, `/v1/lockouts` route,
-   `lockout_timeout`, metrics, docs); adoption in the sequencer with typed origin (D3, D6);
-   no `jobs_off` coupling; `managed` removed (2.2); toggle without kind branches.
+4. **Vocabulary and adoption**, in two sub-phases.
+   - **4a. Vocabulary and lockout.**
+     - `off` / `off-now` on both kinds through the API (`drain_host`, `release_host_lease`
+       with a drain) and the listener; the sequencer already supports them (phase 3). No
+       kind branch remains in the toggle listener or the lease checks.
+     - Reclaim becomes lockout everywhere: lease kind, intent, handlers, `/v1/lockouts`
+       route (replaces `/v1/reclaims`), `lockout_timeout` (replaces `reclaim_timeout`),
+       wait reason, metrics, logs, docs. Accepted on any host with a power section (as
+       reclaim today, minus the exclusive-only rule); power actions only under managed
+       control.
+     - On a shared host the lockout's withdrawal is the drain with in-flight work given
+       `lockout_timeout`; on an exclusive host it is today's reclaim wind-down. Then the veto
+       and the shutdown. Nothing wakes or schedules a locked-out host: no workload, job hold
+       or manual lease (a manual lease does not cancel a lockout; a lockout does not remove
+       the lease either).
+     - **The lockout shuts the host down once.** After the host has been seen off under the
+       lockout, flowmanager leaves it alone: a later boot (another OS, physical work) is
+       neither powered off, nor adopted, nor given work, until the lockout is cleared.
+       Clearing it while the host is up makes it a host found running (adopted, 2.1b); while
+       it is off, the host is woken only if something wants it. A lockout taken while the
+       host is already off just keeps it off.
+   - **4b. Ownership.** Adoption decided in the sequencer (pure) with a typed
+     `origin: adopted` on the lease (D3; the service only applies it), a host found running
+     adopted even while a job holds it (D6), adoption no longer skipped with an unreadable
+     job book (`jobs_off`), `managed` removed (2.2), and the ownership tests of 2.1b.
 5. **HostStatus and reporting.** One derived status; `tick.rs` report weaving, `reason`,
    metrics and toggle `resource_state` consume it. README power section shrunk to the model
    plus tables, caveats moved to *Known blind spots*.
