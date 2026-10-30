@@ -2,6 +2,8 @@
 
 Oct 23, 2026 · @Paul Collins
 
+> **Host power is described in [`power-model.md`](power-model.md), which is authoritative** for ownership (who started a host decides), the shutdown stages (withdraw, veto, power off), the veto, lockout, adoption and `min_off`. This document keeps only a short summary of those and points there. The code does not match `power-model.md` yet: until refactor phases 2 to 5 land (see `milestones.md`, *Power-model refactor*), it behaves as `power-model.md` section 1 describes (for example the current names are *reclaim* for lockout and *drain* for a requested shutdown, and only the NFS mount veto exists). Where this document marks something *target*, the code does not enforce it yet.
+
 ## Problem and goals
 
 A single Rust service, flowmanager (the scheduler), decides which model runs on the GPU node and which shared resources must be up, so every job queue drains in a predictable order without services contending for the GPU.
@@ -29,7 +31,7 @@ The scheduler arbitrates two resources and observes the services that use them; 
 - Observing job demand from each service through configurable adapters.
 - Gating service pods through a KEDA external scaler.
 - Running scheduled jobs, starting with the weekly backup, as scheduler-managed Kubernetes Jobs (M4, rescoped: see `milestones.md`, *Scope reset during M3*).
-- Manual requests: release, cuda-central reclaim, and manual LLM leases that cut batch work short. Open WebUI will hold such a lease and a person releases it (M6, reduced); time-limited interactive leases with renewal are no longer planned.
+- Manual requests: on, release, off, off-now, lockout (called reclaim in the code until phase 4, and valid today for cuda-central only), and manual LLM leases that cut batch work short. Open WebUI will hold such a lease and a person releases it (M6, reduced); time-limited interactive leases with renewal are no longer planned.
 
 **Non-goals**
 
@@ -74,8 +76,13 @@ The scheduler reasons only about generic resources, models, and workload classes
   - *Shared*: any number of holders, tracked by a reference count. The basestar NFS share is shared.
 - **Model.** A mode of an exclusive resource, implemented by one or more scaled workloads, with an estimated load time used as its switch cost.
 - **Workload class.** A unit of demand: its resource requirements, priority, preemptibility, whether it may change power state, and where its demand is observed.
-- **Lease.** A durable record that a holder is using a shared resource or has claimed a model. In M3 only the **manual model lease** exists: it pins a model on its resource, cuts batch work short and is released by a person (it has no expiry). Interactive TTL leases (renewal, expiry) and session sources are no longer planned; the core still has the lease type but nothing issues it (see `milestones.md`, *Scope reset during M3*). An LLM loaded only for batch work has no pin and can be evicted when higher-priority work arrives. A manual power-on of a host is a lease held by the user until they release it. Releasing it powers the host down only after every other hold ends: other leases on basestar, such as a running backup, and queued or in-flight GPU work on cuda-central. A manual lease on the LLM is the interactive counterpart of a reclaim: it cuts batch work short (intake stops; in-flight jobs finish or are stopped after a timeout) and keeps the LLM loaded until released.
-- **Reclaim.** The forceful alternative to releasing, for cuda-central only: the user takes the host back despite pending work. Intake stops at once, in-flight jobs finish or are stopped after a configured timeout, pending jobs stay queued, and the host is not woken or scheduled until the user returns it. A reclaim ends with a full shutdown of the host, since it is rebooted into another operating system; while reclaimed, the node's absence from the cluster is expected rather than an error.
+- **Lease.** A durable record that a holder is using a shared resource or has claimed a model. In M3 only the **manual model lease** exists: it pins a model on its resource, cuts batch work short and is released by a person (it has no expiry). Interactive TTL leases (renewal, expiry) and session sources are no longer planned; the core still has the lease type but nothing issues it (see `milestones.md`, *Scope reset during M3*). An LLM loaded only for batch work has no pin and can be evicted when higher-priority work arrives. A manual power-on of a host is a lease held by the user until they release it, and it always keeps the host up on top of any other hold. Releasing it does not power the host down by itself: the host then goes down like any other, once nothing holds it and `idle_grace` is over (other leases on basestar, such as a running backup, and queued or in-flight GPU work on cuda-central, still hold it). A person who wants the host down asks for `off` or `off-now`, a different action (see *Host power*). A host found running that flowmanager did not start is adopted: the service mints a manual host lease for it, so the user holds it until released or switched off (`power-model.md` 2.1b, D3, D6). A manual lease on the LLM is the interactive counterpart of a lockout: it cuts batch work short (intake stops; in-flight jobs finish or are stopped after a timeout) and keeps the LLM loaded until released.
+- **Host power** (summary; `power-model.md` is authoritative).
+  - *Ownership: who started a host decides.* A host flowmanager powers on is flowmanager's, whatever wanted it (a job's hold, a workload, a manual lease), and it goes down when nothing holds it and `idle_grace` is over. A host something else started is adopted and held by the user through a lease. A manual lease always keeps a host up.
+  - *Shutdown stages.* Withdrawing (the host's consumers leave the allowed set, bounded by a timeout), Vetoing (a fresh reading must show nothing uses the host, unknown counts as in use, bounded; on expiry flowmanager stops and alerts), then power off. Any hold arriving cancels an *idle* shutdown; a *requested* one only a new manual lease does.
+  - *Actions, on any managed host.* `on`, `release`, `off` (requested shutdown, graceful), `off-now` (requested, immediate), `resume`, `lockout`. Releasing never shuts a host down by itself; `off` and `off-now` do.
+  - *Veto on both host kinds (target).* Today only the NFS mount veto exists; a GPU pod veto on cuda-central (D2) comes in phase 3.
+- **Lockout** (target name; called **reclaim** in the code until phase 4). The forceful alternative to releasing: the user tells flowmanager to keep away from a host until they clear it, despite pending work. Intake stops at once, in-flight jobs finish or are stopped after a configured timeout (`reclaim_timeout` today, `lockout_timeout` later), pending jobs stay queued, the host is shut down, and nothing wakes, adopts or schedules it until the user clears the lockout. While locked out the host may be up running something else, and flowmanager neither adopts nor powers it off. The node's absence from the cluster is expected rather than an error. Today it applies to an exclusive resource with a power section (cuda-central) only; the target is any managed host, including basestar, where it deliberately blocks the backup job.
 - **Gate class.** A workload class whose requirements are hosts only: on an exclusive resource it names no model, which means "that host is up". It has no demand source and never influences which model is chosen. It gates a consumer on host readiness, for example paperless-gpt, which may run only while cuda-central is up and paperless-ngx (its documents on basestar-nfs) is reachable. Consumers are not gated for GPU contention at all: that is Kubernetes' job (invariant 2).
 - **Precedence vs. priority.** Precedence (OCR before tagging for one document) is a property of jobs and is handled by readiness: a job is not counted until its upstream step is done. Priority decides which ready model to load next. The two are never mixed.
 - **Exhaustive service, bounded.** Once a model is loaded, it keeps serving while it has ready work, subject to a maximum dwell time or an age threshold on other queues to prevent starvation.
@@ -98,9 +105,9 @@ Each component has one job, and only the planner and sequencer make decisions.
 | Observation cache | Latest observation per source, its age, and a dirty flag | Interpret observations |
 | Planner | Intent: which model the GPU should serve and which shared resources should be held, based on demand, leases, and policy | I/O; knowledge of pods, drain timing, or transitional states |
 | Sequencer | Per-resource state machines and the next safe step toward the intent | I/O; scheduling policy |
-| Lease manager | Durable leases. Built: manual model leases. Planned (M4): NFS reference counts and manual host leases (a manual NFS lease brings up the host and its consumers). Interactive TTL leases are no longer planned | Grant leases on its own; the planner and sequencer decide |
+| Lease manager | Durable leases. Built: manual model leases, NFS reference counts (a running job's `SharedHold`), manual host leases (including the adopted lease the service mints for a host found running; target: a typed `origin: adopted`) and the reclaim lease (target: lockout). Interactive TTL leases are no longer planned | Grant leases on its own; the planner and sequencer decide |
 | KEDA external scaler | Exposing which models and which workload classes are currently allowed (a model in the allowed set; a class with every requirement met, GPU or not) to KEDA, which converges replicas | Any logic beyond a lookup |
-| Restate workflows | Imperative, multi-step actions: power on and off, recovery actions such as re-queueing failed jobs (a `Recovery` virtual object per class, beside the `Scheduler`), the backup procedure | Choose when to run; report success as truth without observation |
+| Restate workflows | Imperative, multi-step actions: power on and the final power-off command (the shutdown stages before it, withdraw and veto, are sequencer state, not workflow steps; see `power-model.md`), recovery actions such as re-queueing failed jobs (a `Recovery` virtual object per class, beside the `Scheduler`), the backup procedure | Choose when to run; report success as truth without observation |
 | Config loader | Loading, validating, and versioning configuration; keeping the last good config | Partial application of invalid config |
 
 Actuators come in two kinds. KEDA is level-triggered: the scheduler publishes desired state and KEDA converges. Restate workflows are edge-triggered: the sequencer invokes a procedure and later confirms its effect through observation.
@@ -146,7 +153,7 @@ Observers push into a cache on their own schedules, and a short decision step, t
 
 **Example: switching from OCR to transcription**
 
-1. The planner's intent changes to whisperX (mineru has served its minimum dwell, counted from the tick it was allowed, and is idle past its grace, or another queue is starved). The sequencer withdraws mineru's classes from the allowed set (intake paused, as far as anything is gated on them) and waits for the in-flight OCR work its queue reports to finish, but only for `drain_timeout` (or the class's `kill_timeout`; `reclaim_timeout` on a reclaim) from the start of the wind-down, forced or not. Nothing gates a consumer on its queue, so a queue fed without end would otherwise hold the GPU for ever; the cut-off is the withdrawal in step 2 (KEDA scales the workload to 0). Only a class with preemptibility `none` and work blocks without a timeout. End to end, a model allowed at `t0` is replaced by about `t0 + max_dwell + drain_timeout` (plus a tick) when another model has runnable ready work and no `none` class of the serving model is busy. That bound holds only while the planner's intent stays away from the serving model: if it flickers back (the waiting queue reading `ready = 0` for one tick every few minutes, or the serving class's demand going stale for one tick every few minutes) the wind-down is dropped and its clock restarts, which can postpone the switch indefinitely (a one-tick blip every 9 minutes never switched in a 6 hour simulation). A class's `kill_timeout` shorter than another blocking class's timeout does not end the wind-down early: each class is cut off at its own timeout but the model is withdrawn only when none of its classes still blocks, so the bound is the maximum over the blocking classes' timeouts. A reclaim that starts and ends mid wind-down restarts the clock twice.
+1. The planner's intent changes to whisperX (mineru has served its minimum dwell, counted from the tick it was allowed, and is idle past its grace, or another queue is starved). The sequencer withdraws mineru's classes from the allowed set (intake paused, as far as anything is gated on them) and waits for the in-flight OCR work its queue reports to finish, but only for `drain_timeout` (or the class's `kill_timeout`; `reclaim_timeout` under a lockout, today's reclaim) from the start of the wind-down, forced or not. Nothing gates a consumer on its queue, so a queue fed without end would otherwise hold the GPU for ever; the cut-off is the withdrawal in step 2 (KEDA scales the workload to 0). Only a class with preemptibility `none` and work blocks without a timeout. End to end, a model allowed at `t0` is replaced by about `t0 + max_dwell + drain_timeout` (plus a tick) when another model has runnable ready work and no `none` class of the serving model is busy. That bound holds only while the planner's intent stays away from the serving model: if it flickers back (the waiting queue reading `ready = 0` for one tick every few minutes, or the serving class's demand going stale for one tick every few minutes) the wind-down is dropped and its clock restarts, which can postpone the switch indefinitely (a one-tick blip every 9 minutes never switched in a 6 hour simulation). A class's `kill_timeout` shorter than another blocking class's timeout does not end the wind-down early: each class is cut off at its own timeout but the model is withdrawn only when none of its classes still blocks, so the bound is the maximum over the blocking classes' timeouts. A lockout that starts and ends mid wind-down restarts the clock twice.
 2. With no work in flight (or at the timeout), in one tick and on a fresh "up" reading of cuda-central, the sequencer replaces mineru by whisperX in the allowed set: mineru leaves and whisperX enters together, and whisperX is serving from that tick. KEDA scales mineru to zero and whisperX to one.
 3. Kubernetes keeps the whisperX pod pending until mineru's pod has terminated and released the GPU (both request `nvidia.com/gpu: 1`, the node exposes one GPU, and the GPU node is tainted so nothing else lands there). The scheduler does not watch for this: pod counts are information only.
 
@@ -179,17 +186,89 @@ Kinds live in code and instances live in configuration, so adding a service that
 
 ## Safety invariants
 
-These hold regardless of policy or configuration, and every milestone's tests should check them.
+These hold regardless of policy or configuration, and every milestone's tests should check them. This is the one canonical list; the numbers are contiguous. Host power invariants follow the model in [`power-model.md`](power-model.md). Each item says whether the code enforces it today: **enforced** means `crates/sched-service/src/invariants.rs` checks it (or the property tests, where stated); **target** means it belongs to the `power-model.md` target model and the code does not enforce it yet (phases 2 to 5). Until phase 2 renumbers the code, the *Mapping* table below translates the old numbers.
 
-1. At most one model is allowed on cuda-central at any time.
-2. GPU exclusivity is enforced by Kubernetes, not by the scheduler: every GPU workload requests `nvidia.com/gpu: 1`, the device plugin exposes exactly one GPU on cuda-central (no time-slicing or MIG), and the GPU node is tainted so that only those workloads run there. This is a deployment requirement. The scheduler decides from queues, leases and policy only, never from pod state: when it switches, the old model leaves the allowed set and the new one enters it in the same decision, and the new pod stays pending until the old one has released the GPU. A model is allowed only if it is configured, and only on a host that is up (never on a host observed off); a model removed from the configuration leaves the allowed set at the next tick.
-3. A host is never powered down while any lease on it is held, including a manual one, nor before its idle grace period ends. Releasing a manual lease never powers a host down by itself; the host powers down only once no hold remains. The one exception is a reclaim of cuda-central, which overrides pending GPU work but still stops in-flight jobs only through their declared preemptibility or after the reclaim timeout.
-4. In v1, power changes come only from manual requests or from workload classes that are explicitly allowed to change power.
-5. Safety-critical steps (allowing a model, powering a host off) require a reachability observation of the host newer than a configured bound (`host_reading_stale_after`); otherwise the sequencer holds, and a switch waits as a whole (the old model stays) rather than leaving the GPU empty. Pod observations are not safety-critical: no decision reads them.
-6. The planner and sequencer are deterministic and have no side effects.
-7. Only the scheduler makes decisions; actuators carry them out and never decide.
-8. Work is switched away from early only for workload classes that declare it safe, or when the user forces it with a reclaim or a manual LLM lease; every switch, forced or not, gives in-flight jobs only a timeout (`drain_timeout`, a class's `kill_timeout`, or `reclaim_timeout`) to finish, except that a busy `none` class holds an unforced switch without one (and the bound assumes a stable intent; see the example in *Control loop and event model*). A manual model lease pins its model against batch eviction.
-9. Invalid configuration never replaces the last good configuration.
+**Models and the GPU**
+
+1. At most one model is allowed on an exclusive resource (cuda-central) at any time. A switch withdraws the old model and allows the new one in the same decision. *Enforced.*
+2. GPU exclusivity is enforced by Kubernetes, not by the scheduler: every GPU workload requests `nvidia.com/gpu: 1`, the device plugin exposes exactly one GPU on cuda-central (no time-slicing or MIG), and the GPU node is tainted so that only those workloads run there. This is a deployment requirement. The scheduler decides from queues, leases and policy only, never from pod state, so the new model's pod stays pending until the old one has released the GPU. The only pod readings that hold anything back are the shutdown veto (13), which only ever vetoes, and recovery (17), which waits for a ready pod. *Deployment requirement; that decisions do not depend on pod observations is checked by the property tests.*
+3. A model is allowed only if it is configured on that resource and only on a host that is up (never one observed off), and never on a host under lockout except while winding down. A model that was not allowed before needs an allow step in the same decision. A model removed from the configuration leaves the allowed set at the next tick. A workload class is allowed only while every requirement holds: its host is up and not under lockout, its model (if it names one) is allowed and not winding down, and its intake is not paused. *Enforced (lockout today as reclaim, exclusive hosts with a power section only).*
+4. A resource gets at most one acting step per tick, except a switch (the withdrawal of the old model together with the allowance of the new one). *Enforced.*
+5. Safety-critical steps (allowing a model on a powered resource, powering a host off) require a reachability observation of the host newer than a configured bound (`host_reading_stale_after`) showing it up; otherwise the sequencer holds, and a switch waits as a whole (the old model stays) rather than leaving the GPU empty. Pod observations are not safety-critical: no decision reads them for this. *Enforced.*
+
+**Host power: starting a host**
+
+6. Power changes come only from the intent's `power_up` (a manual lease, a scheduled job's hold, or a workload class that may change power with work), and a host under `power.control: manual` never gets a power step: its phase follows observation. *Enforced.*
+7. Ownership: flowmanager powers a host off only if it owns it. A host flowmanager powered on is its own, whatever wanted it; a host something else started is adopted and held by the user (15), not powered off until released or switched off; a host under lockout that is up is not powered off or adopted. *Enforced today as "only a host with the `managed` flag, or one under reclaim" (checked by the old invariant 4); the target wording replaces the flag with the ownership rule (phase 2).*
+8. After a shutdown flowmanager started and saw confirmed (the host observed down), an automatic power-on (a workload, a job's hold) waits for `power.min_off` (default 0: no wait); a manual lease does not wait. A host found down, or gone down by itself, is not penalised. The wait only delays a fresh decision; it is never a retry. *Enforced.*
+9. A power transition (powering on, shutting down) is bounded by `power_on_timeout` / `shutdown_timeout`. On expiry the resource enters the failed phase: nothing is allowed on it, no power step is emitted for it again, and it leaves that phase only when a fresh reading shows the state the transition was after (or its control is manual). Other resources are unaffected. *Enforced.*
+
+**Host power: taking a host down**
+
+10. A host is never powered down while any lease on it is held (a manual lease, an adopted one, a job's hold), while any class that needs it has or may have work (unknown demand counts as work), or while a model is allowed on it; and not before `idle_grace` has ended. Releasing a lease never powers a host down by itself: the host then goes down like any other, once nothing holds it. The exceptions, both overriding queued and in-flight work but never a lease, are a requested shutdown (`off`, `off-now`; today a *drain*), which also waives the grace period, and a lockout (today a *reclaim*, 14), whose lease does not count as a hold. *Enforced (requested shutdown today only on shared hosts, lockout only on exclusive hosts with a power section; target: both on any managed host).*
+11. Withdraw before power off, and bounded: before a host is shut down its consumers leave the allowed set (on an exclusive host the model's wind-down, on a shared host scaling its consumer classes down). Graceful waits for in-flight work up to the timeout (`drain_timeout`, a class's `kill_timeout`, `reclaim_timeout` under lockout); immediate does not wait. *Enforced for shared hosts (a drain must scale consumers down first) and for exclusive hosts (no model allowed at power-off); target: one shared Withdrawing stage (phase 3).*
+12. Any hold arriving during Withdrawing or Vetoing cancels an *idle* shutdown. A *requested* shutdown is cancelled only by a new manual lease. *Enforced for the idle drain of a shared host (an idle drain never survives a hold); target: both host kinds.*
+13. Veto: a host is powered off only on a fresh reading showing nothing still uses it. A missing, stale or failed reading is unknown and counts as in use: the shutdown waits, bounded by a timeout, and on expiry flowmanager stops (the host stays up, no retry) and alerts, until the host is seen down, a person resets it (`resume` in the target vocabulary), or a new manual request takes it over. Veto on a shared host (NFS): zero mounting pods, bounded by `power.mounts_timeout`. *Enforced for hosts whose NFS mounts are checked; target: the GPU pod veto on cuda-central, zero model pods (D2, phase 3).*
+14. Lockout: while a host is locked out, nothing wakes, adopts or schedules it (no workload, job hold or manual lease), its consumers are withdrawn (in-flight work is cut off after the lockout timeout) and it is shut down; flowmanager neither adopts nor powers off a locked-out host that is up running something else. Clearing it returns the host to the normal model. *Today the reclaim lease, valid only on an exclusive resource with a power section (ignored and reported as a wait elsewhere); checked: no model or class allowed on it, no power-on. Target: any managed host (D1, phase 4); "nothing is adopted under lockout" is not checked yet.*
+15. Adoption: a host found running that flowmanager did not power on gets a manual host lease at once (typed `origin: adopted` in the target, D3; a magic id prefix today), so the user holds it until released or switched off. A host flowmanager itself woke is never adopted. *Not checked by `invariants.rs`; adoption is applied in `tick.rs` from `adopt.rs`. Target: in the sequencer, even while a job holds the host (D6, phase 4).*
+
+**Work and switching**
+
+16. Work is switched away from early only for workload classes that declare it safe, or when the user forces it (a lockout or a manual LLM lease). Every switch, forced or not, gives in-flight jobs only a timeout (`drain_timeout`, a class's `kill_timeout`, or `reclaim_timeout`) to finish, except that a busy `none` class holds an unforced switch without one (and the bound assumes a stable intent; see the example in *Control loop and event model*). In-flight work is stopped only on a forced switch, class by class, each when its own timeout has run out; in-flight work is what the queues report, not pods. A manual model lease pins its model against batch eviction. *Enforced.*
+17. A recovery action runs only for a class in the allowed set (its model serving, not winding down) that declares one, and only for failed items a fresh reading reports. *Enforced.*
+
+**Design**
+
+18. The planner and sequencer are deterministic and have no side effects: the same snapshot and config always produce the same result. Each tick is pinned to one config generation (a mismatched snapshot is an error). *Enforced by the type of the tick (`TickError::GenerationMismatch`) and the replay and property tests.*
+19. Only the scheduler makes decisions; actuators carry them out and never decide. *Structural.*
+20. Invalid configuration never replaces the last good configuration. *Enforced by the config loader.*
+
+### Mapping from the old numbers
+
+Phase 2 renumbers `invariants.rs` and the module doc comment of `crates/sched-sequencer/src/lib.rs` with this table. "Old checker" is the number in the messages of `crates/sched-service/src/invariants.rs` (there is no 6, 7 or 10; two checks carry no number); "old rule" is the numbered *Safety rules* list in the doc comment of `crates/sched-sequencer/src/lib.rs`; "old design" is this document's list before 2026-10-30.
+
+| Old checker (`invariants.rs`) | New | Notes |
+| --- | --- | --- |
+| 1 | 1 | |
+| 2 | 3 | Also 5 for the fresh reading, which has its own number |
+| (no number) allowed class needs its requirements | 3 | |
+| (no number) more than one acting step per resource | 4 | |
+| 3 | 10 | All the "powered off while ..." messages, including the drain and idle-grace ones |
+| 4 | 6 | The message "powered off unmanaged host" is 7 |
+| 4b | 8 | `min_off` |
+| 5 | 5 | |
+| 8 | 16 | |
+| 9 | 17 | |
+| 11 | 9 | |
+| 12 | 13 | Mount veto |
+| 13 | 11 | Shared consumers scaled down before power-off |
+| 14 | 12 | Idle drain ends on any hold |
+
+| Old rule (`sched-sequencer/src/lib.rs`) | New | Notes |
+| --- | --- | --- |
+| 1 | 1 | |
+| 2 | 2, 3 | Pod-state clause 2, allowed-set clause 3 |
+| 3 | 10, 11 | Holds, work and grace 10; drain withdrawal 11; the reclaim override is 14 |
+| 4 | 6, 7, 14 | Power-up sources and manual control 6; "took responsibility" 7; the reclaim-lease sentence 14 |
+| 5 | 5 | |
+| 6 | 9 | |
+| 7 | 13 | |
+| 8 | 16 | |
+| 9 | 8 | `min_off` |
+
+| Old design invariant (this document, before 2026-10-30) | New | Notes |
+| --- | --- | --- |
+| 1 | 1 | |
+| 2 | 2, 3 | |
+| 3 | 10 | The sentence "Releasing a manual lease never powers a host down by itself" stays true; requested `off` and `off-now` are the stated exception, as is lockout (14) |
+| 4 | 6 | |
+| 5 | 5 | |
+| 6 | 18 | |
+| 7 | 19 | |
+| 8 | 16 | |
+| 9 | 20 | |
+
+New invariants with no old number: 7 (ownership, as a rule; the check today is the `managed` flag under old 4), 12 in its target form, 14 in its target form, 15 (adoption), 18's generation clause.
 
 ## Open questions
 
