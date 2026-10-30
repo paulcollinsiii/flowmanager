@@ -4025,3 +4025,160 @@ fn a_host_with_no_reading_has_no_veto() {
         "uncovered model",
     );
 }
+
+#[test]
+fn a_graceful_request_gives_exactly_drain_timeout_from_the_request() {
+    // drain_timeout of the example is 10 minutes.
+    // (1) Arriving in the middle of an unforced wind-down that started 9 minutes ago: that
+    // start does not shorten it.
+    let mid_wind_down = format!(
+        "{{ phase: serving, model: mineru, since: {}, wind_down: {{ since: {}, timeout: 600000, reclaim: false }} }}",
+        T - 20 * MIN,
+        T - 9 * MIN
+    );
+    let c = Case::new()
+        .gpu_state(&gpu_requested(&mid_wind_down, "graceful", 0, "pending"))
+        .obs(pods("mineru", 1, 1, 0))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0));
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![wait(G, WaitReason::InFlightWork)],
+        "request just made",
+    );
+    let d1 = c.run_fresh_at(&d.state, T + MIN);
+    assert_steps(
+        &d1,
+        vec![wait(G, WaitReason::InFlightWork)],
+        "the old start would have timed out here",
+    );
+    let d2 = c.run_fresh_at(&d.state, T + 10 * MIN);
+    assert_steps(
+        &d2,
+        vec![kill("paperless-ocr"), drain("mineru")],
+        "exactly drain_timeout",
+    );
+
+    // (2) A class's kill_timeout does not extend or shorten it.
+    let yaml = managed_yaml().replace(
+        "    preemptibility: kill\n    demand: { source: paperless-ocr-pending }",
+        "    preemptibility: kill\n    kill_timeout: 1m\n    demand: { source: paperless-ocr-pending }",
+    );
+    assert_ne!(yaml, managed_yaml());
+    let mut c = gpu_serving_with_work("graceful");
+    c.config = Config::from_yaml(&yaml).unwrap();
+    let d = c.run();
+    let d1 = c.run_fresh_at(&d.state, T + MIN);
+    assert_steps(
+        &d1,
+        vec![wait(G, WaitReason::InFlightWork)],
+        "kill_timeout does not apply to a requested shutdown",
+    );
+    let d2 = c.run_fresh_at(&d.state, T + 10 * MIN - 1);
+    assert_steps(&d2, vec![wait(G, WaitReason::InFlightWork)], "just inside");
+    let d3 = c.run_fresh_at(&d.state, T + 10 * MIN);
+    assert_steps(
+        &d3,
+        vec![kill("paperless-ocr"), drain("mineru")],
+        "at drain_timeout",
+    );
+
+    // (3) Counted from the request, not from when the mode machine first saw it.
+    let c = Case::new()
+        .gpu_state(&gpu_requested(
+            &serving("mineru", 30 * MIN),
+            "graceful",
+            9 * MIN,
+            "pending",
+        ))
+        .obs(pods("mineru", 1, 1, 0))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0));
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), wait(G, WaitReason::InFlightWork)],
+        "9 minutes in",
+    );
+    let d1 = c.run_fresh_at(&d.state, T + MIN);
+    assert_steps(
+        &d1,
+        vec![kill("paperless-ocr"), drain("mineru")],
+        "10 minutes in",
+    );
+}
+
+#[test]
+fn a_reclaim_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_one_stays_immediate()
+{
+    let yaml = managed_yaml().replace(
+        "  drain_timeout: 10m",
+        "  drain_timeout: 10m\n  reclaim_timeout: 2m",
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let case = |mode: &str| {
+        let mut c = Case::new()
+            .gpu_state(&gpu_requested(
+                &serving("mineru", 30 * MIN),
+                mode,
+                0,
+                "pending",
+            ))
+            .obs(pods("mineru", 1, 1, 0))
+            .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+            .reclaim();
+        c.config = config.clone();
+        c
+    };
+    let c = case("graceful");
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), wait(G, WaitReason::InFlightWork)],
+        "wind-down starts",
+    );
+    let d1 = c.run_fresh_at(&d.state, T + 2 * MIN - 1);
+    assert_steps(
+        &d1,
+        vec![wait(G, WaitReason::InFlightWork)],
+        "inside reclaim_timeout",
+    );
+    let d2 = c.run_fresh_at(&d.state, T + 2 * MIN);
+    assert_steps(
+        &d2,
+        vec![kill("paperless-ocr"), drain("mineru")],
+        "reclaim_timeout, not drain_timeout",
+    );
+    // Immediate beside a reclaim cuts off at once.
+    let d = case("immediate").run();
+    assert!(d.steps.contains(&kill("paperless-ocr")), "{:?}", d.steps);
+}
+
+#[test]
+fn a_reclaim_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
+    // The veto stopped an idle shutdown (the host is unmanaged now). A reclaim calls the
+    // power-off whatever `managed` says: only the stopped guard keeps it from powering the
+    // host off, and from hiding the stop by starting a fresh wait.
+    let stopped = format!(
+        "{{ power: {}, mode: {}, managed: false, shutdown: {{ cause: {{ kind: idle }}, since: 1, withdrawal: not_needed, veto: {{ phase: stopped, since: 2 }} }} }}",
+        on(),
+        mode_idle()
+    );
+    for pods_now in [0, 1] {
+        let d = Case::new()
+            .gpu_state(&stopped)
+            .obs(pods("llm", pods_now, pods_now, 0))
+            .reclaim()
+            .run();
+        assert_steps(
+            &d,
+            vec![wait(G, WaitReason::ShutdownStopped)],
+            "stopped holds",
+        );
+        assert_eq!(
+            shutdown_of(&d, G).unwrap().stopped_since(),
+            Some(sched_model::Millis(2)),
+            "the stop is kept as it was"
+        );
+        assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
+    }
+}

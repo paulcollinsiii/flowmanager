@@ -286,8 +286,10 @@ pub enum Veto {
 #[serde(try_from = "ShutdownRepr")]
 pub struct Shutdown {
     cause: ShutdownCause,
-    /// When the shutdown was requested (or, for an idle one, started); for a graceful
-    /// withdrawal the start of its `drain_timeout`.
+    /// When the shutdown was requested (or, for an idle one, started). For a graceful
+    /// requested shutdown, on a shared and on an exclusive host alike, in-flight work gets
+    /// exactly `drain_timeout` from here: no class `kill_timeout` extends it and no earlier
+    /// wind-down's start shortens it (a reclaim present keeps its own `reclaim_timeout`).
     since: Millis,
     withdrawal: Withdrawal,
     veto: Veto,

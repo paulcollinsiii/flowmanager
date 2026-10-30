@@ -815,3 +815,165 @@ fn powering_on_after_min_off_with_a_manual_lease_or_without_a_stamp_is_fine() {
     let v = run(&s, &off_since(1), vec![power_on("basestar-nfs")]);
     assert!(v.is_empty(), "{v:?}");
 }
+
+// ---- a requested shutdown of an exclusive host is a forced wind-down: the checker agrees ----
+
+fn busy(class: &str, source: &str) -> sched_model::Observation {
+    sched_model::Observation {
+        source: source.into(),
+        observed_at: Millis(NOW),
+        fidelity: sched_model::Fidelity::Polled,
+        value: sched_model::ObservedValue::Demand {
+            failed: 0,
+            class: ClassId::new(class),
+            ready: 1,
+            in_flight: 1,
+            oldest_ready_at: Some(Millis(NOW - 5)),
+        },
+    }
+}
+
+/// A snapshot with all demand idle but `busy_class`, the host up and every model at zero pods.
+fn world_with(busy_class: sched_model::Observation) -> Snapshot {
+    let mut obs = zero_pods_and_up(&["cuda-central", "basestar-nfs"]);
+    obs.extend(
+        idle_demand()
+            .into_iter()
+            .filter(|o| match (&o.value, &busy_class.value) {
+                (
+                    sched_model::ObservedValue::Demand { class: a, .. },
+                    sched_model::ObservedValue::Demand { class: b, .. },
+                ) => a != b,
+                _ => true,
+            }),
+    );
+    obs.push(busy_class);
+    snap(obs, vec![])
+}
+
+/// cuda-central serving `model` (since long ago, with an optional wind-down started at
+/// `wind_down`), asked to shut down `ago` ms ago in `mode`.
+fn serving_requested(model: &str, mode: &str, ago: u64, wind_down: Option<u64>) -> SchedState {
+    let wd = wind_down.map_or(String::new(), |s| {
+        format!(", wind_down: {{ since: {s}, timeout: 600000, reclaim: false }}")
+    });
+    prev(&format!(
+        "    cuda-central: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: serving, model: {model}, since: 1{wd} }}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, since: {}, withdrawal: pending, veto: {{ phase: none }} }} }}\n    basestar-nfs: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }} }}\n",
+        NOW - ago
+    ))
+}
+
+/// What the sequencer decides, and what the checker says about it.
+fn sequencer_and_checker(snap: &Snapshot, before: &SchedState) -> (Decision, Vec<String>) {
+    let config = example_config();
+    let intent = Intent::default();
+    let d = sched_sequencer::tick(&config, snap, before, &intent).unwrap();
+    let v = check(&config, snap, before, &intent, &d);
+    (d, v)
+}
+
+#[test]
+fn a_graceful_requested_shutdown_of_an_exclusive_host_winds_down_without_a_violation() {
+    // interactive-llm is unpreemptible and busy: a requested shutdown forces past it, but only
+    // after drain_timeout (10 minutes) from the request.
+    let world = world_with(busy("interactive-llm", "llm-sessions"));
+    let (d, v) =
+        sequencer_and_checker(&world, &serving_requested("llm", "graceful", 9 * MIN, None));
+    assert!(v.is_empty(), "{v:?} {:?}", d.steps);
+    assert!(!d.steps.iter().any(|s| matches!(s, Step::DrainModel { .. })));
+    let (d, v) = sequencer_and_checker(
+        &world,
+        &serving_requested("llm", "graceful", 10 * MIN, None),
+    );
+    assert!(v.is_empty(), "{v:?} {:?}", d.steps);
+    assert!(
+        d.steps.iter().any(|s| matches!(s, Step::DrainModel { .. })),
+        "{:?}",
+        d.steps
+    );
+    assert!(
+        d.steps
+            .iter()
+            .any(|s| matches!(s, Step::KillInFlight { .. })),
+        "{:?}",
+        d.steps
+    );
+}
+
+#[test]
+fn an_immediate_requested_shutdown_of_an_exclusive_host_cuts_off_without_a_violation() {
+    let world = world_with(in_flight_ocr());
+    // No wind-down running yet: it starts and cuts off in the same tick.
+    let (d, v) = sequencer_and_checker(&world, &serving_requested("mineru", "immediate", 0, None));
+    assert!(v.is_empty(), "{v:?} {:?}", d.steps);
+    assert!(
+        d.steps.contains(&kill()) && d.steps.contains(&withdraw("mineru")),
+        "{:?}",
+        d.steps
+    );
+    // A wind-down already running (started a minute ago, 9 minutes of its timeout left).
+    let (d, v) = sequencer_and_checker(
+        &world,
+        &serving_requested("mineru", "immediate", 0, Some(NOW - MIN)),
+    );
+    assert!(v.is_empty(), "{v:?} {:?}", d.steps);
+    assert!(d.steps.contains(&kill()), "{:?}", d.steps);
+}
+
+#[test]
+fn the_checker_still_catches_a_kill_before_a_graceful_shutdowns_drain_timeout() {
+    let world = world_with(in_flight_ocr());
+    // 9 minutes after the request, even with a wind-down that started 10 minutes ago.
+    let v = run(
+        &world,
+        &serving_requested("mineru", "graceful", 9 * MIN, Some(NOW - 10 * MIN)),
+        vec![kill()],
+    );
+    assert!(v.iter().any(|m| m.contains("drain_timeout")), "{v:?}");
+    let v = run(
+        &world,
+        &serving_requested("mineru", "graceful", 10 * MIN, Some(NOW - MIN)),
+        vec![kill()],
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Not excused by a manual lease cancelling the request, nor by someone else's shutdown.
+    let manual = lease("m", "cuda-central", LeaseKind::ManualHost);
+    let mut with_manual = world.clone();
+    with_manual.leases.push(manual);
+    let v = run(
+        &with_manual,
+        &serving_requested("mineru", "immediate", 0, None),
+        vec![kill()],
+    );
+    assert!(
+        v.iter().any(|m| m.contains("without a running wind-down")),
+        "a cancelled request forces nothing: {v:?}"
+    );
+    let idle_shutdown = prev(
+        "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1 }, managed: true, shutdown: { cause: { kind: idle }, since: 1, withdrawal: not_needed, veto: { phase: none } } }\n",
+    );
+    let v = run(&world, &idle_shutdown, vec![kill()]);
+    assert!(
+        v.iter().any(|m| m.contains("without a running wind-down")),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn the_checker_still_requires_an_unforced_switch_to_wait_for_an_unpreemptible_class() {
+    let world = world_with(busy("interactive-llm", "llm-sessions"));
+    let v = run(
+        &world,
+        &prev(
+            "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: llm, since: 1 } }\n",
+        ),
+        vec![withdraw("llm"), kill_llm()],
+    );
+    assert!(v.iter().any(|m| m.contains("unpreemptible")), "{v:?}");
+}
+
+fn kill_llm() -> Step {
+    Step::KillInFlight {
+        class: ClassId::new("interactive-llm"),
+    }
+}

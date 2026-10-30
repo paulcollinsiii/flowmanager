@@ -183,6 +183,30 @@ fn manual_model(snap: &Snapshot, res: &ResourceId) -> bool {
     })
 }
 
+/// The shutdown a person asked for that is in force on `res` at this tick, with its mode and
+/// the instant it was requested: stored in the previous state, and not cancelled by a manual
+/// lease taking the host over (the sequencer drops it before the mode step then). On an
+/// exclusive host it makes the wind-down of the model forced (see `exclusive::step`).
+fn requested_shutdown(
+    prev: &SchedState,
+    snap: &Snapshot,
+    res: &ResourceId,
+) -> Option<(sched_model::DrainMode, Millis)> {
+    let s = prev.resource(res)?.shutdown?;
+    let sched_model::ShutdownCause::Requested { mode } = s.cause() else {
+        return None;
+    };
+    let cancelled = snap.leases.iter().any(|l| {
+        &l.resource == res
+            && matches!(
+                l.kind,
+                LeaseKind::ManualHost | LeaseKind::ManualModel { .. }
+            )
+            && active(&l.kind, snap.now)
+    });
+    (!cancelled).then_some((mode, s.since()))
+}
+
 /// Whether the scheduler controls `res`'s power, read from the config spec directly.
 fn managed_power(config: &Config, res: &ResourceId) -> bool {
     config
@@ -676,6 +700,24 @@ pub fn check(
                 } else {
                     policy.drain_timeout
                 };
+                // A shutdown a person asked for on this host: `immediate` cuts work off at
+                // once, `graceful` (unless a reclaim holds the host) after exactly
+                // `drain_timeout` from the request; neither waits for a running wind-down
+                // nor for a class's `kill_timeout`.
+                match (requested_shutdown(prev, snapshot, res), reclaim) {
+                    (Some((sched_model::DrainMode::Immediate, _)), _) => continue,
+                    (Some((sched_model::DrainMode::Graceful, asked)), false) => {
+                        let due = asked.as_u64().saturating_add(policy.drain_timeout.as_u64());
+                        if now.as_u64() < due {
+                            out.push(format!(
+                                "invariant 16: stopped {class} {}ms before the graceful shutdown's drain_timeout",
+                                due - now.as_u64()
+                            ));
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 match prev.resource(res).map(|s| &s.mode) {
                     Some(ModePhase::Serving {
                         wind_down: Some(wd),
@@ -716,8 +758,9 @@ pub fn check(
                     ));
                     continue;
                 };
-                let forced =
-                    reclaimed(config, snapshot, resource) || manual_model(snapshot, resource);
+                let forced = reclaimed(config, snapshot, resource)
+                    || manual_model(snapshot, resource)
+                    || requested_shutdown(prev, snapshot, resource).is_some();
                 if !forced
                     && now.as_u64() - since.as_u64().min(now.as_u64()) < policy.min_dwell.as_u64()
                 {

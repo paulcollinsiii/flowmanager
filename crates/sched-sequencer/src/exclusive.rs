@@ -16,7 +16,8 @@ use crate::power::wait;
 pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool {
     // A reclaim, and a shutdown a person asked for, both take the model away: the host is
     // going down, so nothing is allowed on it whatever the intent says.
-    let requested = requested_mode(st);
+    let request = requested_mode(st);
+    let requested = request.map(|(mode, _)| mode);
     let target = if cx.reclaimed() || requested.is_some() {
         None
     } else {
@@ -29,7 +30,6 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bo
             .filter(|m| configured(cx, m))
     };
     let forced = cx.reclaimed() || requested.is_some() || cx.intent.forced.contains(&cx.res.id);
-    let immediate = requested == Some(DrainMode::Immediate);
     match st.mode.clone() {
         ModePhase::Idle => {
             // Left by a state from before the queue-only change (a drain in progress).
@@ -44,15 +44,16 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bo
             // set now, with no dwell, grace or wind-down; nothing of it can be waited for.
             switch(cx, st, steps, &model, target.as_ref())
         }
-        ModePhase::Serving { .. } => serving(cx, st, steps, target.as_ref(), forced, immediate),
+        ModePhase::Serving { .. } => serving(cx, st, steps, target.as_ref(), forced, request),
     }
 }
 
 /// The mode of the shutdown a person asked for, while the host has one. Its withdrawal on an
 /// exclusive host is this mode machine winding the model down (see `Shutdown`).
-fn requested_mode(st: &ResourceState) -> Option<DrainMode> {
-    match st.shutdown?.cause() {
-        ShutdownCause::Requested { mode } => Some(mode),
+fn requested_mode(st: &ResourceState) -> Option<(DrainMode, Millis)> {
+    let s = st.shutdown?;
+    match s.cause() {
+        ShutdownCause::Requested { mode } => Some((mode, s.since())),
         ShutdownCause::Idle | ShutdownCause::Reclaim => None,
     }
 }
@@ -146,7 +147,7 @@ fn serving(
     steps: &mut Vec<Step>,
     target: Option<&ModelId>,
     forced: bool,
-    immediate: bool,
+    request: Option<(DrainMode, Millis)>,
 ) -> bool {
     let ModePhase::Serving {
         model,
@@ -229,9 +230,11 @@ fn serving(
     // recorded in every case.
     //
     // A shutdown a person asked for is a forced wind-down: `graceful` gives in-flight work
-    // `drain_timeout` like any other non-reclaim cause, `immediate` cuts it off at once (a
-    // class's own `kill_timeout` does not delay it). A reclaim, being stricter on the host,
-    // keeps its own timeout under a graceful request.
+    // exactly `drain_timeout` from the request (`Shutdown::since`; no class `kill_timeout`
+    // extends it, and an earlier unforced wind-down's start does not shorten it), `immediate`
+    // cuts it off at once. A reclaim, being stricter on the host, keeps its own timeout
+    // (`reclaim_timeout`, a class's `kill_timeout`) under a graceful request.
+    let immediate = matches!(request, Some((DrainMode::Immediate, _)));
     let timeout = if immediate {
         Millis::ZERO
     } else if cx.reclaimed() {
@@ -284,8 +287,16 @@ fn serving(
     let mut wd = wd;
     let mut stopped = Vec::new();
     for (c, _) in &blockers {
-        let own = if immediate { None } else { c.kill_timeout };
-        if now >= wd.since.saturating_add(own.unwrap_or(timeout)) {
+        let due = match request {
+            Some((DrainMode::Immediate, _)) => wd.since,
+            // Exactly `drain_timeout` from the request: a class's `kill_timeout` does not
+            // extend it, and an earlier wind-down's start does not shorten it.
+            Some((DrainMode::Graceful, asked)) if !cx.reclaimed() => {
+                asked.saturating_add(policy.drain_timeout)
+            }
+            _ => wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout)),
+        };
+        if now >= due {
             steps.push(Step::KillInFlight {
                 class: c.id.clone(),
             });
