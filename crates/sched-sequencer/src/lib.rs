@@ -134,6 +134,7 @@ fn resource_tick(
     let mut acted = false;
     if cx.res.kind == sched_model::ResourceKind::Exclusive && st.is_on() {
         acted = exclusive::step(cx, &mut st, steps);
+        power::withdrawal_step(cx, &mut st);
     }
     power::step(cx, &mut st, steps, acted);
     Some(st)

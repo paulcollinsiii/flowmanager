@@ -475,18 +475,40 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
         st.shutdown = None;
         return;
     }
-    if s.withdrawal() == Withdrawal::Pending {
-        let waited = cx.now().saturating_sub(s.since());
-        let immediate = matches!(
-            s.cause(),
-            ShutdownCause::Requested {
-                mode: DrainMode::Immediate
-            }
-        );
-        if immediate || waited >= cx.config.policy().drain_timeout || no_work_in_flight(cx) {
-            s = s.withdrawn();
-            st.shutdown = Some(s);
+    // An exclusive host's withdrawal is the mode machine's (see `withdrawal_step`).
+    if cx.res.kind == ResourceKind::Shared
+        && s.withdrawal() == Withdrawal::Pending
+        && graceful_wait_over(cx, s, no_work_in_flight(cx))
+    {
+        s = s.withdrawn();
+        st.shutdown = Some(s);
+    }
+}
+
+/// Whether a requested shutdown's wait for in-flight work is over: it is `immediate`, or
+/// `policy.drain_timeout` has passed since the request, or `work_done` (nothing in flight).
+fn graceful_wait_over(cx: &Cx, s: Shutdown, work_done: bool) -> bool {
+    let waited = cx.now().saturating_sub(s.since());
+    let immediate = matches!(
+        s.cause(),
+        ShutdownCause::Requested {
+            mode: DrainMode::Immediate
         }
+    );
+    immediate || waited >= cx.config.policy().drain_timeout || work_done
+}
+
+/// Advances the withdrawal of an exclusive host's requested shutdown (run after the mode
+/// step): it is done once the mode machine has taken the model away. The mode machine does
+/// the waiting (graceful: in-flight work gets `drain_timeout`; immediate: none), told by the
+/// shutdown being requested (see `exclusive::step`). The classes that need only the host
+/// (gates) have no demand, so no work to wait for.
+pub(crate) fn withdrawal_step(cx: &Cx, st: &mut ResourceState) {
+    if cx.res.kind != ResourceKind::Exclusive || !matches!(st.mode, ModePhase::Idle) {
+        return;
+    }
+    if let Some(s) = st.shutdown {
+        st.shutdown = Some(s.withdrawn());
     }
 }
 

@@ -3499,3 +3499,226 @@ fn an_exclusive_host_held_by_a_host_lease_stays_up_idle_and_goes_down_after_the_
     let d = c.run();
     assert!(!d.steps.contains(&Step::PowerOff { resource: rid(G) }));
 }
+
+// ---- a shutdown a person asked for, on an exclusive host: the mode machine is its withdrawal ----
+// (The service API still refuses an exclusive host; the sequencer supports it.)
+
+/// The GPU host up, managed, with a shutdown requested `ago` ms before the tick whose withdrawal
+/// is `withdrawal` (`pending` while the model is still serving).
+fn gpu_requested(mode_yaml: &str, request: &str, ago: u64, withdrawal: &str) -> String {
+    format!(
+        "{{ power: {}, mode: {mode_yaml}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: {request} }}, since: {}, withdrawal: {withdrawal}, veto: {{ phase: none }} }} }}",
+        on(),
+        T - ago
+    )
+}
+
+fn shutdown_of(d: &Decision, r: &str) -> Option<sched_model::Shutdown> {
+    d.state.resource(&rid(r)).unwrap().shutdown
+}
+
+fn gpu_serving_with_work(request: &str) -> Case {
+    Case::new()
+        .gpu_state(&gpu_requested(
+            &serving("mineru", 10 * MIN),
+            request,
+            0,
+            "pending",
+        ))
+        .obs(pods("mineru", 1, 1, 0))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+}
+
+#[test]
+fn a_graceful_shutdown_of_an_exclusive_host_gives_in_flight_work_drain_timeout_then_winds_down() {
+    // drain_timeout of the example is 10 minutes.
+    let c = gpu_serving_with_work("graceful");
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), wait(G, WaitReason::InFlightWork)],
+        "wind-down starts, work in flight is waited for",
+    );
+    assert_eq!(
+        shutdown_of(&d, G).unwrap().withdrawal(),
+        sched_model::Withdrawal::Pending
+    );
+    assert!(
+        !d.allowed.classes.contains(&cid("paperless-ocr")),
+        "intake stopped"
+    );
+    let d1 = c.run_fresh_at(&d.state, T + 10 * MIN - 1);
+    assert_steps(
+        &d1,
+        vec![wait(G, WaitReason::InFlightWork)],
+        "still inside drain_timeout",
+    );
+    let d2 = c.run_fresh_at(&d.state, T + 10 * MIN);
+    assert_steps(
+        &d2,
+        vec![kill("paperless-ocr"), drain("mineru")],
+        "the timeout cuts the work off and the model leaves",
+    );
+    assert_eq!(mode_of(&d2, G), ModePhase::Idle);
+    assert_eq!(
+        shutdown_of(&d2, G).unwrap().withdrawal(),
+        sched_model::Withdrawal::Done,
+        "the model is gone: the withdrawal is done"
+    );
+    assert!(
+        matches!(power_of(&d2, G), PowerPhase::On { .. }),
+        "one step a tick"
+    );
+    // The next tick powers the host off.
+    let d3 = Case::new().run_fresh_at(&d2.state, T + 10 * MIN + 1_000);
+    assert_steps(&d3, vec![Step::PowerOff { resource: rid(G) }], "power off");
+    assert!(matches!(power_of(&d3, G), PowerPhase::ShuttingDown { .. }));
+}
+
+#[test]
+fn an_immediate_shutdown_of_an_exclusive_host_cuts_work_off_at_once_whatever_its_kill_timeout() {
+    let yaml = managed_yaml().replace(
+        "    preemptibility: kill\n    demand: { source: paperless-ocr-pending }",
+        "    preemptibility: kill\n    kill_timeout: 5m\n    demand: { source: paperless-ocr-pending }",
+    );
+    assert_ne!(yaml, managed_yaml());
+    let mut c = gpu_serving_with_work("immediate");
+    c.config = Config::from_yaml(&yaml).unwrap();
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![
+            pause("paperless-ocr"),
+            kill("paperless-ocr"),
+            drain("mineru"),
+        ],
+        "cut off and withdrawn in the first tick",
+    );
+    assert_eq!(
+        shutdown_of(&d, G).unwrap().withdrawal(),
+        sched_model::Withdrawal::Done
+    );
+    let d2 = Case::new().run_fresh_at(&d.state, T + 1_000);
+    assert_steps(&d2, vec![Step::PowerOff { resource: rid(G) }], "power off");
+}
+
+#[test]
+fn a_requested_shutdown_is_forced_so_a_busy_unpreemptible_class_does_not_hold_it() {
+    // interactive-llm cannot be preempted; without a request the model stays (not preemptible).
+    let busy = || {
+        Case::new().obs(pods("llm", 1, 1, 0)).obs(demand(
+            "interactive-llm",
+            "llm-sessions",
+            0,
+            1,
+            0,
+        ))
+    };
+    let unforced = busy().gpu(&serving("llm", 10 * MIN)).target(None).run();
+    assert_steps(
+        &unforced,
+        vec![wait(G, WaitReason::NotPreemptible)],
+        "without a request it blocks",
+    );
+    for (mode, timed_out_after) in [("graceful", 10 * MIN), ("immediate", 0)] {
+        let c = busy().gpu_state(&gpu_requested(
+            &serving("llm", 10 * MIN),
+            mode,
+            0,
+            "pending",
+        ));
+        let d = c.run();
+        assert!(
+            !d.steps.contains(&wait(G, WaitReason::NotPreemptible)),
+            "{mode}: {:?}",
+            d.steps
+        );
+        // Immediate cuts it off in the first tick; graceful when drain_timeout is over.
+        let d = if timed_out_after == 0 {
+            d
+        } else {
+            c.run_fresh_at(&d.state, T + timed_out_after)
+        };
+        assert!(
+            d.steps.contains(&drain("llm")) && d.steps.contains(&kill("interactive-llm")),
+            "{mode}: {:?}",
+            d.steps
+        );
+    }
+}
+
+#[test]
+fn a_requested_shutdown_of_an_exclusive_host_with_no_model_withdraws_and_powers_off_at_once() {
+    let c = Case::new().gpu_state(&gpu_requested(&mode_idle(), "graceful", 0, "pending"));
+    let d = c.run();
+    assert_steps(
+        &d,
+        vec![Step::PowerOff { resource: rid(G) }],
+        "nothing to wait for",
+    );
+    assert!(matches!(power_of(&d, G), PowerPhase::ShuttingDown { .. }));
+    // A lease that holds the host (a job's hold) is not overridden, as on a shared host.
+    let held = c.lease(format!(
+        "{{ id: h, resource: {G}, granted_at: 0, kind: {{ type: shared_hold, holder: x }} }}"
+    ));
+    let d = held.run();
+    assert_steps(&d, vec![wait(G, WaitReason::DrainHeld)], "held");
+    assert_eq!(
+        shutdown_of(&d, G).unwrap().withdrawal(),
+        sched_model::Withdrawal::Done
+    );
+}
+
+#[test]
+fn a_requested_shutdown_ignores_what_the_intent_wants_on_the_host() {
+    // Work queued for mineru and the planner choosing it: the host is going down regardless.
+    let d = Case::new()
+        .gpu_state(&gpu_requested(&mode_idle(), "graceful", 0, "pending"))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 4, 0, 0))
+        .target(Some("mineru"))
+        .run();
+    assert_steps(
+        &d,
+        vec![Step::PowerOff { resource: rid(G) }],
+        "not allowed again",
+    );
+    assert!(d.allowed.models.is_empty());
+}
+
+#[test]
+fn a_new_manual_request_cancels_a_requested_shutdown_of_an_exclusive_host() {
+    let c = gpu_serving_with_work("graceful")
+        .want(G, PowerWant::Manual)
+        .target(Some("mineru"));
+    let d = c.run();
+    assert_eq!(shutdown_of(&d, G), None);
+    // The model is not wound down for it: back to the intent (staying on mineru).
+    assert!(!d.steps.contains(&pause("paperless-ocr")), "{:?}", d.steps);
+    assert!(matches!(
+        mode_of(&d, G),
+        ModePhase::Serving {
+            wind_down: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_requested_shutdown_that_stopped_on_the_veto_keeps_the_exclusive_host_withdrawn() {
+    // A person-requested stop keeps the consumers out (as on a shared host).
+    let stopped = format!(
+        "{{ power: {}, mode: {}, managed: false, shutdown: {{ cause: {{ kind: requested, mode: graceful }}, since: 1, withdrawal: done, veto: {{ phase: stopped, since: 2 }} }} }}",
+        on(),
+        mode_idle()
+    );
+    let d = Case::new().gpu_state(&stopped).target(Some("mineru")).run();
+    assert_eq!(
+        shutdown_of(&d, G).unwrap().stopped_since(),
+        Some(sched_model::Millis(2))
+    );
+    assert!(
+        !d.steps.iter().any(|s| matches!(s, Step::AllowModel { .. })),
+        "{:?}",
+        d.steps
+    );
+}
