@@ -294,7 +294,7 @@ fn drain_report(state: &SchedState) -> Vec<DrainReport> {
         .filter_map(|(id, st)| {
             let s = st.shutdown.filter(Shutdown::is_drain)?;
             // An idle drain scales the consumers down at once.
-            let mode = match s.cause {
+            let mode = match s.cause() {
                 ShutdownCause::Requested { mode } => mode,
                 ShutdownCause::Idle => DrainMode::Immediate,
                 ShutdownCause::Reclaim => return None,
@@ -302,9 +302,9 @@ fn drain_report(state: &SchedState) -> Vec<DrainReport> {
             Some(DrainReport {
                 resource: id.clone(),
                 mode: mode.as_str().to_string(),
-                since: s.since,
+                since: s.since(),
                 scaled_down: s.consumers_withdrawn(),
-                origin: s.cause.origin()?.to_string(),
+                origin: s.cause().origin()?.to_string(),
             })
         })
         .collect()
@@ -2789,14 +2789,11 @@ mod tests {
         // A shutdown stopped by mounting pods: left as it is.
         let (s, clock) = managed_world();
         let mut d = stored(
-            Some(sched_model::Shutdown {
-                cause: sched_model::ShutdownCause::Idle,
-                stage: sched_model::ShutdownStage::Stopped {
-                    since: Millis(2),
-                    withdrawn: false,
-                },
-                since: Millis(1),
-            }),
+            Some(
+                sched_model::Shutdown::idle_withdrawn(Millis(1))
+                    .vetoing(Millis(1))
+                    .stopped(Millis(2)),
+            ),
             false,
         );
         world(&s, Some(1));
@@ -2835,13 +2832,10 @@ mod tests {
             let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
             st.managed = true;
             if with_drain {
-                st.shutdown = Some(sched_model::Shutdown {
-                    cause: sched_model::ShutdownCause::Requested {
-                        mode: sched_model::DrainMode::Graceful,
-                    },
-                    stage: sched_model::ShutdownStage::Withdrawing,
-                    since: clock.now(),
-                });
+                st.shutdown = Some(sched_model::Shutdown::requested(
+                    sched_model::DrainMode::Graceful,
+                    clock.now(),
+                ));
             }
             d.state.resources.insert(nfs(), st);
             world(&s, Some(0));

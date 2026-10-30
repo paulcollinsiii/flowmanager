@@ -220,14 +220,8 @@ mod tests {
             .resources
             .get_mut(&"basestar-nfs".into())
             .unwrap()
-            .shutdown = Some(sched_model::Shutdown {
-            cause: sched_model::ShutdownCause::Idle,
-            stage: sched_model::ShutdownStage::Vetoing {
-                since: Millis(5_000),
-                withdrawn: true,
-            },
-            since: Millis(4_500),
-        });
+            .shutdown =
+            Some(sched_model::Shutdown::idle_withdrawn(Millis(4_500)).vetoing(Millis(5_000)));
         assert_eq!(decode_state(Some(&encode_state(&s))).unwrap(), s);
     }
 

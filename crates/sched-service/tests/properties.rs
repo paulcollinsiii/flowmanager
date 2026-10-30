@@ -307,16 +307,13 @@ proptest! {
         let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1) });
         st.managed = true;
         // An idle drain (the scheduler's own) is always immediate and already scaled down.
-        st.shutdown = Some(sched_model::Shutdown {
-            cause: if idle {
-                sched_model::ShutdownCause::Idle
-            } else {
-                sched_model::ShutdownCause::Requested {
-                    mode: if immediate { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful },
-                }
-            },
-            stage: if scaled_down || idle { sched_model::ShutdownStage::Withdrawn } else { sched_model::ShutdownStage::Withdrawing },
-            since: Millis(50_000_000 - ago),
+        let since = Millis(50_000_000 - ago);
+        st.shutdown = Some(if idle {
+            sched_model::Shutdown::idle_withdrawn(since)
+        } else {
+            let mode = if immediate { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful };
+            let requested = sched_model::Shutdown::requested(mode, since);
+            if scaled_down { requested.withdrawn() } else { requested }
         });
         sc.initial_state.resources.insert("basestar-nfs".into(), st);
         let results = run(&config, &sc).unwrap();

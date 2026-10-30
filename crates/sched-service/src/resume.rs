@@ -1,7 +1,7 @@
 //! `resume`: a person acts on one resource flowmanager stopped at, after fixing the host by
 //! hand. Two things stop flowmanager and leave it waiting for a person: a power transition
 //! that timed out (`PowerPhase::Failed`) and a shutdown that waited for mounting pods until
-//! `mounts_timeout` ran out (`ShutdownStage::Stopped`).
+//! `mounts_timeout` ran out (`Veto::Stopped`).
 //!
 //! Resuming forgets the resource's state, so the sequencer starts it afresh from what is
 //! observed (the same as a resource it has never seen): found running means up and not
@@ -157,14 +157,11 @@ fn phase(p: PowerPhase) -> &'static str {
 mod tests {
     use super::*;
     use sched_model::test_support::example_config_managed;
-    use sched_model::{Millis, ResourceState, Shutdown, ShutdownCause, ShutdownStage};
+    use sched_model::{Millis, ResourceState, Shutdown};
 
-    fn stage(stage: ShutdownStage) -> Shutdown {
-        Shutdown {
-            cause: ShutdownCause::Idle,
-            stage,
-            since: Millis(1),
-        }
+    /// The idle shutdown of a shared host, held back by the veto since `at`.
+    fn vetoing(at: u64) -> Shutdown {
+        Shutdown::idle_withdrawn(Millis(1)).vetoing(Millis(at))
     }
 
     fn core(entries: &[(&str, ResourceState)]) -> CoreState {
@@ -216,10 +213,7 @@ mod tests {
     fn a_shutdown_stopped_by_mounting_pods_is_forgotten_too() {
         let c = example_config_managed();
         let mut st = on();
-        st.shutdown = Some(stage(ShutdownStage::Stopped {
-            since: Millis(9),
-            withdrawn: false,
-        }));
+        st.shutdown = Some(vetoing(5).stopped(Millis(9)));
         let mut s = core(&[("basestar-nfs", st)]);
         let ack = resume(&mut s, &c, &"basestar-nfs".into()).unwrap();
         assert_eq!(ack.cleared, "shutdown_stopped_by_mounts");
@@ -230,10 +224,7 @@ mod tests {
     fn a_resource_that_is_not_stopped_is_refused_and_left_alone() {
         let c = example_config_managed();
         let mut waiting = on();
-        waiting.shutdown = Some(stage(ShutdownStage::Vetoing {
-            since: Millis(9),
-            withdrawn: true,
-        }));
+        waiting.shutdown = Some(vetoing(9));
         for (st, text) in [
             (on(), "its power phase is on"),
             (

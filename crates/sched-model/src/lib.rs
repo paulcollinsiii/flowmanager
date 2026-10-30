@@ -49,7 +49,7 @@ pub use source_params::{
 };
 pub use state::{
     DrainMode, ModePhase, PowerPhase, PowerTransition, ResourceState, SchedState, Shutdown,
-    ShutdownCause, ShutdownStage, WindDown,
+    ShutdownCause, Veto, WindDown, Withdrawal,
 };
 pub use store::ConfigStore;
 pub use time::Millis;

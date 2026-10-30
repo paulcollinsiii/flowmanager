@@ -2410,7 +2410,18 @@ fn other_resources_keep_scheduling_while_one_is_failed() {
 /// The NFS host managed and idle since `idle` ms ago, with a veto (`veto` is YAML) if any.
 fn nfs_due(idle: u64, veto: Option<&str>) -> String {
     let veto = veto
-        .map(|v| format!(", shutdown: {{ cause: {{ kind: idle }}, stage: {v}, since: 1 }}"))
+        .map(|v| {
+            // As production leaves it: a shared host's idle shutdown has withdrawn its
+            // consumers until it stops, when they come back.
+            let withdrawal = if v.contains("stopped") {
+                "not_needed"
+            } else {
+                "done"
+            };
+            format!(
+                ", shutdown: {{ cause: {{ kind: idle }}, since: 1, withdrawal: {withdrawal}, veto: {v} }}"
+            )
+        })
         .unwrap_or_default();
     format!(
         "{{ power: {}, mode: {}, managed: true, idle_since: {}{veto} }}",
@@ -2421,7 +2432,7 @@ fn nfs_due(idle: u64, veto: Option<&str>) -> String {
 }
 
 fn waiting_since(ago: u64) -> String {
-    format!("{{ phase: vetoing, since: {}, withdrawn: false }}", T - ago)
+    format!("{{ phase: vetoing, since: {} }}", T - ago)
 }
 
 /// The mount veto of the NFS host in the decision's state, as the stage of its shutdown shows it.
@@ -2433,10 +2444,10 @@ enum Veto {
 
 fn veto_of(d: &Decision) -> Option<Veto> {
     let s = d.state.resource(&rid(N)).unwrap().shutdown?;
-    match s.stage {
-        sched_model::ShutdownStage::Vetoing { since, .. } => Some(Veto::Waiting { since }),
-        sched_model::ShutdownStage::Stopped { since, .. } => Some(Veto::Stopped { since }),
-        _ => None,
+    match s.veto() {
+        sched_model::Veto::Vetoing { since } => Some(Veto::Waiting { since }),
+        sched_model::Veto::Stopped { since } => Some(Veto::Stopped { since }),
+        sched_model::Veto::None => None,
     }
 }
 
@@ -2572,7 +2583,7 @@ fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retr
     let stopped = |pods: u32| {
         Case::new()
             .nfs_state(
-                &nfs_due(0, Some("{ phase: stopped, since: 1, withdrawn: false }"))
+                &nfs_due(0, Some("{ phase: stopped, since: 1 }"))
                     .replace("managed: true", "managed: false")
                     .replace(&format!("idle_since: {}", T), "idle_since: null"),
             )
@@ -2593,31 +2604,37 @@ fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retr
 }
 
 #[test]
-fn a_stopped_host_is_never_shut_down_even_if_a_state_says_it_is_managed_and_nothing_mounts_it() {
-    // Normal transitions never leave a host both managed and stopped (giving up clears
-    // `managed`, and a manual request that sets it clears the veto), so the state is built by
-    // hand: the check itself must still refuse, whatever the reading says, rather than rely on
-    // the caller having cleared the flag.
-    let managed_stopped = format!(
-        "{{ power: {}, mode: {}, managed: true, idle_since: {}, shutdown: {{ cause: {{ kind: idle }}, stage: {{ phase: stopped, since: 1, withdrawn: false }}, since: 1 }} }}",
-        on(),
-        mode_idle(),
-        T - 20 * MIN
-    );
+fn a_host_the_scheduler_stopped_on_is_never_shut_down_whatever_the_readings_say_later() {
+    // The state is reached the way production reaches it: pods mount the host past the
+    // veto timeout and the scheduler gives up (this clears `managed`).
+    let stopped = Case::new()
+        .nfs_state(&nfs_due(60 * MIN, Some(&waiting_since(30 * MIN))))
+        .obs(mounts(2, 0))
+        .run();
+    assert!(matches!(veto_of(&stopped), Some(Veto::Stopped { .. })));
+    assert!(!d_managed(&stopped));
     for (name, case) in [
         ("zero mounts", Case::new().obs(mounts(0, 0))),
         ("unknown mounts", Case::new().drop_obs("resource_mounts")),
     ] {
-        let d = case.nfs_state(&managed_stopped).run();
-        assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], name);
-        assert!(matches!(power_of(&d, N), PowerPhase::On { .. }), "{name}");
-        assert!(matches!(veto_of(&d), Some(Veto::Stopped { .. })));
+        let mut state = stopped.state.clone();
+        for k in 1..=3u64 {
+            let d = case.run_fresh_at(&state, T + k * 60 * MIN);
+            assert_steps(&d, vec![wait(N, WaitReason::ShutdownStopped)], name);
+            assert!(matches!(power_of(&d, N), PowerPhase::On { .. }), "{name}");
+            assert!(matches!(veto_of(&d), Some(Veto::Stopped { .. })), "{name}");
+            state = d.state.clone();
+        }
     }
+}
+
+fn d_managed(d: &Decision) -> bool {
+    d.state.resource(&rid(N)).unwrap().managed
 }
 
 #[test]
 fn a_new_manual_request_takes_a_stopped_host_over_and_the_next_idle_period_decides_afresh() {
-    let stopped = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: false, shutdown: { cause: { kind: idle }, stage: { phase: stopped, since: 1, withdrawn: false }, since: 1 } }";
+    let stopped = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: false, shutdown: { cause: { kind: idle }, since: 1, withdrawal: not_needed, veto: { phase: stopped, since: 1 } } }";
     let d = Case::new()
         .nfs_state(stopped)
         .want(N, PowerWant::Manual)
@@ -2650,8 +2667,8 @@ fn something_holding_the_host_ends_the_wait_and_a_host_seen_down_ends_a_stop() {
     assert_steps(&d, vec![], "kept up");
     // The host went down by itself (a person, a power cut): nothing left to veto.
     for veto in [
-        "{ phase: vetoing, since: 1, withdrawn: false }",
-        "{ phase: stopped, since: 1, withdrawn: false }",
+        "{ phase: vetoing, since: 1 }",
+        "{ phase: stopped, since: 1 }",
     ] {
         let d = Case::new()
             .nfs_state(&nfs_due(60 * MIN, Some(veto)))
@@ -3041,7 +3058,7 @@ fn without_a_min_off_no_stamp_is_ever_written_and_a_leftover_one_is_dropped() {
 /// The NFS host managed and up with a drain `mode` requested `ago` ms before the tick.
 fn nfs_draining(mode: &str, ago: u64) -> String {
     format!(
-        "{{ power: {}, mode: {}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, stage: {{ phase: withdrawing }}, since: {} }} }}",
+        "{{ power: {}, mode: {}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, since: {}, withdrawal: pending, veto: {{ phase: none }} }} }}",
         on(),
         mode_idle(),
         T - ago
@@ -3064,7 +3081,7 @@ fn nfs_drain_of(d: &Decision) -> Option<DrainView> {
         .unwrap()
         .shutdown
         .filter(sched_model::Shutdown::is_drain)?;
-    let (mode, idle) = match s.cause {
+    let (mode, idle) = match s.cause() {
         sched_model::ShutdownCause::Requested { mode } => (mode, false),
         _ => (sched_model::DrainMode::Immediate, true),
     };
@@ -3218,13 +3235,11 @@ fn a_shutdown_state_reads_and_writes_and_a_state_that_has_none_stores_none() {
 
 /// The NFS host managed, idle since `idle` ms ago, with an idle drain started `ago` ms ago.
 fn nfs_idle_drain(idle: u64, ago: u64, veto: Option<&str>) -> String {
-    // With a veto (`veto` is the YAML of its stage) the idle drain is at that stage; the
-    // consumers were scaled down before it began.
-    let stage = veto.map_or("{ phase: withdrawn }".to_string(), |v| {
-        v.replace("withdrawn: false", "withdrawn: true")
-    });
+    // With a veto (`veto` is its YAML) the idle drain is at that point; the consumers were
+    // scaled down before it began.
+    let veto = veto.unwrap_or("{ phase: none }");
     format!(
-        "{{ power: {}, mode: {}, managed: true, idle_since: {}, shutdown: {{ cause: {{ kind: idle }}, stage: {stage}, since: {} }} }}",
+        "{{ power: {}, mode: {}, managed: true, idle_since: {}, shutdown: {{ cause: {{ kind: idle }}, since: {}, withdrawal: done, veto: {veto} }} }}",
         on(),
         mode_idle(),
         T - idle,

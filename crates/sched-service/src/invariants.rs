@@ -337,7 +337,7 @@ pub fn check(
     for (id, st) in &decision.state.resources {
         if !st
             .shutdown
-            .is_some_and(|s| s.is_drain() && s.cause == sched_model::ShutdownCause::Idle)
+            .is_some_and(|s| s.is_drain() && s.cause() == sched_model::ShutdownCause::Idle)
         {
             continue;
         }
@@ -557,12 +557,12 @@ pub fn check(
                     let draining = drain.is_some();
                     if let Some(d) = drain {
                         let scaled = matches!(
-                            d.cause,
+                            d.cause(),
                             sched_model::ShutdownCause::Requested {
                                 mode: sched_model::DrainMode::Immediate
                             }
                         ) || d.consumers_withdrawn()
-                            || now.saturating_sub(d.since) >= policy.drain_timeout
+                            || now.saturating_sub(d.since()) >= policy.drain_timeout
                             || config
                                 .classes()
                                 .iter()

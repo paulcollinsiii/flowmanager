@@ -231,7 +231,7 @@ mod scenarios;
 mod tests {
     use super::*;
     use sched_model::test_support::example_config;
-    use sched_model::{PowerPhase, ResourceState, Shutdown, ShutdownCause, ShutdownStage};
+    use sched_model::{PowerPhase, ResourceState, Shutdown};
 
     #[test]
     fn a_host_that_is_on_but_whose_shutdown_flowmanager_gave_up_on_is_not_up_for_a_job() {
@@ -244,25 +244,15 @@ mod tests {
         state.resources.insert(nfs.clone(), st.clone());
         assert!(needs_up(&config, &snapshot, &state, &spec), "on: up");
         // Waiting for the mounts to go away is still up (a shutdown is merely held back).
-        st.shutdown = Some(Shutdown {
-            cause: ShutdownCause::Idle,
-            stage: ShutdownStage::Vetoing {
-                since: Millis(2),
-                withdrawn: false,
-            },
-            since: Millis(2),
-        });
+        st.shutdown = Some(Shutdown::idle_withdrawn(Millis(2)).vetoing(Millis(2)));
         state.resources.insert(nfs.clone(), st.clone());
         assert!(needs_up(&config, &snapshot, &state, &spec));
         // Stopped: the host is On, but flowmanager stopped managing it; a job does not start.
-        st.shutdown = Some(Shutdown {
-            cause: ShutdownCause::Idle,
-            stage: ShutdownStage::Stopped {
-                since: Millis(3),
-                withdrawn: false,
-            },
-            since: Millis(2),
-        });
+        st.shutdown = Some(
+            Shutdown::idle_withdrawn(Millis(2))
+                .vetoing(Millis(2))
+                .stopped(Millis(3)),
+        );
         state.resources.insert(nfs, st);
         assert!(!needs_up(&config, &snapshot, &state, &spec));
     }
