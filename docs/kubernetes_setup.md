@@ -1242,7 +1242,7 @@ dropped. Discarding `lease_book` drops every lease (an LLM pin vanishes).
 **Roll the binary back together with the config.** The build before queue-only switching
 rejects the current config (a gate class: "exclusive; a model is required"; and a config
 without a pods source), so deploy the previous image with the previous ConfigMap. The
-persisted state of this build (version 2) is not readable by the build before it, nor theirs by this one (no migration: see the README, *Versions, and recovering the persisted state*). A document written by a
+persisted `scheduler_state` of this build is version 2: the build before it cannot read it (discard it with `discard_state` after rolling back), and this build drops a version-1 state by itself on the first tick and starts from observation (no migration, no operator step; see the README, *Versions, and recovering the persisted state*). A document written by a
 newer build that this one cannot decode makes ticks report an error and publish nothing
 (the scaler keeps what it had); the fix is the build that wrote it, or `discard_state`.
 After a rollback that changes handlers, re-register the deployment (section 2).
@@ -1251,10 +1251,8 @@ A `managed` shared host's consumers are scaled down before the host is shut down
 goes idle: the scheduler starts an **idle drain** (the `drains` entry has `origin: "idle"`) at
 the moment it would have powered the host off, the consumers leave the allowed set, the mount
 check waits for their pods to go, then the host is shut down. Any hold (a lease, a job, work
-for a consumer) cancels it. A state document holding an idle drain carries an `origin` field
-that an older build cannot decode (a requested drain is stored as before), so roll back
-between idle shutdowns, or `discard_state` after. See the README, *Host leases, reclaim and
-resume*.
+for a consumer) cancels it. Rolling back is as for any state (`discard_state` after the
+rollback, see above). See the README, *Host leases, reclaim and resume*.
 
 A build without scheduled jobs rejects the `jobs:` section of the config (roll the config back
 with it), ignores the `job_book` key and never releases `hold-job-*` leases already in the

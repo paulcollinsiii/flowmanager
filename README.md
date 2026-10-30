@@ -362,14 +362,19 @@ Each document is stored as `{"version": N, "data": ...}`; this build reads and w
 version 2 of `scheduler_state` and version 1 of `lease_book`, `job_book` and the others.
 Version 2 of `scheduler_state` replaced each resource's `drain`, `mounts_veto`,
 `host_idle_since` and `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`
-(`planning/power-model.md`). **There is no migration.** A `scheduler_state` of version 1,
-as the build before wrote it, is a document of another version like any other (next
-paragraph): after deploying this build the first tick reports the error and publishes nothing
-until you discard `scheduler_state` (`discard_state`, no `force` needed, as it cannot be
-read), and the sequencer then starts from observation as described below. The lease book
-and the job book are kept. The `loading` and `draining` mode phases of the build before
+(`planning/power-model.md`). **There is no migration, and no operator step on upgrade.** A
+`scheduler_state` of an *older* version (version 1, as the build before wrote it) is read as
+an absent document: the first tick logs one warning (`event="state_version_discarded"`: the
+version found, discarded, starting from observation) and starts from observation as
+described below, and the state it stores is version 2. Only `scheduler_state` is treated so
+(it is the only document whose version was bumped); the lease book and the job book are
+kept as they are. One consequence: a host that is up when the new build first ticks has no
+`managed` mark, so it is seen as found running (a shared host is adopted, see *Host leases,
+reclaim and resume*; none is powered off by flowmanager on account of anything done before the
+deploy); a requested drain or a stopped shutdown under way is forgotten, and idle and
+`min_off` clocks start over. The `loading` and `draining` mode phases of the build before
 queue-only switching are still read (`loading` as serving since the same instant, `draining`
-as idle). A document that cannot be decoded, or that has another version (written
+as idle). A document that cannot be decoded, or that has a *newer* version (written
 by a newer build, say, before a rollback), is not reset and does not fail the invocation
 (Restate would retry it forever and block every exclusive handler, the lease handlers
 included). Instead:
@@ -385,9 +390,9 @@ switching rejects the shipped config: a gate class (a requirement on an exclusiv
 without a model) fails validation with "exclusive; a model is required", and a config
 without a pods source is refused as well. Deploy the previous binary with the previous
 config. A build before version 2 of `scheduler_state` cannot read the state this build
-writes at all (another version: an error tick until the document is discarded), and this
-build cannot read theirs; there is no migration either way. Discard `scheduler_state` when
-rolling back, as when rolling forward.
+writes (another version: an error tick until the document is discarded with
+`discard_state`), so discard `scheduler_state` when rolling back. Rolling forward again
+needs nothing: this build drops the older document by itself (see above).
 
 **Rolling back across scheduled jobs.** A build without scheduled jobs (the one before the
 `jobs:` key) rejects a config that has the `jobs:` section, so roll the config back with it
@@ -862,7 +867,8 @@ trusted network.
   When a `managed` shared host reaches the point where it would be powered off (nothing holds
   it: no lease, no queued or in-flight work of a class that needs it, no unknown demand
   reading; `idle_grace` over), the sequencer first starts an **idle drain** of its own: an
-  `immediate` drain with `origin: idle`, stored in the host's state like any drain. The
+  `immediate` drain, stored as the host's `shutdown` with cause `idle` (reports and the HTTP
+  JSON label it `origin: idle`, a label derived from that cause). The
   classes that need the host leave the allowed set in that very tick (KEDA scales them to
   zero), then the shutdown goes through the usual path: the mount check (`wait ...
   pods_mounted` while their pods still mount it, bounded by `mounts_timeout`), then
