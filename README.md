@@ -359,10 +359,17 @@ until the first tick (the backstop ticks within seconds).
 ### Versions, and recovering the persisted state
 
 Each document is stored as `{"version": N, "data": ...}`; this build reads and writes
-version 1 of both. The queue-only change kept version 1 of `scheduler_state`: the
-`loading` and `draining` mode phases the build before it wrote are still read (`loading`
-as serving since the same instant, `draining` as idle), and nothing this build writes is
-new to that build. A document that cannot be decoded, or that has another version (written
+version 2 of `scheduler_state` and version 1 of `lease_book`, `job_book` and the others.
+Version 2 of `scheduler_state` replaced each resource's `drain`, `mounts_veto`,
+`host_idle_since` and `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`
+(`planning/power-model.md`). **There is no migration.** A `scheduler_state` of version 1,
+as the build before wrote it, is a document of another version like any other (next
+paragraph): after deploying this build the first tick reports the error and publishes nothing
+until you discard `scheduler_state` (`discard_state`, no `force` needed, as it cannot be
+read), and the sequencer then starts from observation as described below. The lease book
+and the job book are kept. The `loading` and `draining` mode phases of the build before
+queue-only switching are still read (`loading` as serving since the same instant, `draining`
+as idle). A document that cannot be decoded, or that has another version (written
 by a newer build, say, before a rollback), is not reset and does not fail the invocation
 (Restate would retry it forever and block every exclusive handler, the lease handlers
 included). Instead:
@@ -377,10 +384,10 @@ included). Instead:
 switching rejects the shipped config: a gate class (a requirement on an exclusive resource
 without a model) fails validation with "exclusive; a model is required", and a config
 without a pods source is refused as well. Deploy the previous binary with the previous
-config (the persisted state is readable by both builds, except while it holds what only
-this build writes: a `failed` power phase, a `shutdown_confirmed_at` stamp (only for a resource with a `min_off`, see *A minimum off time*), or a `mounts_veto` entry, which is present
-whenever a shutdown is waiting on pods that still mount NFS or has stopped. Until those
-clear, or until `discard_state` is used, the older build cannot read the document).
+config. A build before version 2 of `scheduler_state` cannot read the state this build
+writes at all (another version: an error tick until the document is discarded), and this
+build cannot read theirs; there is no migration either way. Discard `scheduler_state` when
+rolling back, as when rolling forward.
 
 **Rolling back across scheduled jobs.** A build without scheduled jobs (the one before the
 `jobs:` key) rejects a config that has the `jobs:` section, so roll the config back with it
@@ -607,7 +614,7 @@ harmless to repeat).
   demand, the hold of a scheduled job, any other want that is not a manual lease. A **manual
   lease overrides it** (the person asked; they do not wait).
   - *What starts the clock.* The instant of the reading that confirmed the shutdown (the tick
-    that moved the phase to `off`), kept as `shutdown_confirmed_at` on the resource in
+    that moved the phase to `off`), kept as `off_since` on the resource in
     `scheduler_state`. A host found down at first sight, one that was up and went down by
     itself, a host never managed, and one under manual control have no stamp and are not
     delayed: flowmanager did not shut them down. The stamp ends when the phase leaves `off`.
@@ -615,13 +622,11 @@ harmless to repeat).
     on the next confirmed shutdown for a host with no stamp yet (a stamp already kept uses
     the new value; setting it back to 0 drops the stamp).
   - *Durable.* The stamp is part of the persisted sequencer state, so a scheduler restart
-    does not shorten the wait. `STATE_VERSION` is unchanged: the key is optional and absent
-    while unset. **Rolling back:** a build without `min_off` cannot read a state that has the
-    key (like `failed` and `mounts_veto`), which is only while a host with a `min_off` is
-    `off` after a shutdown of ours and the wait has not been left (the key goes away when the
-    host is powered on or seen up). Until then, or until `discard_state`, the older build
-    reports a persisted-state error. Roll the config back (remove `min_off`, which an older
-    build rejects as an unknown key) with it.
+    does not shorten the wait. It is a field of the stored resource, `null` while unset.
+    **Rolling back:** the state version (2) changed with the other fields of the shutdown
+    refactor, so a rollback needs `discard_state` anyway (see *Versions, and recovering the
+    persisted state*); roll the config back too (remove `min_off`, which an older build
+    rejects as an unknown key).
   - *Clock going backwards.* A stamp in the future (the wall clock moved back) is made again
     at the current time on the next tick, so the wait is never longer than `min_off`.
   - *Never a retry.* The wait only delays a fresh decision: nothing is requested while it
@@ -639,7 +644,7 @@ harmless to repeat).
     not powered on); under `catch_up` it alerts `start_late` at the end of the window and
     starts, late and once, after the host is up. Choose `min_off` with the start window in
     mind. Checked by the end-to-end tests in `crates/sched-service/src/jobs/scenarios.rs`.
-  - Invariant 4b (`crates/sched-service/src/invariants.rs`): no `power_on` within `min_off` of
+  - Invariant 8 (`crates/sched-service/src/invariants.rs`): no `power_on` within `min_off` of
     a confirmed shutdown without a manual lease. Replay scenarios `min-off-wait.yaml` and
     `min-off-manual-lease.yaml`.
 - **A shutdown first checks that no pod mounts the host, and a GPU shutdown first winds
@@ -824,7 +829,7 @@ trusted network.
 - **Drain on release** (`release_host_lease` with `"drain": "graceful"` or `"immediate"`;
   absent means the behaviour above). A person who switches a host off does not want queued
   work to hold it up. A drain releases the manual lease and records the request in the host's
-  state (`drain: {mode, since, scaled_down}`, persisted, so it survives a restart): then (a)
+  state (`shutdown` with cause `requested`, persisted, so it survives a restart): then (a)
   queued and in-flight work of the classes that need the host stops counting as a hold, (b)
   those classes leave the allowed set, so KEDA scales their consumers down and their pods stop
   mounting the host (`immediate`: at once; `graceful`: when none of them has work in flight,
@@ -848,11 +853,10 @@ trusted network.
   from the stored state (also right after a restart): `immediate` escalates, `graceful` leaves
   an immediate drain as it is, the start and the scale-down are kept. Only a shared host with a
   power section is accepted (`400` otherwise: an exclusive host has no drain, see below).
-  **Rollback caveat:** a state holding a drain has a field an older build cannot decode (the
-  state version was not bumped, as the field is absent when unset), so a rollback while a drain
-  is under way makes the older build report the persisted state unreadable until the drain
-  clears (the host is seen off, or a new manual lease cancels it) or the state is discarded
-  (`discard_state`). Let a drain finish before rolling back.
+  A drain is the `shutdown` of the host's stored state (cause `requested`, with the mode),
+  so it is covered by the state version like everything else: a rollback needs
+  `discard_state` (see *Versions, and recovering the persisted state*), and a drain under
+  way is lost with it.
 - **Idle drain: the consumers go down before an idle host does.** Consumers of a shared host
   run for as long as the host is up, whoever woke it (a backup job's hold, a lease, a person).
   When a `managed` shared host reaches the point where it would be powered off (nothing holds
@@ -876,13 +880,8 @@ trusted network.
   manual` hosts, exclusive hosts (the GPU host is shut down directly after its wind-down), and
   hosts that are not managed (not ours). Visible as `origin` in `drains` of the tick report and
   `last_decision`, in the `drain` log line, in the `tick` line's `drains` field and as `origin`
-  in the Home Assistant state of the host. **Rollback caveat:** a stored idle drain carries
-  `origin`, which an older build cannot decode, and unlike a requested drain it appears at
-  every idle shutdown (from the start of the drain until the host is seen off, the length of
-  the mount wait). A rollback in that window makes the older build report the persisted state
-  unreadable until the host is seen off or a hold cancels the drain, or the state is
-  discarded (`discard_state`); a requested drain is stored exactly as before. Roll back
-  between idle shutdowns.
+  in the Home Assistant state of the host. It is the `shutdown` of the host's stored state
+  with cause `idle`; rolling back is as for a requested drain (`discard_state`).
 - **A manual model lease on a host that is off** already wakes a managed host (the planner
   asks for the power of any resource a manual lease names), and the model is allowed once the
   host is observed up; there is no separate GPU lease.

@@ -1242,7 +1242,7 @@ dropped. Discarding `lease_book` drops every lease (an LLM pin vanishes).
 **Roll the binary back together with the config.** The build before queue-only switching
 rejects the current config (a gate class: "exclusive; a model is required"; and a config
 without a pods source), so deploy the previous image with the previous ConfigMap. The
-persisted state itself is readable by both builds (version 1). A document written by a
+persisted state of this build (version 2) is not readable by the build before it, nor theirs by this one (no migration: see the README, *Versions, and recovering the persisted state*). A document written by a
 newer build that this one cannot decode makes ticks report an error and publish nothing
 (the scaler keeps what it had); the fix is the build that wrote it, or `discard_state`.
 After a rollback that changes handlers, re-register the deployment (section 2).
