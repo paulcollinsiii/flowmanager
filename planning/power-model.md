@@ -126,30 +126,34 @@ new. Whether reclaim stays a separate thing is open decision D1.
 - **The toggle listener** routes and translates only. It does not branch on resource kind.
 - Adoption no longer depends on whether the job book was readable (`jobs_off`).
 
-## 3. Open decisions
+## 3. Decisions
 
-- **D1. Reclaim.** Reclaim exists because cuda-central gets rebooted into Windows: off now,
-  and not woken until handed back. Options:
-  (a) keep reclaim as its own lease, now meaning `off-now` + *parked*;
-  (b) make *parked* a separate flag any host can have, set by a reclaim;
-  (c) leave reclaim exactly as it is and only unify `off`/`off-now`.
-  Recommendation: (a). Parking stays exclusive-only, which avoids the Oct 29 worry that
-  parking basestar would block the backup job from waking it.
-- **D2. GPU veto.** Gate cuda-central's shutdown on a fresh reading of zero model pods,
-  bounded, stop on timeout? Recommendation: yes. It comes almost free with the generalised
-  veto, and the pods reading already exists (`fresh_model_pods`).
-- **D3. Adopted hosts and the lease book.** Keep minting an adopted `ManualHost` lease (one
-  source of truth for "held by the user", HA unchanged), but mark it with a field instead of
-  an id prefix? Or record it only in state and have the listener derive "held"?
-  Recommendation: keep the lease and add a typed `origin: adopted`.
-- **D4. Persisted state.** This is a single deployment. Bump the state version and start
-  from observation (one tick re-derives everything; leases and the job book are kept), or
-  write a migration? Recommendation: version bump, no migration, and drop the
-  "reads and writes as before" serde shims.
-- **D5. Behaviour changes allowed?** Phases 2–5 below are meant to keep behaviour except
-  where D1/D2 change it on purpose. Confirm that the refactor may change *observable* output
-  (log reason strings, `TickReport` fields, metric labels) where they only mirror internal
-  structure, as long as Home Assistant and the documented alerts keep working.
+### Open
+
+- **D1. Reclaim: scope and name.** In use, reclaim is "flowmanager, keep away from this
+  host": withdraw everything (forced, `reclaim_timeout`), shut it down, then neither wake nor
+  schedule it until the person hands it back. While it is held the host may be running
+  something else entirely (Windows). homesvr's `power.py` already uses it this way, as a
+  lock around its own shutdown and wake of cuda-central (HA `dashboards/flowmanager.yaml:54`).
+  It stays its own lease, separate from `off-now`, which shuts down but lets anything wake
+  the host afterwards. Still to settle: the name (the user finds "reclaim" unclear), and
+  whether it is accepted on any managed host or on exclusive hosts only.
+
+### Decided (2026-10-30, user)
+
+- **D2. GPU veto: yes.** cuda-central's shutdown waits for a fresh reading of zero model
+  pods, bounded, and stops and alerts on timeout, as the mount veto does
+  (`fresh_model_pods` exists).
+- **D3. Adopted hosts keep a lease**, marked with a typed `origin: adopted` field instead of
+  the id prefix. The HA dashboards and templates are open to refactoring for clarity
+  (homesvr `kubernetes/apps/home-assistant/ha-config/`; the homesvr agent makes the changes).
+- **D4. No migration or back-compat.** Bump the state version, start from observation (leases
+  and job book kept), and drop the "reads and writes as before" serde shims. A later
+  multi-deployment future may want migrations; not now.
+- **D5. Observable output may break for clarity.** Log lines, reason strings, `TickReport`
+  fields and metric labels may change in breaking ways when that makes them clearer. The
+  homesvr agent updates Grafana dashboards and alerts. Each phase's report lists every such
+  change for hand-off.
 
 ## 4. Refactor phases (after the decisions)
 
