@@ -1,13 +1,13 @@
 # Host power model: plan
 
-Status: **decisions complete, awaiting phase 1**, branch `refactor/power-model`, based on main @ 689ab82.
+Status: **decisions complete; phase 1 (documents) written, phases 2 to 5 (code) not started**, branch `refactor/power-model`, based on main @ 689ab82.
 All decisions are recorded in section 3 (2026-10-30).
 
 This document is the single description of how flowmanager owns and changes a host's
 power. It exists because five features (adoption, drain on release, `drain_host`, idle
 drain, exclusive host lease) were added one at a time and each was reviewed only against
-itself. Once accepted, it replaces the power parts of `architecture.md` and becomes the
-model that every later power change is reviewed against.
+itself. Accepted on 2026-10-30, it replaces the power parts of `architecture.md` and is the
+model that every later power change is reviewed against. Section 1 is what the code does today; section 2 is the target.
 
 ## 1. The model today, as the code behaves
 
@@ -194,13 +194,15 @@ Each phase goes through the three-role process. From now on the Reviewer is also
 this document and checks the phase against it ("does this still fit the model").
 
 1. **Model document.** This file, accepted; `architecture.md` power sections and invariants
-   rewritten to point here; invariants renumbered.
-2. **State types.** `HandsOff`, `Shutdown{cause, stage}`, `off_since`; drop `managed`,
+   rewritten to point here; one canonical invariant list, with a mapping from the old
+   numbers (`architecture.md`, *Mapping from the old numbers*). Documents only.
+2. **State types.** `Shutdown{cause, stage}`, `off_since`; drop `managed`,
    `drain`, `mounts_veto`, `shutdown_confirmed_at`. Behaviour preserved; the invariant
-   checker and scenario tests are the safety net.
+   checker and scenario tests are the safety net. The invariant numbers in `invariants.rs`
+   and in the `sched-sequencer` doc comment are renumbered from the mapping table.
 3. **One withdrawal, one veto.** The shared drain and the exclusive wind-down share the
    Withdrawing stage; the mount veto becomes a veto with a per-host reading (adds the GPU
-   pod veto if D2 is accepted).
+   pod veto, D2).
 4. **Vocabulary and adoption.** `off`/`off-now` on both kinds; reclaim renamed to lockout
    and accepted on any managed host (D1: lease kind, handlers, `/v1/lockouts` route,
    `lockout_timeout`, metrics, docs); adoption in the sequencer with typed origin (D3, D6);
