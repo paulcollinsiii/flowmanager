@@ -150,8 +150,9 @@ say). `off-now` differs in that anything may wake the host again afterwards.
 
 ### 2.4 Who decides what
 
-- **Adoption** moves into the sequencer as a pure ownership change. Whether it still mints a
-  lease (so `/v1/leases` and Home Assistant see it) is open decision D3.
+- **Adoption** moves into the sequencer as a pure ownership decision, and still results in
+  an adopted lease with a typed `origin: adopted` (D3), so `/v1/leases` and Home Assistant
+  see it.
 - **One `HostStatus` per resource** comes out of the sequencer (phase, stage, wait reason,
   attention). `TickReport`, `reason`, metrics and the toggle listener all read it instead of
   each diffing state.
