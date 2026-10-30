@@ -196,17 +196,21 @@ this document and checks the phase against it ("does this still fit the model").
 1. **Model document.** This file, accepted; `architecture.md` power sections and invariants
    rewritten to point here; one canonical invariant list, with a mapping from the old
    numbers (`architecture.md`, *Mapping from the old numbers*). Documents only.
-2. **State types.** `Shutdown{cause, stage}`, `off_since`; drop `managed`,
-   `drain`, `mounts_veto`, `shutdown_confirmed_at`. Behaviour preserved; the invariant
-   checker and scenario tests are the safety net. The invariant numbers in `invariants.rs`
-   and in the `sched-sequencer` doc comment are renumbered from the mapping table.
+2. **State types.** `Shutdown{cause, stage}`, `off_since`, `idle_since`; drop `drain`,
+   `mounts_veto`, `shutdown_confirmed_at`, `host_idle_since`. Behaviour preserved; the
+   invariant checker and scenario tests are the safety net. State version bumped, no
+   migration, serde back-compat shims dropped (D4). The invariant numbers in
+   `invariants.rs` and in the `sched-sequencer` doc comment are renumbered from the mapping
+   table. `managed` stays until phase 4: two of the cases it still covers (a host found
+   running under a job hold, adoption skipped with an unreadable job book) go only with
+   D6 and the `jobs_off` decoupling.
 3. **One withdrawal, one veto.** The shared drain and the exclusive wind-down share the
    Withdrawing stage; the mount veto becomes a veto with a per-host reading (adds the GPU
    pod veto, D2).
 4. **Vocabulary and adoption.** `off`/`off-now` on both kinds; reclaim renamed to lockout
    and accepted on any managed host (D1: lease kind, handlers, `/v1/lockouts` route,
    `lockout_timeout`, metrics, docs); adoption in the sequencer with typed origin (D3, D6);
-   no `jobs_off` coupling; toggle without kind branches.
+   no `jobs_off` coupling; `managed` removed (2.2); toggle without kind branches.
 5. **HostStatus and reporting.** One derived status; `tick.rs` report weaving, `reason`,
    metrics and toggle `resource_state` consume it. README power section shrunk to the model
    plus tables, caveats moved to *Known blind spots*.
