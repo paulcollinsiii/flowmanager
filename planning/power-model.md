@@ -85,23 +85,26 @@ A sketch (names not final):
 struct ResourceState {
     power: PowerPhase,                    // Off | PoweringOn | On | ShuttingDown | Failed
     mode: ModePhase,                      // unchanged: exclusive model serving/idle/wind-down
-    hands_off: Option<HandsOff>,          // flowmanager will not power this host down by itself
     shutdown: Option<Shutdown>,           // only while On
     idle_since: Option<Millis>,
     off_since: Option<Millis>,            // for min_off; only while Off after our shutdown
     pending_recovery: BTreeSet<ClassId>,  // unchanged
 }
-enum HandsOff { FailedTransition, VetoTimedOut, FoundRunningUnderHold }
 struct Shutdown { cause: Cause, stage: Stage, since: Millis }
-enum Cause { Idle, Requested { mode: DrainMode }, Reclaim }
-enum Stage { Withdrawing, Vetoing { since: Millis } }
+enum Cause { Idle, Requested { mode: DrainMode }, Lockout }
+enum Stage { Withdrawing, Vetoing { since: Millis }, Stopped { since: Millis } }
 ```
 
-Hypothesis to verify before committing to it: since adoption landed, every host that is up
-under managed control is either flowmanager's (powered on by it or held by a lease, adopted
-or not) or deliberately left alone after something went wrong. If so, `managed: bool` is
-really "not hands-off", and the explicit `HandsOff` reason replaces the flag and the
-adoption predicate's guesswork about why a host is in a given state.
+**The `managed` flag goes away.** Checked on 689ab82: outside tests it is written in eight
+places (set: power-on, a manual want, `drain_host`; cleared: shutdown, failed transition,
+mount-veto timeout, manual control, end of an adoption). Since adoption mints a lease, an up
+host under managed control has `managed = false` in only two lasting cases: the shutdown
+stopped on a veto timeout (now `Stage::Stopped`) and a host found running while a job holds
+it (adoption waits for the hold to end; see D6). A third, transient case (adoption skipped
+while the job book is unreadable) goes when phase 4 removes that coupling. So "may
+flowmanager power this down?" becomes "is the host up under managed control and not
+`Stopped`?", and the adoption predicate no longer has to guess why a host is in a given
+state.
 
 ### 2.3 One vocabulary for both kinds
 
@@ -111,10 +114,20 @@ adoption predicate's guesswork about why a host is in a given state.
 | `release` | drop the lease; the host goes down when idle like any other |
 | `off` | requested shutdown, graceful |
 | `off-now` | requested shutdown, immediate |
-| `resume` | clear a hands-off state |
+| `resume` | clear a `Stopped` shutdown or a failed power transition |
+| `lockout` on / off | see below (replaces reclaim) |
 
 On an exclusive host, Withdrawing is the mode wind-down, so `off`/`off-now` cost nothing
-new. Whether reclaim stays a separate thing is open decision D1.
+new.
+
+**Lockout** (D1) means "flowmanager, keep away from this host until I clear it". It forces the
+withdrawal (in-flight work is cut off after `lockout_timeout`, today's `reclaim_timeout`),
+shuts the host down, and then nothing wakes or schedules it: no workload, job hold or
+manual lease. It is valid on any managed host. While locked out the host may be up running
+something else (another OS, physical work on it); flowmanager neither adopts it nor powers
+it off. Clearing the lockout returns the host to the normal model: it is woken only if
+something wants it. On basestar it deliberately blocks the backup job (for a physical move,
+say). `off-now` differs in that anything may wake the host again afterwards.
 
 ### 2.4 Who decides what
 
@@ -130,17 +143,18 @@ new. Whether reclaim stays a separate thing is open decision D1.
 
 ### Open
 
-- **D1. Reclaim: scope and name.** In use, reclaim is "flowmanager, keep away from this
-  host": withdraw everything (forced, `reclaim_timeout`), shut it down, then neither wake nor
-  schedule it until the person hands it back. While it is held the host may be running
-  something else entirely (Windows). homesvr's `power.py` already uses it this way, as a
-  lock around its own shutdown and wake of cuda-central (HA `dashboards/flowmanager.yaml:54`).
-  It stays its own lease, separate from `off-now`, which shuts down but lets anything wake
-  the host afterwards. Still to settle: the name (the user finds "reclaim" unclear), and
-  whether it is accepted on any managed host or on exclusive hosts only.
+- **D6. Adopt a host found running even while a job holds it?** Today adoption waits until
+  the hold ends, so the host has no owner meanwhile and the dashboard shows it not held. The
+  end result is the same either way: once the backup finishes, the host is adopted and stays
+  up held by the user. Adopting at once removes the last lasting `managed = false` case and
+  a special branch in the adoption predicate; the only visible change is that the dashboard
+  shows the host held during the backup. Recommendation: adopt at once.
 
 ### Decided (2026-10-30, user)
 
+- **D1. Reclaim becomes `lockout`, on any managed host** (section 2.3). The HA dashboard
+  gives it help text, since the intent is clear once explained but not from the name alone.
+  homesvr's `power.py` is ignored: it will be dropped once cuda-central's power is managed.
 - **D2. GPU veto: yes.** cuda-central's shutdown waits for a fresh reading of zero model
   pods, bounded, and stops and alerts on timeout, as the mount veto does
   (`fresh_model_pods` exists).
@@ -168,8 +182,23 @@ this document and checks the phase against it ("does this still fit the model").
 3. **One withdrawal, one veto.** The shared drain and the exclusive wind-down share the
    Withdrawing stage; the mount veto becomes a veto with a per-host reading (adds the GPU
    pod veto if D2 is accepted).
-4. **Vocabulary and adoption.** `off`/`off-now` on both kinds (D1), adoption in the
-   sequencer with typed origin (D3), no `jobs_off` coupling, toggle without kind branches.
+4. **Vocabulary and adoption.** `off`/`off-now` on both kinds; reclaim renamed to lockout
+   and accepted on any managed host (D1: lease kind, handlers, `/v1/lockouts` route,
+   `lockout_timeout`, metrics, docs); adoption in the sequencer with typed origin (D3, D6);
+   no `jobs_off` coupling; toggle without kind branches.
 5. **HostStatus and reporting.** One derived status; `tick.rs` report weaving, `reason`,
    metrics and toggle `resource_state` consume it. README power section shrunk to the model
    plus tables, caveats moved to *Known blind spots*.
+
+## 5. Hand-off to homesvr (collected as phases land)
+
+The homesvr agent owns these; each phase adds what it changed.
+
+- HA: rename the reclaim switch and sensors to lockout, with help text on the dashboard.
+  Suggested: *"Lockout: flowmanager stops all work on this host, shuts it down, and will not
+  power it on or schedule anything on it until the lockout is cleared. Use it before
+  rebooting into another OS or doing physical work on the machine. Backups that need the host
+  wait too."*
+- HA: expose `off` / `off-now` / `release` / lockout for cuda-central like basestar; update
+  the stale "cuda-central is powered by hand" dashboard note.
+- Grafana and alerts: every breaking log, reason or metric change listed in phase reports (D5).
