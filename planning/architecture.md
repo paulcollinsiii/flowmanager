@@ -31,7 +31,7 @@ The scheduler arbitrates two resources and observes the services that use them; 
 - Observing job demand from each service through configurable adapters.
 - Gating service pods through a KEDA external scaler.
 - Running scheduled jobs, starting with the weekly backup, as scheduler-managed Kubernetes Jobs (M4, rescoped: see `milestones.md`, *Scope reset during M3*).
-- Manual requests: on, release, off, off-now, lockout (called reclaim in the code until phase 4, and valid today for cuda-central only), and manual LLM leases that cut batch work short. Open WebUI will hold such a lease and a person releases it (M6, reduced); time-limited interactive leases with renewal are no longer planned.
+- Manual requests: on, release, off, off-now (today a drain on shared hosts only; an exclusive host's `off` is a plain release and `off-now` is refused until phase 4), lockout (called reclaim in the code until phase 4, and valid today for cuda-central only), and manual LLM leases that cut batch work short. Open WebUI will hold such a lease and a person releases it (M6, reduced); time-limited interactive leases with renewal are no longer planned.
 
 **Non-goals**
 
