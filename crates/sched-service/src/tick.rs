@@ -377,7 +377,7 @@ pub struct TickReport {
     /// flowmanager started: the time left per resource. A manual lease never waits.
     #[serde(default)]
     pub min_off_waits: Vec<MinOffWait>,
-    /// Shared hosts found running in this tick that were adopted: a manual host lease was
+    /// Managed hosts found running in this tick that were adopted: a manual host lease was
     /// minted for each, so the user is taken to hold them up.
     #[serde(default)]
     pub adopted: Vec<ResourceId>,
@@ -2438,7 +2438,7 @@ mod tests {
         );
         let st = d.state.resource(&nfs()).unwrap();
         assert!(st.managed && st.is_on(), "{st:?}");
-        // The GPU host is exclusive: never adopted.
+        // The GPU host is `control: manual` in this fixture: never adopted.
         assert!(
             d.state
                 .resource(&"cuda-central".into())
