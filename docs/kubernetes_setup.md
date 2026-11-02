@@ -235,7 +235,7 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/tick` | none | Runs one decision now. Harmless (the core is deterministic, a tick is cheap). Answers `{"config_generation","at","kinds","error"}`. | flowmanager itself (it calls `.../tick/send`); an operator for debugging. |
 | `Scheduler/main/arm_backstop` | none | Starts a new backstop chain and supersedes any earlier one (bumps an epoch in the object's state). Answers `{"epoch": N}`. | flowmanager itself (`.../arm_backstop/send`). |
 | `Scheduler/main/backstop` | `{"epoch": N}` | One link of the backstop chain; the object sends it to itself with a delay. Called by hand with the **current** epoch it would run a tick and schedule itself again, which would fork the chain (read from the code, not exercised); with an old epoch it just ends. | Nobody. Block it at the ingress. |
-| `Scheduler/main/last_decision` | none | Read only. The latest tick report this process published (inputs with their ages, the reason, the kinds, the sequencer state, the leases it saw); `null` right after a restart until the first tick. Does not wait behind a tick. | operators, monitoring. |
+| `Scheduler/main/last_decision` | none | Read only. The latest tick report this process published (inputs with their ages, the reason, the kinds, the sequencer state, a `hosts` status per resource and the `events` of that tick, the leases it saw); `null` right after a restart until the first tick. Does not wait behind a tick. | operators, monitoring. |
 | `Scheduler/main/leases` | none | Read only. The leases held (a JSON array). | operators, monitoring, Open WebUI. |
 | `Scheduler/main/acquire_model_lease` | `{"model": "<id>"}` | **Pins a model on its GPU**: batch work is cut short (its classes leave the allowed set at once, in-flight work gets `drain_timeout`, or a class's `kill_timeout`, then is stopped) and the model stays allowed however much other work waits, until the lease is released. Asking again for the leased model returns the existing lease; another model of the same resource is `409`; an unknown model is `400`. | an operator (a person); later Open WebUI's service account. |
 | `Scheduler/main/release_lease` | `{"id": "manual-model-<n>"}` | Releases a lease and returns it; unknown id `404`. Whoever can release can end somebody's pin. | an operator; the same identity that acquired it. |
@@ -388,13 +388,15 @@ derived from the last tick's report and are **left out when they cannot be said*
 
 - model: `active` (in the allowed set), `waiting_for_host` (its host is not up),
   `host_failed`, `draining` (another model of the resource is winding down, its in-flight work
-  awaited), `locked out` (a lockout is held on its resource: no model is allowed there until it is
+  awaited), `locked_out` (a lockout is held on its resource: no model is allowed there until it is
   released, whatever the host is doing), `pending` (the last tick predates the lease, or another
   model is still allowed and the report gives no more);
 - host lease (`GET /v1/resources/..`): `power` (the phase as the sequencer holds it, with `since`
-  and, when failed, `during`), `wait` (a list: `min_off` with the seconds left, or
-  `shutdown_held_by_veto` with `stopped`), `drain` (present while a drain is under way: `mode`,
-  `since_ms`, `scaled_down`), `needs_attention`;
+  and, when failed, `during`), `wait` (a list: `min_off` with the seconds left,
+  `shutdown_held_by_veto` with `readings`, `blocking` and `stopped`, or `locked_out`), `drain`
+  (present while a requested or idle shutdown is withdrawing the consumers: `mode`, `cause`
+  (`requested` or `idle`; `origin` now means only a lease's), `since_ms`, `scaled_down`),
+  `needs_attention`;
 - lockout: `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_alone` (the host booted after the lockout shut it down: flowmanager leaves it alone until the lockout is cleared), `left_for_person` (the host
   is up and its power is `control: manual`, so flowmanager never shuts it down: power it off
   yourself), `pending`, the `power`
@@ -1274,7 +1276,7 @@ newer build that this one cannot decode makes ticks report an error and publish 
 After a rollback that changes handlers, re-register the deployment (section 2).
 
 A `managed` shared host's consumers are scaled down before the host is shut down when it
-goes idle: the scheduler starts an **idle drain** (the `drains` entry has `origin: "idle"`) at
+goes idle: the scheduler starts an **idle drain** (its `hosts` status and the HTTP `drain` object say `cause: "idle"`) at
 the moment it would have powered the host off, the consumers leave the allowed set, the mount
 check waits for their pods to go, then the host is shut down. Any hold (a lease, a job, work
 for a consumer) cancels it. Rolling back is as for any state (`discard_state` after the

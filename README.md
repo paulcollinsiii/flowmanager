@@ -558,182 +558,189 @@ Metrics: `sched_recovery_runs_total{class,outcome}` (`ran`, `skipped_interval`,
 
 ## Power actions
 
-A resource with `power.control: managed` is powered on and off by the scheduler. The
-sequencer emits `PowerOn` and `PowerOff` steps for it (never for a `manual` one), and the
-tick carries each one out by sending the resource's `Power` object (key: the resource id)
-a one-way request after storing the decision; Restate journals the send, so a retried or
-replayed tick sends it once, and the sequencer emits one step per transition. The object
-makes the call in a journaled step, so a replay never repeats it (a crash after the call
-but before its result is journaled makes Restate run the step once more: both calls are
-harmless to repeat).
+A resource with `power.control: managed` is powered on and off by the scheduler. Under
+`control: manual` its power phase only follows observation and nothing in this section
+applies. Why the model is shaped this way, and every rule it must keep, is in
+`planning/power-model.md`; this section is what an operator needs. Caveats and limits are in
+*Known blind spots*.
 
-- **Power on** is Wake-on-LAN sent by the router, because flowmanager runs in the cluster
-  and cannot broadcast on the LAN: `POST /api/wol/wol/set` to the OPNsense `os-wol` API with
-  basic auth. `https` only, verification never off, no redirect followed.
-- **Power off** is SSH (`russh`) with a forced-command key: the host key is pinned by its
-  SHA256 fingerprint (any other key is refused), `poweroff` is exec'd (the forced command
-  ignores it), and the wait after the exec is bounded (the link may drop as the host goes
-  down; that is success).
-- **Config** (`resources[].power`, typed and checked at load; see `config/example.yaml`):
-  `wake_on_lan: {router_url, interface (default lan), mac}` and
-  `shutdown: {host, port (default 22), user, host_key}`; `router_url` must be a plain
-  `https://` base URL, without credentials, a query string or a fragment (the API path is
-  appended to it). `managed` requires both. Optional `power_on_timeout`, `veto_timeout`, `min_off` and
-  `shutdown_timeout` (see below). A MAC or
-  an SSH target may not be shared by two resources. A reload that turns a host `managed`
-  applies like any other change; one that leaves it incomplete is rejected and the previous
-  config stays.
-- **Secrets are not config.** Files mounted from Kubernetes Secrets and named on the
-  command line (or in the environment), read on every call so rotation needs no restart:
-  `--opnsense-credentials-file` (`SCHED_OPNSENSE_CREDENTIALS_FILE`, `key:secret` on one
-  line), `--opnsense-ca-file` (`SCHED_OPNSENSE_CA_FILE`, optional PEM bundle, the only CA
-  trusted when given) and `--ssh-key-file` (`SCHED_SSH_KEY_FILE`). The service refuses to
-  start when the config has a managed host and the files its calls need are not given.
-- **A failed power action is never retried automatically.** A host that does not come up or
-  go down is beyond the scheduler's scope, and a retry risks flapping it. The failure is
-  logged at error level (`event="power_request_failed"`), counted
-  (`sched_power_requests_total{resource,action,outcome="failed"}`) and stored; the
-  invocation still succeeds, so Restate does not retry it either. The next ticks also say
-  so: the `TickReport` (`last_decision`) lists it in `power_request_failures` and the
-  `reason` carries `power on of <resource> FAILED at <t>ms: <error>` for as long as the
-  resource is in the transition that request belongs to (a request of an earlier cycle or of
-  the other action is dropped, a later accepted request clears it). (This is in memory of the process that
-  ran the request: after a restart only the log, the metric and `last_action` have it. A
-  request that failed is never reported as success: the sequencer's `powering on` /
-  `shutting down` phase means a request was decided, not that it was accepted.) The
-  sequencer has recorded the step and follows the host's observed reachability from there,
-  until the timeout below.
-- **Power transitions time out: alert and stop.** A power-on that is not observed up within
-  `power_on_timeout` (default 10m), or a shutdown not observed down within
-  `shutdown_timeout` (default 15m), moves the resource to the **failed** power phase
-  (`{phase: failed, since, during: powering_on|shutting_down}` in `scheduler_state`). Both
-  are set per resource under `resources[].power`, must be above 0, above
-  `policy.host_reading_stale_after` (checked under `managed` only) and at most 1d, and only matter under `managed` (a
-  `manual` host has no such phase). In the failed phase flowmanager:
-  - raises the alert once: an error log line with `event="power_timeout"`, a count in
-    `sched_power_timeouts_total{resource,during}` and a `power_timeouts` entry in that
-    tick's `TickReport`;
-  - stays visibly failed: `sched_resource_power_failed{resource,during} == 1` (alert on
-    it), `sched_resource_phase_age_seconds{axis="power",phase="failed"}`, every tick's
-    `reason` ends with `<resource> is in the FAILED power state ...`, the report's `kinds`
-    has `power_failed` and `power_failed` lists the resource, and the resource's step is
-    `wait ... power_failed`;
-  - allows nothing on that host (a model, or a class that requires it), exactly as while it
-    is powering on or shutting down. Other resources keep scheduling: their state machines
-    and the models and classes that need only them are unaffected by one resource's failure;
-  - **never takes a power action for it again**, however long work stays queued or the
-    host stays as it is. Waking or shutting it down is for a person.
-  It leaves the failed phase only when a fresh reachability reading shows the state the
-  transition was after (up after a power-on, down after a shutdown), which is also what
-  happens when a person fixes or powers the host, or when the resource is switched to
-  `control: manual` in the config (the phase then simply follows observation). No lease or
-  lockout clears it; a person can clear it with `resume` (see *Host leases, lockout and
-  resume*). A host that comes back down to `off` while work is queued is then
-  treated like any off host (a manual lease or a power-changing class may wake it, as before).
-  A host that comes back up out of a failed power-on is treated like a host found running,
-  not as one flowmanager powered on: the recovery itself never powers it off. For a host (shared or exclusive)
-  host under `control: managed` that means it is **adopted** (see *Host leases, lockout and
-  resume*): a manual host lease is minted, which takes responsibility for the host, and
-  releasing it (plus the idle grace) powers the host off. Any other found-running host is
-  powered off only by an explicit `off` / `off-now` or lockout, or a manual lease that is held and then released.
-  The timeouts are measured on the wall clock only, with no fresh reading required, so a
-  scheduler restart or a long outage can raise the alert before a fresh reading could show
-  the host in the state wanted (a known trade-off; the failed phase then clears on that
-  reading, but the alert has fired).
-- **A minimum off time (`min_off`), so a host does not flap.** Per resource under
-  `resources[].power`, a duration, **default 0: disabled**, and then nothing here applies and
-  nothing in the stored state changes. At most 1d; `0` is allowed; it only matters under
-  `control: managed` (a `manual` host accepts and ignores it). With `min_off` set, after a
-  shutdown that **flowmanager started** and saw **confirmed** (the phase reached `off` because a
-  fresh reading showed the host down while it was `shutting_down`, or `failed` while shutting
-  down), an *automatic* power-on waits until `min_off` has passed: a power-changing class with
-  demand, the hold of a scheduled job, any other want that is not a manual lease. A **manual
-  lease overrides it** (the person asked; they do not wait).
-  - *What starts the clock.* The instant of the reading that confirmed the shutdown (the tick
-    that moved the phase to `off`), kept as `off_since` on the resource in
-    `scheduler_state`. A host found down at first sight, one that was up and went down by
-    itself, a host never managed, and one under manual control have no stamp and are not
-    delayed: flowmanager did not shut them down. The stamp ends when the phase leaves `off`.
-    It is written only for a resource that has a `min_off`. Changing `min_off` takes effect
-    on the next confirmed shutdown for a host with no stamp yet (a stamp already kept uses
-    the new value; setting it back to 0 drops the stamp).
-  - *Durable.* The stamp is part of the persisted sequencer state, so a scheduler restart
-    does not shorten the wait. It is a field of the stored resource, `null` while unset.
-    **Rolling back:** the state version (2) changed with the other fields of the shutdown
-    refactor, so a rollback needs `discard_state` anyway (see *Versions, and recovering the
-    persisted state*); roll the config back too (remove `min_off`, which an older build
-    rejects as an unknown key).
-  - *Clock going backwards.* A stamp in the future (the wall clock moved back) is made again
-    at the current time on the next tick, so the wait is never longer than `min_off`.
-  - *Never a retry.* The wait only delays a fresh decision: nothing is requested while it
-    lasts, and when it is over the next tick decides from the then current intent, so a want
-    that went away in the meantime powers nothing on. A power-on that is then requested is
-    subject to everything else as before (timeouts, failed phase).
-  - *Reported.* Step `wait <resource> min_off`, a `min_off_waits` entry in the tick's report
-    (`resource`, `since`, `until`, `remaining`, all in ms), the `reason` says `<resource> is
-    wanted but was shut down by flowmanager and seen down at <t>ms: waiting for min_off, <N>s
-    left`, and the gauge `sched_resource_min_off_remaining_seconds{resource}` counts the
-    seconds left (0 outside the window; series only for managed resources with a `min_off`).
-  - *Scheduled jobs.* A job's hold is a want like any other, so a run waits for the host
-    through the wait. Its start window keeps running meanwhile: under `skip` a run whose
-    window ends inside the wait is dropped as `missed` and its hold released (the host is then
-    not powered on); under `catch_up` it alerts `start_late` at the end of the window and
-    starts, late and once, after the host is up. Choose `min_off` with the start window in
-    mind. Checked by the end-to-end tests in `crates/sched-service/src/jobs/scenarios.rs`.
-  - Invariant 8 (`crates/sched-service/src/invariants.rs`): no `power_on` within `min_off` of
-    a confirmed shutdown without a manual lease. Replay scenarios `min-off-wait.yaml` and
-    `min-off-manual-lease.yaml`.
-- **A shutdown first checks that no pod mounts the host, and a GPU shutdown first winds
-  its model down.** Neither is a retry or a new power action; both only hold a shutdown back.
-  - *NFS host (the mount check).* A host named by a `mounts` source (`kubernetes_watch`
-    with `observe: [mounts]` and `params.nfs_servers: {<resource>: [<server name or address>]}`,
-    see `config/example.yaml` and `docs/kubernetes_setup.md` for the RBAC) is powered off
-    only on a fresh reading that no pod mounts it. A pod mounts it when it has not finished
-    and one of its volumes, directly or through a PersistentVolumeClaim, is an NFS volume
-    (or an NFS CSI volume, by its `server` attribute) of one of the configured servers
-    (compared ignoring case; list the name and the address if the cluster uses both). The
-    mapping from a host to its servers is in the config, never in the code. The source lists
-    PersistentVolumes, claims and pods once per `resync` (every namespace unless
-    `params.namespaces` restricts them). **Unknown is never "no mounts"**: a failed or slow
-    list, a reading older than `policy.host_reading_stale_after`, or a pod whose claim or
-    volume the lists do not show makes the count unknown, and unknown counts as mounted. (One
-    thing is not counted: a claim not bound to any volume yet, which cannot be mounted.) A
-    `managed` shared host must be named by such a source, or the config is refused at load.
-    While the shutdown is due (idle, no holds, `idle_grace` over) and pods mount the host
-    (or the count is unknown), the step is `wait ... veto_in_use` (or `veto_unknown`), the
-    `reason` says so, the host stays up and what needs it stays allowed, and
-    `sched_resource_veto{resource,state="waiting"}` is 1. The wait is bounded by
-    `resources[].power.veto_timeout` (default 30m, above `host_reading_stale_after`, at most
-    1d). When it runs out flowmanager **alerts and stops**: `event="shutdown_veto_timeout"`
-    at error level once (a replayed tick logs `shutdown_veto_timeout_replayed` at info),
-    `sched_veto_timeouts_total{resource,reading}`, a `veto_timeouts` entry in that tick's report (`readings`: those that apply; `blocking`: those still holding it, each `in_use` or `unknown`),
-    then `veto_held` lists the resource with `stopped: true`, the kind
-    `shutdown_stopped`, the step `wait ... shutdown_stopped` and
-    `sched_resource_veto{state="stopped"} == 1` (alert on it). The host is **not** shut
-    down, however long it stays like this and even after the pods are gone, and the
-    host is no longer ours (as after a failed power transition). It leaves the stopped
-    state when the host is observed down (a person shut it down), when a person calls
-    `resume` for it, or when a new manual lease takes the host over again (the next idle
-    period then decides afresh). The wait counts from the moment the shutdown is due, not
-    from when the host went idle, and is cleared at once if something holds the host again.
-  - *GPU host (the wind-down and the pods veto).* A `pods` source that covers its models adds the
-    pods veto to the same wait: a fresh reading of zero pods for every model of the host, or it
-    waits like the mount veto (`reading` `pods`; a `mounts` source naming it adds that too).
-    **Covers** means the model lists the namespaces its workloads run in (`models[].namespaces`)
-    and every one is in `params.namespaces` of a source observing `pods` (with `list`/`watch`
-    RBAC on pods there): the observer sees pods of those namespaces only, so a workload elsewhere
-    would read as zero pods unseen. A managed host with an uncovered model is refused at load.
-    Its shutdown is already preceded by the bounded wind-down of the model: a managed
-    exclusive host is powered off only when its mode is idle, so a model that is allowed, or
-    being wound down, blocks it. The wind-down gives in-flight work `drain_timeout` (a class's
-    `kill_timeout`; `lockout_timeout` for a lockout), then stops it and withdraws the model in
-    one tick, and the shutdown is decided on a later tick, after the host has also been idle for
-    `idle_grace` (a lockout overrides that grace). Checked by the sequencer tests
-    `a_managed_gpu_host_is_never_powered_off_while_a_model_is_allowed_and_only_after_the_drain`
-    and `a_lockout_gives_in_flight_work_its_timeout_before_the_managed_gpu_host_is_shut_down`,
-    and the `lockout.yaml` scenario.
-- `Power/{resource}/run` is ingress-private; `Power/{resource}/last_action` returns the
-  last action (`{action, at, outcome: requested|failed, error}`, `null` if none).
+**How a request is carried out.** The sequencer emits `PowerOn` and `PowerOff` steps (never for
+a `manual` host) and the tick sends the resource's `Power` object (key: the resource id) a
+one-way request after storing the decision, so a retried or replayed tick sends it once. The
+object makes the call in a journaled step.
+
+- **Power on** is Wake-on-LAN sent by the router (flowmanager runs in the cluster and cannot
+  broadcast on the LAN): `POST /api/wol/wol/set` to the OPNsense `os-wol` API with basic auth.
+  `https` only, verification never off, no redirect followed.
+- **Power off** is SSH (`russh`) with a forced-command key: the host key is pinned by its SHA256
+  fingerprint (any other key is refused), `poweroff` is exec'd (the forced command ignores it),
+  and the wait after the exec is bounded (the link may drop as the host goes down; that is
+  success).
+- `Power/{resource}/run` is ingress-private; `Power/{resource}/last_action` returns the last
+  action (`{action, at, outcome: requested|failed, error}`, `null` if none).
+
+### One lifecycle
+
+```
+              want (lease, hold, workload)              seen up
+   Off ───────────────────────────────▶ PoweringOn ───────────────▶ On
+    ▲    (waits min_off unless manual)       │ timeout                 │ nothing holds it and idle_grace
+    │                                        ▼                         │ is over, or a person asks for off
+    │        seen down                    Failed ◀── timeout ──┐       ▼
+    └───────────── ShuttingDown ◀── Vetoing ◀── Withdrawing ◀──┴───────┘
+                                        └─ timeout ─▶ Stopped (stays up, alerts)
+```
+
+- **Wants.** A manual host or model lease, a scheduled job's hold and a busy class with
+  `may_change_power` want a host up. Queued work, failed items, an interactive session and a job
+  whose needs are on another host do not wake an exclusive host.
+- **Held.** While a lease, a job's hold or queued or in-flight work of a class that needs the host
+  stands, the host stays up and what needs it stays allowed. When nothing holds it and
+  `idle_grace` has passed, it goes down by the three steps below.
+- **Withdrawing.** The host's consumers leave the allowed set. On a shared host (basestar) the
+  classes that need it are scaled down (an *idle* shutdown does it at once; an unreadable
+  in-flight count waits for the timeout); on an exclusive host (cuda-central) the model is wound
+  down by the mode machine. In-flight work gets `drain_timeout` (a class's `kill_timeout`;
+  `lockout_timeout` under a lockout), or nothing when the shutdown is `immediate`.
+- **Vetoing.** Before any power-off a fresh reading must show nothing still uses the host
+  (below). Bounded by `veto_timeout`.
+- **ShuttingDown.** The power-off was requested; the host is followed from its reachability
+  until it is seen down (`shutdown_timeout`).
+- **Failed** and **Stopped** are where flowmanager stops and a person acts (below).
+
+**An idle shutdown is cancelled by any hold** (a manual or adopted lease, a job's hold, work
+queued or in flight for a class that needs the host): the consumers are allowed again and the
+idle clock starts over. Unknown demand starts no shutdown. A shutdown a person *requested*
+overrides queued and in-flight work, never a lease: a job's hold or another lease keeps the host
+up (`wait ... drain_held`) and the shutdown follows when they are gone; only a new manual host
+lease cancels it.
+
+### Who owns a host
+
+A host flowmanager powers on is **ours**, whatever wanted it (a backup job's hold, a workload, a
+manual lease), and goes down when nothing holds it, after `idle_grace`: a backup that woke
+basestar lets it power down when the job ends. A short blip down and back does not change this.
+A host something else started (a power button, a manual Wake-on-LAN, a host found running after
+flowmanager lost its state, or one that came up after flowmanager's own power-on timed out) is
+**adopted**: it counts as held by the user, through a manual host lease with `origin: adopted`
+(id `adopted-host-<resource>`, listed by `leases`), until it is released or switched off. The
+lease is minted before the planner looks, so the same tick sees it; switching the host off
+releases it, and it is dropped when a fresh reading shows the host down. A job's hold plays no
+part: a host found running while a job holds it is adopted at once, a host the job woke is ours
+and never adopted. A manual lease always keeps a host up, on top of anything else. Under a
+lockout nothing is adopted or woken, and under `control: manual` the host is never adopted or
+powered off. The rule is one pure function, `sched_sequencer::adopt::adopt`.
+
+### Verbs
+
+The same vocabulary on every host with a power section, shared or exclusive.
+
+| Verb | Handler | Toggle route | Meaning |
+| --- | --- | --- | --- |
+| `on` | `acquire_host_lease` | `.../on` | take a manual host lease: wake the host if off, keep it up until released |
+| `release` | `release_host_lease` | `.../release` | drop the lease; the host goes down when idle, like any other |
+| `off` | `release_host_lease` or `drain_host`, `"drain": "graceful"` | `.../off` | requested shutdown, graceful: in-flight work gets `drain_timeout`; releases the lease if one is held |
+| `off-now` | the same, `"drain": "immediate"` | `.../off-now` | requested shutdown, immediate: consumers withdrawn at once |
+| `resume` | `resume` | `.../resume` | clear a Stopped shutdown or a failed power transition |
+| lockout | `lockout` / `clear_lockout` | `/v1/lockouts/...` | keep away from the host until cleared (below) |
+
+**Lockout** means "flowmanager, keep away from this host until I clear it". Intake stops,
+in-flight work gets `lockout_timeout` (default `drain_timeout`) and is then cut off, then the
+veto and the power-off, whatever holds the host (a job's hold, a manual or adopted lease; none is
+cancelled, they simply want nothing while the lockout stands). Nothing wakes or schedules a
+locked-out host. **It shuts the host down once**: after the host has been seen off under it
+(`locked_down` in the stored state), a host that boots again (another OS, physical work) is not
+powered off, adopted or given work (`wait ... locked_out`) until the lockout is cleared; clearing
+it while the host is up makes it found running (adopted), while it is off the host is woken only
+if something wants it. A lockout takes over a shutdown already in progress and clearing it drops
+that shutdown. A due scheduled job needing a locked-out host does not start, up or not: it waits
+as for a host that is not up (its `missed_run` rules apply); on basestar that deliberately blocks
+the backup.
+
+### The veto
+
+A shutdown waits for a fresh reading that nothing uses the host. **Unknown is never "unused"**: a
+failed, slow or stale reading counts as in use. A host has a veto if a source covers it:
+
+- *Mounts* (an NFS host): a `kubernetes_watch` source with `observe: [mounts]` and
+  `params.nfs_servers: {<resource>: [<server name or address>]}` (see `config/example.yaml` and
+  `docs/kubernetes_setup.md` for the RBAC). A pod mounts the host when it has not finished and one
+  of its volumes, directly or through a claim, is an NFS volume (or an NFS CSI volume, by its
+  `server` attribute) of a listed server (compared ignoring case; list the name and the address
+  if the cluster uses both). A `managed` shared host must be named by such a source or the config
+  is refused at load.
+- *Pods* (a GPU host): a `pods` source that **covers** the host's models: each model lists the
+  namespaces its workloads run in (`models[].namespaces`) and every one is in `params.namespaces`
+  of a source observing `pods` (with `list`/`watch` RBAC on pods there). A workload outside the
+  watched namespaces would read as zero pods unseen, so a managed host with an uncovered model is
+  refused at load.
+
+While the veto holds, the step is `wait ... veto_in_use` or `veto_unknown`, the host stays up and
+what needs it stays allowed. On `veto_timeout` (default 30m, above `host_reading_stale_after`, at
+most 1d) flowmanager **alerts once and stops**: the shutdown is *stopped* (`wait ...
+shutdown_stopped`, kind `shutdown_stopped`, `needs_attention`), the host stays up even after the
+pods are gone, and it is no longer ours. It leaves Stopped when the host is seen down, on
+`resume`, or when a new manual lease takes the host over.
+
+### Failed power transitions
+
+A power-on not observed up within `power_on_timeout` (default 10m), or a shutdown not observed
+down within `shutdown_timeout` (default 15m), moves the host to the **failed** phase and
+flowmanager alerts once. It then allows nothing on the host, takes **no power action for it
+again**, and `wait ... power_failed`; other resources keep scheduling. It leaves the phase when a
+fresh reading shows the state the transition was after (also when a person fixes the host or sets
+`control: manual`) or on `resume`. A host that comes back up out of a failed power-on is found
+running and adopted. A **failed power request** (the call itself) is never retried either: it is
+logged (`event="power_request_failed"`), counted
+(`sched_power_requests_total{resource,action,outcome="failed"}`), stored, and shown in
+`power_request_failures` and in the `reason` until the transition ends; the host is followed from
+its reachability until the timeout.
+
+### Minimum off time (`min_off`)
+
+Per resource, default 0 (disabled), at most 1d, only under `managed`. After a shutdown flowmanager
+started and saw confirmed, an *automatic* power-on (a workload, a job's hold) waits until
+`min_off` has passed (`wait ... min_off`); a **manual lease does not wait**. It is meant to stop slow
+power flapping of the NFS host. A host found down, or one that went down by itself, has no stamp
+and is not delayed.
+
+### What the status says
+
+Every tick builds one status per resource (`sched_sequencer::status`) and everything reads it:
+the `hosts` of the report (`last_decision`), the `reason` text, the metrics, the logs and the
+toggle listener. A status says the phase, whether the host is ours, the shutdown in progress
+(cause, withdrawal, veto and the readings blocking it), the lockout (held, withdrawing, left
+alone), the manual lease and its origin, the `min_off` left, the wait reason and whether a person
+must attend. The `events` of the report are what became true in that very tick and is alerted
+once: a power or veto timeout, an adoption, an adoption ended. A replayed tick carries the same
+events and logs them under `..._replayed` at info level without counting them again. A failed
+tick has neither. A drain under way (a requested or idle shutdown withdrawing the consumers) is
+logged every tick as `event="drain"` (`cause`, `mode`, `scaled_down`) and in the `tick` line's
+`drains` field; a request is logged as `event="drain_requested"`. The metrics are listed under
+*Metrics*; the HTTP view is in *Toggle listener*.
+
+### Config
+
+`resources[].power`, typed and checked at load (see `config/example.yaml`):
+
+| Key | Meaning |
+| --- | --- |
+| `wake_on_lan: {router_url, interface (default lan), mac}` | power on; `router_url` a plain `https://` base URL, no credentials, query or fragment |
+| `shutdown: {host, port (default 22), user, host_key}` | power off; `host_key` the pinned SHA256 fingerprint |
+| `control` | `manual` (default) or `managed`; `managed` requires both of the above |
+| `power_on_timeout`, `shutdown_timeout` | 10m / 15m; above 0, above `policy.host_reading_stale_after` (managed only), at most 1d |
+| `veto_timeout` | 30m; above `host_reading_stale_after`, at most 1d |
+| `min_off` | 0 (disabled), at most 1d |
+| `policy.idle_grace`, `drain_timeout`, `lockout_timeout` | the grace before an idle shutdown; in-flight work's time on a requested shutdown; and under a lockout |
+
+A MAC or an SSH target may not be shared by two resources. A reload that turns a host `managed`
+applies like any other change; one that leaves it incomplete is rejected and the previous config
+stays. **Secrets are not config**: files mounted from Kubernetes Secrets and named on the command
+line (or in the environment), read on every call so rotation needs no restart:
+`--opnsense-credentials-file` (`SCHED_OPNSENSE_CREDENTIALS_FILE`, `key:secret` on one line),
+`--opnsense-ca-file` (`SCHED_OPNSENSE_CA_FILE`, optional PEM bundle, the only CA trusted when
+given) and `--ssh-key-file` (`SCHED_SSH_KEY_FILE`). The service refuses to start when the config
+has a managed host and the files its calls need are not given.
 
 ## Handlers
 
@@ -756,6 +763,7 @@ counted under `unknown`).
 | `release_lease` | yes | Releases a lease by id. |
 | `acquire_host_lease` | yes | Acquires a manual lease on a host with a power section, shared or exclusive (`{"resource": "basestar-nfs"}`). |
 | `release_host_lease` | yes | Releases the manual host lease of a resource (`{"resource": ...}`); with `"drain": "graceful"` or `"immediate"` it also takes the host (shared or exclusive) down despite queued work (see *Host leases*). |
+| `drain_host` | yes | The same requested shutdown without a lease being needed (`{"resource": ..., "drain": ...}`). |
 | `lockout` | yes | Locks out a resource with a power section, shared or exclusive (`{"resource": "cuda-central"}`). |
 | `jobs` | yes (shared) | Every configured scheduled job with its state (see *Scheduled jobs*). |
 | `trigger_job` | yes | Starts a run of a scheduled job now (`{"id": "backup"}`); `409` while the previous instance is pending or running, `404` for an unknown job. |
@@ -813,167 +821,20 @@ curl -X POST localhost:8080/Scheduler/main/last_decision
 
 ### Host leases, lockout and resume
 
-These four handlers and `resume` take `{"resource": "<id>"}`, are validated against the
-active config inside a journaled step (a replay gets the same answer after a reload), answer
-`400` for an unknown or unsuitable resource (the message lists what is configured), `404` for
-a release with nothing to release and `409` for a `resume` with nothing to resume, and ask for
-a tick. Like the other lease handlers they are public on the Restate ingress: keep it on a
-trusted network.
+These handlers take `{"resource": "<id>"}`, are validated against the active config inside a
+journaled step (a replay gets the same answer after a reload), and ask for a tick. They answer
+`400` for an unknown resource or one without a `power` section (the message lists what is
+configured), `404` for a release with nothing to release and `409` for a `resume` with nothing
+to resume. Like the other lease handlers they are public on the Restate ingress: keep it on a
+trusted network. What each verb means is in *Power actions*.
 
-- **Manual host lease** (`acquire_host_lease` / `release_host_lease`): a hold on a resource with
-  a `power` section, typically the NFS host (shared) or a GPU host (exclusive). It wakes the host when it is off
-  (under `managed`; under `manual` it waits for a person to power it on), keeps it up until it
-  is released, and, because the host is up, allows everything gated on it (the NFS-only
-  consumers and the gate classes that require it) even with no work queued, so their queues
-  become visible. Asking again returns the lease (`"created": false`). Ids are `manual-host-<n>`.
-  Released, the host is
-  shut down only when nothing else holds it (a shared hold, another lease, queued or
-  in-flight work of a class that needs it), `idle_grace` has passed and the mount check above
-  passes; two holders keep it up until both are gone.
-  **On an exclusive host** (a GPU, `cuda-central`) the lease only powers the host on and keeps
-  it up: the queues still choose the model, nothing is pinned (a manual *model* lease pins one).
-  Nothing else powers an exclusive managed host on except a manual host or model lease or a class
-  with `may_change_power`: queued work, failed items, an interactive session and a job whose needs
-  are on a shared host leave it down. A plain release (`release_host_lease` without `drain`)
-  leaves queued or in-flight work holding the host until it is idle, and `idle_grace` after the
-  model is withdrawn it is shut down. `release_host_lease` with `drain`, and `drain_host`, work
-  on an exclusive host as on a shared one (the same `off` / `off-now` vocabulary on every host
-  with a power section): the host is asked to go down despite queued work, and the model is
-  wound down by the mode machine (graceful: in-flight work gets exactly `drain_timeout` from
-  the request; immediate: at once; a busy unpreemptible class does not hold it), then the
-  veto and the power-off. The shutdown happens only with the mode idle (the model already
-  withdrawn, so KEDA is scaling its pods down); an idle shutdown has no further wait for the
-  pods to be gone beyond the veto: the only other delay is `idle_grace`.
-- **Who owns a host, and a host found running** (`planning/power-model.md`, 2.1b). A host
-  flowmanager powers on is flowmanager's, whatever wanted it (a backup job's hold, a workload,
-  a manual lease): the power phase carries `ours` (on `off` and `on`; the `powering_on` phase
-  is ours by construction). A host that is `ours` goes down when nothing holds it, after
-  `idle_grace`, and a short blip (`on`, `off`, `on`) does not change that. A host something
-  else started is **adopted** (a changed default: it used to be left alone for ever). For a
-  host (shared or exclusive) with `power.control: managed`, when a fresh reading shows it up
-  and it is not ours, it counts as held by the user and the tick mints a manual host lease
-  for it with `origin: adopted` (id `adopted-host-<resource>`, listed by `leases`; the id is
-  only a name, the `origin` is what marks it). "Not ours" is read from the previous state, by
-  one pure function (`sched_sequencer::adopt::adopt`): no state (first start, discarded
-  state), `off` not ours (a power button, a manual Wake-on-LAN, a host flowmanager shut down
-  or one that went down by itself and came back, adopted afresh each time), `on` not ours (a
-  host switched from `control: manual` to `managed` while it was up, one whose stopped
-  shutdown a person cleared with `resume`), or a failed power-on that a reading has now
-  cleared (an alert is already out, a person decides). It is not adopted when it is
-  `powering_on`, when it is ours (a restart with the persisted state adopts nothing, and a
-  blip of a host flowmanager woke is not a start), when its shutdown was stopped by the veto
-  (a person decides with `resume`), when a manual host lease already holds it, or when it is
-  locked out. **A job's hold plays no part**: a host found running while a job holds it is
-  adopted at once and stays up after the job, while a host the job itself woke is ours, is
-  never adopted and goes down when the hold ends (unless a person's manual lease keeps it).
-  The lease is minted before the planner looks, so the same tick sees it; the adopted lease
-  is a manual want, so the host is ours from then on; the Home Assistant switch reads `on`
-  for it (its `origin` is `adopted` in the switch JSON, `requested` for a person's lease), and
-  switching it off releases it like any manual host lease. An adopted lease is dropped when a
-  fresh reading shows the host down (the user switched it off by hand): the host is then no
-  longer ours, so it is never woken again by a lease nobody asked for and the person's next
-  power-on is adopted afresh. A person's lease is never treated as adopted and never dropped
-  this way. Two limits: after `release`, or after a host flowmanager powered on went down
-  for any length of time, a person's power-on cannot be told from a blip and is not adopted.
-  Adoption does not depend on the job book: with an unreadable job book it still runs, and
-  the lease book is still written (see *Versions, and recovering the persisted state*). The
-  tick report lists `adopted` and `adoptions_ended`, and the log has `event="host_adopted"`
-  and `event="host_adoption_ended"`. Under `control: manual` nothing changes: the host is
-  never adopted and never powered off. After a `resume` the host is found running again and
-  is adopted at the next tick. An exclusive host found running (the GPU box switched on by
-  hand) is adopted too, so it stays up until its lease is released (or it is seen down); only
-  then does the idle shutdown apply.
-- **Drain on release** (`release_host_lease` with `"drain": "graceful"` or `"immediate"`;
-  absent means the behaviour above). A person who switches a host off does not want queued
-  work to hold it up. A drain releases the manual lease and records the request in the host's
-  state (`shutdown` with cause `requested`, persisted, so it survives a restart): then (a)
-  queued and in-flight work of the classes that need the host stops counting as a hold, (b)
-  those classes leave the allowed set, so KEDA scales their consumers down and their pods stop
-  mounting the host (`immediate`: at once; `graceful`: when none of them has work in flight,
-  or `policy.drain_timeout` after the request, whichever is first; an unreadable in-flight
-  count waits for the timeout), and (c) the host is shut down once no lease holds it and the
-  mount check above passes. **A drain overrides no lease**: a scheduled job's hold or another
-  lease keeps the host up, the step is `wait ... drain_held` and the shutdown follows when
-  they are gone. Before the scale-down the step is `wait ... draining`. The mount check and
-  `veto_timeout` apply after the scale-down as for any shutdown (a managed shared host always
-  has a `mounts` source, so there is no `idle_grace` wait). The drain ends when the host is no longer up, and a **new manual host lease
-  cancels it** (the consumers are allowed again). It is visible as `drains` in the tick
-  report (and `last_decision`), as `drain` in the Home Assistant state of the host, and as
-  `event="drain_requested"` / `event="drain"` log lines. Known limit: a class that may change
-  power and still has queued work wakes the host again once it is off (after `min_off`),
-  exactly as it would after any shutdown.
-  `drain_host` (`{"resource", "drain"}`, mode required) is the same request without the
-  lease being a precondition: it releases the manual lease if one is held, records the drain,
-  and answers `{resource, released, drain}` (`drain` absent when the host is not up under
-  managed control). It is what the Home Assistant switch-off calls, so a host held up only by
-  queued work can be taken down too. Asked again, it changes the drain under way in place,
-  from the stored state (also right after a restart): `immediate` escalates, `graceful` leaves
-  an immediate drain as it is, the start and the scale-down are kept. Only a shared host with a
-  power section is accepted (`400` otherwise: an exclusive host has no drain, see below).
-  A drain is the `shutdown` of the host's stored state (cause `requested`, with the mode),
-  so it is covered by the state version like everything else: a rollback needs
-  `discard_state` (see *Versions, and recovering the persisted state*), and a drain under
-  way is lost with it.
-- **Idle drain: the consumers go down before an idle host does.** Consumers of a shared host
-  run for as long as the host is up, whoever woke it (a backup job's hold, a lease, a person).
-  When a `managed` shared host reaches the point where it would be powered off (nothing holds
-  it: no lease, no queued or in-flight work of a class that needs it, no unknown demand
-  reading; `idle_grace` over), the sequencer first starts an **idle drain** of its own: an
-  `immediate` drain, stored as the host's `shutdown` with cause `idle` (reports and the HTTP
-  JSON label it `origin: idle`, a label derived from that cause). The
-  classes that need the host leave the allowed set in that very tick (KEDA scales them to
-  zero), then the shutdown goes through the usual path: the mount check (`wait ...
-  veto_in_use` while their pods still mount it, bounded by `veto_timeout`), then
-  `PowerOff`. Without it every host a backup woke would sit out `veto_timeout` (30m) on its
-  own consumers' pods and then stop with an alert. An idle drain differs from a requested one:
-  **any hold cancels it** and re-allows the consumers at once (a manual or adopted lease, a
-  job's lease, work queued or in flight for a class that needs the host), and the idle clock
-  then starts from scratch. Unknown demand starts no idle drain (`wait ... stale_demand`), and
-  keeps one that is set without shutting the host down. If the mount wait runs out
-  (`shutdown_stopped`, alert, host stays up, no retry) the idle drain is cleared so the
-  consumers come back; the host is then no longer ours, so no idle drain starts again until
-  a new manual lease takes it over (a requested drain keeps today's behaviour). A person's
-  `drain_host` or switch-off on a host with an idle drain turns it into a requested drain
-  (start and scale-down kept). The drain ends when the host is seen down. Not changed: `control:
-  manual` hosts, exclusive hosts (the GPU host is shut down directly after its wind-down), and
-  hosts that are not ours. Visible as `origin` in `drains` of the tick report and
-  `last_decision`, in the `drain` log line, in the `tick` line's `drains` field and as `origin`
-  in the Home Assistant state of the host. It is the `shutdown` of the host's stored state
-  with cause `idle`; rolling back is as for a requested drain (`discard_state`).
-- **A manual model lease on a host that is off** already wakes a managed host (the planner
-  asks for the power of any resource a manual lease names), and the model is allowed once the
-  host is observed up; there is no separate GPU lease.
-- **Lockout** (`lockout` / `clear_lockout`; called reclaim before phase 4a): "flowmanager,
-  keep away from this host until I clear it". Valid on any resource with a power section,
-  shared or exclusive (`400` otherwise). Until cleared, intake stops, in-flight work gets
-  `lockout_timeout` (`policy.lockout_timeout`, default `drain_timeout`) and is then cut off (an
-  exclusive host's model is wound down; a shared host's consumers are scaled down, as in a
-  drain), then the usual veto and the power-off, whatever holds the host: a job's hold, a
-  manual or adopted lease (the lease is neither cancelled nor deleted by a lockout; it simply
-  wants nothing while the lockout stands) or queued work. A `manual`-control host is left for a
-  person to power off. Nothing wakes or schedules a locked-out host: no workload, job hold or
-  lease. **The lockout shuts the host down once.** After the host has been seen off under it
-  (also a lockout taken while the host was already off), flowmanager leaves it alone: if
-  something else boots it (another OS, physical work) it is not powered off again, not
-  adopted and not given work (`wait ... locked_out`; `locked_down` in its stored state),
-  until the lockout is cleared. Clearing it while the host is up makes it a host found
-  running (adopted, as above); while it is off, the host is woken only if something wants it,
-  a manual lease included. On basestar a lockout deliberately blocks the backup job: a due run does not start while the host is locked out, up or not (it waits as for a host that is not up, so its `missed_run` rules apply), while a run already in progress is not killed and keeps its hold until it ends. A waiting
-  run keeps its own hold, which is inert during the lockout; when the lockout clears it may wake
-  a host that is down so the run can catch up, after which the host is flowmanager's and powers
-  down when the job is done. A lockout also takes over a shutdown already in progress (an
-  earlier `off`), on either kind of host: in-flight work gets `lockout_timeout` from the
-  takeover, and clearing the lockout drops that earlier `off`. Ids are
-  `lockout-<n>`; asking again returns the lease.
-- **`resume`**: for a person who has fixed a host by hand. It applies to a resource in the
-  failed power phase, or whose shutdown was stopped by mounting pods, and forgets that
-  resource's state so the sequencer starts it afresh from observation, as for a resource it
-  has not seen: found running is up and *not ours* (flowmanager will not power it off on
-  account of an earlier action; a host under `control: managed`, shared or exclusive, is then adopted, see
-  above), found down is off. It powers nothing on or off itself, does
-  not touch any other resource's state or the leases, and is logged at warn level
-  (`event="power_resumed"`). `409` if the resource is not stopped (including a host that is
-  merely powering on or shutting down, or has no state yet).
+| Handler | Answer and notes |
+| --- | --- |
+| `acquire_host_lease` | `on`. The lease (`"created": false` if held already); ids `manual-host-<n>`. Under `managed` it wakes an off host; under `manual` it waits for a person to power it on. It allows everything gated on the host even with no work queued, so those queues become visible. On an exclusive host it only powers on and keeps it up: the queues still choose the model (a manual *model* lease pins one). |
+| `release_host_lease` | `release` (no `drain`): the host goes down when nothing else holds it. With `"drain": "graceful"` or `"immediate"`: `off` / `off-now`, a requested shutdown despite queued work; a lease is not needed. |
+| `drain_host` | `{"resource", "drain"}`, mode required: the same request, releasing the lease if one is held, answering `{resource, released, drain}` (`drain` absent when the host is not up under managed control, or is locked out: the lockout decides). Asked again it changes the shutdown under way in place (`immediate` escalates, `graceful` leaves an immediate one; the start and the scale-down are kept). It is what the Home Assistant switch-off calls. |
+| `lockout`, `clear_lockout` | the lockout lease (ids `lockout-<n>`, asking again returns it) and its release. |
+| `resume` | for a person who has fixed a host by hand. Applies to a failed power phase or a Stopped shutdown: forgets that resource's state so the sequencer starts it afresh from observation (found up is not ours, so a managed host is adopted; found down is off). Powers nothing, touches no other resource or lease, logs `event="power_resumed"` at warn level. |
 
 ```sh
 curl -X POST localhost:8080/Scheduler/main/acquire_host_lease \
@@ -1017,11 +878,16 @@ journaling are the handlers'; the handler's refusal comes back as `{"error": "<m
 with its status (`400` unsuitable resource, `409` another model leased or nothing to resume,
 `404` unknown name or path; a `404` from Restate is a `502`, never an answer). The token is checked
 before a body is read. A state read has `held` and `state`, and, when the last tick's report
-supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draining`, `locked out`,
+supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draining`, `locked_out`,
 `host_failed`, `pending`; a lockout also `left_for_person` on a `control: manual` host, and `left_alone` for a host that booted after the lockout shut it down), `power`,
-`wait` and `needs_attention` (the failed power phase or mounts-stopped shutdown also seen in
+`wait` and `needs_attention` (the failed power phase or Stopped shutdown also seen in
 `sched_resource_power_failed` and `sched_resource_veto`); a field that cannot be derived is
-left out. Every on/off/resume request and every refused request logs one `event="toggle"` line
+left out. They are read off the host's status in the last tick's report and only formatted
+here. A host switch has `drain` while a requested or idle shutdown is withdrawing the host's
+consumers: `{mode, cause, since_ms, scaled_down}`, with `cause` `requested` (a person asked) or
+`idle` (the scheduler started it). `origin` appears only on a held lease: `requested` (a person)
+or `adopted` (minted for a host found running). A `wait` entry is `shutdown_held_by_veto`
+(`readings`, `blocking`, `stopped`), `min_off` (`remaining_seconds`) or `locked_out`. Every on/off/resume request and every refused request logs one `event="toggle"` line
 (names escaped, refusals rate limited), is counted in
 `sched_toggle_requests_total{endpoint,outcome}`, and a held lease shows in
 `sched_manual_lease_age_seconds{kind,target}`. The flags, the token Secret, the NetworkPolicy and
@@ -1309,6 +1175,68 @@ Notes:
 ## Known blind spots
 
 Read these before trusting a "no demand" or "idle" line, or a phase.
+
+- **Host power: limits of the model in *Power actions*.**
+  - *Upgrading and rolling back.* The versions and their effects are in *Versions, and
+    recovering the persisted state*. Two facts to keep in front of you: a **stored lease of kind
+    `reclaim`** (a reclaim left held, from before lockouts) does not parse in this build, and the
+    lease book is not versioned away, so every tick publishes nothing and the lease handlers
+    answer `503` until it is cleared (`unreclaim` on the old build before upgrading, or discard
+    `lease_book`); `policy.reclaim_timeout` is refused at load, rename it `lockout_timeout`. A
+    rollback needs `scheduler_state` and `lease_book` discarded, and the config rolled back too
+    (an older build rejects the keys it does not know, `min_off` for one). The first tick after an upgrade starts from observation: a host that is up
+    is not ours, so a managed one is adopted (also one a job woke before the upgrade, which then
+    stays up until a person switches it off); a requested shutdown under way is forgotten and the
+    idle and `min_off` clocks start over.
+  - *Timeouts are wall-clock only.* A power transition times out on the clock, with no fresh
+    reading required, so a restart or a long outage can raise the alert before a reading could
+    show the host in the wanted state (the failed phase then clears on that reading, but the
+    alert has fired).
+  - *A failed power request is remembered in memory.* `power_request_failures` and the `reason`
+    line are in the memory of the process that ran the request; after a restart only the log, the
+    metric and `last_action` have it. The sequencer's `powering_on` / `shutting_down` phase means
+    a request was decided, not that it was accepted.
+  - *The veto.* Neither source counts a claim not bound to a volume yet (it cannot be mounted).
+    The mounts source lists volumes, claims and pods once per `resync` (every namespace unless
+    `params.namespaces` restricts them). The wait counts from the moment the shutdown is due, not
+    from when the host went idle, and is cleared at once if something holds the host again. A
+    Stopped host is not shut down even after the pods are gone; a stopped *idle* shutdown lets
+    its consumers come back, the host is no longer ours, so no idle shutdown starts again until a
+    new manual lease takes it over (a requested one keeps its consumers withdrawn). An exclusive
+    host is powered off only with its mode idle (the model withdrawn, so KEDA is scaling its pods
+    down); beyond the veto the only delay is `idle_grace` (a lockout overrides it).
+  - *`min_off`.* The clock starts at the reading that confirmed a shutdown flowmanager started
+    (`off_since` in `scheduler_state`, written only for a resource with a `min_off`, kept across
+    restarts, `null` while unset). A host found down at first sight, one that went down by itself
+    and one under manual control have no stamp and are not delayed. Changing `min_off` takes
+    effect on the next confirmed shutdown for a host with no stamp (a stamp already kept uses the
+    new value; setting it to 0 drops it). A stamp in the future (the clock went back) is made
+    again at the current time, so the wait is never longer than `min_off`. The wait only delays a
+    fresh decision: nothing is requested while it lasts, and a want that went away meanwhile
+    powers nothing on. A scheduled job's hold waits through it while its start window keeps
+    running: under `skip` a run whose window ends inside the wait is dropped as `missed` and its
+    hold released; under `catch_up` it alerts `start_late` at the end of the window and starts,
+    late and once, after the host is up (so choose `min_off` with the start window in mind;
+    `crates/sched-service/src/jobs/scenarios.rs`). Invariant 8
+    (`crates/sched-service/src/invariants.rs`): no `power_on` within `min_off` of a confirmed
+    shutdown without a manual lease; replay scenarios `min-off-wait.yaml` and
+    `min-off-manual-lease.yaml`.
+  - *Adoption.* After `release`, or after a host flowmanager powered on went down for any length
+    of time, a person's power-on cannot be told from a blip and is not adopted. A power-on that
+    timed out and was then seen up is adopted (an alert is already out, a person decides). An
+    exclusive host found running (the GPU box switched on by hand) is adopted too, so it stays up
+    until its lease is released or it is seen down; after a `resume` the host is found running
+    again and adopted at the next tick. Adoption does not depend on the job book: with an
+    unreadable job book it still runs and the lease book is still written.
+  - *A shutdown does not stop the work that comes back.* A class that may change power and still
+    has queued work wakes the host again once it is off (after `min_off`), as after any shutdown.
+    Unknown demand starts no idle shutdown (`wait ... stale_demand`) and keeps one that is set
+    without shutting the host down. A person's `off` on a host with an idle shutdown turns it into
+    a requested one (start and scale-down kept). A shutdown under way is part of the stored state,
+    so `discard_state` loses it.
+  - *Lockout and `control: manual`.* A lockout on a `manual`-control host withdraws the consumers
+    (or winds the model down) but powers nothing: the host is left for a person to power off.
+    The lease of a locked-out host is neither cancelled nor deleted by the lockout.
 
 - **A lockout shuts a host down once, which has two consequences.** The one shutdown is
   remembered as `locked_down` in the stored sequencer state (set when the host is seen off
