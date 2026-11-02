@@ -931,7 +931,7 @@ trusted network.
   then starts from scratch. Unknown demand starts no idle drain (`wait ... stale_demand`), and
   keeps one that is set without shutting the host down. If the mount wait runs out
   (`shutdown_stopped`, alert, host stays up, no retry) the idle drain is cleared so the
-  consumers come back; the host is then no longer managed, so no idle drain starts again until
+  consumers come back; the host is then no longer ours, so no idle drain starts again until
   a new manual lease takes it over (a requested drain keeps today's behaviour). A person's
   `drain_host` or switch-off on a host with an idle drain turns it into a requested drain
   (start and scale-down kept). The drain ends when the host is seen down. Not changed: `control:
