@@ -1256,7 +1256,7 @@ mod tests {
     /// `loading` and `draining` phases it no longer writes (in the current document version).
     fn legacy_state(mode: &str) -> Vec<u8> {
         format!(
-            r#"{{"version":3,"data":{{"state":{{"resources":{{"cuda-central":{{"power":{{"phase":"on","since":1}},"mode":{mode},"managed":false,"idle_since":null,"pending_recovery":[]}},"basestar-nfs":{{"power":{{"phase":"on","since":1}},"mode":{{"phase":"idle"}},"managed":false,"idle_since":null,"pending_recovery":[]}}}}}},"reported":["cluster-pods"]}}}}"#
+            r#"{{"version":4,"data":{{"state":{{"resources":{{"cuda-central":{{"power":{{"phase":"on","since":1}},"mode":{mode},"idle_since":null,"pending_recovery":[]}},"basestar-nfs":{{"power":{{"phase":"on","since":1}},"mode":{{"phase":"idle"}},"idle_since":null,"pending_recovery":[]}}}}}},"reported":["cluster-pods"]}}}}"#
         )
         .into_bytes()
     }
@@ -1288,7 +1288,7 @@ mod tests {
         assert_eq!(r.error, None, "{r:?}");
         assert_eq!(r.allowed_models, vec![ModelId::from("whisperx")], "{r:?}");
         let text = String::from_utf8(ctx.stored(STATE_KEY).unwrap()).unwrap();
-        assert!(text.starts_with("{\"version\":3,"), "{text}");
+        assert!(text.starts_with("{\"version\":4,"), "{text}");
         assert!(
             !text.contains("draining") && !text.contains("loading"),
             "{text}"
@@ -1889,7 +1889,7 @@ mod tests {
     /// cuda-central failed in a shutdown, basestar up and managed: what a person finds after
     /// a shutdown that never completed and a host fixed by hand.
     fn failed_gpu_state() -> Vec<u8> {
-        br#"{"version":3,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"failed","since":5,"during":"shutting_down"},"mode":{"phase":"idle"}},"basestar-nfs":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"idle_since":null}}},"reported":["cluster-pods"]}}"#.to_vec()
+        br#"{"version":4,"data":{"state":{"resources":{"cuda-central":{"power":{"phase":"failed","since":5,"during":"shutting_down"},"mode":{"phase":"idle"}},"basestar-nfs":{"power":{"phase":"on","since":1,"ours":true},"mode":{"phase":"idle"},"idle_since":null}}},"reported":["cluster-pods"]}}"#.to_vec()
     }
 
     #[tokio::test]
@@ -2034,7 +2034,7 @@ mod tests {
         ctx.commit();
         assert_eq!(r.error, None, "{r:?}");
         let text = String::from_utf8(ctx.stored(STATE_KEY).unwrap()).unwrap();
-        assert!(text.starts_with("{\"version\":3,"), "{text}");
+        assert!(text.starts_with("{\"version\":4,"), "{text}");
         assert_eq!(ctx.stored(LEASES_KEY), leases, "the lease book is kept");
     }
 

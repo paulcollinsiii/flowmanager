@@ -3089,7 +3089,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_an_older_build_stored_as_on_and_unmanaged_is_adopted_once_unless_left_so_on_purpose()
+    fn a_host_that_is_up_and_not_ours_is_adopted_once_unless_ours_or_stopped_by_the_veto()
     {
         let stored = |shutdown: Option<sched_model::Shutdown>, managed: bool| {
             let mut st = sched_model::ResourceState::new(PowerPhase::On {
@@ -3102,7 +3102,7 @@ mod tests {
             d.state.resources.insert(nfs(), st);
             d
         };
-        // Old state, probe up, no lease: adopted, once.
+        // Up and not ours (a manual-to-managed reload, say), no lease: adopted, once.
         let (s, clock) = managed_world();
         let mut d = stored(None, false);
         world(&s, Some(0));
@@ -3113,7 +3113,7 @@ mod tests {
         world(&s, Some(0));
         assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
         assert_eq!(d.leases.len(), 1);
-        // A host we powered on (managed): not adopted.
+        // A host we powered on: ours, not adopted.
         let (s, clock) = managed_world();
         let mut d = stored(None, true);
         world(&s, Some(0));
@@ -3135,7 +3135,7 @@ mod tests {
     }
 
     #[test]
-    fn an_adoption_skipped_for_an_unreadable_job_book_happens_on_a_later_tick() {
+    fn adoption_runs_with_an_unreadable_job_book_and_its_lease_is_kept() {
         let (s, clock) = managed_world();
         let mut d = Durable {
             jobs_off: true,
@@ -3143,17 +3143,25 @@ mod tests {
         };
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert!(r.adopted.is_empty() && d.leases.is_empty(), "{r:?}");
-        // The state is stored as on and unmanaged all the same.
-        let st = d.state.resource(&nfs()).unwrap();
-        assert!(st.is_on() && !st.ours());
-        // The book is readable again: the host is adopted then.
-        d.jobs_off = false;
+        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        // The lease is part of what the tick says to keep, and `apply` takes it in.
+        assert_eq!(d.leases.len(), 1);
+        assert!(d.leases[0].is_adopted_host());
+        assert!(d.state.resource(&nfs()).unwrap().ours());
+        // The next tick, still without a job book, finds the lease and adopts nothing more.
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
-        assert!(d.state.resource(&nfs()).unwrap().ours());
+        assert!(r.adopted.is_empty(), "{r:?}");
+        assert_eq!(d.leases.len(), 1);
+        // The host goes down: the adopted lease ends, jobs still off.
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        nfs_probe(&s, false);
+        let r = s.tick(clock.now(), &mut d);
+        assert_eq!(r.adoptions_ended, vec![nfs()], "{r:?}");
+        assert!(d.leases.is_empty());
+        assert!(!d.state.resource(&nfs()).unwrap().ours());
     }
 
     #[test]
@@ -3199,7 +3207,7 @@ mod tests {
             let r = s.tick(clock.now(), &mut d);
             assert_eq!(
                 d.state.resource(&nfs()).unwrap().power,
-                PowerPhase::Off { ours: false },
+                PowerPhase::Off { ours: true },
                 "{r:?}"
             );
             assert!(d.state.resource(&nfs()).unwrap().ours());

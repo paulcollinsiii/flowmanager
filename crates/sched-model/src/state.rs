@@ -728,7 +728,7 @@ mod tests {
         }
     }
 
-    const BASE: &str = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"idle_since":null,"pending_recovery":[],"shutdown":SHUTDOWN,"off_since":null}"#;
+    const BASE: &str = r#"{"power":{"phase":"on","since":1,"ours":true},"mode":{"phase":"idle"},"idle_since":null,"pending_recovery":[],"shutdown":SHUTDOWN,"off_since":null}"#;
 
     fn resource_with(shutdown: &str) -> Result<ResourceState, serde_json::Error> {
         serde_json::from_str(&BASE.replace("SHUTDOWN", shutdown))
@@ -913,5 +913,53 @@ mod tests {
         // Not a resource the sequencer treats as on.
         assert!(!ResourceState::new(p).is_on());
         assert!(serde_yaml_ng::from_str::<PowerPhase>(r#"{"phase":"failed","since":9}"#).is_err());
+    }
+
+    #[test]
+    fn the_ours_marker_lives_on_off_and_on_only_and_a_missing_one_means_not_ours() {
+        let read = |text: &str| serde_json::from_str::<PowerPhase>(text);
+        assert_eq!(
+            read(r#"{"phase":"off"}"#).unwrap(),
+            PowerPhase::Off { ours: false }
+        );
+        assert_eq!(
+            read(r#"{"phase":"on","since":4}"#).unwrap(),
+            PowerPhase::On {
+                since: Millis(4),
+                ours: false
+            }
+        );
+        // Always written, and it reads back.
+        for p in [
+            PowerPhase::Off { ours: true },
+            PowerPhase::Off { ours: false },
+            PowerPhase::On {
+                since: Millis(4),
+                ours: true,
+            },
+        ] {
+            let text = serde_json::to_string(&p).unwrap();
+            assert!(text.contains("\"ours\""), "{text}");
+            assert_eq!(read(&text).unwrap(), p);
+        }
+        // The phases that cannot carry it refuse it, so no transition has to clear it there.
+        for text in [
+            r#"{"phase":"powering_on","since":1,"ours":true}"#,
+            r#"{"phase":"shutting_down","since":1,"ours":true}"#,
+            r#"{"phase":"failed","since":1,"during":"powering_on","ours":true}"#,
+        ] {
+            assert!(read(text).is_err(), "{text}");
+        }
+        // The old free-standing flag is gone (version 4 of the stored state).
+        let old = r#"{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true,"idle_since":null}"#;
+        assert!(serde_json::from_str::<ResourceState>(old).is_err());
+        // `ours()` and `set_ours` see only the two phases that carry it.
+        let mut st = ResourceState::new(PowerPhase::Off { ours: true });
+        assert!(st.ours());
+        st.set_ours(false);
+        assert_eq!(st.power, PowerPhase::Off { ours: false });
+        let mut st = ResourceState::new(PowerPhase::PoweringOn { since: Millis(1) });
+        st.set_ours(true);
+        assert!(!st.ours() && st.power == PowerPhase::PoweringOn { since: Millis(1) });
     }
 }

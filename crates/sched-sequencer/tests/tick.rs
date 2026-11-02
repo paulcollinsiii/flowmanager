@@ -1002,7 +1002,6 @@ fn power_on_only_with_a_reason() {
         let d = off().want(G, want).run();
         assert_steps(&d, vec![Step::PowerOn { resource: rid(G) }], "wanted");
         assert!(matches!(power_of(&d, G), PowerPhase::PoweringOn { .. }));
-        assert!(d.state.resource(&rid(G)).unwrap().ours());
     }
 }
 
@@ -1831,8 +1830,8 @@ fn manual(mut c: Case) -> Case {
     c
 }
 
-fn host_state(power: &str, mode: &str, managed: bool) -> String {
-    format!("{{ power: {power}, mode: {mode}, managed: {managed} }}")
+fn host_state(power: &str, mode: &str) -> String {
+    format!("{{ power: {power}, mode: {mode} }}")
 }
 
 #[test]
@@ -1840,7 +1839,7 @@ fn manual_control_never_powers_a_host_on_and_waits_for_a_person() {
     let lease = lease_on("m", G, "{ type: manual_model, model: llm }");
     let c = manual(
         Case::new()
-            .gpu_state(&host_state("{ phase: \"off\" }", "{ phase: idle }", false))
+            .gpu_state(&host_state("{ phase: \"off\" }", "{ phase: idle }"))
             .obs(up(G, false, 0))
             .lease(lease)
             .target(Some("llm"))
@@ -1861,7 +1860,7 @@ fn manual_control_never_powers_a_host_on_and_waits_for_a_person() {
     // A person powers it on: the phase follows the observation and the model is allowed.
     let on = manual(
         Case::new()
-            .gpu_state(&host_state("{ phase: \"off\" }", "{ phase: idle }", false))
+            .gpu_state(&host_state("{ phase: \"off\" }", "{ phase: idle }"))
             .target(Some("llm"))
             .want(G, PowerWant::Manual),
     );
@@ -1914,7 +1913,7 @@ fn manual_control_converges_transitional_phases_to_what_is_observed() {
     // Shutting down but observed up: on again, and the model can be allowed.
     let d = manual(
         Case::new()
-            .gpu_state(&host_state(shutting, "{ phase: idle }", true))
+            .gpu_state(&host_state(shutting, "{ phase: idle }"))
             .target(Some("mineru")),
     )
     .run();
@@ -1924,7 +1923,7 @@ fn manual_control_converges_transitional_phases_to_what_is_observed() {
     // Powering on but observed down: off.
     let d = manual(
         Case::new()
-            .gpu_state(&host_state(powering, "{ phase: idle }", true))
+            .gpu_state(&host_state(powering, "{ phase: idle }"))
             .obs(up(G, false, 0)),
     )
     .run();
@@ -1932,7 +1931,7 @@ fn manual_control_converges_transitional_phases_to_what_is_observed() {
     // Without a fresh reading the phase cannot be known yet: it holds, visibly.
     let d = manual(
         Case::new()
-            .gpu_state(&host_state(shutting, "{ phase: idle }", true))
+            .gpu_state(&host_state(shutting, "{ phase: idle }"))
             .drop_obs("type: resource_up, resource: cuda-central")
             .target(Some("mineru")),
     )
@@ -1942,7 +1941,7 @@ fn manual_control_converges_transitional_phases_to_what_is_observed() {
     // Under managed control a host observed up stays shutting down (the managed machine
     // waits for it to go down).
     let recent = format!("{{ phase: shutting_down, since: {} }}", T - 1000);
-    let mut m = Case::new().gpu_state(&host_state(&recent, "{ phase: idle }", true));
+    let mut m = Case::new().gpu_state(&host_state(&recent, "{ phase: idle }"));
     m.config = example_config_managed();
     assert!(matches!(
         power_of(&m.run(), G),
@@ -2648,7 +2647,7 @@ fn something_holding_the_host_ends_the_wait_and_a_host_seen_down_ends_a_stop() {
             .nfs_state(&nfs_due(60 * MIN, Some(veto)))
             .obs(up(N, false, 0))
             .run();
-        assert_eq!(power_of(&d, N), PowerPhase::Off { ours: false });
+        assert_eq!(power_of(&d, N), PowerPhase::Off { ours: true });
         assert_eq!(veto_of(&d), None, "{veto}");
     }
 }
@@ -2856,7 +2855,7 @@ fn a_manual_lease_overrides_min_off() {
         .want(N, PowerWant::Manual)
         .run();
     assert_steps(&d, vec![Step::PowerOn { resource: rid(N) }], "manual");
-    assert!(d.state.resource(&rid(N)).unwrap().ours());
+    assert!(matches!(power_of(&d, N), PowerPhase::PoweringOn { .. }));
     assert_eq!(stamp_of(&d, N), None);
 }
 
@@ -3191,7 +3190,7 @@ fn a_new_manual_lease_cancels_a_drain_and_a_host_seen_off_ends_it() {
         .nfs_state(&nfs_draining("immediate", 0))
         .run();
     assert_eq!(nfs_drain_of(&d), None);
-    assert_eq!(power_of(&d, N), PowerPhase::Off { ours: false });
+    assert_eq!(power_of(&d, N), PowerPhase::Off { ours: true });
 }
 
 #[test]
@@ -3356,7 +3355,7 @@ fn a_host_seen_down_ends_an_idle_drain_and_manual_control_never_starts_one() {
         .nfs_state(&nfs_idle_drain(11 * MIN, MIN, None))
         .run();
     assert_eq!(nfs_drain_of(&d), None);
-    assert_eq!(power_of(&d, N), PowerPhase::Off { ours: false });
+    assert_eq!(power_of(&d, N), PowerPhase::Off { ours: true });
     // control: manual: nothing is ever drained or powered off.
     let mut c = Case::new().nfs_state(&nfs_due(60 * MIN, None));
     c.config = example_config();
@@ -3409,7 +3408,7 @@ fn a_managed_exclusive_host_that_is_off_is_powered_on_only_for_a_manual_want() {
         "{:?}",
         d.steps
     );
-    assert!(d.state.resource(&rid(G)).unwrap().ours());
+    assert!(matches!(power_of(&d, G), PowerPhase::PoweringOn { .. }));
 }
 
 #[test]

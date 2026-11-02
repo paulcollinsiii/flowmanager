@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(decode_state(None).unwrap(), CoreState::default());
         assert_eq!(decode_leases(None).unwrap(), LeaseBook::default());
         let text = String::from_utf8(encode_state(&s)).unwrap();
-        assert!(text.starts_with("{\"version\":3,\"data\":"), "{text}");
+        assert!(text.starts_with("{\"version\":4,\"data\":"), "{text}");
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
         let bytes = encode_state(&s);
         assert_eq!(decode_state(Some(&bytes)).unwrap(), s);
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.starts_with("{\"version\":3,\"data\":"), "{text}");
+        assert!(text.starts_with("{\"version\":4,\"data\":"), "{text}");
         assert_eq!(text.matches("\"off_since\":4000").count(), 1, "{text}");
         // A shutdown, in the stage it has reached, is part of the stored state.
         s.state
@@ -268,6 +268,10 @@ mod tests {
         // Version 2 stored a shutdown cause `reclaim` and a wind-down flag `reclaim`.
         let v2 = br#"{"version":2,"data":{"state":{"resources":{"b":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"shutdown":{"cause":{"kind":"reclaim"},"since":1,"withdrawal":"not_needed","veto":{"phase":"none"}}}}},"reported":["x"]}}"#;
         assert_eq!(decode_state(Some(v2)).unwrap(), CoreState::default());
+        // Version 3 stored a free-standing `managed` flag, now `ours` on the `off` and `on`
+        // phases.
+        let v3 = br#"{"version":3,"data":{"state":{"resources":{"b":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"managed":true}}},"reported":["x"]}}"#;
+        assert_eq!(decode_state(Some(v3)).unwrap(), CoreState::default());
         // The lease book is not versioned away: a stored `reclaim` lease (kind renamed
         // `lockout` in phase 4a, no alias) is an error until it is cleared.
         let reclaim_lease = br#"{"version":1,"data":{"next":1,"leases":[{"id":"reclaim-1","resource":"cuda-central","kind":{"type":"reclaim"},"granted_at":1}]}}"#;
@@ -281,11 +285,64 @@ mod tests {
     }
 
     #[test]
+    fn a_version_1_lease_book_is_read_without_its_adopted_leases_and_a_person_s_stay_requested() {
+        use sched_model::LeaseOrigin;
+        // As the build before phase 4b stored it: no `origin`, an adopted lease marked by the
+        // prefix of its id, a person's by `manual-host-<n>`.
+        let v1 = br#"{"version":1,"data":{"next":3,"leases":[
+            {"id":"adopted-host-basestar-nfs","resource":"basestar-nfs","kind":{"type":"manual_host"},"granted_at":1},
+            {"id":"manual-host-2","resource":"cuda-central","kind":{"type":"manual_host"},"granted_at":2},
+            {"id":"manual-model-3","resource":"cuda-central","kind":{"type":"manual_model","model":"llm"},"granted_at":3}]}}"#;
+        let book = decode_leases(Some(v1)).unwrap();
+        let ids: Vec<_> = book.leases.iter().map(|l| l.id.to_string()).collect();
+        assert_eq!(
+            ids,
+            ["manual-host-2", "manual-model-3"],
+            "adopted lease dropped"
+        );
+        assert!(
+            book.leases
+                .iter()
+                .all(|l| l.origin == LeaseOrigin::Requested && !l.is_adopted_host())
+        );
+        assert_eq!(book.next, 3, "the counter is kept");
+        // It is written back as version 2, with an origin on every lease.
+        let text = String::from_utf8(encode_leases(&book)).unwrap();
+        assert!(text.starts_with("{\"version\":2,\"data\":"), "{text}");
+        assert_eq!(
+            text.matches("\"origin\":\"requested\"").count(),
+            2,
+            "{text}"
+        );
+        assert_eq!(decode_leases(Some(text.as_bytes())).unwrap(), book);
+        // An adopted lease of this build round-trips as adopted.
+        let adopted = LeaseBook {
+            next: 0,
+            leases: vec![sched_sequencer::adopt::adopted_lease(
+                &"basestar-nfs".into(),
+                sched_model::Millis(5),
+            )],
+        };
+        let text = String::from_utf8(encode_leases(&adopted)).unwrap();
+        assert!(text.contains("\"origin\":\"adopted\""), "{text}");
+        assert_eq!(decode_leases(Some(text.as_bytes())).unwrap(), adopted);
+        assert!(decode_leases(Some(text.as_bytes())).unwrap().leases[0].is_adopted_host());
+        // A version 2 book is read as it is, whatever the ids say: only the origin decides.
+        let lookalike = text.replace("\"origin\":\"adopted\"", "\"origin\":\"requested\"");
+        assert!(
+            !decode_leases(Some(lookalike.as_bytes())).unwrap().leases[0].is_adopted_host(),
+            "a person's lease is never adopted"
+        );
+        // Any other version is still an error.
+        assert!(decode_leases(Some(br#"{"version":3,"data":{"next":0,"leases":[]}}"#)).is_err());
+    }
+
+    #[test]
     fn a_state_of_a_newer_version_is_still_an_error() {
-        let newer = br#"{"version":4,"data":{"state":{},"reported":[]}}"#;
+        let newer = br#"{"version":5,"data":{"state":{},"reported":[]}}"#;
         let e = decode_state(Some(newer)).unwrap_err();
         assert_eq!(e.key, STATE_KEY);
-        assert!(e.problem.contains("version 4"), "{e}");
+        assert!(e.problem.contains("version 5"), "{e}");
     }
 
     #[test]
@@ -304,17 +361,17 @@ mod tests {
 
     #[test]
     fn unknown_versions_garbage_and_unversioned_values_are_errors_not_resets() {
-        let newer = br#"{"version":4,"data":{"state":{},"reported":[],"later_field":1}}"#;
+        let newer = br#"{"version":5,"data":{"state":{},"reported":[],"later_field":1}}"#;
         let e = decode_state(Some(newer)).unwrap_err();
         assert_eq!(e.key, STATE_KEY);
-        assert!(e.problem.contains("version 4"), "{e}");
+        assert!(e.problem.contains("version 5"), "{e}");
         let e = decode_state(Some(b"not json")).unwrap_err();
         assert!(e.problem.contains("not a versioned document"), "{e}");
         // What the unversioned first cut stored.
         let e = decode_leases(Some(br#"{"next":1,"leases":[]}"#)).unwrap_err();
         assert!(e.problem.contains("no version"), "{e}");
         // The right version with a field this build does not know.
-        let e = decode_state(Some(br#"{"version":3,"data":{"surprise":true}}"#)).unwrap_err();
-        assert!(e.problem.contains("cannot decode version 3"), "{e}");
+        let e = decode_state(Some(br#"{"version":4,"data":{"surprise":true}}"#)).unwrap_err();
+        assert!(e.problem.contains("cannot decode version 4"), "{e}");
     }
 }
