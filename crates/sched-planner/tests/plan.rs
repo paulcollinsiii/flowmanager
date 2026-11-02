@@ -382,12 +382,12 @@ fn dedupe(obs: Vec<String>) -> Vec<String> {
 #[test]
 fn leases_override_selection() {
     let work = [ocr(1, T - MIN), transcription(1, T - MIN)];
-    let reclaim = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: reclaim }} }}");
-    let f = fixture(&work, &[&reclaim], None);
+    let lockout = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: lockout }} }}");
+    let f = fixture(&work, &[&lockout], None);
     let i = run(&f);
     assert_eq!(i.models[&ResourceId::new(G)], None);
     assert!(i.forced.contains(&ResourceId::new(G)));
-    assert!(i.reclaim.contains(&ResourceId::new(G)));
+    assert!(i.lockout.contains(&ResourceId::new(G)));
     assert!(i.power_up.is_empty());
 
     let manual = format!(
@@ -597,26 +597,26 @@ fn snapshot_order_never_changes_the_intent() {
 }
 
 #[test]
-fn a_reclaim_lease_on_a_shared_host_is_dropped_by_the_planner() {
-    let reclaim = "{ id: r, resource: basestar-nfs, granted_at: 0, kind: { type: reclaim } }";
+fn a_lockout_lease_on_a_shared_host_is_dropped_by_the_planner() {
+    let lockout = "{ id: r, resource: basestar-nfs, granted_at: 0, kind: { type: lockout } }";
     let host = "{ id: h, resource: basestar-nfs, granted_at: 0, kind: { type: manual_host } }";
-    let y = fixture_yaml(&[], &[reclaim, host], None);
-    // The fixture checker rejects the reclaim; the planner must cope with it anyway.
+    let y = fixture_yaml(&[], &[lockout, host], None);
+    // The fixture checker rejects the lockout; the planner must cope with it anyway.
     let f = Fixture::from_yaml(&y).unwrap();
     let i = run(&f);
-    assert!(i.reclaim.is_empty());
+    assert!(i.lockout.is_empty());
     assert_eq!(
         i.power_up.get(&ResourceId::new("basestar-nfs")),
         Some(&PowerWant::Manual)
     );
-    // A reclaim on the exclusive host is kept.
-    let reclaim = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: reclaim }} }}");
-    let f = fixture(&[], &[&reclaim], None);
-    assert!(run(&f).reclaim.contains(&ResourceId::new(G)));
+    // A lockout on the exclusive host is kept.
+    let lockout = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: lockout }} }}");
+    let f = fixture(&[], &[&lockout], None);
+    assert!(run(&f).lockout.contains(&ResourceId::new(G)));
 }
 
 #[test]
-fn a_reclaim_removes_the_power_wants_of_the_reclaimed_host_only() {
+fn a_lockout_removes_the_power_wants_of_the_locked_out_host_only() {
     let host = ResourceId::new(G);
     let nfs = ResourceId::new("basestar-nfs");
     let manual_host =
@@ -625,24 +625,24 @@ fn a_reclaim_removes_the_power_wants_of_the_reclaimed_host_only() {
         "{{ id: m, resource: {G}, granted_at: 0, kind: {{ type: manual_model, model: llm }} }}"
     );
     let nfs_host = "{ id: n, resource: basestar-nfs, granted_at: 0, kind: { type: manual_host } }";
-    let reclaim = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: reclaim }} }}");
+    let lockout = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: lockout }} }}");
     let backup = batch(1);
 
-    // Without the reclaim, both manual leases want the host powered.
+    // Without the lockout, both manual leases want the host powered.
     let f = fixture(&[], &[&manual_host, &manual_model], None);
     assert_eq!(run(&f).power_up.get(&host), Some(&PowerWant::Manual));
 
-    // With it, intake stops and no want to power the reclaimed host survives, whatever
+    // With it, intake stops and no want to power the locked out host survives, whatever
     // leases ask for it.
     let f = batch_fixture(
         std::slice::from_ref(&backup),
-        &[&manual_host, &manual_model, &reclaim, nfs_host],
+        &[&manual_host, &manual_model, &lockout, nfs_host],
     );
     let i = run_batch(&f);
-    assert!(i.reclaim.contains(&host));
+    assert!(i.lockout.contains(&host));
     assert!(
         !i.power_up.contains_key(&host),
-        "reclaimed host still has a power want: {:?}",
+        "locked-out host still has a power want: {:?}",
         i.power_up
     );
     assert_eq!(i.models[&host], None);
@@ -889,9 +889,9 @@ fn an_exclusive_host_is_wanted_up_only_by_a_manual_host_or_model_lease() {
     let host = format!("{{ id: h, resource: {G}, granted_at: 0, kind: {{ type: manual_host }} }}");
     let f = fixture(&work, &[&host], None);
     assert_eq!(run(&f).power_up.get(&gpu), Some(&PowerWant::Manual));
-    // A reclaim wins over it.
-    let reclaim = format!("{{ id: r, resource: {G}, granted_at: 1, kind: {{ type: reclaim }} }}");
-    let f = fixture(&work, &[&host, &reclaim], None);
+    // A lockout wins over it.
+    let lockout = format!("{{ id: r, resource: {G}, granted_at: 1, kind: {{ type: lockout }} }}");
+    let f = fixture(&work, &[&host, &lockout], None);
     assert!(!run(&f).power_up.contains_key(&gpu));
 }
 

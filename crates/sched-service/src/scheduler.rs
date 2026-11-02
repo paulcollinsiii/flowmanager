@@ -17,7 +17,7 @@
 //!   and bumps an epoch kept in the object's state, so a chain started earlier (before a
 //!   restart, say) sees a stale epoch and ends instead of doubling the ticks.
 //! - `acquire_host_lease` / `release_host_lease`: a manual lease on a host with a power section (an NFS
-//!   server, or a GPU host): it powers a managed host on and keeps it up. `reclaim` / `unreclaim`: take an
+//!   server, or a GPU host): it powers a managed host on and keeps it up. `lockout` / `clear_lockout`: take an
 //!   exclusive resource with a power section back, and give it up again. `resume`: for a
 //!   person who fixed a host by hand, clears what flowmanager stopped at on one resource (a
 //!   failed power transition, or a shutdown stopped by mounting pods) so it follows
@@ -357,29 +357,29 @@ impl Scheduler {
         ))
     }
 
-    /// Reclaims an exclusive resource with a power section: intake stops, its work is cut
-    /// off after the reclaim timeout, the host is shut down (if its power is managed) and it
-    /// is not woken until `unreclaim`. Asking again returns the same lease; a resource that
-    /// cannot be reclaimed (shared, or without a power section) or an unknown one is refused
+    /// Lockouts an exclusive resource with a power section: intake stops, its work is cut
+    /// off after the lockout timeout, the host is shut down (if its power is managed) and it
+    /// is not woken until `clear_lockout`. Asking again returns the same lease; a resource that
+    /// cannot be locked out (shared, or without a power section) or an unknown one is refused
     /// (400).
     #[handler]
-    async fn reclaim(
+    async fn lockout(
         &self,
         ctx: ObjectContext<'_>,
         Json(req): Json<ResourceRequest>,
     ) -> Result<Json<LeaseGrant>, HandlerError> {
-        Ok(Json(object::reclaim(&self.shared, &Rctx(&ctx), req).await?))
+        Ok(Json(object::lockout(&self.shared, &Rctx(&ctx), req).await?))
     }
 
-    /// Releases the reclaim on a resource and returns it; none held is refused (404).
+    /// Releases the lockout on a resource and returns it; none held is refused (404).
     #[handler]
-    async fn unreclaim(
+    async fn clear_lockout(
         &self,
         ctx: ObjectContext<'_>,
         Json(req): Json<ResourceRequest>,
     ) -> Result<Json<Lease>, HandlerError> {
         Ok(Json(
-            object::unreclaim(&self.shared, &Rctx(&ctx), req).await?,
+            object::clear_lockout(&self.shared, &Rctx(&ctx), req).await?,
         ))
     }
 
@@ -628,19 +628,19 @@ mod tests {
                 ("acquire_model_lease".to_string(), None),
                 ("arm_backstop".to_string(), None),
                 ("backstop".to_string(), None),
+                ("clear_lockout".to_string(), None),
                 ("discard_state".to_string(), None),
                 ("drain_host".to_string(), None),
                 ("jobs".to_string(), None),
                 ("last_decision".to_string(), None),
                 ("leases".to_string(), None),
+                ("lockout".to_string(), None),
                 ("observe".to_string(), Some(true)),
-                ("reclaim".to_string(), None),
                 ("release_host_lease".to_string(), None),
                 ("release_lease".to_string(), None),
                 ("resume".to_string(), None),
                 ("tick".to_string(), None),
                 ("trigger_job".to_string(), None),
-                ("unreclaim".to_string(), None),
             ]
         );
         assert_eq!(d.ingress_private, None);

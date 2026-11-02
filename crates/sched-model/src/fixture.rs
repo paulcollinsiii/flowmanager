@@ -308,13 +308,13 @@ impl Fixture {
                         l.resource.as_str()
                     ),
                 ),
-                LeaseKind::Reclaim
+                LeaseKind::Lockout
                     if res.kind != ResourceKind::Exclusive || res.power.is_none() =>
                 {
                     add(
                         &at,
                         format!(
-                            "reclaim on resource {:?}, which is not an exclusive resource with a power section",
+                            "lockout on resource {:?}, which is not an exclusive resource with a power section",
                             l.resource.as_str()
                         ),
                     )

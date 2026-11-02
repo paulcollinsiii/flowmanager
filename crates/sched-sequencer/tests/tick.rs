@@ -183,8 +183,8 @@ impl Case {
         self
     }
 
-    fn reclaim(mut self) -> Case {
-        self.intent.reclaim.insert(rid(G));
+    fn lockout(mut self) -> Case {
+        self.intent.lockout.insert(rid(G));
         self.intent.models.insert(rid(G), None);
         self.intent.forced.insert(rid(G));
         self
@@ -379,7 +379,7 @@ fn allowing_a_model_never_waits_on_pods_but_needs_the_host_freshly_up() {
 #[test]
 fn pod_observations_never_change_a_decision() {
     // Cases that reach every branch of the mode machine: allow, stay, wind down, switch,
-    // forced switch with a kill, and reclaim.
+    // forced switch with a kill, and lockout.
     let cases: Vec<(&str, Case)> = vec![
         ("allow", Case::new().target(Some("mineru"))),
         (
@@ -406,8 +406,8 @@ fn pod_observations_never_change_a_decision() {
             Case::new().gpu(&serving("mineru", MIN)).target(Some("llm")),
         ),
         (
-            "reclaim",
-            Case::new().gpu(&serving("mineru", 10 * MIN)).reclaim(),
+            "lockout",
+            Case::new().gpu(&serving("mineru", 10 * MIN)).lockout(),
         ),
         // A power-off is not among them: the veto reads the host's models' pods (see
         // `the_pods_veto_*`).
@@ -678,8 +678,8 @@ fn gate_classes_follow_their_hosts_and_nothing_else() {
         .obs(up(N, false, 0))
         .run();
     assert!(!d.allowed.classes.contains(&gate));
-    // A reclaimed GPU host closes it too.
-    assert!(!Case::new().reclaim().run().allowed.classes.contains(&gate));
+    // A locked out GPU host closes it too.
+    assert!(!Case::new().lockout().run().allowed.classes.contains(&gate));
 }
 
 #[test]
@@ -857,7 +857,7 @@ fn forced_switches_give_in_flight_work_its_timeout() {
 }
 
 #[test]
-fn reclaim_uses_reclaim_timeout_and_class_kill_timeout() {
+fn lockout_uses_lockout_timeout_and_class_kill_timeout() {
     // A class-level kill_timeout shortens the wait for that class.
     let yaml = managed_yaml().replace(
         "    preemptibility: kill\n    demand: { source: paperless-ocr-pending }",
@@ -869,13 +869,13 @@ fn reclaim_uses_reclaim_timeout_and_class_kill_timeout() {
         .gpu(&serving("mineru", 10 * MIN))
         .obs(pods("mineru", 1, 1, 0))
         .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
-        .reclaim();
+        .lockout();
     c.config = config;
     let d = c.run();
     assert_steps(
         &d,
         vec![pause("paperless-ocr"), wait(G, WaitReason::InFlightWork)],
-        "reclaim starts",
+        "lockout starts",
     );
     assert_steps(
         &c.run_at(&d.state, T + MIN - 1),
@@ -888,32 +888,32 @@ fn reclaim_uses_reclaim_timeout_and_class_kill_timeout() {
         "class timeout elapsed",
     );
 
-    // With a distinct reclaim_timeout the policy value applies.
+    // With a distinct lockout_timeout the policy value applies.
     let yaml = managed_yaml().replace(
         "  drain_timeout: 10m",
-        "  drain_timeout: 10m\n  reclaim_timeout: 2m",
+        "  drain_timeout: 10m\n  lockout_timeout: 2m",
     );
     let mut c = Case::new()
         .gpu(&serving("mineru", 10 * MIN))
         .obs(pods("mineru", 1, 1, 0))
         .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
-        .reclaim();
+        .lockout();
     c.config = Config::from_yaml(&yaml).unwrap();
     let d = c.run();
     assert_steps(
         &c.run_at(&d.state, T + 2 * MIN - 1),
         vec![wait(G, WaitReason::InFlightWork)],
-        "before reclaim timeout",
+        "before lockout timeout",
     );
     assert_steps(
         &c.run_at(&d.state, T + 2 * MIN),
         vec![kill("paperless-ocr"), drain("mineru")],
-        "reclaim timeout elapsed",
+        "lockout timeout elapsed",
     );
 }
 
 #[test]
-fn reclaim_shuts_the_host_down_overriding_holds_and_grace() {
+fn lockout_shuts_the_host_down_overriding_holds_and_grace() {
     let lease = format!(
         "{{ id: h, resource: {G}, granted_at: 0, kind: {{ type: shared_hold, holder: x }} }}"
     );
@@ -921,25 +921,25 @@ fn reclaim_shuts_the_host_down_overriding_holds_and_grace() {
     let d = Case::new()
         .lease(lease.clone())
         .obs(demand("paperless-ocr", "paperless-ocr-pending", 4, 0, 0))
-        .reclaim()
+        .lockout()
         .run();
     assert_steps(
         &d,
         vec![Step::PowerOff { resource: rid(G) }],
-        "reclaim powers off",
+        "lockout powers off",
     );
     assert!(matches!(power_of(&d, G), PowerPhase::ShuttingDown { .. }));
     assert!(d.allowed.models.is_empty());
 
-    // The pods veto applies to a reclaim's power-off too: a stale reading is unknown, and
+    // The pods veto applies to a lockout's power-off too: a stale reading is unknown, and
     // unknown counts as in use.
-    let d = Case::new().obs(pods("llm", 2, 2, 31_000)).reclaim().run();
+    let d = Case::new().obs(pods("llm", 2, 2, 31_000)).lockout().run();
     assert_steps(
         &d,
         vec![wait(G, WaitReason::VetoUnknown)],
         "a stale pod reading holds the power-off",
     );
-    let d = Case::new().obs(up(G, true, 31_000)).reclaim().run();
+    let d = Case::new().obs(up(G, true, 31_000)).lockout().run();
     assert_steps(
         &d,
         vec![wait(G, WaitReason::StaleObservation)],
@@ -947,13 +947,13 @@ fn reclaim_shuts_the_host_down_overriding_holds_and_grace() {
     );
 
     // A model allowed a second ago, with nothing in flight, is wound down and withdrawn
-    // at once (a reclaim ignores min_dwell); the power-off follows on the next tick.
+    // at once (a lockout ignores min_dwell); the power-off follows on the next tick.
     let c = Case::new()
         .gpu(&format!(
             "{{ phase: loading, model: mineru, since: {} }}",
             T - 1000
         ))
-        .reclaim();
+        .lockout();
     let d = c.obs(pods("mineru", 1, 0, 0)).run();
     assert_steps(
         &d,
@@ -964,13 +964,13 @@ fn reclaim_shuts_the_host_down_overriding_holds_and_grace() {
     let off = Case::new()
         .gpu_state("{ power: { phase: \"off\" }, mode: { phase: idle } }")
         .obs(up(G, false, 0))
-        .reclaim()
+        .lockout()
         .want(G, PowerWant::Manual);
     let d = off.run();
     assert_steps(
         &d,
-        vec![wait(G, WaitReason::Reclaimed)],
-        "a reclaimed host is not woken, even if wanted",
+        vec![wait(G, WaitReason::LockedOut)],
+        "a locked-out host is not woken, even if wanted",
     );
     assert!(!uses_gpu(&d));
 }
@@ -1267,22 +1267,22 @@ fn lease_on(id: &str, res: &str, kind: &str) -> String {
 }
 
 #[test]
-fn a_reclaim_on_a_shared_resource_is_ignored_and_never_overrides_holds() {
+fn a_lockout_on_a_shared_resource_is_ignored_and_never_overrides_holds() {
     let hold = lease_on("h", N, "{ type: shared_hold, holder: x }");
-    let reclaim = lease_on("r", N, "{ type: reclaim }");
+    let lockout = lease_on("r", N, "{ type: lockout }");
     let mut c = Case::new()
         .nfs_state(&managed_idle(99 * MIN))
         .lease(hold)
-        .lease(reclaim);
+        .lease(lockout);
     // A planner bug (or a hand-made intent) that names the shared resource changes nothing.
-    c.intent.reclaim.insert(rid(N));
+    c.intent.lockout.insert(rid(N));
     let d = c.run();
     assert!(
         !d.steps.contains(&Step::PowerOff { resource: rid(N) }),
         "{:?}",
         d.steps
     );
-    assert!(d.steps.contains(&wait(N, WaitReason::ReclaimUnsupported)));
+    assert!(d.steps.contains(&wait(N, WaitReason::LockoutUnsupported)));
     assert!(matches!(power_of(&d, N), PowerPhase::On { .. }));
     assert!(
         d.allowed.classes.contains(&cid("paperless-ngx")),
@@ -1293,9 +1293,9 @@ fn a_reclaim_on_a_shared_resource_is_ignored_and_never_overrides_holds() {
     let d = Case::new()
         .nfs_state(&managed_idle(99 * MIN))
         .lease(lease_on("h", N, "{ type: shared_hold, holder: x }"))
-        .lease(lease_on("r", N, "{ type: reclaim }"))
+        .lease(lease_on("r", N, "{ type: lockout }"))
         .run();
-    assert!(d.steps.contains(&wait(N, WaitReason::ReclaimUnsupported)));
+    assert!(d.steps.contains(&wait(N, WaitReason::LockoutUnsupported)));
     assert!(!d.steps.contains(&Step::PowerOff { resource: rid(N) }));
 }
 
@@ -1503,7 +1503,7 @@ fn a_legacy_wind_down_without_a_timeout_gets_one_and_keeps_its_clock() {
         Some(sched_model::WindDown {
             since: sched_model::Millis(T - 3 * MIN),
             timeout: Some(sched_model::Millis(10 * MIN)),
-            reclaim: false,
+            lockout: false,
             killed: Default::default(),
         })
     );
@@ -1586,7 +1586,7 @@ fn each_class_is_stopped_when_its_own_timeout_expires() {
             .obs(pods("llm", 1, 1, 0))
             .obs(demand("paperless-tagging", "paperless-post-ocr", 0, 1, 0))
             .obs(demand("speakr-summarization", "speakr-summaries", 0, 1, 0))
-            .reclaim();
+            .lockout();
         c.config = Config::from_yaml(&yaml).unwrap();
         c
     };
@@ -1601,7 +1601,7 @@ fn each_class_is_stopped_when_its_own_timeout_expires() {
         ],
         "start",
     );
-    // Tagging's own timeout (1m) is shorter than the reclaim timeout (10m).
+    // Tagging's own timeout (1m) is shorter than the lockout timeout (10m).
     let d1 = busy().run_at(&d0.state, T + MIN);
     assert_steps(
         &d1,
@@ -1724,22 +1724,22 @@ fn future_dated_observations_are_not_fresh() {
 }
 
 /// What a change of cause during a wind-down does to `since` and the timeout: the clock
-/// restarts exactly when the cause flips between reclaim and not-reclaim; a manual lease
+/// restarts exactly when the cause flips between lockout and not-lockout; a manual lease
 /// coming or going (both use drain_timeout) leaves it alone.
 #[test]
-fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
+fn a_cause_change_restarts_the_clock_only_when_lockout_flips() {
     let yaml = managed_yaml().replace(
         "  drain_timeout: 10m",
-        "  drain_timeout: 10m\n  reclaim_timeout: 2m",
+        "  drain_timeout: 10m\n  lockout_timeout: 2m",
     );
-    // `cause`: 0 unforced, 1 manual lease, 2 reclaim.
+    // `cause`: 0 unforced, 1 manual lease, 2 lockout.
     let base = |cause: u8| {
         let mut c = Case::new()
             .gpu(&serving("mineru", 30 * MIN))
             .obs(pods("mineru", 1, 1, 0))
             .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0));
         c = if cause == 2 {
-            c.reclaim()
+            c.lockout()
         } else {
             c.target(Some("llm"))
         };
@@ -1752,7 +1752,7 @@ fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
     let ms = sched_model::Millis;
     let shape = |d: &Decision| {
         let wd = wind_down(d).unwrap();
-        (wd.since, wd.timeout, wd.reclaim)
+        (wd.since, wd.timeout, wd.lockout)
     };
     // Unforced start: already bounded by drain_timeout.
     let d0 = base(0).run();
@@ -1770,12 +1770,12 @@ fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
         "the original cut-off still holds after the lease came and went",
     );
 
-    // unforced -> reclaim: restarts with the reclaim timeout.
+    // unforced -> lockout: restarts with the lockout timeout.
     let d2 = base(2).run_fresh_at(&d0.state, T + 5 * MIN);
     assert_steps(
         &d2,
         vec![wait(G, WaitReason::InFlightWork)],
-        "the reclaim restarts rather than inheriting the elapsed time",
+        "the lockout restarts rather than inheriting the elapsed time",
     );
     assert_eq!(shape(&d2), (ms(T + 5 * MIN), Some(ms(2 * MIN)), true));
     let d2b = base(2).run_fresh_at(&d2.state, T + 7 * MIN - 1);
@@ -1783,10 +1783,10 @@ fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
     assert_steps(
         &base(2).run_fresh_at(&d2b.state, T + 7 * MIN),
         vec![kill("paperless-ocr"), drain("mineru")],
-        "reclaim timeout over",
+        "lockout timeout over",
     );
 
-    // reclaim -> unforced (the reclaim ended): restarts with drain_timeout, never no timeout.
+    // lockout -> unforced (the lockout ended): restarts with drain_timeout, never no timeout.
     let d3 = base(0).run_fresh_at(&d2.state, T + 6 * MIN);
     assert_eq!(shape(&d3), (ms(T + 6 * MIN), Some(ms(10 * MIN)), false));
     assert_steps(
@@ -1800,7 +1800,7 @@ fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
         "fresh drain_timeout over",
     );
 
-    // manual lease -> reclaim -> manual lease: each flip restarts.
+    // manual lease -> lockout -> manual lease: each flip restarts.
     let m0 = base(1).run();
     let m1 = base(2).run_fresh_at(&m0.state, T + MIN);
     let m2 = base(1).run_fresh_at(&m1.state, T + 2 * MIN);
@@ -1824,14 +1824,14 @@ fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
         "    preemptibility: kill\n    kill_timeout: 1m\n    demand: { source: paperless-post-ocr }",
     );
     assert_ne!(yaml_k, yaml);
-    let llm = |reclaim: bool| {
+    let llm = |lockout: bool| {
         let mut c = Case::new()
             .gpu(&serving("llm", 30 * MIN))
             .obs(pods("llm", 1, 1, 0))
             .obs(demand("paperless-tagging", "paperless-post-ocr", 0, 1, 0))
             .obs(demand("speakr-summarization", "speakr-summaries", 0, 1, 0));
-        c = if reclaim {
-            c.reclaim()
+        c = if lockout {
+            c.lockout()
         } else {
             c.target(Some("mineru"))
         };
@@ -1848,7 +1848,7 @@ fn a_cause_change_restarts_the_clock_only_when_reclaim_flips() {
     let k2 = llm(true).run_fresh_at(&k1.state, T + 2 * MIN);
     assert_steps(&k2, vec![wait(G, WaitReason::InFlightWork)], "flipped");
     let wd = wind_down(&k2).unwrap();
-    assert_eq!((wd.since, wd.reclaim), (ms(T + 2 * MIN), true));
+    assert_eq!((wd.since, wd.lockout), (ms(T + 2 * MIN), true));
     assert!(wd.killed.contains(&cid("paperless-tagging")));
 }
 
@@ -1979,8 +1979,8 @@ fn manual_control_converges_transitional_phases_to_what_is_observed() {
 }
 
 #[test]
-fn manual_control_reclaim_clears_the_model_but_does_not_power_off() {
-    let d = manual(Case::new().reclaim()).run();
+fn manual_control_lockout_clears_the_model_but_does_not_power_off() {
+    let d = manual(Case::new().lockout()).run();
     assert!(
         !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
         "{:?}",
@@ -2090,10 +2090,10 @@ fn recovery_never_runs_while_the_class_is_not_allowed() {
         .obs(items())
         .run();
     assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
-    // Reclaimed.
+    // Lockouted.
     let d = Case::new()
         .gpu(&serving("whisperx", 10 * MIN))
-        .reclaim()
+        .lockout()
         .obs(items())
         .run();
     assert_eq!(recoveries(&d), 0, "{:?}", d.steps);
@@ -2695,7 +2695,7 @@ fn an_unchecked_host_is_powered_off_without_a_mount_reading() {
 
 // Before a managed GPU host is powered off its model is wound down: the shutdown follows the
 // mode going idle (after the bounded wind-down of in-flight work, see `drain_timeout` and
-// `reclaim_timeout`), never the other way round.
+// `lockout_timeout`), never the other way round.
 
 #[test]
 fn a_managed_gpu_host_is_never_powered_off_while_a_model_is_allowed_and_only_after_the_drain() {
@@ -2743,8 +2743,8 @@ fn a_managed_gpu_host_is_never_powered_off_while_a_model_is_allowed_and_only_aft
 }
 
 #[test]
-fn a_reclaim_gives_in_flight_work_its_timeout_before_the_managed_gpu_host_is_shut_down() {
-    // whisperx serving with work in flight, a reclaim: the model is wound down first. Nothing
+fn a_lockout_gives_in_flight_work_its_timeout_before_the_managed_gpu_host_is_shut_down() {
+    // whisperx serving with work in flight, a lockout: the model is wound down first. Nothing
     // powers the host off while it is winding down, or in the tick that drains the model.
     let serving_whisperx = format!(
         "{{ phase: serving, model: whisperx, since: {} }}",
@@ -2756,10 +2756,10 @@ fn a_reclaim_gives_in_flight_work_its_timeout_before_the_managed_gpu_host_is_shu
             on()
         ))
         .obs(demand("speakr-transcription", "speakr-pending", 0, 1, 0))
-        .reclaim();
+        .lockout();
     let mut st = case.state();
     let mut powered_off_at = None;
-    // The example's drain_timeout (the reclaim timeout default) is 10 minutes.
+    // The example's drain_timeout (the lockout timeout default) is 10 minutes.
     for i in 0..=12u64 {
         let d = case.run_fresh_at(&st, T + i * MIN);
         if d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })) {
@@ -2980,7 +2980,7 @@ fn the_wait_is_a_delay_of_a_fresh_decision_never_a_retry() {
 }
 
 #[test]
-fn min_off_also_holds_back_an_exclusive_host_and_a_reclaim_is_not_delayed() {
+fn min_off_also_holds_back_an_exclusive_host_and_a_lockout_is_not_delayed() {
     let off = format!(
         "{{ power: {{ phase: \"off\" }}, mode: {{ phase: idle }}, off_since: {} }}",
         T - MIN
@@ -2998,11 +2998,11 @@ fn min_off_also_holds_back_an_exclusive_host_and_a_reclaim_is_not_delayed() {
         d.steps
     );
     assert!(d.allowed.models.is_empty());
-    // A reclaim removes the want and the wait says reclaimed, as before.
+    // A lockout removes the want and the wait says locked out, as before.
     let d = with_min_off(Case::new())
         .gpu_state(&off)
         .obs(up(G, false, 0))
-        .reclaim()
+        .lockout()
         .run();
     assert!(
         !d.steps.contains(&wait(G, WaitReason::MinOff)),
@@ -3863,7 +3863,7 @@ fn the_pods_veto_wait_keeps_its_start_ends_when_the_pods_are_gone_and_is_bounded
 }
 
 #[test]
-fn the_pods_veto_applies_to_a_requested_shutdown_and_a_reclaim_too() {
+fn the_pods_veto_applies_to_a_requested_shutdown_and_a_lockout_too() {
     // Requested: withdrawn (the model is gone), then the veto; a stop keeps it withdrawn.
     let requested = |ago: u64| {
         Case::new()
@@ -3887,29 +3887,29 @@ fn the_pods_veto_applies_to_a_requested_shutdown_and_a_reclaim_too() {
         vec![Step::PowerOff { resource: rid(G) }],
         "requested, clear",
     );
-    // Reclaim: the same.
-    let d = Case::new().obs(pods("whisperx", 1, 1, 0)).reclaim().run();
-    assert_steps(&d, vec![wait(G, WaitReason::VetoInUse)], "reclaim, in use");
+    // Lockout: the same.
+    let d = Case::new().obs(pods("whisperx", 1, 1, 0)).lockout().run();
+    assert_steps(&d, vec![wait(G, WaitReason::VetoInUse)], "lockout, in use");
     let s = d.state.resource(&rid(G)).unwrap().shutdown.unwrap();
-    assert_eq!(s.cause(), sched_model::ShutdownCause::Reclaim);
-    let d = Case::new().reclaim().run();
+    assert_eq!(s.cause(), sched_model::ShutdownCause::Lockout);
+    let d = Case::new().lockout().run();
     assert_steps(
         &d,
         vec![Step::PowerOff { resource: rid(G) }],
-        "reclaim, clear",
+        "lockout, clear",
     );
-    // A reclaim's veto is bounded like any other.
-    let stopped = Case::new().obs(pods("whisperx", 1, 1, 0)).reclaim();
+    // A lockout's veto is bounded like any other.
+    let stopped = Case::new().obs(pods("whisperx", 1, 1, 0)).lockout();
     let first = stopped.run();
     let d = stopped.run_fresh_at(&first.state, T + 30 * MIN);
     assert_steps(
         &d,
         vec![wait(G, WaitReason::ShutdownStopped)],
-        "reclaim stops",
+        "lockout stops",
     );
     assert!(matches!(gpu_veto_of(&d), Some(Veto::Stopped { .. })));
     let s = d.state.resource(&rid(G)).unwrap().shutdown.unwrap();
-    assert_eq!(s.cause(), sched_model::ShutdownCause::Reclaim);
+    assert_eq!(s.cause(), sched_model::ShutdownCause::Lockout);
 }
 
 #[test]
@@ -4031,7 +4031,7 @@ fn a_graceful_request_gives_exactly_drain_timeout_from_the_request() {
     // (1) Arriving in the middle of an unforced wind-down that started 9 minutes ago: that
     // start does not shorten it.
     let mid_wind_down = format!(
-        "{{ phase: serving, model: mineru, since: {}, wind_down: {{ since: {}, timeout: 600000, reclaim: false }} }}",
+        "{{ phase: serving, model: mineru, since: {}, wind_down: {{ since: {}, timeout: 600000, lockout: false }} }}",
         T - 20 * MIN,
         T - 9 * MIN
     );
@@ -4107,11 +4107,11 @@ fn a_graceful_request_gives_exactly_drain_timeout_from_the_request() {
 }
 
 #[test]
-fn a_reclaim_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_one_stays_immediate()
+fn a_lockout_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_one_stays_immediate()
 {
     let yaml = managed_yaml().replace(
         "  drain_timeout: 10m",
-        "  drain_timeout: 10m\n  reclaim_timeout: 2m",
+        "  drain_timeout: 10m\n  lockout_timeout: 2m",
     );
     let config = Config::from_yaml(&yaml).unwrap();
     let case = |mode: &str| {
@@ -4124,7 +4124,7 @@ fn a_reclaim_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_on
             ))
             .obs(pods("mineru", 1, 1, 0))
             .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
-            .reclaim();
+            .lockout();
         c.config = config.clone();
         c
     };
@@ -4139,22 +4139,22 @@ fn a_reclaim_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_on
     assert_steps(
         &d1,
         vec![wait(G, WaitReason::InFlightWork)],
-        "inside reclaim_timeout",
+        "inside lockout_timeout",
     );
     let d2 = c.run_fresh_at(&d.state, T + 2 * MIN);
     assert_steps(
         &d2,
         vec![kill("paperless-ocr"), drain("mineru")],
-        "reclaim_timeout, not drain_timeout",
+        "lockout_timeout, not drain_timeout",
     );
-    // Immediate beside a reclaim cuts off at once.
+    // Immediate beside a lockout cuts off at once.
     let d = case("immediate").run();
     assert!(d.steps.contains(&kill("paperless-ocr")), "{:?}", d.steps);
 }
 
 #[test]
-fn a_reclaim_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
-    // The veto stopped an idle shutdown (the host is unmanaged now). A reclaim calls the
+fn a_lockout_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
+    // The veto stopped an idle shutdown (the host is unmanaged now). A lockout calls the
     // power-off whatever `managed` says: only the stopped guard keeps it from powering the
     // host off, and from hiding the stop by starting a fresh wait.
     let stopped = format!(
@@ -4166,7 +4166,7 @@ fn a_reclaim_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
         let d = Case::new()
             .gpu_state(&stopped)
             .obs(pods("llm", pods_now, pods_now, 0))
-            .reclaim()
+            .lockout()
             .run();
         assert_steps(
             &d,

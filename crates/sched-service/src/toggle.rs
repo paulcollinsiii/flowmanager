@@ -23,7 +23,7 @@
 //!   On an **exclusive** host (a GPU) `on` powers it and keeps it up while the queues keep
 //!   choosing the model, `off` is a plain release (the same as `release`: queued work holds the
 //!   host until idle, then `idle_grace` later it shuts down; no lease held is still a success),
-//!   and `off-now` is refused (`400`: an exclusive host is never drained; a reclaim is the
+//!   and `off-now` is refused (`400`: an exclusive host is never drained; a lockout is the
 //!   forced "off now"). On a **shared** host `off` releases
 //!   the lease with a **graceful drain** (queued work no longer keeps the host up; in-flight
 //!   work gets `drain_timeout`; also with no lease held, through `drain_host`), and
@@ -32,9 +32,9 @@
 //!   `POST /v1/resources/{resource}/release` is a plain release of the lease (an adopted one
 //!   too) with **no drain**: the host goes down only when nothing holds it, as before; `404`
 //!   if no lease is held, and the reply reads `on` while the host is up.
-//! - `GET  /v1/reclaims/{resource}` and `POST /v1/reclaims/{resource}[/on|/off]`: the
-//!   reclaim of an exclusive resource with a power section ("this GPU is mine"): `reclaim`
-//!   and `unreclaim`.
+//! - `GET  /v1/lockouts/{resource}` and `POST /v1/lockouts/{resource}[/on|/off]`: the
+//!   lockout of an exclusive resource with a power section ("this GPU is mine"): `lockout`
+//!   and `clear_lockout`.
 //!
 //! Every POST logs one `toggle` line (kind, name, action, outcome, status; never the
 //! token) and is counted in `sched_toggle_requests_total`.
@@ -101,8 +101,8 @@ pub trait Backend: Send + Sync {
         mode: DrainMode,
     ) -> BoxFut<'_, Result<DrainAck, ApiError>>;
     fn resume(&self, resource: &ResourceId) -> BoxFut<'_, Result<ResumeAck, ApiError>>;
-    fn reclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
-    fn unreclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>>;
+    fn lockout(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>>;
+    fn clear_lockout(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>>;
 }
 
 /// [`Backend`] over `POST {ingress}/Scheduler/main/{handler}`.
@@ -212,14 +212,14 @@ impl Backend for RestateIngress {
         Box::pin(self.call("resume", Some(body)))
     }
 
-    fn reclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
+    fn lockout(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
         let body = json!({ "resource": resource });
-        Box::pin(self.call("reclaim", Some(body)))
+        Box::pin(self.call("lockout", Some(body)))
     }
 
-    fn unreclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
+    fn clear_lockout(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
         let body = json!({ "resource": resource });
-        Box::pin(self.call("unreclaim", Some(body)))
+        Box::pin(self.call("clear_lockout", Some(body)))
     }
 }
 
@@ -233,12 +233,12 @@ pub enum Route {
     MethodNotAllowed(&'static str),
 }
 
-/// What a switch is on: a model lease, a manual host lease or a reclaim.
+/// What a switch is on: a model lease, a manual host lease or a lockout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Model,
     Host,
-    Reclaim,
+    Lockout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,11 +286,11 @@ pub fn route(method: &Method, path: &str) -> Route {
                 Route::MethodNotAllowed("GET")
             };
         }
-        ["", "v1", k @ ("models" | "resources" | "reclaims"), n] => (*k, *n, None),
+        ["", "v1", k @ ("models" | "resources" | "lockouts"), n] => (*k, *n, None),
         [
             "",
             "v1",
-            k @ ("models" | "resources" | "reclaims"),
+            k @ ("models" | "resources" | "lockouts"),
             n,
             t @ ("on" | "off" | "resume" | "off-now" | "release"),
         ] => (*k, *n, Some(*t)),
@@ -302,7 +302,7 @@ pub fn route(method: &Method, path: &str) -> Route {
     let kind = match kind {
         "models" => Kind::Model,
         "resources" => Kind::Host,
-        _ => Kind::Reclaim,
+        _ => Kind::Lockout,
     };
     let act = match (tail, method) {
         (None, m) if m == Method::GET => Act::Get,
@@ -349,11 +349,11 @@ fn endpoint_label(route: &Route, want: Option<Option<bool>>) -> &'static str {
             "resource_off_now",
             "resource_release",
         ],
-        Kind::Reclaim => [
-            "reclaim_get",
-            "reclaim_on",
-            "reclaim_off",
-            "reclaim_set",
+        Kind::Lockout => [
+            "lockout_get",
+            "lockout_on",
+            "lockout_off",
+            "lockout_set",
             "unmatched",
             "unmatched",
             "unmatched",
@@ -417,7 +417,7 @@ impl ToggleLog {
                 let kind = match kind {
                     Kind::Model => "model",
                     Kind::Host => "host",
-                    Kind::Reclaim => "reclaim",
+                    Kind::Lockout => "lockout",
                 };
                 (kind, short(name), action, *act != Act::Get)
             }
@@ -613,7 +613,7 @@ impl Toggle {
         match kind {
             Kind::Model => self.model(name, set).await,
             Kind::Host => self.resource(name, set, DrainMode::Graceful).await,
-            Kind::Reclaim => self.reclaim(name, set).await,
+            Kind::Lockout => self.lockout(name, set).await,
         }
     }
 
@@ -625,9 +625,9 @@ impl Toggle {
             .models()
             .iter()
             .map(|m| {
-                let reclaimed = Some(find_reclaim(&leases, &m.resource).is_some());
+                let locked_out = Some(find_lockout(&leases, &m.resource).is_some());
                 let held = find_model(&leases, &m.id);
-                model_state(&m.id, &m.resource, held, reclaimed, &report, now)
+                model_state(&m.id, &m.resource, held, locked_out, &report, now)
             })
             .collect();
         let resources: Vec<Value> = config
@@ -645,21 +645,21 @@ impl Toggle {
                 )
             })
             .collect();
-        let reclaims: Vec<Value> = config
+        let lockouts: Vec<Value> = config
             .resources()
             .iter()
-            .filter(|r| config.supports_reclaim(&r.id))
-            .map(|r| reclaim_state(&config, &r.id, find_reclaim(&leases, &r.id), &report, now))
+            .filter(|r| config.supports_lockout(&r.id))
+            .map(|r| lockout_state(&config, &r.id, find_lockout(&leases, &r.id), &report, now))
             .collect();
         let attention = resources
             .iter()
-            .chain(&reclaims)
+            .chain(&lockouts)
             .any(|r| r["needs_attention"] == true);
         Ok(json!({
             "needs_attention": attention,
             "models": models,
             "resources": resources,
-            "reclaims": reclaims,
+            "lockouts": lockouts,
         }))
     }
 
@@ -705,14 +705,14 @@ impl Toggle {
                 (None, Some(l))
             }
         };
-        let reclaimed = leases
+        let locked_out = leases
             .as_ref()
-            .map(|l| find_reclaim(l, &spec.resource).is_some());
+            .map(|l| find_lockout(l, &spec.resource).is_some());
         Ok(model_state(
             &id,
             &spec.resource,
             held.as_ref(),
-            reclaimed,
+            locked_out,
             &self.shared.last_report(),
             self.shared.clock.now(),
         ))
@@ -821,23 +821,23 @@ impl Toggle {
         Ok(v)
     }
 
-    async fn reclaim(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
+    async fn lockout(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
         let held = match set {
-            None => find_reclaim(&self.backend.leases().await?, &id).cloned(),
-            Some(true) => Some(self.backend.reclaim(&id).await?.lease),
+            None => find_lockout(&self.backend.leases().await?, &id).cloned(),
+            Some(true) => Some(self.backend.lockout(&id).await?.lease),
             Some(false) => {
                 let l = self.backend.leases().await?;
-                if let Some(lease) = find_reclaim(&l, &id).cloned()
-                    && let Err(e) = self.backend.unreclaim(&id).await
+                if let Some(lease) = find_lockout(&l, &id).cloned()
+                    && let Err(e) = self.backend.clear_lockout(&id).await
                 {
                     self.gone_after(e, &lease.id).await?;
                 }
                 None
             }
         };
-        Ok(reclaim_state(
+        Ok(lockout_state(
             &config,
             &id,
             held.as_ref(),
@@ -918,32 +918,32 @@ fn switch(
 /// up), `host_failed` (its host's power transition failed), `draining` (another model of
 /// the resource is being wound down, its in-flight work awaited), or `pending` (the
 /// scheduler has not yet acted on the lease, or is serving another model for a reason the
-/// report does not give). Absent while the process has not ticked. While a reclaim is held
-/// on the model's resource the status is `reclaimed` whatever the report says: the planner
-/// gives a reclaimed resource no model, so the lease cannot become active until the reclaim
-/// is released. `reclaimed` is whether the lease book holds one; `None` (the book could not
+/// report does not give). Absent while the process has not ticked. While a lockout is held
+/// on the model's resource the status is `locked out` whatever the report says: the planner
+/// gives a locked out resource no model, so the lease cannot become active until the lockout
+/// is released. `locked out` is whether the lease book holds one; `None` (the book could not
 /// be read just now) leaves the status out.
 pub fn model_state(
     model: &ModelId,
     resource: &ResourceId,
     held: Option<&Lease>,
-    reclaimed: Option<bool>,
+    locked_out: Option<bool>,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
     let mut m = switch("model", model.as_str(), held, now);
     m.insert("resource".into(), json!(resource));
-    if let (Some(lease), Some(reclaimed)) = (held, reclaimed) {
-        let status = if reclaimed {
+    if let (Some(lease), Some(locked_out)) = (held, locked_out) {
+        let status = if locked_out {
             let power = report
                 .as_ref()
                 .and_then(|r| r.state.resource(resource))
                 .map(|st| format!(" (power: {})", power_name(&st.power)))
                 .unwrap_or_default();
             Some((
-                "reclaimed",
+                "locked_out",
                 format!(
-                    "{resource} is reclaimed{power}: no model is allowed on it until the reclaim is released"
+                    "{resource} is locked out{power}: no model is allowed on it until the lockout is released"
                 ),
             ))
         } else {
@@ -1025,29 +1025,29 @@ fn power_name(p: &PowerPhase) -> &'static str {
     }
 }
 
-fn find_reclaim<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Lease> {
+fn find_lockout<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Lease> {
     leases
         .iter()
-        .find(|l| &l.resource == resource && l.kind == LeaseKind::Reclaim)
+        .find(|l| &l.resource == resource && l.kind == LeaseKind::Lockout)
 }
 
-/// A reclaim switch ("this GPU is mine") on an exclusive resource with a power section.
-/// `supported` is false for any other resource, which cannot be reclaimed. While held and
+/// A lockout switch ("this GPU is mine") on an exclusive resource with a power section.
+/// `supported` is false for any other resource, which cannot be locked out. While held and
 /// seen by the last tick, `status` is `host_failed` (a power transition failed),
 /// `powered_off` (the host is down and is not woken), `left_for_person` (up, with `control:
 /// manual`: flowmanager never shuts it down), `shutting_down`, `draining` (its work
-/// is awaited for at most the reclaim timeout, then cut off) or `pending` (the tick has
+/// is awaited for at most the lockout timeout, then cut off) or `pending` (the tick has
 /// not acted on it yet, or the report does not say more); `tick_reason` is that tick's
 /// reason as the sequencer gave it. `needs_attention` is as for a host.
-pub fn reclaim_state(
+pub fn lockout_state(
     config: &Config,
     resource: &ResourceId,
     held: Option<&Lease>,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
-    let mut m = switch("reclaim", resource.as_str(), held, now);
-    m.insert("supported".into(), json!(config.supports_reclaim(resource)));
+    let mut m = switch("lockout", resource.as_str(), held, now);
+    m.insert("supported".into(), json!(config.supports_lockout(resource)));
     if let Some(r) = report {
         if let Some(st) = r.state.resource(resource) {
             m.insert(
@@ -1061,7 +1061,7 @@ pub fn reclaim_state(
         }
         if let Some(lease) = held {
             let managed = config.power_managed(resource);
-            let (status, detail) = reclaim_status(r, lease, resource, managed);
+            let (status, detail) = lockout_status(r, lease, resource, managed);
             m.insert("status".into(), json!(status));
             m.insert("detail".into(), json!(detail));
             m.insert("tick_reason".into(), json!(r.reason));
@@ -1079,7 +1079,7 @@ fn attention(r: &TickReport, resource: &ResourceId, power: &PowerPhase) -> bool 
             .any(|h| &h.resource == resource && h.stopped)
 }
 
-fn reclaim_status(
+fn lockout_status(
     r: &TickReport,
     lease: &Lease,
     resource: &ResourceId,
@@ -1088,7 +1088,7 @@ fn reclaim_status(
     if !r.leases.iter().any(|l| l.id == lease.id) {
         return (
             "pending",
-            "the last tick was decided before this reclaim was taken; the next tick acts on it"
+            "the last tick was decided before this lockout was taken; the next tick acts on it"
                 .into(),
         );
     }
@@ -1102,7 +1102,7 @@ fn reclaim_status(
         ),
         PowerPhase::Off => (
             "powered_off",
-            format!("{resource} is off and is not woken while reclaimed"),
+            format!("{resource} is off and is not woken while locked out"),
         ),
         PowerPhase::ShuttingDown { .. } => {
             ("shutting_down", format!("{resource} is shutting down"))
@@ -1119,7 +1119,7 @@ fn reclaim_status(
             } => (
                 "draining",
                 format!(
-                    "{model} is winding down on {resource}; its work is cut off after the reclaim timeout"
+                    "{model} is winding down on {resource}; its work is cut off after the lockout timeout"
                 ),
             ),
             _ if !managed => (
@@ -1130,7 +1130,7 @@ fn reclaim_status(
             ),
             _ => (
                 "pending",
-                format!("{resource} is up; the reclaim has not yet shut it down"),
+                format!("{resource} is up; the lockout has not yet shut it down"),
             ),
         },
     }
@@ -1374,23 +1374,23 @@ mod tests {
             })
         }
 
-        fn reclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
+        fn lockout(&self, resource: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
             let req = ResourceRequest {
                 resource: resource.clone(),
             };
             Box::pin(async move {
-                let r = object::reclaim(&self.shared, &self.ctx, req).await;
+                let r = object::lockout(&self.shared, &self.ctx, req).await;
                 self.ctx.commit();
                 r.map_err(api)
             })
         }
 
-        fn unreclaim(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
+        fn clear_lockout(&self, resource: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
             let req = ResourceRequest {
                 resource: resource.clone(),
             };
             Box::pin(async move {
-                let r = object::unreclaim(&self.shared, &self.ctx, req).await;
+                let r = object::clear_lockout(&self.shared, &self.ctx, req).await;
                 self.ctx.commit();
                 r.map_err(api)
             })
@@ -1539,23 +1539,23 @@ mod tests {
             Route::MethodNotAllowed("POST")
         );
         assert_eq!(route(&p, "/v1/models/llm/release"), Route::NotFound);
-        assert_eq!(route(&p, "/v1/reclaims/gpu/release"), Route::NotFound);
+        assert_eq!(route(&p, "/v1/lockouts/gpu/release"), Route::NotFound);
         assert_eq!(route(&p, "/v1/models/llm/off-now"), Route::NotFound);
-        assert_eq!(route(&p, "/v1/reclaims/gpu/off-now"), Route::NotFound);
+        assert_eq!(route(&p, "/v1/lockouts/gpu/off-now"), Route::NotFound);
         assert_eq!(
             route(&g, "/v1/resources/nfs/off-now"),
             Route::MethodNotAllowed("POST")
         );
         assert_eq!(route(&p, "/v1/models/llm/resume"), Route::NotFound);
         assert_eq!(
-            route(&p, "/v1/reclaims/gpu/on"),
-            Route::Switch(Kind::Reclaim, "gpu".into(), Act::Set(Some(true)))
+            route(&p, "/v1/lockouts/gpu/on"),
+            Route::Switch(Kind::Lockout, "gpu".into(), Act::Set(Some(true)))
         );
         assert_eq!(
-            route(&g, "/v1/reclaims/gpu"),
-            Route::Switch(Kind::Reclaim, "gpu".into(), Act::Get)
+            route(&g, "/v1/lockouts/gpu"),
+            Route::Switch(Kind::Lockout, "gpu".into(), Act::Get)
         );
-        assert_eq!(route(&p, "/v1/reclaims/gpu/resume"), Route::NotFound);
+        assert_eq!(route(&p, "/v1/lockouts/gpu/resume"), Route::NotFound);
         assert_eq!(
             route(&g, "/v1/resources/nfs/on"),
             Route::MethodNotAllowed("POST")
@@ -1565,9 +1565,9 @@ mod tests {
             Route::MethodNotAllowed("GET, POST")
         );
         for gone in [
-            "/v1/resources/nfs/reclaim",
-            "/v1/resources/nfs/unreclaim",
-            "/reclaim",
+            "/v1/resources/nfs/lockout",
+            "/v1/resources/nfs/clear_lockout",
+            "/lockout",
             "/v1/models/",
             "/v1/models/%zz",
             "/v1/leases/extra",
@@ -2170,7 +2170,7 @@ mod tests {
             wind_down: Some(WindDown {
                 since: Millis(2),
                 timeout: Some(Millis(600_000)),
-                reclaim: false,
+                lockout: false,
                 killed: Default::default(),
             }),
         };
@@ -2334,58 +2334,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reclaim_switch_is_idempotent_and_refuses_what_cannot_be_reclaimed() {
+    async fn a_lockout_switch_is_idempotent_and_refuses_what_cannot_be_locked_out() {
         let r = rig(&example_yaml_managed_nfs_only());
-        let (s, v) = r.get("/v1/reclaims/cuda-central").await;
+        let (s, v) = r.get("/v1/lockouts/cuda-central").await;
         assert_eq!(
             (s, &v["held"], &v["supported"]),
             (200, &json!(false), &json!(true))
         );
-        let (s, v) = r.post("/v1/reclaims/cuda-central/on", "").await;
+        let (s, v) = r.post("/v1/lockouts/cuda-central/on", "").await;
         assert_eq!(
             (s, &v["held"], &v["kind"]),
-            (200, &json!(true), &json!("reclaim"))
+            (200, &json!(true), &json!("lockout"))
         );
-        assert_eq!(r.post("/v1/reclaims/cuda-central", "ON").await.0, 200);
+        assert_eq!(r.post("/v1/lockouts/cuda-central", "ON").await.0, 200);
         assert_eq!(r.lease_count(), 1);
-        // A manual host lease and a reclaim are different switches.
+        // A manual host lease and a lockout are different switches.
         assert_eq!(r.get("/v1/resources/cuda-central").await.1["held"], false);
-        let (s, v) = r.post("/v1/reclaims/cuda-central/off", "").await;
+        let (s, v) = r.post("/v1/lockouts/cuda-central/off", "").await;
         assert_eq!((s, &v["held"]), (200, &json!(false)));
-        let (s, v) = r.post("/v1/reclaims/cuda-central/off", "").await;
+        let (s, v) = r.post("/v1/lockouts/cuda-central/off", "").await;
         assert_eq!((s, &v["held"]), (200, &json!(false)));
         assert_eq!(r.lease_count(), 0);
-        // A shared host cannot be reclaimed: the handler's 400 with its message.
-        let (s, v) = r.post("/v1/reclaims/basestar-nfs/on", "").await;
+        // A shared host cannot be locked out: the handler's 400 with its message.
+        let (s, v) = r.post("/v1/lockouts/basestar-nfs/on", "").await;
         assert_eq!(s, 400);
         assert!(
-            v["error"].as_str().unwrap().contains("cannot be reclaimed"),
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be locked out"),
             "{v}"
         );
-        let (s, v) = r.get("/v1/reclaims/basestar-nfs").await;
+        let (s, v) = r.get("/v1/lockouts/basestar-nfs").await;
         assert_eq!((s, &v["supported"]), (200, &json!(false)));
-        assert_eq!(r.post("/v1/reclaims/nowhere/on", "").await.0, 404);
-        assert_eq!(r.post("/v1/reclaims/nowhere/off", "").await.0, 404);
+        assert_eq!(r.post("/v1/lockouts/nowhere/on", "").await.0, 404);
+        assert_eq!(r.post("/v1/lockouts/nowhere/off", "").await.0, 404);
 
         // Listed apart from the host leases.
-        r.post("/v1/reclaims/cuda-central/on", "").await;
+        r.post("/v1/lockouts/cuda-central/on", "").await;
         let (_, v) = r.get("/v1/leases").await;
-        let reclaims = v["reclaims"].as_array().unwrap();
-        assert_eq!(reclaims.len(), 1);
+        let lockouts = v["lockouts"].as_array().unwrap();
+        assert_eq!(lockouts.len(), 1);
         assert_eq!(
-            (&reclaims[0]["id"], &reclaims[0]["held"]),
+            (&lockouts[0]["id"], &lockouts[0]["held"]),
             (&json!("cuda-central"), &json!(true))
         );
         assert_eq!(v["needs_attention"], false);
     }
 
     #[tokio::test]
-    async fn a_reclaim_status_and_needs_attention_come_from_the_report() {
+    async fn a_lockout_status_and_needs_attention_come_from_the_report() {
         use sched_model::ResourceState;
         let lease = Lease {
-            id: "reclaim-1".into(),
+            id: "lockout-1".into(),
             resource: "cuda-central".into(),
-            kind: LeaseKind::Reclaim,
+            kind: LeaseKind::Lockout,
             granted_at: Millis(1),
         };
         let gpu: ResourceId = "cuda-central".into();
@@ -2397,7 +2400,7 @@ mod tests {
         rep.leases.clear();
         rep.veto_held.clear();
         let at = |rep: &TickReport| {
-            reclaim_state(
+            lockout_state(
                 &config,
                 &gpu,
                 Some(&lease),
@@ -2408,7 +2411,7 @@ mod tests {
         // Not in the report's leases yet.
         assert_eq!(at(&rep)["status"], "pending");
         rep.leases.push(lease.clone());
-        rep.reason = "reclaimed".into();
+        rep.reason = "locked_out".into();
         for (power, want) in [
             (PowerPhase::Off, "powered_off"),
             (
@@ -2423,7 +2426,7 @@ mod tests {
             let v = at(&rep);
             assert_eq!(v["status"], want, "{v}");
             assert_eq!(v["needs_attention"], false);
-            assert_eq!(v["tick_reason"], "reclaimed");
+            assert_eq!(v["tick_reason"], "locked_out");
             assert_eq!(v["held_for_seconds"], 4);
         }
         rep.state.resources.insert(
@@ -2482,13 +2485,13 @@ mod tests {
         );
         let got = l(
             "POST",
-            "/v1/reclaims/cuda-central",
+            "/v1/lockouts/cuda-central",
             Some(Some(false)),
             "ok",
             200,
         )
         .unwrap();
-        assert_eq!((got.kind, got.action), ("reclaim", "off"));
+        assert_eq!((got.kind, got.action), ("lockout", "off"));
         let got = l("POST", "/v1/resources/nfs", Some(None), "bad_request", 400).unwrap();
         assert_eq!((got.kind, got.action), ("host", "unknown"));
         let got = l("POST", "/v1/resources/nfs/resume", None, "conflict", 409).unwrap();
@@ -2556,8 +2559,8 @@ mod tests {
             "release_lease",
             "acquire_host_lease",
             "drain_host",
-            "reclaim",
-            "unreclaim",
+            "lockout",
+            "clear_lockout",
             "resume",
         ] {
             server.set(
@@ -2573,14 +2576,14 @@ mod tests {
             (Method::GET, "/v1/models/llm"),
             (Method::GET, "/v1/leases"),
             (Method::GET, "/v1/resources/basestar-nfs"),
-            (Method::GET, "/v1/reclaims/cuda-central"),
+            (Method::GET, "/v1/lockouts/cuda-central"),
             (Method::POST, "/v1/models/llm/on"),
             (Method::POST, "/v1/models/llm/off"),
             (Method::POST, "/v1/resources/basestar-nfs/on"),
             (Method::POST, "/v1/resources/basestar-nfs/off"),
             (Method::POST, "/v1/resources/basestar-nfs/resume"),
-            (Method::POST, "/v1/reclaims/cuda-central/on"),
-            (Method::POST, "/v1/reclaims/cuda-central/off"),
+            (Method::POST, "/v1/lockouts/cuda-central/on"),
+            (Method::POST, "/v1/lockouts/cuda-central/off"),
         ] {
             let (s, v) = ask(&t, m.clone(), p).await;
             assert_eq!(s, 502, "{m} {p}: {v}");
@@ -2811,14 +2814,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_model_lease_on_a_reclaimed_resource_says_it_is_reclaimed() {
+    async fn a_model_lease_on_a_locked_out_resource_says_it_is_locked_out() {
         let r = rig(&example_yaml_managed_nfs_only());
         r.hosts_up(true);
         assert_eq!(r.post("/v1/models/llm/on", "").await.0, 200);
-        assert_eq!(r.post("/v1/reclaims/cuda-central/on", "").await.0, 200);
+        assert_eq!(r.post("/v1/lockouts/cuda-central/on", "").await.0, 200);
         let check = |v: &Value| {
-            assert_eq!(v["status"], "reclaimed", "{v}");
-            assert!(v["detail"].as_str().unwrap().contains("reclaimed"));
+            assert_eq!(v["status"], "locked_out", "{v}");
+            assert!(v["detail"].as_str().unwrap().contains("locked out"));
         };
         check(&r.get("/v1/models/llm").await.1);
         check(&r.post("/v1/models/llm/on", "").await.1);
@@ -2830,19 +2833,19 @@ mod tests {
         check(&list["models"][1]);
         // Other models on it hold no lease, so no status.
         assert!(list["models"][0].get("status").is_none());
-        // Released, the reclaim no longer answers for the model.
-        assert_eq!(r.post("/v1/reclaims/cuda-central/off", "").await.0, 200);
+        // Released, the lockout no longer answers for the model.
+        assert_eq!(r.post("/v1/lockouts/cuda-central/off", "").await.0, 200);
         let (_, v) = r.get("/v1/models/llm").await;
-        assert_ne!(v["status"], "reclaimed", "{v}");
+        assert_ne!(v["status"], "locked_out", "{v}");
     }
 
     #[tokio::test]
-    async fn a_reclaim_on_a_manual_host_is_left_for_a_person_to_power_off() {
+    async fn a_lockout_on_a_manual_host_is_left_for_a_person_to_power_off() {
         let r = rig(EXAMPLE_CONFIG);
         r.hosts_up(true);
-        assert_eq!(r.post("/v1/reclaims/cuda-central/on", "").await.0, 200);
+        assert_eq!(r.post("/v1/lockouts/cuda-central/on", "").await.0, 200);
         r.tick().await;
-        let (_, v) = r.get("/v1/reclaims/cuda-central").await;
+        let (_, v) = r.get("/v1/lockouts/cuda-central").await;
         assert_eq!(v["status"], "left_for_person", "{v}");
         assert!(
             v["detail"]
@@ -2854,9 +2857,9 @@ mod tests {
         // Under managed control the same state is not that: flowmanager does the shutdown.
         let m = rig(&example_yaml_managed());
         m.hosts_up(true);
-        assert_eq!(m.post("/v1/reclaims/cuda-central/on", "").await.0, 200);
+        assert_eq!(m.post("/v1/lockouts/cuda-central/on", "").await.0, 200);
         m.tick().await;
-        let (_, v) = m.get("/v1/reclaims/cuda-central").await;
+        let (_, v) = m.get("/v1/lockouts/cuda-central").await;
         assert_ne!(v["status"], "left_for_person", "{v}");
         assert!(v.get("status").is_some());
     }
@@ -2867,7 +2870,7 @@ mod tests {
         r.hosts_up(true);
         r.post("/v1/models/llm/on", "").await;
         r.post("/v1/resources/basestar-nfs/on", "").await;
-        r.post("/v1/reclaims/cuda-central/on", "").await;
+        r.post("/v1/lockouts/cuda-central/on", "").await;
         assert!(
             !r.shared
                 .metrics
@@ -2879,7 +2882,7 @@ mod tests {
         for series in [
             "kind=\"model\",target=\"llm\"",
             "kind=\"host\",target=\"basestar-nfs\"",
-            "kind=\"reclaim\",target=\"cuda-central\"",
+            "kind=\"lockout\",target=\"cuda-central\"",
         ] {
             assert!(
                 text.contains(&format!("sched_manual_lease_age_seconds{{{series}}}")),

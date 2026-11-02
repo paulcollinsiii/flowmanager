@@ -174,13 +174,13 @@ impl DemandGaps {
     }
 }
 
-/// The resources a manual model lease pins, with their model: forced to a model (a reclaim
+/// The resources a manual model lease pins, with their model: forced to a model (a lockout
 /// is forced to none).
 pub fn pinned(intent: &Intent) -> Vec<(ResourceId, ModelId)> {
     intent
         .forced
         .iter()
-        .filter(|r| !intent.reclaim.contains(*r))
+        .filter(|r| !intent.lockout.contains(*r))
         .filter_map(|r| match intent.models.get(r) {
             Some(Some(m)) => Some((r.clone(), m.clone())),
             _ => None,
@@ -255,8 +255,8 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::StaleDemand => {
             "a demand observation needed to prove no work is in flight is missing or stale"
         }
-        WaitReason::Reclaimed => "the resource is reclaimed",
-        WaitReason::ReclaimUnsupported => "a reclaim names a resource that cannot be reclaimed",
+        WaitReason::LockedOut => "the resource is locked out",
+        WaitReason::LockoutUnsupported => "a lockout names a resource that cannot be locked out",
         WaitReason::HostNotUp => "the host is not up",
         WaitReason::PoweringOn => "the host is powering on",
         WaitReason::ShuttingDown => "the host is shutting down",
@@ -399,13 +399,13 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
     if !intent.forced.is_empty() {
         let f: Vec<_> = intent.forced.iter().map(|r| r.to_string()).collect();
         out.push_str(&format!(
-            ", forced [{}] (a manual model lease or a reclaim cuts batch work short: intake paused, in-flight work gets a timeout)",
+            ", forced [{}] (a manual model lease or a lockout cuts batch work short: intake paused, in-flight work gets a timeout)",
             f.join(", ")
         ));
     }
-    if !intent.reclaim.is_empty() {
-        let rc: Vec<_> = intent.reclaim.iter().map(|r| r.to_string()).collect();
-        out.push_str(&format!(", reclaim [{}]", rc.join(", ")));
+    if !intent.lockout.is_empty() {
+        let rc: Vec<_> = intent.lockout.iter().map(|r| r.to_string()).collect();
+        out.push_str(&format!(", lockout [{}]", rc.join(", ")));
     }
     let pins = pinned(intent);
     if !pins.is_empty() {
@@ -576,11 +576,11 @@ mod tests {
             r.contains("pinned by a manual model lease [cuda-central=mineru]"),
             "{r}"
         );
-        // A reclaim is forced to no model: not a pin.
+        // A lockout is forced to no model: not a pin.
         let mut rc = Intent::default();
         rc.models.insert("cuda-central".into(), None);
         rc.forced.insert("cuda-central".into());
-        rc.reclaim.insert("cuda-central".into());
+        rc.lockout.insert("cuda-central".into());
         assert!(pinned(&rc).is_empty());
     }
 

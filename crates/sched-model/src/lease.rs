@@ -34,7 +34,7 @@ pub enum LeaseKind {
     Interactive { model: ModelId, expires_at: Millis },
     /// The user takes an exclusive host back despite pending work. Until released, intake
     /// stops, the host is shut down and it is not woken.
-    Reclaim,
+    Lockout,
 }
 
 impl Lease {
@@ -63,9 +63,9 @@ impl Lease {
     }
 
     /// Whether this lease holds the host up (counts against powering it down). Every
-    /// active lease does except a reclaim, which asks for the opposite.
+    /// active lease does except a lockout, which asks for the opposite.
     pub fn holds_host(&self, now: Millis) -> bool {
-        self.is_active(now) && !matches!(self.kind, LeaseKind::Reclaim)
+        self.is_active(now) && !matches!(self.kind, LeaseKind::Lockout)
     }
 
     /// Whether this is a manual host lease the scheduler minted for a host found running
@@ -75,8 +75,8 @@ impl Lease {
             && self.id.as_str().starts_with(ADOPTED_HOST_PREFIX)
     }
 
-    pub fn is_reclaim(&self) -> bool {
-        matches!(self.kind, LeaseKind::Reclaim)
+    pub fn is_lockout(&self) -> bool {
+        matches!(self.kind, LeaseKind::Lockout)
     }
 
     /// An interactive lease renewed to expire `ttl` after `now`; `None` for other kinds.

@@ -201,7 +201,7 @@ pub struct ClassSpec {
     #[serde(default)]
     pub recovery: Option<RecoverySpec>,
     /// How long this class's in-flight work may run once a wind-down starts (forced or not).
-    /// Defaults to the policy's reclaim or drain timeout.
+    /// Defaults to the policy's lockout or drain timeout.
     #[serde(default)]
     pub kill_timeout: Option<Millis>,
 }
@@ -342,15 +342,15 @@ pub struct PolicyConfig {
     pub interactive_ttl: Millis,
     /// How long in-flight jobs may run after a manual model lease cuts batch work short.
     pub drain_timeout: Millis,
-    /// How long in-flight jobs may run after a reclaim. Defaults to `drain_timeout`.
+    /// How long in-flight jobs may run after a lockout. Defaults to `drain_timeout`.
     #[serde(default)]
-    pub reclaim_timeout: Option<Millis>,
+    pub lockout_timeout: Option<Millis>,
 }
 
 impl PolicyConfig {
-    /// The effective reclaim timeout.
-    pub fn reclaim_timeout(&self) -> Millis {
-        self.reclaim_timeout.unwrap_or(self.drain_timeout)
+    /// The effective lockout timeout.
+    pub fn lockout_timeout(&self) -> Millis {
+        self.lockout_timeout.unwrap_or(self.drain_timeout)
     }
 
     /// The oldest an observation of this kind may be and still be used: safety-critical
@@ -477,9 +477,9 @@ impl Config {
             .find(|s| s.observe.contains(&Capability::Jobs))
     }
 
-    /// Whether a reclaim lease means anything for `id`: only an exclusive resource with a
-    /// power section can be taken back and shut down. Everywhere else a reclaim is ignored.
-    pub fn supports_reclaim(&self, id: &ResourceId) -> bool {
+    /// Whether a lockout lease means anything for `id`: only an exclusive resource with a
+    /// power section can be taken back and shut down. Everywhere else a lockout is ignored.
+    pub fn supports_lockout(&self, id: &ResourceId) -> bool {
         self.resource(id)
             .is_some_and(|r| r.kind == ResourceKind::Exclusive && r.power.is_some())
     }

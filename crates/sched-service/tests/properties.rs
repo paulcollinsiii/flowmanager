@@ -86,7 +86,7 @@ fn lease(kind: usize, now: u64, n: usize) -> Lease {
                 expires_at: Millis(now + 700_000),
             },
         ),
-        6 => ("cuda-central", LeaseKind::Reclaim),
+        6 => ("cuda-central", LeaseKind::Lockout),
         _ => (
             "cuda-central",
             LeaseKind::Interactive {

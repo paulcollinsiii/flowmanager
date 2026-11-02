@@ -274,7 +274,7 @@ impl Metrics {
         let toggle_requests = IntCounterVec::new(
             Opts::new(
                 "sched_toggle_requests_total",
-                "Requests to the toggle listener (Home Assistant) by endpoint (a fixed set: list, model_get, model_on, model_off, model_set, resource_get, resource_on, resource_off, resource_set, resource_resume, resource_off_now, resource_release, reclaim_get, reclaim_on, reclaim_off, reclaim_set, unmatched) and outcome (ok, unauthorized, bad_request, not_found, method_not_allowed, conflict, error); never labelled with a model or resource name",
+                "Requests to the toggle listener (Home Assistant) by endpoint (a fixed set: list, model_get, model_on, model_off, model_set, resource_get, resource_on, resource_off, resource_set, resource_resume, resource_off_now, resource_release, lockout_get, lockout_on, lockout_off, lockout_set, unmatched) and outcome (ok, unauthorized, bad_request, not_found, method_not_allowed, conflict, error); never labelled with a model or resource name",
             ),
             &["endpoint", "outcome"],
         )
@@ -302,7 +302,7 @@ impl Metrics {
         let manual_lease_age = GaugeVec::new(
             Opts::new(
                 "sched_manual_lease_age_seconds",
-                "Seconds since each manual lease or reclaim was granted, as of the last tick: kind is model (target = the model), host (the manual host lease) or reclaim (target = the resource). An alert on this finds a lease that was forgotten",
+                "Seconds since each manual lease or lockout was granted, as of the last tick: kind is model (target = the model), host (the manual host lease) or lockout (target = the resource). An alert on this finds a lease that was forgotten",
             ),
             &["kind", "target"],
         )
@@ -705,7 +705,7 @@ impl Metrics {
             let (kind, target) = match &l.kind {
                 LeaseKind::ManualModel { model } => ("model", model.to_string()),
                 LeaseKind::ManualHost => ("host", l.resource.to_string()),
-                LeaseKind::Reclaim => ("reclaim", l.resource.to_string()),
+                LeaseKind::Lockout => ("lockout", l.resource.to_string()),
                 _ => continue,
             };
             let age = now.as_u64().saturating_sub(l.granted_at.as_u64()) as f64 / 1000.0;
@@ -830,7 +830,7 @@ mod tests {
                 },
             ),
             lease("b", "nfs", LeaseKind::ManualHost),
-            lease("c", "gpu", LeaseKind::Reclaim),
+            lease("c", "gpu", LeaseKind::Lockout),
         ];
         m.set_manual_lease_ages(Millis(61_000), &leases);
         let text = m.render();
@@ -843,7 +843,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("sched_manual_lease_age_seconds{kind=\"reclaim\",target=\"gpu\"} 60"),
+            text.contains("sched_manual_lease_age_seconds{kind=\"lockout\",target=\"gpu\"} 60"),
             "{text}"
         );
         m.set_manual_lease_ages(Millis(62_000), &leases[1..]);
@@ -981,7 +981,7 @@ mod tests {
             wind_down: Some(WindDown {
                 since: Millis(20_000),
                 timeout: None,
-                reclaim: false,
+                lockout: false,
                 killed: Default::default(),
             }),
         };

@@ -58,10 +58,10 @@ impl Backend for Stub {
     fn resume(&self, _: &ResourceId) -> BoxFut<'_, Result<ResumeAck, ApiError>> {
         refused()
     }
-    fn reclaim(&self, _: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
+    fn lockout(&self, _: &ResourceId) -> BoxFut<'_, Result<LeaseGrant, ApiError>> {
         refused()
     }
-    fn unreclaim(&self, _: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
+    fn clear_lockout(&self, _: &ResourceId) -> BoxFut<'_, Result<Lease, ApiError>> {
         refused()
     }
 }
@@ -104,7 +104,7 @@ async fn change_requests_and_refusals_log_structured_escaped_lines_without_the_t
 
     let calls: [(Method, &str, Option<&str>); 8] = [
         (Method::POST, "/v1/models/llm/on", ok),
-        (Method::POST, "/v1/reclaims/cuda-central", ok),
+        (Method::POST, "/v1/lockouts/cuda-central", ok),
         (Method::POST, "/v1/resources/basestar-nfs/resume", ok),
         (Method::GET, "/v1/models/llm", ok), // a read that succeeds: no line
         (Method::GET, "/v1/leases", None),
@@ -147,7 +147,7 @@ async fn change_requests_and_refusals_log_structured_escaped_lines_without_the_t
     );
     has(
         1,
-        &["kind=\"reclaim\"", "name=\"cuda-central\"", "action=\"on\""],
+        &["kind=\"lockout\"", "name=\"cuda-central\"", "action=\"on\""],
     );
     has(
         2,

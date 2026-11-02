@@ -1,4 +1,4 @@
-description: "A reclaim stops intake, gives in-flight work its timeout, stops it and withdraws the model (its recovery action re-queues failed items and needs the model allowed, so it is not run after the cut-off), then shuts the host down; it is then not woken."
+description: "A lockout stops intake, gives in-flight work its timeout, stops it and withdraws the model (its recovery action re-queues failed items and needs the model allowed, so it is not run after the cut-off), then shuts the host down; it is then not woken."
 # The power machine as under managed control (M4).
 power_control: managed
 initial_state:
@@ -24,7 +24,7 @@ frames:
       - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 1, ready_pods: 1 } }
       - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 1 } }
     leases:
-      - { id: reclaim-1, resource: cuda-central, granted_at: 100000000, kind: { type: reclaim } }
+      - { id: lockout-1, resource: cuda-central, granted_at: 100000000, kind: { type: lockout } }
     expect:
       steps: [{ type: pause_intake, class: speakr-transcription }, { type: wait, resource: cuda-central, reason: in_flight_work }]
       allowed: { models: [whisperx], classes: [paperless-ngx, immich-server] }
@@ -54,9 +54,9 @@ frames:
     observe:
       - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: false } }
     expect:
-      steps: [{ type: wait, resource: cuda-central, reason: reclaimed }]
+      steps: [{ type: wait, resource: cuda-central, reason: locked_out }]
       allowed: { models: [], classes: [paperless-ngx, immich-server] }
-  # Reclaim released with work queued: the host is not woken (power is manual in v1); the intent waits.
+  # Lockout released with work queued: the host is not woken (power is manual in v1); the intent waits.
   - at: 100700000
     refresh: true
     observe:

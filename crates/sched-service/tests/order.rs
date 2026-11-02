@@ -449,7 +449,7 @@ fn arb_lease() -> impl Strategy<Value = Lease> {
                     model: ModelId::new("whisperx"),
                 },
             ),
-            4 => ("cuda-central", LeaseKind::Reclaim),
+            4 => ("cuda-central", LeaseKind::Lockout),
             _ => (
                 "cuda-central",
                 LeaseKind::Interactive {

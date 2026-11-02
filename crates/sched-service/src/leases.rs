@@ -1,5 +1,5 @@
-//! Manual leases as the user requests them: on a model, on a shared host, a reclaim of an
-//! exclusive resource; released by id (or by resource for a host lease and a reclaim),
+//! Manual leases as the user requests them: on a model, on a shared host, a lockout of an
+//! exclusive resource; released by id (or by resource for a host lease and a lockout),
 //! listed. The book is plain data that the `Scheduler` object keeps in its Restate state;
 //! the rules here are pure, so they can be tested without Restate.
 //!
@@ -8,8 +8,8 @@
 //! - At most one manual model lease is held per exclusive resource. Asking again for the
 //!   model already leased returns that lease; asking for another model of the same
 //!   resource is refused until the first is released.
-//! - A manual host lease is for a resource (shared or exclusive) with a power section, a reclaim for an
-//!   exclusive resource with a power section (`Config::supports_reclaim`); each is held at
+//! - A manual host lease is for a resource (shared or exclusive) with a power section, a lockout for an
+//!   exclusive resource with a power section (`Config::supports_lockout`); each is held at
 //!   most once per resource, and asking again returns the lease held.
 //! - Lease ids come from a counter kept in the book, so they are deterministic under
 //!   Restate's replay.
@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 pub const MANUAL_MODEL_PREFIX: &str = "manual-model-";
 /// Prefix of the ids of manual host leases.
 pub const MANUAL_HOST_PREFIX: &str = "manual-host-";
-/// Prefix of the ids of reclaim leases.
-pub const RECLAIM_PREFIX: &str = "reclaim-";
+/// Prefix of the ids of lockout leases.
+pub const LOCKOUT_PREFIX: &str = "lockout-";
 
 /// Every lease the scheduler holds, and the counter its ids are drawn from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,9 +68,9 @@ pub enum LeaseError {
     NotShared { resource: ResourceId },
     /// The resource has no power section: it is always on, so a lease on it would do nothing.
     NoPowerSection { resource: ResourceId },
-    /// A reclaim names a resource that cannot be reclaimed: only an exclusive resource with a
+    /// A lockout names a resource that cannot be locked out: only an exclusive resource with a
     /// power section can be taken back and shut down.
-    NotReclaimable { resource: ResourceId },
+    NotLockable { resource: ResourceId },
     /// The resource holds no lease of the kind that was asked to be released.
     NoLeaseOnResource { resource: ResourceId, kind: String },
     /// No lease has this id.
@@ -86,7 +86,7 @@ impl LeaseError {
             | LeaseError::UnknownResource { .. }
             | LeaseError::NotShared { .. }
             | LeaseError::NoPowerSection { .. }
-            | LeaseError::NotReclaimable { .. } => 400,
+            | LeaseError::NotLockable { .. } => 400,
             LeaseError::Conflict { .. } => 409,
             LeaseError::UnknownLease { .. } | LeaseError::NoLeaseOnResource { .. } => 404,
         }
@@ -135,7 +135,7 @@ impl fmt::Display for LeaseError {
             }
             LeaseError::NotShared { resource } => write!(
                 f,
-                "resource {:?} is not a shared resource; a drain is for shared hosts such as an NFS server (an exclusive host is taken down by releasing its host lease, or by a reclaim)",
+                "resource {:?} is not a shared resource; a drain is for shared hosts such as an NFS server (an exclusive host is taken down by releasing its host lease, or by a lockout)",
                 resource.as_str()
             ),
             LeaseError::NoPowerSection { resource } => write!(
@@ -143,9 +143,9 @@ impl fmt::Display for LeaseError {
                 "resource {:?} has no power section: it is always on, so a lease on it would do nothing",
                 resource.as_str()
             ),
-            LeaseError::NotReclaimable { resource } => write!(
+            LeaseError::NotLockable { resource } => write!(
                 f,
-                "resource {:?} cannot be reclaimed: only an exclusive resource with a power section can be taken back and shut down",
+                "resource {:?} cannot be locked out: only an exclusive resource with a power section can be taken back and shut down",
                 resource.as_str()
             ),
             LeaseError::NoLeaseOnResource { resource, kind } => {
@@ -227,7 +227,7 @@ impl LeaseBook {
 
     /// Whether `resource` can be drained: a shared resource with a power section. An
     /// exclusive host is taken down by releasing its host lease (a plain release) or by a
-    /// reclaim, never by a drain.
+    /// lockout, never by a drain.
     pub fn check_drain(config: &Config, resource: &ResourceId) -> Result<(), LeaseError> {
         Self::check_host(config, resource)?;
         if known_resource(config, resource)?.kind != ResourceKind::Shared {
@@ -251,22 +251,22 @@ impl LeaseBook {
         Ok(self.acquire_unique(resource, LeaseKind::ManualHost, MANUAL_HOST_PREFIX, now))
     }
 
-    /// Reclaims an exclusive resource with a power section: the user takes the host back
-    /// despite pending work (see [`LeaseKind::Reclaim`]). Asking again returns the lease
+    /// Lockouts an exclusive resource with a power section: the user takes the host back
+    /// despite pending work (see [`LeaseKind::Lockout`]). Asking again returns the lease
     /// already held.
-    pub fn acquire_reclaim(
+    pub fn acquire_lockout(
         &mut self,
         config: &Config,
         resource: &ResourceId,
         now: Millis,
     ) -> Result<LeaseGrant, LeaseError> {
         known_resource(config, resource)?;
-        if !config.supports_reclaim(resource) {
-            return Err(LeaseError::NotReclaimable {
+        if !config.supports_lockout(resource) {
+            return Err(LeaseError::NotLockable {
                 resource: resource.clone(),
             });
         }
-        Ok(self.acquire_unique(resource, LeaseKind::Reclaim, RECLAIM_PREFIX, now))
+        Ok(self.acquire_unique(resource, LeaseKind::Lockout, LOCKOUT_PREFIX, now))
     }
 
     /// The lease of `kind` on `resource`, if one is held, else a new one from the counter.
@@ -308,9 +308,9 @@ impl LeaseBook {
         })
     }
 
-    /// Releases the reclaim on `resource` and returns it.
-    pub fn release_reclaim(&mut self, resource: &ResourceId) -> Result<Lease, LeaseError> {
-        self.release_kind(resource, "reclaim", |k| matches!(k, LeaseKind::Reclaim))
+    /// Releases the lockout on `resource` and returns it.
+    pub fn release_lockout(&mut self, resource: &ResourceId) -> Result<Lease, LeaseError> {
+        self.release_kind(resource, "lockout", |k| matches!(k, LeaseKind::Lockout))
     }
 
     fn release_kind(
@@ -574,34 +574,34 @@ mod tests {
     }
 
     #[test]
-    fn a_reclaim_is_for_an_exclusive_powered_resource_and_is_unique_per_resource() {
+    fn a_lockout_is_for_an_exclusive_powered_resource_and_is_unique_per_resource() {
         let c = example_config();
         let mut b = LeaseBook::default();
         let g = b
-            .acquire_reclaim(&c, &"cuda-central".into(), Millis(3))
+            .acquire_lockout(&c, &"cuda-central".into(), Millis(3))
             .unwrap();
         assert!(g.created);
-        assert_eq!(g.lease.id.as_str(), "reclaim-1");
-        assert_eq!(g.lease.kind, LeaseKind::Reclaim);
+        assert_eq!(g.lease.id.as_str(), "lockout-1");
+        assert_eq!(g.lease.kind, LeaseKind::Lockout);
         assert!(
-            !b.acquire_reclaim(&c, &"cuda-central".into(), Millis(4))
+            !b.acquire_lockout(&c, &"cuda-central".into(), Millis(4))
                 .unwrap()
                 .created
         );
         let e = b
-            .acquire_reclaim(&c, &"basestar-nfs".into(), Millis(1))
+            .acquire_lockout(&c, &"basestar-nfs".into(), Millis(1))
             .unwrap_err();
         assert_eq!(e.status(), 400);
-        assert!(e.to_string().contains("cannot be reclaimed"), "{e}");
+        assert!(e.to_string().contains("cannot be locked out"), "{e}");
         assert_eq!(b.leases.len(), 1);
         // It does not disturb a model lease on the same resource, and each is released alone.
         let m = b
             .acquire_manual_model(&c, &"llm".into(), Millis(5))
             .unwrap();
-        assert_eq!(b.release_reclaim(&"cuda-central".into()).unwrap(), g.lease);
+        assert_eq!(b.release_lockout(&"cuda-central".into()).unwrap(), g.lease);
         assert_eq!(b.leases, vec![m.lease]);
         assert_eq!(
-            b.release_reclaim(&"cuda-central".into())
+            b.release_lockout(&"cuda-central".into())
                 .unwrap_err()
                 .status(),
             404

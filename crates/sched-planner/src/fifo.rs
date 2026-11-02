@@ -26,7 +26,7 @@
 //! `max_dwell` has passed or another queue has become starved, and only when none of its
 //! busy classes is unpreemptible. An idle model is released only after `idle_grace`.
 //! Leases override this: a manual model lease forces its model, an interactive lease pins
-//! its model against batch eviction, and a reclaim clears the resource.
+//! its model against batch eviction, and a lockout clears the resource.
 
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
@@ -51,12 +51,12 @@ impl Strategy for FifoExhaustive {
         let now = snapshot.now;
         let active = |l: &&Lease| l.is_active(now);
 
-        intent.reclaim = snapshot
+        intent.lockout = snapshot
             .leases
             .iter()
             .filter(active)
-            .filter(|l| l.is_reclaim())
-            .filter(|l| config.supports_reclaim(&l.resource))
+            .filter(|l| l.is_lockout())
+            .filter(|l| config.supports_lockout(&l.resource))
             .map(|l| l.resource.clone())
             .collect();
 
@@ -101,14 +101,14 @@ impl Strategy for FifoExhaustive {
                 }
             }
         }
-        intent.power_up.retain(|r, _| !intent.reclaim.contains(r));
+        intent.power_up.retain(|r, _| !intent.lockout.contains(r));
 
         for res in config
             .resources()
             .iter()
             .filter(|r| r.kind == ResourceKind::Exclusive)
         {
-            let (target, forced) = target_for(config, snapshot, state, &res.id, &intent.reclaim);
+            let (target, forced) = target_for(config, snapshot, state, &res.id, &intent.lockout);
             intent.models.insert(res.id.clone(), target);
             if forced {
                 intent.forced.insert(res.id.clone());
@@ -124,9 +124,9 @@ fn target_for(
     snap: &Snapshot,
     state: &SchedState,
     resource: &ResourceId,
-    reclaimed: &BTreeSet<ResourceId>,
+    locked_out: &BTreeSet<ResourceId>,
 ) -> (Option<ModelId>, bool) {
-    if reclaimed.contains(resource) {
+    if locked_out.contains(resource) {
         return (None, true);
     }
     let now = snap.now;

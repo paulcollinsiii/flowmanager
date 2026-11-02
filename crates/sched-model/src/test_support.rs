@@ -398,15 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn fixture_state_and_reclaim_are_checked() {
+    fn fixture_state_and_lockout_are_checked() {
         let cfg = example_config();
-        let bad = "description: x\nsnapshot:\n  config_generation: 4\n  now: 10\n  leases:\n    - { id: r, resource: basestar-nfs, granted_at: 1, kind: { type: reclaim } }\nstate:\n  resources:\n    ghost: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: immich-ml, since: 0 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: loading, model: llm, since: 0 } }\n";
+        let bad = "description: x\nsnapshot:\n  config_generation: 4\n  now: 10\n  leases:\n    - { id: r, resource: basestar-nfs, granted_at: 1, kind: { type: lockout } }\nstate:\n  resources:\n    ghost: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: immich-ml, since: 0 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: loading, model: llm, since: 0 } }\n";
         let msg = Fixture::from_yaml_checked(bad, &cfg)
             .unwrap_err()
             .to_string();
         for needle in [
             "does not match the config generation",
-            "reclaim on resource",
+            "lockout on resource",
             "unknown resource \"ghost\"",
             "a shared resource has no model mode",
             "does not belong to this resource",

@@ -211,8 +211,8 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
             if acted {
                 return;
             }
-            if cx.reclaimed() {
-                wait(cx, steps, WaitReason::Reclaimed);
+            if cx.locked_out() {
+                wait(cx, steps, WaitReason::LockedOut);
             } else if want.is_some()
                 && want != Some(PowerWant::Manual)
                 && st.min_off_remaining(
@@ -262,11 +262,11 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 return;
             }
             let idle_mode = matches!(st.mode, ModePhase::Idle);
-            if cx.reclaimed() {
-                // No `idle` check: a reclaim exists only for an exclusive resource, whose mode
+            if cx.locked_out() {
+                // No `idle` check: a lockout exists only for an exclusive resource, whose mode
                 // step has run just before this (the host is on) and always acts while a model
                 // is allowed (`acted`, returned above), so a host that gets here has no model.
-                power_off(cx, st, steps, Shutdown::reclaim(now));
+                power_off(cx, st, steps, Shutdown::lockout(now));
                 return;
             }
             if want == Some(PowerWant::Manual) {
@@ -351,7 +351,7 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
             .is_some_and(|m| m.is_some());
     match st.power {
         PowerPhase::On { .. } => {}
-        _ if cx.reclaimed() => wait(cx, steps, WaitReason::Reclaimed),
+        _ if cx.locked_out() => wait(cx, steps, WaitReason::LockedOut),
         // Only left from managed control while reachability is not fresh.
         PowerPhase::PoweringOn { .. } => wait(cx, steps, WaitReason::PoweringOn),
         PowerPhase::ShuttingDown { .. } => wait(cx, steps, WaitReason::ShuttingDown),
@@ -362,7 +362,7 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
 }
 
 /// The pre-shutdown veto: whether nothing still uses the host. Before any power-off (idle,
-/// requested, reclaim) every reading that applies to the host must be fresh and show it
+/// requested, lockout) every reading that applies to the host must be fresh and show it
 /// unused: no pod mounts its NFS server (a `mounts` source names it) and no pod of its models
 /// exists (a `pods` source covers them, all of its models). This is the one place a pod
 /// reading decides anything, and only to hold a shutdown back. A reading that is missing,
@@ -372,7 +372,7 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
 /// host is seen down, a person resets it, or a new manual request takes it over.
 ///
 /// `shutdown` is the shutdown this power-off belongs to; it is recorded only when the host
-/// has none yet (an exclusive host's idle or reclaim shutdown starts here).
+/// has none yet (an exclusive host's idle or lockout shutdown starts here).
 fn veto_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, shutdown: Shutdown) -> bool {
     if st.shutdown.is_some_and(|s| s.stopped_since().is_some()) {
         wait(cx, steps, WaitReason::ShutdownStopped);

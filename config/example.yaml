@@ -40,7 +40,7 @@ resources:
       # (acquire_host_lease), a manual model lease, or a class with may_change_power: queued
       # work never wakes it. A host lease keeps it up and pins no model (the queues still
       # choose); releasing it is a plain release (no drain): once idle the model is withdrawn
-      # and idle_grace later the host is shut down. A reclaim is the forced "off now". A host
+      # and idle_grace later the host is shut down. A lockout is the forced "off now". A host
       # found running is adopted like a shared one (held by the user until released).
       control: manual
       # Under managed control, how long the host may take to be observed up after a

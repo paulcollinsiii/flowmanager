@@ -7,7 +7,7 @@
 //! which compare decisions with and without them.
 //!
 //! The checker is deliberately independent of the sequencer: it reads observations and
-//! leases straight from the snapshot with its own small readers, derives "reclaimed",
+//! leases straight from the snapshot with its own small readers, derives "locked_out",
 //! "forced" and "held" from the leases rather than from the intent, and shares only the
 //! data types and config accessors with the code it checks. It re-uses none of
 //! `sched_model`'s query helpers (`class_work`, `fresh_*`, `holds_host`, ...).
@@ -167,11 +167,11 @@ fn active(kind: &LeaseKind, now: Millis) -> bool {
     !matches!(kind, LeaseKind::Interactive { expires_at, .. } if now >= *expires_at)
 }
 
-fn reclaimed(config: &Config, snap: &Snapshot, res: &ResourceId) -> bool {
+fn locked_out(config: &Config, snap: &Snapshot, res: &ResourceId) -> bool {
     let spec = config.resource(res);
     spec.is_some_and(|r| r.kind == ResourceKind::Exclusive && r.power.is_some())
         && snap.leases.iter().any(|l| {
-            &l.resource == res && matches!(l.kind, LeaseKind::Reclaim) && active(&l.kind, snap.now)
+            &l.resource == res && matches!(l.kind, LeaseKind::Lockout) && active(&l.kind, snap.now)
         })
 }
 
@@ -255,7 +255,7 @@ pub fn check(
         }
     }
 
-    // 3. Only a configured model, on a host that is up and not reclaimed, is allowed; one
+    // 3. Only a configured model, on a host that is up and not locked out, is allowed; one
     // that was not allowed before needs an allow step in this decision.
     let before_allowed: BTreeSet<&ModelId> = prev
         .resources
@@ -283,15 +283,15 @@ pub fn check(
         let allowed_now = decision.steps.iter().any(
             |s| matches!(s, Step::AllowModel { resource, model: m } if resource == res && m == model),
         );
-        // A reclaim withdraws the model once its in-flight work is done or timed out; until
+        // A lockout withdraws the model once its in-flight work is done or timed out; until
         // then it stays allowed, winding down. It is never newly allowed.
         let winding_down = matches!(
             decision.state.resource(res).map(|s| &s.mode),
             Some(ModePhase::Serving { model: m, wind_down: Some(_), .. }) if m == model
         );
-        if reclaimed(config, snapshot, res) && (allowed_now || !winding_down) {
+        if locked_out(config, snapshot, res) && (allowed_now || !winding_down) {
             out.push(format!(
-                "invariant 3: {model} allowed on reclaimed {res} without winding down"
+                "invariant 3: {model} allowed on locked out {res} without winding down"
             ));
         }
         if !before_allowed.contains(model) && !allowed_now {
@@ -303,7 +303,7 @@ pub fn check(
 
     // Classes: every requirement holds. A model requirement needs that model allowed and
     // not being wound down in this decision; any requirement needs its host not observed
-    // down and not reclaimed (a gate class, on an exclusive host without a model, included).
+    // down and not locked out (a gate class, on an exclusive host without a model, included).
     for class in &decision.allowed.classes {
         let Some(spec) = config.class(class) else {
             out.push(format!(
@@ -320,9 +320,9 @@ pub fn check(
                     "invariant 3: allowed class {class} while {r} is not up"
                 ));
             }
-            if reclaimed(config, snapshot, r) {
+            if locked_out(config, snapshot, r) {
                 out.push(format!(
-                    "invariant 3: allowed class {class} on reclaimed {r}"
+                    "invariant 3: allowed class {class} on locked out {r}"
                 ));
             }
             if let Some(m) = &req.model {
@@ -367,7 +367,7 @@ pub fn check(
         }
         let leased = snapshot.leases.iter().any(|l| {
             &l.resource == id
-                && !matches!(l.kind, LeaseKind::Reclaim)
+                && !matches!(l.kind, LeaseKind::Lockout)
                 && active(&l.kind, snapshot.now)
         });
         let busy = config
@@ -529,11 +529,11 @@ pub fn check(
                         ));
                     }
                 }
-                if reclaimed(config, snapshot, resource) {
-                    out.push(format!("invariant 14: powered on reclaimed {resource}"));
+                if locked_out(config, snapshot, resource) {
+                    out.push(format!("invariant 14: powered on locked out {resource}"));
                 }
             }
-            // 5, 6, 7, 10, 11, 13. Power-off needs no holds (a reclaim of an exclusive powered resource
+            // 5, 6, 7, 10, 11, 13. Power-off needs no holds (a lockout of an exclusive powered resource
             // is the only exception), idle grace, management, and fresh observations.
             Step::PowerOff { resource } => {
                 if !managed_power(config, resource) {
@@ -542,7 +542,7 @@ pub fn check(
                     ));
                 }
                 let before = prev.resource(resource);
-                if !reclaimed(config, snapshot, resource) {
+                if !locked_out(config, snapshot, resource) {
                     if !before.is_some_and(|s| s.managed) {
                         out.push(format!(
                             "invariant 7: powered off unmanaged host {resource}"
@@ -564,7 +564,7 @@ pub fn check(
                     }
                     let held = snapshot.leases.iter().any(|l| {
                         &l.resource == resource
-                            && !matches!(l.kind, LeaseKind::Reclaim)
+                            && !matches!(l.kind, LeaseKind::Lockout)
                             && active(&l.kind, now)
                     });
                     if held {
@@ -672,7 +672,7 @@ pub fn check(
                 }
             }
             // 16. Stopping in-flight work is allowed only per class, after that class's own
-            // timeout (`kill_timeout`, else the cause's: `reclaim_timeout` under a reclaim,
+            // timeout (`kill_timeout`, else the cause's: `lockout_timeout` under a lockout,
             // `drain_timeout` otherwise) has run out within a running wind-down.
             Step::KillInFlight { class } => {
                 let Some(spec) = config.class(class) else {
@@ -694,17 +694,17 @@ pub fn check(
                         "invariant 16: stopped {class} though nothing of it is in flight"
                     ));
                 }
-                let reclaim = reclaimed(config, snapshot, res);
-                let base = if reclaim {
-                    policy.reclaim_timeout()
+                let lockout = locked_out(config, snapshot, res);
+                let base = if lockout {
+                    policy.lockout_timeout()
                 } else {
                     policy.drain_timeout
                 };
                 // A shutdown a person asked for on this host: `immediate` cuts work off at
-                // once, `graceful` (unless a reclaim holds the host) after exactly
+                // once, `graceful` (unless a lockout holds the host) after exactly
                 // `drain_timeout` from the request; neither waits for a running wind-down
                 // nor for a class's `kill_timeout`.
-                match (requested_shutdown(prev, snapshot, res), reclaim) {
+                match (requested_shutdown(prev, snapshot, res), lockout) {
                     (Some((sched_model::DrainMode::Immediate, _)), _) => continue,
                     (Some((sched_model::DrainMode::Graceful, asked)), false) => {
                         let due = asked.as_u64().saturating_add(policy.drain_timeout.as_u64());
@@ -722,7 +722,7 @@ pub fn check(
                     Some(ModePhase::Serving {
                         wind_down: Some(wd),
                         ..
-                    }) if wd.reclaim == reclaim && wd.timeout.is_some() => {
+                    }) if wd.lockout == lockout && wd.timeout.is_some() => {
                         let due = wd
                             .since
                             .as_u64()
@@ -758,7 +758,7 @@ pub fn check(
                     ));
                     continue;
                 };
-                let forced = reclaimed(config, snapshot, resource)
+                let forced = locked_out(config, snapshot, resource)
                     || manual_model(snapshot, resource)
                     || requested_shutdown(prev, snapshot, resource).is_some();
                 if !forced

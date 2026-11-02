@@ -240,10 +240,10 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/acquire_model_lease` | `{"model": "<id>"}` | **Pins a model on its GPU**: batch work is cut short (its classes leave the allowed set at once, in-flight work gets `drain_timeout`, or a class's `kill_timeout`, then is stopped) and the model stays allowed however much other work waits, until the lease is released. Asking again for the leased model returns the existing lease; another model of the same resource is `409`; an unknown model is `400`. | an operator (a person); later Open WebUI's service account. |
 | `Scheduler/main/release_lease` | `{"id": "manual-model-<n>"}` | Releases a lease and returns it; unknown id `404`. Whoever can release can end somebody's pin. | an operator; the same identity that acquired it. |
 | `Scheduler/main/acquire_host_lease` | `{"resource": "<id>"}` | **Holds a host with a power section up**, shared (the NFS server) or exclusive (a GPU): a `managed` host that is off is powered on, and while the lease is held everything gated on the host is allowed even with no work queued. On an exclusive host it pins no model (the queues keep choosing); with no host or model lease, and no `may_change_power` class, nothing powers an exclusive managed host on. Asking again returns the lease; a resource without a power section or an unknown one is `400`. Ids `manual-host-<n>`. | an operator. |
-| `Scheduler/main/release_host_lease` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` (`drain` optional) | Releases the manual host lease of a resource (also the one flowmanager minted for a host it found running); none held is `404`. Without `drain` the host is shut down once nothing else holds it (queued or in-flight work of its consumers included), `idle_grace` has passed and no pod mounts it. On an exclusive host the release is always plain: queued or in-flight work holds the host until it is idle, then `idle_grace` after the model is withdrawn it is shut down (the reclaim is the forced "off now"), and `drain` is `400`. With `drain` (shared hosts) the request is recorded in the host's state: queued and in-flight work stops holding the host, its consumers are scaled down (`immediate`: at once; `graceful`: when nothing is in flight or after `policy.drain_timeout`), and the host is shut down once no lease holds it (a job's hold is waited for, never overridden) and no pod mounts it (`veto_timeout` still applies). A new `acquire_host_lease` cancels the drain. The drain is in the tick report (`drains`) and the logs (`drain_requested`, `drain`). | an operator. |
-| `Scheduler/main/drain_host` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` | Takes a shared host down whether or not a manual lease is held (the Home Assistant switch-off): releases the lease if there is one and records the drain as `release_host_lease` does. Asked again it changes the drain under way in place (`immediate` escalates, `graceful` leaves an immediate one), from the stored state. Answers `{resource, released, drain}`; `drain` is absent when the host is not up under managed control. An exclusive resource (switch it off with `release_host_lease`, or reclaim it), one without a power section or an unknown one is `400`. **Rollback:** an older build cannot decode a stored state that holds a drain, so let it finish (or discard the state) before rolling back. | an operator. |
-| `Scheduler/main/reclaim` | `{"resource": "<id>"}` | **Takes an exclusive host back despite pending work**: intake stops, in-flight work gets `reclaim_timeout` and is then cut off, a `managed` host is shut down and not woken until `unreclaim`. Only for an exclusive resource with a power section (`400` otherwise). Ids `reclaim-<n>`. | an operator. |
-| `Scheduler/main/unreclaim` | `{"resource": "<id>"}` | Releases the reclaim; none held is `404`. | an operator. |
+| `Scheduler/main/release_host_lease` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` (`drain` optional) | Releases the manual host lease of a resource (also the one flowmanager minted for a host it found running); none held is `404`. Without `drain` the host is shut down once nothing else holds it (queued or in-flight work of its consumers included), `idle_grace` has passed and no pod mounts it. On an exclusive host the release is always plain: queued or in-flight work holds the host until it is idle, then `idle_grace` after the model is withdrawn it is shut down (the lockout is the forced "off now"), and `drain` is `400`. With `drain` (shared hosts) the request is recorded in the host's state: queued and in-flight work stops holding the host, its consumers are scaled down (`immediate`: at once; `graceful`: when nothing is in flight or after `policy.drain_timeout`), and the host is shut down once no lease holds it (a job's hold is waited for, never overridden) and no pod mounts it (`veto_timeout` still applies). A new `acquire_host_lease` cancels the drain. The drain is in the tick report (`drains`) and the logs (`drain_requested`, `drain`). | an operator. |
+| `Scheduler/main/drain_host` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` | Takes a shared host down whether or not a manual lease is held (the Home Assistant switch-off): releases the lease if there is one and records the drain as `release_host_lease` does. Asked again it changes the drain under way in place (`immediate` escalates, `graceful` leaves an immediate one), from the stored state. Answers `{resource, released, drain}`; `drain` is absent when the host is not up under managed control. An exclusive resource (switch it off with `release_host_lease`, or lockout it), one without a power section or an unknown one is `400`. **Rollback:** an older build cannot decode a stored state that holds a drain, so let it finish (or discard the state) before rolling back. | an operator. |
+| `Scheduler/main/lockout` | `{"resource": "<id>"}` | **Takes an exclusive host back despite pending work**: intake stops, in-flight work gets `lockout_timeout` and is then cut off, a `managed` host is shut down and not woken until `clear_lockout`. Only for an exclusive resource with a power section (`400` otherwise). Ids `lockout-<n>`. | an operator. |
+| `Scheduler/main/clear_lockout` | `{"resource": "<id>"}` | Releases the lockout; none held is `404`. | an operator. |
 | `Scheduler/main/resume` | `{"resource": "<id>"}` | After a host was fixed by hand: clears a failed power transition, or a shutdown stopped by mounting pods, for that one resource, which then follows observation (found running means up and not managed; a `managed` host, shared or exclusive, is then adopted at the next tick). Powers nothing; other resources and the leases are untouched. Not stopped: `409`. | an operator. |
 | `Scheduler/main/jobs` | none | Read only. Every configured scheduled job with its state: next time, the run in progress (phase, attempt, Job name, retry time), the last outcome and the last success, and a Job past its deadline that may still be active. | operators, monitoring. |
 | `Scheduler/main/trigger_job` | `{"id": "<job id>"}` | **Starts a run of a scheduled job now** (it waits for the job's needs, then the Job is created). Refused with `409` while the previous instance is pending or running, never queued; unknown id `404`. | an operator. |
@@ -293,7 +293,7 @@ curl -sS -X POST $INGRESS/Scheduler/main/tick
 Acquiring and releasing also ask for a tick, so the effect shows within seconds (the
 published set changes; KEDA follows at its next poll, section 6).
 
-The same shape serves the other lease handlers (`README.md`, *Host leases, reclaim and
+The same shape serves the other lease handlers (`README.md`, *Host leases, lockout and
 resume*):
 
 ```sh
@@ -303,9 +303,9 @@ curl -sS -X POST $INGRESS/Scheduler/main/acquire_host_lease \
 curl -sS -X POST $INGRESS/Scheduler/main/release_host_lease \
   -H 'content-type: application/json' -d '{"resource": "basestar-nfs"}'
 # Take the GPU host back / give it up again:
-curl -sS -X POST $INGRESS/Scheduler/main/reclaim \
+curl -sS -X POST $INGRESS/Scheduler/main/lockout \
   -H 'content-type: application/json' -d '{"resource": "cuda-central"}'
-curl -sS -X POST $INGRESS/Scheduler/main/unreclaim \
+curl -sS -X POST $INGRESS/Scheduler/main/clear_lockout \
   -H 'content-type: application/json' -d '{"resource": "cuda-central"}'
 # After fixing a host flowmanager stopped at (the answer says what was cleared):
 curl -sS -X POST $INGRESS/Scheduler/main/resume \
@@ -353,7 +353,7 @@ cluster; do not expose the port outside it.
 
 **What it does.** Nothing is decided in the listener. Each request is turned into the
 Restate handler a person would call (`acquire_model_lease`, `release_lease`,
-`acquire_host_lease`, `release_host_lease`, `reclaim`, `unreclaim`, `resume`, `leases`) and
+`acquire_host_lease`, `release_host_lease`, `lockout`, `clear_lockout`, `resume`, `leases`) and
 sent through the Restate ingress (`--restate-ingress`, the URL the process already uses), so
 the object's lock, journal and persisted state are used exactly as for any other caller; the
 listener keeps no lease state. Reads come from the lease list the same way and from the last
@@ -361,14 +361,14 @@ tick's report in the process (so a status is absent until this process has ticke
 
 | Request | Meaning |
 | --- | --- |
-| `GET /v1/leases` | Every model, powered resource and reclaimable resource with its state, and a top-level `needs_attention`. |
+| `GET /v1/leases` | Every model, powered resource and lockoutable resource with its state, and a top-level `needs_attention`. |
 | `GET /v1/models/{model}` | A manual model lease (on = the lease is held, **not** that the model is loaded). |
 | `POST /v1/models/{model}/on`, `/off` | Take or release it. Idempotent: on when held returns the same state; off when not held is a success. |
-| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release` | The manual host lease of a host with a power section (the NFS server, or an exclusive GPU host): powers a managed host on and keeps it up. On an **exclusive** host `off` is a plain release (the same as `release`, a success with nothing held), `off-now` is `400` (never drained; reclaim is the forced off), and the queues keep choosing the model. A host found running (power button, Wake-on-LAN, first start) reads **on**: flowmanager holds it for you with an adopted lease, and switching it off releases it. `off` releases with a **graceful drain** (queued work no longer keeps the host up; in-flight work gets `drain_timeout`, then the consumers are scaled down and the host is shut down once nothing else holds it), `off-now` with an **immediate** drain (consumers scaled down at once). Neither overrides a job's hold: the host stays up until it ends. `release` is a plain release with no drain (what `off` did before drains): the host is shut down only once nothing holds it, `404` if no lease is held, and the reply keeps `state: "on"` while the host is up. A later `on` cancels a drain. This works with no lease held too (a host held up only by queued work), and the answer is `state: "draining"` with a `drain` object while the host is up, never `off`; an idle drain (no lease, `held:false`) is shown the same way, with `drain.origin` `idle`. |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release` | The manual host lease of a host with a power section (the NFS server, or an exclusive GPU host): powers a managed host on and keeps it up. On an **exclusive** host `off` is a plain release (the same as `release`, a success with nothing held), `off-now` is `400` (never drained; lockout is the forced off), and the queues keep choosing the model. A host found running (power button, Wake-on-LAN, first start) reads **on**: flowmanager holds it for you with an adopted lease, and switching it off releases it. `off` releases with a **graceful drain** (queued work no longer keeps the host up; in-flight work gets `drain_timeout`, then the consumers are scaled down and the host is shut down once nothing else holds it), `off-now` with an **immediate** drain (consumers scaled down at once). Neither overrides a job's hold: the host stays up until it ends. `release` is a plain release with no drain (what `off` did before drains): the host is shut down only once nothing holds it, `404` if no lease is held, and the reply keeps `state: "on"` while the host is up. A later `on` cancels a drain. This works with no lease held too (a host held up only by queued work), and the answer is `state: "draining"` with a `drain` object while the host is up, never `off`; an idle drain (no lease, `held:false`) is shown the same way, with `drain.origin` `idle`. |
 | `POST /v1/resources/{resource}/resume` | Clears a failed power phase (or a shutdown stopped by mounting pods) after a person fixed the host. `409` if the resource is not stopped. |
-| `GET /v1/reclaims/{resource}`, `POST .../on`, `.../off` | `reclaim` / `unreclaim` of an exclusive resource with a power section ("this GPU is mine"): intake stops, work is cut off after the reclaim timeout, the host is shut down if its power is managed, and it is not woken until released. |
+| `GET /v1/lockouts/{resource}`, `POST .../on`, `.../off` | `lockout` / `clear_lockout` of an exclusive resource with a power section ("this GPU is mine"): intake stops, work is cut off after the lockout timeout, the host is shut down if its power is managed, and it is not woken until released. |
 
-`POST /v1/{models,resources,reclaims}/{name}` with a body of `ON` or `OFF` (also
+`POST /v1/{models,resources,lockouts}/{name}` with a body of `ON` or `OFF` (also
 `true`/`false`, or JSON `{"state": "on"}` / `{"held": true}`) does the same as `/on` and
 `/off`: that is the shape Home Assistant's REST switch sends to a single URL. Names are the
 config's ids (percent-encoded if needed). A body over 1 KiB is refused.
@@ -386,14 +386,14 @@ derived from the last tick's report and are **left out when they cannot be said*
 
 - model: `active` (in the allowed set), `waiting_for_host` (its host is not up),
   `host_failed`, `draining` (another model of the resource is winding down, its in-flight work
-  awaited), `reclaimed` (a reclaim is held on its resource: no model is allowed there until it is
+  awaited), `locked out` (a lockout is held on its resource: no model is allowed there until it is
   released, whatever the host is doing), `pending` (the last tick predates the lease, or another
   model is still allowed and the report gives no more);
 - host lease (`GET /v1/resources/..`): `power` (the phase as the sequencer holds it, with `since`
   and, when failed, `during`), `wait` (a list: `min_off` with the seconds left, or
   `shutdown_held_by_veto` with `stopped`), `drain` (present while a drain is under way: `mode`,
   `since_ms`, `scaled_down`), `needs_attention`;
-- reclaim: `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_for_person` (the host
+- lockout: `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_for_person` (the host
   is up and its power is `control: manual`, so flowmanager never shuts it down: power it off
   yourself), `pending`, the `power`
   phase, `tick_reason` (the tick's reason in words) and `needs_attention`.
@@ -406,7 +406,7 @@ there is no separate metric for it (alert on those two, see the alert list).
 
 Errors are JSON `{"error": "<message>"}`. The handler's own message and status are relayed for
 `400` (a resource that cannot be leased or drained: one without a power section for a host lease, an exclusive one for `off-now`, a shared one or
-one without a power section for a reclaim) and `409` (another model already leased on the
+one without a power section for a lockout) and `409` (another model already leased on the
 resource; `resume` of a resource that is not stopped). `404` is the listener's own answer for a
 name the config does not have (the message lists what is configured) or a path it does not
 serve. A `404` from Restate is never relayed: Restate gives it for a service it does not know
@@ -419,7 +419,7 @@ checked against a fresh listing and is otherwise the error. `GET /v1/resources/.
 
 **Observability.** Every on/off/resume request, and every refused request of any kind (a
 wrong or missing token, an unknown path, a wrong method, an oversize body), logs one structured
-line `event="toggle"` with `kind` (`model`, `host`, `reclaim`, `list`, `unmatched`), `name`,
+line `event="toggle"` with `kind` (`model`, `host`, `lockout`, `list`, `unmatched`), `name`,
 `action` (`get`, `on`, `off`, `resume`, `unknown`), `outcome`, `status` and `suppressed`; never the
 token or a body. `name` is what the caller put in the path, shortened to 64 characters and logged
 escaped (a newline in a path cannot start a log line of its own). At most 30 refused requests are
@@ -428,7 +428,7 @@ still counted in the metric, and a successful change is always logged). The acqu
 themselves log as
 before. Metrics: `sched_toggle_requests_total{endpoint,outcome}` (counted per endpoint
 label, never per name), `sched_manual_lease_age_seconds{kind,target}` for each held manual
-model lease, host lease and reclaim (`kind` is `model`, `host` or `reclaim`), and the existing
+model lease, host lease and lockout (`kind` is `model`, `host` or `lockout`), and the existing
 `sched_resource_power_failed` / `sched_resource_veto` for needs-attention.
 
 **Limits.** The token is checked before a request's body is read (an oversize or non-UTF-8 body
@@ -522,11 +522,11 @@ switch:
     headers:
       Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
     timeout: 20
-  - platform: rest                  # the GPU host reclaimed: "this GPU is mine"
-    name: Flowmanager GPU reclaim
-    unique_id: flowmanager_reclaim_cuda_central
-    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/reclaims/cuda-central
-    state_resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/reclaims/cuda-central
+  - platform: rest                  # the GPU host locked out: "this GPU is mine"
+    name: Flowmanager GPU lockout
+    unique_id: flowmanager_lockout_cuda_central
+    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/lockouts/cuda-central
+    state_resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/lockouts/cuda-central
     method: post
     body_on: "ON"
     body_off: "OFF"
@@ -1127,7 +1127,7 @@ and allowing one needs a fresh "up" reading (`policy.host_reading_stale_after`, 
   `sched_veto_timeouts_total`, `sched_resource_veto{state="stopped"} == 1`) and
   stops: the host stays up and is not shut down by flowmanager again until a person calls
   `resume`, it is seen down, or a new manual lease takes it over. A GPU host's shutdown
-  follows the bounded wind-down of its model (`drain_timeout`, `reclaim_timeout`); see "Power
+  follows the bounded wind-down of its model (`drain_timeout`, `lockout_timeout`); see "Power
   actions" in the README.
 - **A minimum off time for a managed host** (`resources[].power.min_off`, default 0:
   disabled; at most 1 d): after flowmanager has shut a host down and seen it down, it does not
@@ -1170,7 +1170,7 @@ event):
   seconds left of the `min_off` wait before a host that flowmanager shut down may be powered on
   again by itself (0 outside it). The power metrics (`sched_resource_power_failed`,
   `sched_power_timeouts_total`, `sched_power_requests_total`) are in the README.
-- `sched_manual_lease_age_seconds{kind,target}`: seconds since each manual model lease (`kind="model"`), manual host lease (`host`) and reclaim (`reclaim`) was granted; alert on a lease held too long. `sched_toggle_requests_total{endpoint,outcome}`: requests to the toggle listener. `sched_webhook_requests_total{outcome}`: requests to the webhook listener; `sched_webhook_nudges_total`: sources nudged to poll now.
+- `sched_manual_lease_age_seconds{kind,target}`: seconds since each manual model lease (`kind="model"`), manual host lease (`host`) and lockout (`lockout`) was granted; alert on a lease held too long. `sched_toggle_requests_total{endpoint,outcome}`: requests to the toggle listener. `sched_webhook_requests_total{outcome}`: requests to the webhook listener; `sched_webhook_nudges_total`: sources nudged to poll now.
 - `sched_tick_duration_seconds` (histogram), `sched_last_tick_timestamp_seconds`,
   `sched_tick_trigger_failures_total` (flowmanager could not ask the Restate ingress for a
   tick), `sched_config_generation`, `sched_config_reloads_total{outcome}`
@@ -1201,7 +1201,7 @@ event):
   expr: time() - (sched_job_last_success_timestamp_seconds{scheduled_job="backup"} or on() vector(0)) > 8 * 86400
 - alert: FlowmanagerNeedsAttention       # a host in a failed power phase, or a shutdown stopped by mounting pods: resume it after fixing it (the toggle listener's needs_attention is these two)
   expr: sched_resource_power_failed == 1 or sched_resource_veto{state="stopped"} == 1
-- alert: FlowmanagerLeaseHeldTooLong     # a forgotten manual lease or reclaim
+- alert: FlowmanagerLeaseHeldTooLong     # a forgotten manual lease or lockout
   expr: sched_manual_lease_age_seconds > 6 * 3600
   for: 10m
 - alert: FlowmanagerConfigRejected       # the last good config is still active
@@ -1261,7 +1261,7 @@ goes idle: the scheduler starts an **idle drain** (the `drains` entry has `origi
 the moment it would have powered the host off, the consumers leave the allowed set, the mount
 check waits for their pods to go, then the host is shut down. Any hold (a lease, a job, work
 for a consumer) cancels it. Rolling back is as for any state (`discard_state` after the
-rollback, see above). See the README, *Host leases, reclaim and resume*.
+rollback, see above). See the README, *Host leases, lockout and resume*.
 
 A build without scheduled jobs rejects the `jobs:` section of the config (roll the config back
 with it), ignores the `job_book` key and never releases `hold-job-*` leases already in the

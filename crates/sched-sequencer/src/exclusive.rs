@@ -14,11 +14,11 @@ use crate::power::wait;
 
 /// Advances the mode machine. Returns whether a resource-scoped step was emitted.
 pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bool {
-    // A reclaim, and a shutdown a person asked for, both take the model away: the host is
+    // A lockout, and a shutdown a person asked for, both take the model away: the host is
     // going down, so nothing is allowed on it whatever the intent says.
     let request = requested_mode(st);
     let requested = request.map(|(mode, _)| mode);
-    let target = if cx.reclaimed() || requested.is_some() {
+    let target = if cx.locked_out() || requested.is_some() {
         None
     } else {
         cx.intent
@@ -29,7 +29,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) -> bo
             // Never a model the config does not have on this resource, whatever the intent.
             .filter(|m| configured(cx, m))
     };
-    let forced = cx.reclaimed() || requested.is_some() || cx.intent.forced.contains(&cx.res.id);
+    let forced = cx.locked_out() || requested.is_some() || cx.intent.forced.contains(&cx.res.id);
     match st.mode.clone() {
         ModePhase::Idle => {
             // Left by a state from before the queue-only change (a drain in progress).
@@ -54,7 +54,7 @@ fn requested_mode(st: &ResourceState) -> Option<(DrainMode, Millis)> {
     let s = st.shutdown?;
     match s.cause() {
         ShutdownCause::Requested { mode } => Some((mode, s.since())),
-        ShutdownCause::Idle | ShutdownCause::Reclaim => None,
+        ShutdownCause::Idle | ShutdownCause::Lockout => None,
     }
 }
 
@@ -215,15 +215,15 @@ fn serving(
     }
 
     // Every wind-down has a timeout, forced or not: the class's own `kill_timeout` or else
-    // the cause's (`reclaim_timeout` for a reclaim, `drain_timeout` otherwise), counted from
+    // the cause's (`lockout_timeout` for a lockout, `drain_timeout` otherwise), counted from
     // the start of the wind-down. Without it a serving model whose queue is fed
     // continuously would never hand over, because withdrawing the allowed model is what
     // cuts work off here. Only a busy `none` class (checked above, unforced only) blocks
     // without a timeout.
     //
     // A cause change during a wind-down: the clock restarts exactly when the cause flips
-    // between reclaim and not-reclaim (the new cause's timeout counts from the change; a
-    // reclaim ending gives the work a fresh `drain_timeout`). Unforced, a manual lease and a
+    // between lockout and not-lockout (the new cause's timeout counts from the change; a
+    // lockout ending gives the work a fresh `drain_timeout`). Unforced, a manual lease and a
     // lease released all share `drain_timeout` and keep `since`, so the cut-off neither
     // moves nor is extended by them. A state persisted without a timeout (before unforced
     // wind-downs had one) gets it filled in, keeping `since`. Classes already stopped stay
@@ -232,32 +232,32 @@ fn serving(
     // A shutdown a person asked for is a forced wind-down: `graceful` gives in-flight work
     // exactly `drain_timeout` from the request (`Shutdown::since`; no class `kill_timeout`
     // extends it, and an earlier unforced wind-down's start does not shorten it), `immediate`
-    // cuts it off at once. A reclaim, being stricter on the host, keeps its own timeout
-    // (`reclaim_timeout`, a class's `kill_timeout`) under a graceful request.
+    // cuts it off at once. A lockout, being stricter on the host, keeps its own timeout
+    // (`lockout_timeout`, a class's `kill_timeout`) under a graceful request.
     let immediate = matches!(request, Some((DrainMode::Immediate, _)));
     let timeout = if immediate {
         Millis::ZERO
-    } else if cx.reclaimed() {
-        policy.reclaim_timeout()
+    } else if cx.locked_out() {
+        policy.lockout_timeout()
     } else {
         policy.drain_timeout
     };
     let started = wind_down.is_none();
     let wd = match wind_down {
-        Some(w) if w.reclaim == cx.reclaimed() => WindDown {
+        Some(w) if w.lockout == cx.locked_out() => WindDown {
             timeout: Some(timeout),
             ..w
         },
         Some(w) => WindDown {
             since: now,
             timeout: Some(timeout),
-            reclaim: cx.reclaimed(),
+            lockout: cx.locked_out(),
             killed: w.killed,
         },
         None => WindDown {
             since: now,
             timeout: Some(timeout),
-            reclaim: cx.reclaimed(),
+            lockout: cx.locked_out(),
             killed: Default::default(),
         },
     };
@@ -291,7 +291,7 @@ fn serving(
             Some((DrainMode::Immediate, _)) => wd.since,
             // Exactly `drain_timeout` from the request: a class's `kill_timeout` does not
             // extend it, and an earlier wind-down's start does not shorten it.
-            Some((DrainMode::Graceful, asked)) if !cx.reclaimed() => {
+            Some((DrainMode::Graceful, asked)) if !cx.locked_out() => {
                 asked.saturating_add(policy.drain_timeout)
             }
             _ => wd.since.saturating_add(c.kill_timeout.unwrap_or(timeout)),

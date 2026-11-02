@@ -69,10 +69,10 @@ pub struct WindDown {
     /// read from a state persisted before unforced wind-downs had a timeout.
     #[serde(default)]
     pub timeout: Option<Millis>,
-    /// Whether the cause is a reclaim (rather than a manual lease or none), so that the
+    /// Whether the cause is a lockout (rather than a manual lease or none), so that the
     /// cause flipping later restarts the clock with the new cause's timeout.
     #[serde(default)]
-    pub reclaim: bool,
+    pub lockout: bool,
     /// Classes already stopped. Each class is stopped once, when its own timeout expires.
     #[serde(default)]
     pub killed: BTreeSet<ClassId>,
@@ -212,19 +212,19 @@ pub enum ShutdownCause {
     /// mode machine on an exclusive one. The sequencer supports it on both kinds; the service
     /// API still refuses an exclusive host.
     Requested { mode: DrainMode },
-    /// A reclaim lease on an exclusive host forced the shutdown (the model was wound down
+    /// A lockout lease on an exclusive host forced the shutdown (the model was wound down
     /// first, see `ModePhase`).
-    Reclaim,
+    Lockout,
 }
 
 impl ShutdownCause {
     /// The label used in logs and reports for who started a drain: `requested` or `idle`.
-    /// A reclaim is not a drain and has no label.
+    /// A lockout is not a drain and has no label.
     pub fn origin(self) -> Option<&'static str> {
         match self {
             ShutdownCause::Requested { .. } => Some("requested"),
             ShutdownCause::Idle => Some("idle"),
-            ShutdownCause::Reclaim => None,
+            ShutdownCause::Lockout => None,
         }
     }
 }
@@ -240,7 +240,7 @@ pub enum Withdrawal {
     Pending,
     /// The consumers are out. They stay out for as long as the shutdown stands.
     Done,
-    /// Nothing is kept out: an exclusive host's idle or reclaim shutdown begins after its
+    /// Nothing is kept out: an exclusive host's idle or lockout shutdown begins after its
     /// model has gone, and an idle shutdown that stopped lets its consumers come back
     /// (nobody asked for them to stay down).
     NotNeeded,
@@ -281,7 +281,7 @@ pub enum Veto {
 /// | idle | not needed | any |
 /// | requested | pending | none |
 /// | requested | done | any |
-/// | reclaim | not needed | any |
+/// | lockout | not needed | any |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ShutdownRepr")]
 pub struct Shutdown {
@@ -289,7 +289,7 @@ pub struct Shutdown {
     /// When the shutdown was requested (or, for an idle one, started). For a graceful
     /// requested shutdown, on a shared and on an exclusive host alike, in-flight work gets
     /// exactly `drain_timeout` from here: no class `kill_timeout` extends it and no earlier
-    /// wind-down's start shortens it (a reclaim present keeps its own `reclaim_timeout`).
+    /// wind-down's start shortens it (a lockout present keeps its own `lockout_timeout`).
     since: Millis,
     withdrawal: Withdrawal,
     veto: Veto,
@@ -336,8 +336,8 @@ impl Shutdown {
             (ShutdownCause::Idle, Withdrawal::Pending) => false,
             (ShutdownCause::Idle, Withdrawal::Done) => !matches!(self.veto, Veto::Stopped { .. }),
             (ShutdownCause::Idle, Withdrawal::NotNeeded) => true,
-            (ShutdownCause::Reclaim, Withdrawal::NotNeeded) => true,
-            (ShutdownCause::Reclaim, Withdrawal::Pending | Withdrawal::Done) => false,
+            (ShutdownCause::Lockout, Withdrawal::NotNeeded) => true,
+            (ShutdownCause::Lockout, Withdrawal::Pending | Withdrawal::Done) => false,
         }
     }
 
@@ -372,10 +372,10 @@ impl Shutdown {
         }
     }
 
-    /// The shutdown a reclaim forces (the model was wound down first: nothing to withdraw).
-    pub fn reclaim(since: Millis) -> Shutdown {
+    /// The shutdown a lockout forces (the model was wound down first: nothing to withdraw).
+    pub fn lockout(since: Millis) -> Shutdown {
         Shutdown {
-            cause: ShutdownCause::Reclaim,
+            cause: ShutdownCause::Lockout,
             since,
             withdrawal: Withdrawal::NotNeeded,
             veto: Veto::None,
@@ -600,7 +600,7 @@ mod tests {
             ModePhase::Idle
         );
         let wd = mode(
-            r#"{"phase":"serving","model":"llm","since":1,"idle_since":5,"wind_down":{"since":3,"timeout":600000,"reclaim":false,"killed":["c"]}}"#,
+            r#"{"phase":"serving","model":"llm","since":1,"idle_since":5,"wind_down":{"since":3,"timeout":600000,"lockout":false,"killed":["c"]}}"#,
         )
         .unwrap();
         let ModePhase::Serving {
@@ -630,7 +630,7 @@ mod tests {
                 wind_down: Some(WindDown {
                     since: Millis(11),
                     timeout: None,
-                    reclaim: false,
+                    lockout: false,
                     killed: Default::default(),
                 }),
             },
@@ -657,7 +657,7 @@ mod tests {
             Shutdown::idle_without_consumers(Millis(1)),
             Shutdown::requested(DrainMode::Graceful, Millis(1)),
             Shutdown::requested(DrainMode::Immediate, Millis(1)),
-            Shutdown::reclaim(Millis(1)),
+            Shutdown::lockout(Millis(1)),
         ];
         let mut i = 0;
         while i < seen.len() {
@@ -680,7 +680,7 @@ mod tests {
     fn every_shutdown_the_transitions_reach_is_a_possible_one_and_reads_back() {
         let all = reachable();
         // 3 causes' worth of states: idle {done: none, vetoing; not needed: none, vetoing,
-        // stopped}, requested x2 modes {pending; done: none, vetoing, stopped}, reclaim
+        // stopped}, requested x2 modes {pending; done: none, vetoing, stopped}, lockout
         // {none, vetoing, stopped}.
         assert_eq!(all.len(), 5 + 2 * 4 + 3, "{all:#?}");
         for s in all {
@@ -697,7 +697,7 @@ mod tests {
         let cause = |c: &str| match c {
             "idle" => r#"{"kind":"idle"}"#,
             "requested" => r#"{"kind":"requested","mode":"graceful"}"#,
-            _ => r#"{"kind":"reclaim"}"#,
+            _ => r#"{"kind":"lockout"}"#,
         };
         let text = |c: &str, withdrawal: &str, veto: &str| {
             format!(
@@ -711,10 +711,10 @@ mod tests {
         // The combinations the type does not have.
         for (c, w, v) in [
             ("idle", "pending", none),
-            ("reclaim", "pending", none),
-            ("reclaim", "done", none),
-            ("reclaim", "done", vetoing),
-            ("reclaim", "done", stopped),
+            ("lockout", "pending", none),
+            ("lockout", "done", none),
+            ("lockout", "done", vetoing),
+            ("lockout", "done", stopped),
             ("idle", "done", stopped),
             ("requested", "not_needed", vetoing),
             ("requested", "not_needed", stopped),
@@ -731,7 +731,7 @@ mod tests {
             ("idle", "not_needed", stopped),
             ("requested", "pending", none),
             ("requested", "done", stopped),
-            ("reclaim", "not_needed", vetoing),
+            ("lockout", "not_needed", vetoing),
         ] {
             assert!(resource_with(&text(c, w, v)).is_ok(), "{c} {w} {v}");
         }
@@ -763,7 +763,7 @@ mod tests {
         // An exclusive host's shutdown never withdrew anything: nothing is left of it.
         for s in [
             Shutdown::idle_without_consumers(Millis(2)),
-            Shutdown::reclaim(Millis(2)),
+            Shutdown::lockout(Millis(2)),
         ] {
             assert_eq!(s.vetoing(Millis(5)).without_veto(), None);
         }

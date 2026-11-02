@@ -45,7 +45,7 @@ scenarios! {
     stale_reachability_blocks_allow => "stale-reachability-blocks-allow.yaml",
     manual_nfs_lease => "manual-nfs-lease.yaml",
     job_hold_power_cycle => "job-hold-power-cycle.yaml",
-    reclaim => "reclaim.yaml",
+    lockout => "lockout.yaml",
     manual_llm_lease => "manual-llm-lease.yaml",
     interactive_pin => "interactive-pin.yaml",
     readiness_precedence => "readiness-precedence.yaml",

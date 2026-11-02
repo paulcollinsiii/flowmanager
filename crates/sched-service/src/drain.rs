@@ -80,7 +80,7 @@ pub fn request(
         Some(before) => {
             let before_mode = match before.cause() {
                 ShutdownCause::Requested { mode } => mode,
-                ShutdownCause::Idle | ShutdownCause::Reclaim => DrainMode::Immediate,
+                ShutdownCause::Idle | ShutdownCause::Lockout => DrainMode::Immediate,
             };
             // Immediate escalates; graceful asked of an immediate drain leaves it immediate.
             let mode = if before_mode == DrainMode::Immediate {

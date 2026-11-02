@@ -26,16 +26,16 @@ pub struct Intent {
     /// Per exclusive resource, the model it should serve; `None` means no model.
     #[serde(default)]
     pub models: BTreeMap<ResourceId, Option<ModelId>>,
-    /// Resources where reaching `models` is forced (a manual model lease or a reclaim):
+    /// Resources where reaching `models` is forced (a manual model lease or a lockout):
     /// batch work is cut short, and in-flight work gets a timeout instead of being awaited.
     #[serde(default)]
     pub forced: BTreeSet<ResourceId>,
     /// Hosts that must be powered up, and why.
     #[serde(default)]
     pub power_up: BTreeMap<ResourceId, PowerWant>,
-    /// Reclaimable resources the user has reclaimed (never a shared resource): intake stops and they are shut down, not woken.
+    /// Lockoutable resources the user has locked out (never a shared resource): intake stops and they are shut down, not woken.
     #[serde(default)]
-    pub reclaim: BTreeSet<ResourceId>,
+    pub lockout: BTreeSet<ResourceId>,
 }
 
 /// Why the sequencer is not moving a resource this tick. Pod readings gate one decision only:
@@ -49,10 +49,10 @@ pub enum WaitReason {
     StaleObservation,
     /// A scheduling observation needed to prove no work is in flight is missing or stale.
     StaleDemand,
-    Reclaimed,
-    /// A reclaim lease names a resource that cannot be reclaimed (shared, or without a
+    LockedOut,
+    /// A lockout lease names a resource that cannot be locked out (shared, or without a
     /// power section). It is ignored.
-    ReclaimUnsupported,
+    LockoutUnsupported,
     HostNotUp,
     PoweringOn,
     ShuttingDown,

@@ -85,8 +85,8 @@ pub struct ReleaseLease {
     pub id: LeaseId,
 }
 
-/// A request about one resource: `acquire_host_lease`, `release_host_lease`, `reclaim`,
-/// `unreclaim`.
+/// A request about one resource: `acquire_host_lease`, `release_host_lease`, `lockout`,
+/// `clear_lockout`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceRequest {
@@ -387,8 +387,8 @@ pub async fn acquire_host_lease<C: ObjectCtx>(
     .await
 }
 
-/// Reclaims an exclusive resource (see `LeaseBook::acquire_reclaim`).
-pub async fn reclaim<C: ObjectCtx>(
+/// Lockouts an exclusive resource (see `LeaseBook::acquire_lockout`).
+pub async fn lockout<C: ObjectCtx>(
     shared: &Arc<Shared>,
     ctx: &C,
     req: ResourceRequest,
@@ -396,10 +396,10 @@ pub async fn reclaim<C: ObjectCtx>(
     acquire_resource_lease(
         shared,
         ctx,
-        "reclaim",
-        "reclaim",
+        "lockout",
+        "lockout",
         req,
-        LeaseBook::acquire_reclaim,
+        LeaseBook::acquire_lockout,
     )
     .await
 }
@@ -581,13 +581,13 @@ pub async fn drain_host<C: ObjectCtx>(
     Ok(ack)
 }
 
-/// Releases the reclaim on a resource.
-pub async fn unreclaim<C: ObjectCtx>(
+/// Releases the lockout on a resource.
+pub async fn clear_lockout<C: ObjectCtx>(
     shared: &Arc<Shared>,
     ctx: &C,
     req: ResourceRequest,
 ) -> Result<Lease, HandlerError> {
-    release_resource_lease(shared, ctx, req, LeaseBook::release_reclaim).await
+    release_resource_lease(shared, ctx, req, LeaseBook::release_lockout).await
 }
 
 /// Clears what flowmanager stopped at on one resource (see `resume`): its failed power
@@ -1622,7 +1622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_lease_and_reclaim_requests_are_validated_against_the_active_config() {
+    async fn host_lease_and_lockout_requests_are_validated_against_the_active_config() {
         let (s, _) = process_managed();
         let ctx = FakeCtx::default();
         for (resource, text) in [("nowhere", "unknown resource")] {
@@ -1633,9 +1633,9 @@ mod tests {
         }
         for (resource, text) in [
             ("nowhere", "unknown resource"),
-            ("basestar-nfs", "cannot be reclaimed"),
+            ("basestar-nfs", "cannot be locked out"),
         ] {
-            let e = reclaim(&s, &ctx, req(resource)).await.unwrap_err();
+            let e = lockout(&s, &ctx, req(resource)).await.unwrap_err();
             assert!(refused(&e).contains(text), "{resource}: {}", refused(&e));
         }
         ctx.commit();
@@ -1644,16 +1644,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reclaim_is_stored_stops_intake_and_is_released_by_resource() {
+    async fn a_lockout_is_stored_stops_intake_and_is_released_by_resource() {
         let (s, _) = process_managed();
         let ctx = FakeCtx::default();
         world(&s, 3);
-        let g = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        let g = lockout(&s, &ctx, req("cuda-central")).await.unwrap();
         ctx.commit();
         assert!(g.created);
-        assert_eq!(g.lease.id.as_str(), "reclaim-1");
-        assert_eq!(g.lease.kind, sched_model::LeaseKind::Reclaim);
-        let again = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        assert_eq!(g.lease.id.as_str(), "lockout-1");
+        assert_eq!(g.lease.kind, sched_model::LeaseKind::Lockout);
+        let again = lockout(&s, &ctx, req("cuda-central")).await.unwrap();
         assert!(!again.created && again.lease == g.lease);
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
@@ -1665,14 +1665,14 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(own, vec![g.lease.clone()]);
-        // Work is waiting (3 OCR items) but the reclaimed resource allows no model, and a
+        // Work is waiting (3 OCR items) but the locked out resource allows no model, and a
         // managed host is shut down (the one power request of the tick).
         assert!(r.allowed_models.is_empty(), "{r:?}");
         assert_eq!(
             *ctx.powers.lock().unwrap(),
             [("cuda-central".to_string(), PowerAction::Off)]
         );
-        let released = unreclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        let released = clear_lockout(&s, &ctx, req("cuda-central")).await.unwrap();
         ctx.commit();
         assert_eq!(released, g.lease);
         let r = tick(&s, &ctx).await.unwrap();
@@ -1682,9 +1682,11 @@ mod tests {
             r.leases.iter().all(|l| l.is_adopted_host()) && r.allowed_models.is_empty(),
             "{r:?}"
         );
-        let e = unreclaim(&s, &ctx, req("cuda-central")).await.unwrap_err();
+        let e = clear_lockout(&s, &ctx, req("cuda-central"))
+            .await
+            .unwrap_err();
         assert!(
-            refused(&e).contains("holds no reclaim lease"),
+            refused(&e).contains("holds no lockout lease"),
             "{}",
             refused(&e)
         );
@@ -1844,11 +1846,11 @@ mod tests {
             list_leases(&s, ctx.stored(LEASES_KEY).as_deref()).unwrap(),
             vec![g.lease]
         );
-        // The same for a reclaim.
+        // The same for a lockout.
         let ctx = FakeCtx::default();
-        let g = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        let g = lockout(&s, &ctx, req("cuda-central")).await.unwrap();
         ctx.crash_and_retry();
-        let again = reclaim(&s, &ctx, req("cuda-central")).await.unwrap();
+        let again = lockout(&s, &ctx, req("cuda-central")).await.unwrap();
         assert!(ctx.ran().is_empty());
         assert_eq!(again, g);
     }

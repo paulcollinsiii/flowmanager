@@ -91,9 +91,9 @@ fn power_off(res: &str) -> Step {
 const MANAGED_NFS: &str = "    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 1 }\n";
 
 #[test]
-fn a_reclaim_does_not_excuse_powering_off_a_held_shared_host() {
+fn a_lockout_does_not_excuse_powering_off_a_held_shared_host() {
     let leases = vec![
-        lease("r", "basestar-nfs", LeaseKind::Reclaim),
+        lease("r", "basestar-nfs", LeaseKind::Lockout),
         lease(
             "h",
             "basestar-nfs",
@@ -113,9 +113,9 @@ fn a_reclaim_does_not_excuse_powering_off_a_held_shared_host() {
 }
 
 #[test]
-fn a_reclaim_does_excuse_powering_off_an_exclusive_host() {
+fn a_lockout_does_excuse_powering_off_an_exclusive_host() {
     let leases = vec![
-        lease("r", "cuda-central", LeaseKind::Reclaim),
+        lease("r", "cuda-central", LeaseKind::Lockout),
         lease(
             "h",
             "cuda-central",
@@ -130,7 +130,7 @@ fn a_reclaim_does_excuse_powering_off_an_exclusive_host() {
     assert!(v.is_empty(), "{v:?}");
 }
 
-const SERVING_OCR: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1, wind_down: { since: 90000000, timeout: 600000, reclaim: false } } }\n";
+const SERVING_OCR: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1, wind_down: { since: 90000000, timeout: 600000, lockout: false } } }\n";
 
 fn in_flight_ocr() -> sched_model::Observation {
     sched_model::Observation {
@@ -153,7 +153,7 @@ fn kill() -> Step {
     }
 }
 
-fn with_wind_down(since: u64, reclaim: bool) -> SchedState {
+fn with_wind_down(since: u64, lockout: bool) -> SchedState {
     let mut s = prev(SERVING_OCR);
     if let Some(ModePhase::Serving { wind_down, .. }) =
         s.resources.values_mut().next().map(|r| &mut r.mode)
@@ -161,7 +161,7 @@ fn with_wind_down(since: u64, reclaim: bool) -> SchedState {
         *wind_down = Some(WindDown {
             since: Millis(since),
             timeout: Some(Millis(10 * MIN)),
-            reclaim,
+            lockout,
             killed: Default::default(),
         });
     }
@@ -231,8 +231,8 @@ fn killing_before_the_class_timeout_is_a_violation() {
 fn killing_on_a_clock_that_should_have_restarted_is_a_violation() {
     let mut obs = zero_pods_and_up(&["cuda-central"]);
     obs.push(in_flight_ocr());
-    // The wind-down began under a manual lease; a reclaim now holds, so the clock restarts.
-    let l = lease("r", "cuda-central", LeaseKind::Reclaim);
+    // The wind-down began under a manual lease; a lockout now holds, so the clock restarts.
+    let l = lease("r", "cuda-central", LeaseKind::Lockout);
     let v = run(
         &snap(obs, vec![l]),
         &with_wind_down(NOW - 20 * MIN, false),
@@ -455,30 +455,30 @@ fn allowing_an_unconfigured_model_or_one_without_an_allow_step_is_a_violation() 
         v.iter().any(|m| m.contains("without an allow step")),
         "{v:?}"
     );
-    // On a reclaimed host: kept without winding down, or newly allowed.
+    // On a locked out host: kept without winding down, or newly allowed.
     let s = snap(
         zero_pods_and_up(&["cuda-central", "basestar-nfs"]),
-        vec![lease("r", "cuda-central", LeaseKind::Reclaim)],
+        vec![lease("r", "cuda-central", LeaseKind::Lockout)],
     );
     let v = check_with(
         &s,
         &prev(GPU_SERVING_OCR),
         &decided(vec![], &["mineru"], &[], GPU_SERVING_OCR),
     );
-    assert!(v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
+    assert!(v.iter().any(|m| m.contains("locked out")), "{v:?}");
     let v = check_with(
         &s,
         &prev(GPU_ON_IDLE),
         &decided(vec![allow("mineru")], &["mineru"], &[], SERVING_OCR),
     );
-    assert!(v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
+    assert!(v.iter().any(|m| m.contains("locked out")), "{v:?}");
     // Kept while it winds down: fine.
     let v = check_with(
         &s,
         &prev(SERVING_OCR),
         &decided(vec![], &["mineru"], &[], SERVING_OCR),
     );
-    assert!(!v.iter().any(|m| m.contains("reclaimed")), "{v:?}");
+    assert!(!v.iter().any(|m| m.contains("locked out")), "{v:?}");
 }
 
 #[test]
@@ -541,7 +541,7 @@ fn allowing_a_class_whose_requirements_do_not_hold_is_a_violation() {
 
 #[test]
 fn powering_off_a_host_with_a_model_allowed_is_a_violation() {
-    let leases = vec![lease("r", "cuda-central", LeaseKind::Reclaim)];
+    let leases = vec![lease("r", "cuda-central", LeaseKind::Lockout)];
     let v = check_with(
         &snap(zero_pods_and_up(&["cuda-central"]), leases),
         &prev(GPU_SERVING_OCR),
@@ -564,7 +564,7 @@ fn tied_reachability_readings_count_as_up_only_when_every_reading_is_up() {
     let off = || Step::PowerOff {
         resource: ResourceId::new("cuda-central"),
     };
-    let reclaim = || vec![lease("r", "cuda-central", LeaseKind::Reclaim)];
+    let lockout = || vec![lease("r", "cuda-central", LeaseKind::Lockout)];
     let up = |v: bool| sched_model::Observation {
         source: "cluster-pods".into(),
         observed_at: Millis(NOW),
@@ -581,10 +581,10 @@ fn tied_reachability_readings_count_as_up_only_when_every_reading_is_up() {
     };
     let mut o = base();
     o.push(up(false));
-    let v = run(&snap(o, reclaim()), &SchedState::default(), vec![off()]);
+    let v = run(&snap(o, lockout()), &SchedState::default(), vec![off()]);
     assert!(v.iter().any(|m| m.contains("invariant 5")), "{v:?}");
     let v = run(
-        &snap(base(), reclaim()),
+        &snap(base(), lockout()),
         &SchedState::default(),
         vec![off()],
     );
@@ -855,7 +855,7 @@ fn world_with(busy_class: sched_model::Observation) -> Snapshot {
 /// `wind_down`), asked to shut down `ago` ms ago in `mode`.
 fn serving_requested(model: &str, mode: &str, ago: u64, wind_down: Option<u64>) -> SchedState {
     let wd = wind_down.map_or(String::new(), |s| {
-        format!(", wind_down: {{ since: {s}, timeout: 600000, reclaim: false }}")
+        format!(", wind_down: {{ since: {s}, timeout: 600000, lockout: false }}")
     });
     prev(&format!(
         "    cuda-central: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: serving, model: {model}, since: 1{wd} }}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, since: {}, withdrawal: pending, veto: {{ phase: none }} }} }}\n    basestar-nfs: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }} }}\n",

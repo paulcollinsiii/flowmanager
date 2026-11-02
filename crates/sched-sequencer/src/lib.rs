@@ -100,10 +100,10 @@ impl Cx<'_> {
         self.snapshot.now
     }
 
-    /// Whether this resource is reclaimed. A reclaim only exists for an exclusive resource
+    /// Whether this resource is locked out. A lockout only exists for an exclusive resource
     /// with a power section; the intent cannot make it apply anywhere else.
-    pub fn reclaimed(&self) -> bool {
-        self.intent.reclaim.contains(&self.res.id) && self.config.supports_reclaim(&self.res.id)
+    pub fn locked_out(&self) -> bool {
+        self.intent.lockout.contains(&self.res.id) && self.config.supports_lockout(&self.res.id)
     }
 }
 
@@ -112,17 +112,17 @@ fn resource_tick(
     prev: Option<&ResourceState>,
     steps: &mut Vec<Step>,
 ) -> Option<ResourceState> {
-    // A reclaim lease on a resource that cannot be reclaimed is ignored, visibly.
-    if !cx.config.supports_reclaim(&cx.res.id)
+    // A lockout lease on a resource that cannot be locked out is ignored, visibly.
+    if !cx.config.supports_lockout(&cx.res.id)
         && cx
             .snapshot
             .leases
             .iter()
-            .any(|l| l.resource == cx.res.id && l.is_reclaim() && l.is_active(cx.now()))
+            .any(|l| l.resource == cx.res.id && l.is_lockout() && l.is_active(cx.now()))
     {
         steps.push(Step::Wait {
             resource: cx.res.id.clone(),
-            reason: WaitReason::ReclaimUnsupported,
+            reason: WaitReason::LockoutUnsupported,
         });
     }
     let mut st = match prev {
@@ -141,7 +141,7 @@ fn resource_tick(
 }
 
 /// `RunRecovery` for every class whose recovery action needs its model up, while the class is
-/// in the allowed set (its model serving and not winding down, its hosts up, no reclaim) and
+/// in the allowed set (its model serving and not winding down, its hosts up, no lockout) and
 /// the snapshot reports failed items for it. Emitted on every such tick: the action is
 /// idempotent and rate-limited by itself, and must re-check the allowed set before it acts.
 /// Never for a class that is not allowed, so recovery never runs for a model that is not.
@@ -212,7 +212,7 @@ fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent:
         if !st.is_on()
             // A drain has scaled the consumers of this host down.
             || st.shutdown.is_some_and(|s| s.consumers_withdrawn())
-            || (intent.reclaim.contains(&req.resource) && config.supports_reclaim(&req.resource))
+            || (intent.lockout.contains(&req.resource) && config.supports_lockout(&req.resource))
         {
             return false;
         }

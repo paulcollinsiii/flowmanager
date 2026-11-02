@@ -289,7 +289,7 @@ fn policy(c: &Config, p: &mut Problems) {
         ("drain_timeout", pol.drain_timeout),
     ]
     .into_iter()
-    .chain(pol.reclaim_timeout.map(|t| ("reclaim_timeout", t)))
+    .chain(pol.lockout_timeout.map(|t| ("lockout_timeout", t)))
     {
         if value > MAX_LEASE_DURATION {
             p.add(
@@ -298,8 +298,8 @@ fn policy(c: &Config, p: &mut Problems) {
             );
         }
     }
-    if pol.reclaim_timeout == Some(Millis::ZERO) {
-        p.add("policy.reclaim_timeout", "must be greater than zero");
+    if pol.lockout_timeout == Some(Millis::ZERO) {
+        p.add("policy.lockout_timeout", "must be greater than zero");
     }
     for (name, value) in positive {
         if value == Millis::ZERO {
@@ -1549,26 +1549,26 @@ sources:
         assert!(has(&problems(&over), "policy.interactive_ttl"));
         let ok = VALID.replace(
             "drain_timeout: 5m",
-            "drain_timeout: 5m\n  reclaim_timeout: 1d",
+            "drain_timeout: 5m\n  lockout_timeout: 1d",
         );
         assert!(Config::from_yaml(&ok).is_ok());
     }
 
     #[test]
-    fn reclaim_and_kill_timeouts_are_validated() {
+    fn lockout_and_kill_timeouts_are_validated() {
         let y = VALID.replace(
             "drain_timeout: 5m",
-            "drain_timeout: 5m\n  reclaim_timeout: 0",
+            "drain_timeout: 5m\n  lockout_timeout: 0",
         );
         assert!(has(
             &problems(&y),
-            "policy.reclaim_timeout: must be greater than zero"
+            "policy.lockout_timeout: must be greater than zero"
         ));
         let y = VALID.replace(
             "drain_timeout: 5m",
-            "drain_timeout: 5m\n  reclaim_timeout: 2d",
+            "drain_timeout: 5m\n  lockout_timeout: 2d",
         );
-        assert!(has(&problems(&y), "policy.reclaim_timeout"));
+        assert!(has(&problems(&y), "policy.lockout_timeout"));
         let y = VALID.replace("    priority: 10", "    kill_timeout: 0\n    priority: 10");
         assert!(has(&problems(&y), "classes[c1].kill_timeout"));
         let y = VALID.replace(
@@ -1580,7 +1580,7 @@ sources:
             c.class(&"c1".into()).unwrap().kill_timeout,
             Some(crate::Millis(30_000))
         );
-        assert_eq!(c.policy().reclaim_timeout(), c.policy().drain_timeout);
+        assert_eq!(c.policy().lockout_timeout(), c.policy().drain_timeout);
     }
 
     #[test]

@@ -365,7 +365,7 @@ fn drain_report(state: &SchedState) -> Vec<DrainReport> {
             let mode = match s.cause() {
                 ShutdownCause::Requested { mode } => mode,
                 ShutdownCause::Idle => DrainMode::Immediate,
-                ShutdownCause::Reclaim => return None,
+                ShutdownCause::Lockout => return None,
             };
             Some(DrainReport {
                 resource: id.clone(),
@@ -397,7 +397,7 @@ pub struct TickReport {
     /// has never reported: nothing polls it. A config gap; counted as no demand, like
     /// `unsupported_demand`.
     pub unpolled_demand: Vec<ClassId>,
-    /// Exclusive resources where the intent is forced: a manual model lease (or a reclaim)
+    /// Exclusive resources where the intent is forced: a manual model lease (or a lockout)
     /// cuts batch work short, so intake is paused and in-flight work gets a timeout instead
     /// of being waited for.
     #[serde(default)]
@@ -737,7 +737,7 @@ impl Shared {
     }
 
     /// Whether the allowed set this process published contains `class`: its model is
-    /// serving and not winding down, its hosts are up, no reclaim. False until a tick has
+    /// serving and not winding down, its hosts are up, no lockout. False until a tick has
     /// been published, so nothing runs on a guess.
     pub fn class_is_allowed(&self, class: &ClassId) -> bool {
         self.allowed
