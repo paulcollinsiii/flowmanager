@@ -1,59 +1,36 @@
 # Host power model: plan
 
-Status: **decisions complete; phase 1 (documents) written, phases 2, 3, 4a and 4b (code) done on the branch (4b awaiting review); 5 not started**, branch `refactor/power-model`, based on main @ 689ab82.
+Status: **decisions complete; all five phases built on the branch `refactor/power-model`** (based on main @ 689ab82; phase 1 documents, phases 2, 3, 4a, 4b and 5 code). Phase 5 (one derived `HostStatus`, section 2.4) is done and awaits review. The code behaves as sections 2 and 3 describe; section 5 is the one hand-off to the homesvr agent.
 All decisions are recorded in section 3 (2026-10-30).
 
 This document is the single description of how flowmanager owns and changes a host's
 power. It exists because five features (adoption, drain on release, `drain_host`, idle
 drain, exclusive host lease) were added one at a time and each was reviewed only against
 itself. Accepted on 2026-10-30, it replaces the power parts of `architecture.md` and is the
-model that every later power change is reviewed against. Section 1 is what the code does today; section 2 is the target.
+model that every later power change is reviewed against. Section 1 is a short note on what
+the refactor replaced; sections 2 and 3 are the model and the decisions, as built.
 
-## 1. The model today, as the code behaves
+## 1. What the refactor replaced
 
 Only hosts with a `power` section under `control: managed` take part; under `manual` the
 phase just follows observation and nothing below applies.
 
-**State per host** (`ResourceState`, `sched-model/src/state.rs`), six fields that together
-encode one lifecycle:
+Before the refactor, one lifecycle was encoded in six loosely related fields of
+`ResourceState` (`power`, a `managed` flag, `host_idle_since`, a `drain` with an origin, a
+`mounts_veto`, `shutdown_confirmed_at`), ownership was held in two places (the flag and an
+adopted lease recognised by an id prefix, minted by the service), the consumers were
+withdrawn by two separate mechanisms (the exclusive mode wind-down in `exclusive.rs` and the
+shared host drain in the service's `power.rs`), only the NFS mounts were checked before a
+power-off (cuda-central relied on the `idle_grace` margin for its GPU pods to be gone), and
+every output (report fields, reason text, metrics, the toggle JSON) was rebuilt by diffing
+state in its own place. The shapes that replaced them are in 2.2; where each output now comes
+from is in 2.4.
 
-| Field | Meaning in practice |
-| --- | --- |
-| `power` | `Off`, `PoweringOn`, `On`, `ShuttingDown`, `Failed{during}` |
-| `managed` (until phase 4b; now `ours` on `Off` and `On`, see 2.2) | "flowmanager may power this down". Set by a power-on or a manual want; cleared by a shutdown, a failed transition, a mount-veto timeout and the end of an adoption |
-| `host_idle_since` | start of the `idle_grace` clock |
-| `drain` | `{mode: graceful/immediate, origin: requested/idle, scaled_down, since}` |
-| `mounts_veto` | `Waiting{since}` / `Stopped{since}` (shared hosts with a mounts source) |
-| `shutdown_confirmed_at` | starts the `min_off` wait after a confirmed shutdown |
-
-**What wants a host up** (`intent.power_up`, planner `fifo.rs`): a `ManualHost` or
+What wants a host up has not changed (`intent.power_up`, planner `fifo.rs`): a `ManualHost` or
 `ManualModel` lease (`Manual`), a job's `SharedHold` and a busy `may_change_power` class
-(`Workload`). A reclaim removes the want.
+(`Workload`). A reclaim, now a lockout, removes the want.
 
-**Ownership, held in two places** (before phase 4b): the `managed` flag, and, for a host found
-running, an *adopted* `ManualHost` lease minted by the service (`adopt.rs`, applied in
-`tick.rs`) with a magic id prefix. Since 4b the first is the `ours` marker on `Off` and `On`,
-the second a lease with `origin: adopted`, and the adoption decision is one pure function in
-the sequencer (2.4).
-
-**Taking a host down, by kind:**
-
-| | Shared (basestar-nfs) | Exclusive (cuda-central) |
-| --- | --- | --- |
-| Idle (nothing holds it, `idle_grace` over) | idle drain: scale consumers down, mount veto, power off | model already withdrawn (mode idle), power off; no pod check |
-| Listener `off` | requested drain, graceful | plain release of the host lease |
-| Listener `off-now` | requested drain, immediate | refused |
-| Forced, despite work | the drain | reclaim lease: forced wind-down with `reclaim_timeout`, shut down, not woken until unreclaimed |
-| Release only | `release` | `release` |
-
-**Withdrawing consumers is implemented twice:** the exclusive mode wind-down
-(`exclusive.rs`: `drain_timeout`, a class's `kill_timeout`, `reclaim_timeout`), and the
-shared host drain (`power.rs::drain_step`: `drain_timeout`).
-
-**Pre-shutdown check:** only the NFS mount veto (bounded by `mounts_timeout`, stops on
-expiry). cuda-central relies on the `idle_grace` margin for its GPU pods to be gone.
-
-## 2. Target model
+## 2. The model
 
 ### 2.1 One lifecycle
 
@@ -102,23 +79,39 @@ through the `Scheduler` tick with the real job machine
 
 ### 2.2 State as types, not flags
 
-A sketch (names not final):
+The types as built (`crates/sched-model/src/state.rs`, trimmed to the fields):
 
 ```rust
-struct ResourceState {
-    power: PowerPhase,                    // Off | PoweringOn | On | ShuttingDown | Failed
-    mode: ModePhase,                      // unchanged: exclusive model serving/idle/wind-down
-    shutdown: Option<Shutdown>,           // only while On
-    idle_since: Option<Millis>,
-    off_since: Option<Millis>,            // for min_off; only while Off after our shutdown
-    pending_recovery: BTreeSet<ClassId>,  // unchanged
+pub struct ResourceState {
+    pub power: PowerPhase,
+    pub mode: ModePhase,                       // exclusive model: idle / serving (+ wind_down)
+    pub idle_since: Option<Millis>,            // the idle_grace clock
+    pub pending_recovery: BTreeSet<ClassId>,
+    pub shutdown: Option<Shutdown>,            // only while On, or stopped on the way
+    pub off_since: Option<Millis>,             // for min_off; only while Off after our shutdown
+    pub locked_down: bool,                     // see below
 }
-struct Shutdown { cause: Cause, stage: Stage, since: Millis }
-enum Cause { Idle, Requested { mode: DrainMode }, Lockout }
-enum Stage { Withdrawing, Vetoing { since: Millis }, Stopped { since: Millis } }
+pub enum PowerPhase {
+    Off { ours: bool },
+    PoweringOn { since: Millis },
+    On { since: Millis, ours: bool },
+    ShuttingDown { since: Millis },
+    Failed { since: Millis, during: PowerTransition },
+}
+pub struct Shutdown {                          // fields private; every transition is a method
+    cause: ShutdownCause, since: Millis, withdrawal: Withdrawal, veto: Veto,
+}
+pub enum ShutdownCause { Idle, Requested { mode: DrainMode }, Lockout }
+pub enum Withdrawal { Pending, Done, NotNeeded }
+pub enum Veto { None, Vetoing { since: Millis }, Stopped { since: Millis } }
 ```
 
-**Phase 4a adds one field, `locked_down: bool`** (per resource, default false): the host was
+The two axes of a `Shutdown` (withdrawal, then veto) replace the single stage an earlier
+sketch had, so a combination that cannot happen cannot be built; the combinations that exist
+are tabled on `Shutdown`. The 2.1 diagram's Withdrawing, Vetoing and Stopped are those axes read
+as one path.
+
+**`locked_down: bool`** (per resource, default false): the host was
 seen off while it was locked out, so the lockout has done its one shutdown (2.3). It is set
 when the host is seen off under a lockout (also a lockout taken while the host is already
 off), cleared the tick no lockout applies, and never set under `control: manual`. While it is
@@ -198,16 +191,46 @@ the run can catch up (per the job's `missed_run` rules), after which the host is
 (2.1b) and powers down when the job is done. A run already running when the lockout arrives
 is not killed and keeps its hold until it ends.
 
-### 2.4 Who decides what
+### 2.4 Who decides what (built)
 
-- **Adoption** moves into the sequencer as a pure ownership decision, and still results in
-  an adopted lease with a typed `origin: adopted` (D3), so `/v1/leases` and Home Assistant
-  see it.
-- **One `HostStatus` per resource** comes out of the sequencer (phase, stage, wait reason,
-  attention). `TickReport`, `reason`, metrics and the toggle listener all read it instead of
-  each diffing state.
-- **The toggle listener** routes and translates only. It does not branch on resource kind.
-- Adoption no longer depends on whether the job book was readable (`jobs_off`).
+- **Adoption** is a pure ownership decision in the sequencer (`sched_sequencer::adopt::adopt`,
+  phase 4b), and still results in an adopted lease with a typed `origin: adopted` (D3), so
+  `/v1/leases` and Home Assistant see it. It no longer depends on whether the job book was
+  readable (`jobs_off`).
+- **One `HostStatus` per resource** is derived by one pure function,
+  `sched_sequencer::status::derive` (phase 5), from the config, the snapshot the tick decided
+  on, the decided state and steps. `TickReport`, `reason`, the logs, the metrics and the toggle
+  listener read it instead of each diffing state. It says, in this document's terms:
+  - the phase (`power`: with its timestamps, `ours`, the failed transition) and the exclusive
+    `mode` (idle, serving, winding down);
+  - the `shutdown` in progress, if any: `cause` (idle, requested with its mode, lockout),
+    `withdrawal` (pending, done, not needed) and `veto` (clear, waiting, stopped; the readings
+    that are blocking are in the waiting and stopped variants), and `veto_readings`, the
+    readings this host's veto consults;
+  - the `lockout` (held, withdrawing, left alone) when a lockout lease applies;
+  - the manual host `lease` and its origin (`requested`, `adopted`);
+  - `min_off` (since, remaining, until) for a managed host with a minimum off time;
+  - the current `wait` reason, from the decision's wait step for the host;
+  - `attention`: a person has to act (failed power phase, or the veto stopped the shutdown);
+  - plus what a reader needs to place it: `kind`, `has_power`, `managed`, `ours`.
+  It is derived for every resource in the decided state, not only those with a power section
+  (the others are always up and the rest of their status is plain).
+- **One-time events** (`HostEvent`: a power timeout, a veto timeout, an adoption, an adoption
+  ended) are derived in the same function from the previous and the next state (adoption from
+  what `adopt` did before the tick), one list in `TickReport.events`. An event is an edge, a
+  status is a level: a timeout is an event in the tick that makes it and a level (`attention`)
+  after. The events are part of the decided outcome Restate journals, so a replayed tick has the
+  same events and the service alerts (logs at error level, counts) only when it decided the tick,
+  logging a replay at info level under `..._replayed` and counting nothing: the alert-once rule
+  has one definition, in `publish`.
+- **A failed tick** (the core refused to decide) has no statuses and no events; the per-host
+  gauges keep what the last decided tick set.
+- **The toggle listener** routes and translates only: it formats statuses (the status text of a
+  switch, the `drain` and `wait` objects, `needs_attention`) and holds no status logic beyond
+  that. It does not branch on resource kind.
+- Request failures (a power call that failed) are not derived from state: they are the service's
+  record of what the `Power` object reported, so `TickReport.power_request_failures` stays a
+  field of its own.
 
 ## 3. Decisions
 
@@ -333,170 +356,204 @@ this document and checks the phase against it ("does this still fit the model").
 5. **HostStatus and reporting.** One derived status; `tick.rs` report weaving, `reason`,
    metrics and toggle `resource_state` consume it. README power section shrunk to the model
    plus tables, caveats moved to *Known blind spots*.
+   - *As built.* `sched_sequencer::status::derive` returns `(Vec<HostStatus>, Vec<HostEvent>)`
+     (2.4). `TickReport` has `hosts` and `events` and lost `power_failed`, `power_timeouts`,
+     `veto_held`, `veto_timeouts`, `min_off_waits`, `drains`, `adopted` and `adoptions_ended`;
+     `power_request_failures` stays. The service's `power_report`, `veto_report`,
+     `min_off_report` and `drain_report`, the `reason::with_power`, `with_veto` and
+     `with_min_off` and the `if error.is_none()` cascade are gone; `reason::with_hosts` is the
+     one place that writes the power words into the kinds and reason, `Metrics::set_host_gauges`
+     the one that sets the per-host gauges and `log_host_event` the one that logs an event.
+     No decision changed: the planner, the sequencer's decisions and the jobs machine are
+     untouched apart from the new pure module. The output changes are in section 5.
 
-## 5. Hand-off to homesvr (collected as phases land)
+## 5. Hand-off to homesvr
 
-The homesvr agent owns these; each phase adds what it changed.
+One list for the homesvr agent, grouped by what it must change. It collects what phases 2 to 5
+changed in everything outside the flowmanager repository (D4, D5: breaking changes were accepted
+for clarity). Names are the ones the code has now. The README (*Power actions*, *Known blind
+spots*, *Versions, and recovering the persisted state*, *Metrics*) and `docs/kubernetes_setup.md`
+describe the behaviour.
 
-- HA: rename the reclaim switch and sensors to lockout, with help text on the dashboard.
-  Suggested: *"Lockout: flowmanager stops all work on this host, shuts it down, and will not
-  power it on or schedule anything on it until the lockout is cleared. Use it before
-  rebooting into another OS or doing physical work on the machine. Backups that need the host
-  wait too."*
-- HA: expose `off` / `off-now` / `release` / lockout for cuda-central like basestar; update
-  the stale "cuda-central is powered by hand" dashboard note.
-- Grafana and alerts: every breaking log, reason or metric change listed in phase reports (D5).
-- **Phase 2 and 3 output changes (breaking, D5).** Phase 4 and 5 will add theirs here.
-  - *Persisted state.* `scheduler_state` was version 2 after phases 2 and 3 (phase 4a makes it 3, below). A state of an older version is
-    discarded on read and the sequencer starts afresh from observation (leases and the job
-    book are kept); nothing to migrate. Its shape changed in version 2: per resource `drain`,
-    `mounts_veto`, `host_idle_since` and `shutdown_confirmed_at` are gone, replaced by
-    `shutdown { cause, since, withdrawal, veto }` and `off_since`. Phase 3 changed the stored
-    `shutdown` again (`stage` and the `withdrawn` flags became `withdrawal` and `veto`), still
-    version 2 because nothing was deployed at version 2 before it.
-  - *Config.* `resources[].power.mounts_timeout` is renamed `veto_timeout` (same default 30m
-    and bounds; no alias). New `models[].namespaces`: required, for a managed exclusive host
-    whose models are covered by a `pods` source, to list the namespaces of each model's
-    workloads, all watched by that source; otherwise the config is refused at load.
-  - *Wait reasons* (`TickReport.steps`, scenario YAML, `reason` text): `pods_mounted` is
-    `veto_in_use`, `mounts_unknown` is `veto_unknown`; `shutdown_stopped` is unchanged.
-  - *TickReport.* `mounts_held` is `veto_held` and `mounts_timeouts` is `veto_timeouts`.
-    Entries carry `readings` (those that apply: `mounts`, `pods`) and `blocking` (the readings
-    holding the shutdown now, each with `state` `in_use` or `unknown`).
-  - *Metrics.* `sched_resource_mounts_veto{resource,state}` is
-    `sched_resource_veto{resource,reading,state}`, one series per applicable reading
-    (`waiting` is 1 on the blocking reading(s), `stopped` is 1 on every reading of the host);
-    `sched_mounts_timeouts_total{resource}` is `sched_veto_timeouts_total{resource,reading}`,
-    one count per blocking reading. cuda-central now has series too.
-  - *Log events.* `shutdown_mounts_timeout` is `shutdown_veto_timeout` (and `..._replayed`),
-    with `readings` and `blocking` fields.
-  - *HTTP JSON* (toggle listener): the wait `shutdown_held_by_mounts` is
-    `shutdown_held_by_veto` with `readings` and `blocking`; resume's `cleared`
-    `shutdown_stopped_by_mounts` is `shutdown_stopped_by_veto`.
-  - *New GPU behaviour.* cuda-central's power-off now waits for zero pods of every model
-    (`wait ... veto_in_use` or `veto_unknown`), up to `veto_timeout`, then stops and alerts
-    (`shutdown_veto_timeout`, `sched_resource_veto{state="stopped"} == 1`). cuda-central
-    therefore belongs in the stopped and needs-attention alerts that already cover basestar
-    (`sched_resource_veto{state="stopped"} == 1`, and `needs_attention` in the toggle JSON),
-    and the "shutdown stopped" Home Assistant sensor must not assume the host is basestar.
-  - *Requested shutdown on an exclusive host* exists in the sequencer only; the API and
-    toggle listener still refuse it until phase 4.
-  - *Turning the GPU veto on in the deployed config* (checked read-only against homesvr
-    `kubernetes/apps/flowmanager/config.yaml` on 2026-10-30): no source there observes
-    `pods` today (`cluster-nodes` has `observe: [reachability]` and nodes-only RBAC), so
-    cuda-central has no GPU veto until homesvr (1) adds `pods` to a `kubernetes_watch`
-    source with `namespaces: [ollama, paperless-ngx, speakr]`, (2) grants that service
-    account pods list/watch in those namespaces, and (3) declares `namespaces` on the
-    models: `mineru` -> `paperless-ngx`, `llm` -> `ollama`, `whisperx` -> `speakr`. Until
-    then behaviour is as before (no veto on cuda-central), which is safe.
-- **Phase 4a output changes (breaking, D5).** Reclaim is now lockout on any host with a power
-  section, and `off` / `off-now` exist on both kinds. The phase 3 bullet saying the API and
-  listener refuse a requested shutdown on an exclusive host is superseded.
-  - *Before deploying.* A stored lease of kind `reclaim` no longer parses (the lease book is
-    not versioned away): clear every reclaim (`unreclaim`) before the new build starts, or the
-    lease book read fails. A config with `policy.reclaim_timeout` is refused at load (unknown
-    key): rename it first.
-  - *Persisted state.* `scheduler_state` is version 3 (older: discarded on read, start from
-    observation, leases and job book kept). Changes: the shutdown cause `{"kind":"reclaim"}` is
-    `{"kind":"lockout"}`, the wind-down flag `reclaim` is `lockout`, and a new per-resource
-    `locked_down` (bool, default false, see 2.2). A lockout shutdown can now also carry
-    withdrawal `pending` or `done` (a shared host).
-  - *Config.* `policy.reclaim_timeout` is renamed `policy.lockout_timeout` (same default,
-    `drain_timeout`, same bounds; no alias). It now applies to a shared host's withdrawal too.
-    A lockout is valid on any resource with a power section (it was exclusive only).
-  - *Restate handlers.* `Scheduler/main/reclaim` is `lockout` and `unreclaim` is
-    `clear_lockout` (same request `{"resource": ...}`, same `LeaseGrant` / `Lease` replies;
-    new lease ids `lockout-<n>`, kind `lockout`). `drain_host` and `release_host_lease` with
-    `drain` now accept an exclusive host (they answered `400` "not a shared resource"); on a
-    locked-out host `drain_host` records nothing (`drain` absent in its reply). The `400` for a
-    resource without a power section reads "...so a lease, a lockout or a drain on it would do
-    nothing"; there is no longer a "cannot be reclaimed" refusal.
-  - *Toggle listener routes and JSON.* `/v1/reclaims/{resource}[/on|/off]` is
-    `/v1/lockouts/{resource}[/on|/off]` (the old route is a `404`). `/v1/leases` has `lockouts`
-    where it had `reclaims`, one entry per resource with a power section (basestar-nfs now
-    too), each with `kind: "lockout"` and `supported: true`. `off` and `off-now` on
-    `/v1/resources/cuda-central` behave as on basestar: `200`, `state: "draining"` with a
-    `drain` object while the host is up (before: plain release, and `400` for `off-now`).
-    The lockout switch's `status` gains `left_alone` (the host booted after the lockout shut
-    it down) and `draining` also covers a shared host's pending withdrawal; the model switch's
-    `status` `reclaimed` is `locked_out` (its `detail` says "locked out").
-  - *Wait reasons* (`TickReport.steps`, scenario YAML, `reason` text): `reclaimed` is
-    `locked_out`, `reclaim_unsupported` is `lockout_unsupported`. A locked-out host that is up
-    after its one shutdown now reports `locked_out` every tick (before: `power_off` again every
-    tick while a reclaim was held and the host seen up). `reason` text: ", reclaim [..]" is
-    ", lockout [..]" and the wait texts say "locked out".
-  - *Fix round (jobs, takeover, replies).*
-    - *Jobs.* A scheduled job whose needs include a locked-out host does not start (the
-      host up or not): its run waits in `Waiting` as for a host that is not up, so
-      `job_events` show no `started`, `start_late` and `missed` follow the job's
-      `missed_run` policy as usual, and a `started` (with `caught_up`) comes once the lockout
-      is cleared. The waiting run's own hold (`hold-job-<id>-<resource>`) exists as for a
-      down host but is inert under the lockout; when the lockout clears it may wake a host
-      that is down so the run can catch up, after which the host is flowmanager's and
-      powers down when the job is done. A run already running is not killed and
-      keeps its hold; the lockout shuts the host down regardless (the veto waits for the
-      job's pods, bounded by `veto_timeout`). The invariant checker sees only the
-      sequencer's decision, not job starts, so this is covered by service tests, not by
-      invariant 14.
-    - *A lockout taking over a shutdown in progress* (any host, shared or exclusive) makes
-      it the lockout's: `shutdown.cause` is `lockout` (it stays `requested` for an
-      immediate request whose withdrawal is still pending). A pending graceful withdrawal
-      restarts at the takeover with `lockout_timeout` (`shutdown.since` is the takeover
-      time); a done one stays done. Clearing the lockout drops the shutdown, so an earlier
-      `off` on an exclusive host no longer survives it (it used to).
-    - *Toggle replies for a resource.* `GET` and `POST` on `/v1/resources/{r}[/...]` and the
-      `resources` entries of `/v1/leases` have a new boolean `locked_out` (true while a
-      lockout lease is held on that host). While true the `wait` array has an entry
-      `{"reason": "locked_out"}` (created even before the first tick), and `state` reads
-      `locked_out` instead of `off` while the last report does not show the host off and no
-      lease is held (`draining` and `on` keep their meaning). Status codes are unchanged
-      (`off`, `off-now` and `on` still answer 200: the request is recorded or ignored as
-      before and the reply now says the lockout decides).
-  - *Intent and TickReport JSON.* `intent.reclaim` is `intent.lockout` (where the intent is
-    serialized: `last_decision`, scenario files).
-  - *Metrics.* `sched_manual_lease_age_seconds{kind="reclaim"}` is `kind="lockout"`;
-    `sched_toggle_requests_total{endpoint}` values `reclaim_get`, `reclaim_on`, `reclaim_off`,
-    `reclaim_set` are `lockout_get`, `lockout_on`, `lockout_off`, `lockout_set`. No new metric.
-  - *Log events.* No event was added or removed. The toggle `event="toggle"` line has
-    `kind="lockout"` where it had `kind="reclaim"`; `host_adopted` is not emitted for a
-    locked-out host.
-  - *Home Assistant.* The reclaim switch is a lockout switch: resource
-    `/v1/lockouts/cuda-central` (unique id `flowmanager_lockout_cuda_central`, was
-    `flowmanager_reclaim_cuda_central`), with the help text suggested above shown on the
-    dashboard. Add the same switch for basestar (`/v1/lockouts/basestar-nfs`; it deliberately
-    blocks the backup job). Add `off` and `off-now` for cuda-central as for basestar
-    (`POST /v1/resources/cuda-central/off`, `.../off-now`) and drop the "cuda-central is
-    powered by hand" note. Sensors reading the lockout switch's `status` should expect
-    `left_alone`.
-- **Phase 4b output changes (breaking, D5).** Ownership is a marker, adoption is one
-  sequencer function, a lease has a typed origin.
-  - *Persisted state.* `scheduler_state` is version 4 (older: discarded on read, start from
-    observation, leases and job book kept). The per-resource `managed` flag is gone; `power`
-    of phase `off` carries `ours` (`{"phase":"off","ours":bool}`) and of phase `on`
-    (`{"phase":"on","since":N,"ours":bool}`). A host that is up at the first tick after the
-    upgrade is not ours, so it is adopted; a host a job woke before the upgrade is adopted too
-    and stays up until a person switches it off.
-  - *Lease book.* `lease_book` is version 2: every lease has `origin` (`"requested"` or
-    `"adopted"`), written always, `requested` when absent in a hand-written lease. A version 1
-    book is read, with its adopted leases (a `manual_host` lease whose id begins
-    `adopted-host-`) dropped and one warning each (`event="legacy_adopted_lease_dropped"`);
-    this keeps a stored adopted lease from reading as a person's and waking the host after it
-    went down. Nothing is lost (the hosts that are up are adopted afresh at the first tick,
-    with `origin: adopted`). No operator step. A rollback needs the lease book discarded.
-  - *Behaviour (D6).* A host found running is adopted even while a job holds it (before: only
-    after the hold ended). A host a job woke is never adopted.
-  - *`jobs_off`.* Adoption (adopting, ending, the `adopted` and `adoptions_ended` report
-    fields, the `host_adopted` log events) now runs with an unreadable job book. With it the
-    lease book is stored as the tick decided it; only the job book and job creation are still
-    skipped (the job book's bytes are never written). Before, no adoption happened and the
-    lease book was not written.
-  - *HTTP JSON.* The `origin` field (`"requested"` or `"adopted"`) is new on every switch
-    entry (`/v1/resources/{r}`, `/v1/models/{m}`, `/v1/leases`) while a lease is held. A raw
-    `Lease` (in `TickReport.leases`, `last_decision`, Restate replies such as `LeaseGrant`)
-    has `origin`. Home Assistant can use it to tell an adopted lease from a person's.
-  - *A host adopted the tick a lockout is cleared.* Only a shutdown stopped by the veto blocks
-    adoption of a not-ours host that is up (before, any shutdown did). So a not-ours host
-    carrying the lockout's shutdown is adopted at the very tick its lockout lease disappears;
-    the build before waited one tick. The adopted lease then cancels the leftover shutdown.
-  - *Metrics, logs, reason, wait reasons.* No change. The invariant checker's message for 7
-    reads "powered off X, which flowmanager did not start (not ours)".
+### 5.1 Upgrade steps (in this order)
+
+1. **Clear every reclaim before the new build starts.** A stored lease of kind `reclaim` no
+   longer parses (the lease book is not versioned away): list the leases (`leases`) and clear
+   each with the old build's `unreclaim` (`{"resource": "cuda-central"}`), or the lease book
+   read fails, every tick publishes nothing (the scaler keeps what it had) and the lease
+   handlers answer `503`. If the upgrade was done first: roll back, `unreclaim`, roll forward;
+   or discard `lease_book` (`discard_state`, which drops every lease, job holds are re-derived).
+2. **Config renames and additions** (5.2): `policy.reclaim_timeout` is `lockout_timeout` (the old
+   key is refused at load); `resources[].power.mounts_timeout` is `veto_timeout`.
+3. **Persisted state: nothing to migrate, nothing to do.** `scheduler_state` is version 4. An
+   older state (1, 2 or 3) is discarded on read: one warning
+   (`event="state_version_discarded"`), the sequencer starts afresh from observation, leases and
+   the job book are kept. `lease_book` is version 2 (see below). A rollback needs
+   `scheduler_state` and `lease_book` discarded and the config rolled back too.
+4. **What the first tick after the upgrade does.** A host that is up is not ours, so a host under
+   managed control is adopted (a manual host lease with `origin: adopted`), also one a job woke
+   before the upgrade, which then stays up until a person switches it off; a requested shutdown
+   under way is forgotten; the idle and `min_off` clocks start over.
+5. **Lease book version 2.** Every lease has `origin` (`"requested"` or `"adopted"`). A version 1
+   book is read with its adopted leases (a `manual_host` lease whose id begins `adopted-host-`)
+   dropped, one warning each (`event="legacy_adopted_lease_dropped"`); nothing is lost, the hosts
+   that are up are adopted afresh at the first tick. No operator step.
+6. **State shape history** (for anyone reading `last_decision`): version 2 replaced each
+   resource's `drain`, `mounts_veto`, `host_idle_since` and `shutdown_confirmed_at` with
+   `shutdown { cause, since, withdrawal, veto }`, `idle_since` and `off_since`; version 3 renamed
+   the shutdown cause `reclaim` to `lockout` and the wind-down flag `reclaim` to `lockout`, and
+   added `locked_down`; version 4 replaced the per-resource `managed` flag with `ours` on the
+   `off` and `on` phases (`{"phase":"off","ours":bool}`, `{"phase":"on","since":N,"ours":bool}`).
+
+### 5.2 flowmanager config (homesvr `kubernetes/apps/flowmanager/config.yaml`)
+
+- `resources[].power.mounts_timeout` is `veto_timeout` (same default 30m and bounds; no alias).
+- `policy.reclaim_timeout` is `policy.lockout_timeout` (same default, `drain_timeout`, same bounds;
+  no alias). It now also applies to a shared host's withdrawal.
+- New `models[].namespaces`: required, for a managed exclusive host whose models are covered by a
+  `pods` source, to list the namespaces of each model's workloads, all watched by that source;
+  otherwise the config is refused at load.
+- **Turning the GPU veto on in the deployed config** (checked read-only on 2026-10-30): no source
+  there observes `pods` today (`cluster-nodes` has `observe: [reachability]` and nodes-only RBAC),
+  so cuda-central has no GPU veto until homesvr (1) adds `pods` to a `kubernetes_watch` source with
+  `namespaces: [ollama, paperless-ngx, speakr]`, (2) grants that service account pods list/watch in
+  those namespaces, and (3) declares `namespaces` on the models: `mineru` -> `paperless-ngx`, `llm`
+  -> `ollama`, `whisperx` -> `speakr`. Until then behaviour is as before (no veto on cuda-central),
+  which is safe. With it on, cuda-central's power-off waits for zero pods of every model (`wait ...
+  veto_in_use` or `veto_unknown`), up to `veto_timeout`, then stops and alerts
+  (`shutdown_veto_timeout`, `sched_resource_veto{state="stopped"} == 1`).
+- `power.min_off` is unchanged (opt-in, default 0).
+
+### 5.3 Home Assistant (homesvr `kubernetes/apps/home-assistant/ha-config/`)
+
+Routes and switches:
+
+- The reclaim switch is a **lockout switch**: resource `/v1/lockouts/cuda-central` (unique id
+  `flowmanager_lockout_cuda_central`, was `flowmanager_reclaim_cuda_central`). `/v1/reclaims/...`
+  is a `404`. Give it the help text, suggested: *"Lockout: flowmanager stops all work on this
+  host, shuts it down, and will not power it on or schedule anything on it until the lockout is
+  cleared. Use it before rebooting into another OS or doing physical work on the machine. Backups
+  that need the host wait too."* Add the same switch for basestar (`/v1/lockouts/basestar-nfs`; it
+  deliberately blocks the backup job). `/v1/leases` has `lockouts` where it had `reclaims`, one
+  entry per resource with a power section, each with `kind: "lockout"` and `supported: true`.
+- Expose `off` / `off-now` / `release` / lockout for cuda-central like basestar:
+  `POST /v1/resources/cuda-central/off`, `.../off-now`, `.../release`; they answer `200` with
+  `state: "draining"` and a `drain` object while the host is up. Drop the stale "cuda-central is
+  powered by hand" dashboard note. (homesvr's `power.py` is ignored: it will be dropped once
+  cuda-central's power is managed.)
+- The "shutdown stopped" sensor must not assume the host is basestar: cuda-central can be stopped
+  by the veto too.
+
+Fields the sensors read (JSON of `/v1/resources/{r}`, `/v1/models/{m}`, `/v1/lockouts/{r}`,
+`/v1/leases`):
+
+- `origin` (`"requested"` or `"adopted"`) is on every switch entry while a lease is held; it means
+  only the lease's origin. Use it to tell an adopted lease from a person's.
+- **`drain.origin` is now `drain.cause`** (`requested` or `idle`; phase 5). The object is
+  `{mode, cause, since_ms, scaled_down}`.
+- `locked_out` (boolean, true while a lockout lease is held on that host) on the resource entries,
+  with a `wait` entry `{"reason": "locked_out"}` (created even before the first tick); `state` reads
+  `locked_out` instead of `off` while the last report does not show the host off and no lease is
+  held (`draining` and `on` keep their meaning). `off`, `off-now` and `on` still answer `200`: the
+  request is recorded or ignored as before and the reply says the lockout decides.
+- Lockout switch `status` gains `left_alone` (the host booted after the lockout shut it down) and
+  `draining` also covers a shared host's pending withdrawal; sensors reading it should expect
+  `left_alone`. The model switch's `status` `reclaimed` is `locked_out` (its `detail` says "locked
+  out").
+- The `wait` entry of the veto is `shutdown_held_by_veto` (was `shutdown_held_by_mounts`) with
+  `readings`, `blocking` (each reading's `state`: `in_use` or `unknown`) and `stopped`; resume's
+  `cleared` is `shutdown_stopped_by_veto` (was `shutdown_stopped_by_mounts`). `needs_attention` is
+  true for a failed power phase or a stopped shutdown, on either host.
+
+### 5.4 Grafana and alerts
+
+Metrics (names, values and labels; phase 5 changed none, see the end of this group):
+
+- `sched_resource_mounts_veto{resource,state}` is `sched_resource_veto{resource,reading,state}`,
+  one series per applicable reading (`mounts`, `pods`): `waiting` is 1 on the blocking reading(s),
+  `stopped` is 1 on every reading of the host. cuda-central now has series too.
+- `sched_mounts_timeouts_total{resource}` is `sched_veto_timeouts_total{resource,reading}`, one count
+  per blocking reading.
+- `cuda-central` therefore belongs in the stopped and needs-attention alerts that already cover
+  basestar (`sched_resource_veto{state="stopped"} == 1`, `sched_resource_power_failed == 1`, and
+  `needs_attention` in the toggle JSON).
+- `sched_manual_lease_age_seconds{kind="reclaim"}` is `kind="lockout"`;
+  `sched_toggle_requests_total{endpoint}` values `reclaim_get`, `reclaim_on`, `reclaim_off`,
+  `reclaim_set` are `lockout_get`, `lockout_on`, `lockout_off`, `lockout_set`.
+- **Phase 5:** no metric name, label or value changed. One behavioural note: the per-host gauges
+  (`sched_resource_power_failed`, `sched_resource_veto`, `sched_resource_min_off_remaining_seconds`)
+  are set from the statuses of a decided tick; on a tick that failed to decide (a state that cannot
+  be read, not a normal event) they keep what the last decided tick set, where before they were
+  recomputed from the unchanged state (so `min_off_remaining` does not count down during such a
+  tick). The alert-once counters (`sched_power_timeouts_total`, `sched_veto_timeouts_total`) count
+  exactly as before, once per timeout, never for a replayed tick.
+
+Logs (for log-based alerts and queries):
+
+- `shutdown_mounts_timeout` is `shutdown_veto_timeout` (and `..._replayed`), with `readings`
+  (joined with `+`) and `blocking` (`mounts:in_use,pods:unknown`) fields.
+- `host_adopted` is not emitted for a locked-out host. No other event was added or removed in 4a
+  and 4b: the toggle `event="toggle"` line has `kind="lockout"` where it had `kind="reclaim"`.
+- **Phase 5:** the `event="drain"` line (every tick while a requested or idle shutdown is
+  withdrawing consumers) has `cause` where it had `origin` (values `requested`, `idle`), and the
+  `tick` line's `drains` field entries read `resource:cause:mode:scaled_down|running` (the second
+  part was the origin). `host_adopted` and `host_adoption_ended` are now emitted from the tick's
+  events list (same text, same fields); the alert events (`power_timeout`,
+  `shutdown_veto_timeout`) and their `_replayed` twins are unchanged in name, fields and text.
+- Adoption (`host_adopted`, `host_adoption_ended`) and the adoption events of the report run with an
+  unreadable job book too (`jobs_off`); the lease book is stored as the tick decided it. Before, no
+  adoption happened then (and the lease book was not written).
+- The invariant checker's message for 7 reads "powered off X, which flowmanager did not start (not
+  ours)" (test harness output only).
+
+`last_decision` / `TickReport` JSON, `reason` text and wait reasons:
+
+- Wait reasons (`TickReport.steps`, scenario YAML, `reason` text): `pods_mounted` is
+  `veto_in_use`, `mounts_unknown` is `veto_unknown`, `reclaimed` is `locked_out`,
+  `reclaim_unsupported` is `lockout_unsupported`; `shutdown_stopped` is unchanged. A locked-out host
+  that is up after its one shutdown reports `locked_out` every tick (before: `power_off` again every
+  tick). `reason` text: ", reclaim [..]" is ", lockout [..]" and the wait texts say "locked out".
+- `intent.reclaim` is `intent.lockout` (`last_decision`, scenario files).
+- `mounts_held` was `veto_held` and `mounts_timeouts` `veto_timeouts` after phase 3; **phase 5
+  removes the per-feature fields**: `power_failed`, `power_timeouts`, `veto_held`, `veto_timeouts`,
+  `min_off_waits`, `drains`, `adopted`, `adoptions_ended` are gone from `TickReport`. In their place
+  `hosts` (one status per resource: `resource`, `kind`, `has_power`, `managed`, `power`, `ours`,
+  `mode`, `shutdown` {`cause`, `since`, `withdrawal`, `veto`: `clear` / `waiting` / `stopped` with
+  `since` and the `blocking` readings}, `veto_readings`, `lease` origin, `lockout`, `min_off`
+  {`since`, `remaining`, `until`}, `wait`, `attention`) and `events` (a list tagged by `event`:
+  `power_timeout`, `veto_timeout`, `adopted`, `adoption_ended`). `power_request_failures` stays. A
+  failed tick has empty `hosts` and `events`. The reason text, the kinds (`power_failed`,
+  `shutdown_stopped`) and their order are unchanged.
+- `Lease` JSON (`TickReport.leases`, `last_decision`, Restate replies such as `LeaseGrant`) has
+  `origin`.
+- Restate handlers: `Scheduler/main/reclaim` is `lockout` and `unreclaim` is `clear_lockout` (same
+  request `{"resource": ...}`, same `LeaseGrant` / `Lease` replies; new lease ids `lockout-<n>`, kind
+  `lockout`). `drain_host` and `release_host_lease` with `drain` now accept an exclusive host (they
+  answered `400` "not a shared resource"); on a locked-out host `drain_host` records nothing
+  (`drain` absent in its reply). The `400` for a resource without a power section reads "...so a
+  lease, a lockout or a drain on it would do nothing"; there is no longer a "cannot be reclaimed"
+  refusal.
+
+Behaviour changes that show on dashboards:
+
+- A host found running is adopted at once, even while a job holds it (D6; before: only after the
+  hold ended, same end state), so the dashboard shows it held during the backup. A host a job woke is
+  never adopted.
+- Only a shutdown stopped by the veto blocks adoption of a not-ours host that is up. So a not-ours
+  host carrying the lockout's shutdown is adopted at the very tick its lockout lease disappears (the
+  build before waited one tick); the adopted lease then cancels the leftover shutdown.
+- A scheduled job whose needs include a locked-out host does not start (host up or not): its run waits
+  in `Waiting` as for a host that is not up, so `job_events` show no `started`; `start_late` and
+  `missed` follow the job's `missed_run` policy and a `started` (with `caught_up`) comes once the
+  lockout is cleared. The waiting run's own hold (`hold-job-<id>-<resource>`) is inert under the
+  lockout; when it clears the hold may wake a host that is down so the run can catch up, after which
+  the host is flowmanager's and powers down when the job is done. A run already running is not
+  killed and keeps its hold; the lockout shuts the host down regardless (the veto waits for the job's
+  pods, bounded by `veto_timeout`).
+- A lockout taking over a shutdown in progress (any host) makes it the lockout's: `shutdown.cause` is
+  `lockout` (it stays `requested` for an immediate request whose withdrawal is still pending); a
+  pending graceful withdrawal restarts at the takeover with `lockout_timeout`; clearing the lockout
+  drops the shutdown, so an earlier `off` on an exclusive host no longer survives it.
+- `off` and `off-now` on `/v1/resources/cuda-central` behave as on basestar (`200`, `state:
+  "draining"` and a `drain` object while the host is up; before: plain release, and `400` for
+  `off-now`).

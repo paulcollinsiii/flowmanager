@@ -2,7 +2,7 @@
 
 Oct 23, 2026 · @Paul Collins
 
-> **Host power is described in [`power-model.md`](power-model.md), which is authoritative** for ownership (who started a host decides), the shutdown stages (withdraw, veto, power off), the veto, lockout, adoption and `min_off`. This document keeps only a short summary of those and points there. The code matches `power-model.md` except for what refactor phase 5 still changes (see `milestones.md`, *Power-model refactor*): the single derived `HostStatus`. Ownership is done (phase 4b): the `ours` marker on the `off` and `on` phases, adoption decided by one pure sequencer function, a typed lease `origin`. The names *drain* and `drain_host` still mean a requested shutdown in handlers and logs. Where this document marks something *target*, the code does not enforce it yet.
+> **Host power is described in [`power-model.md`](power-model.md), which is authoritative** for ownership (who started a host decides), the shutdown stages (withdraw, veto, power off), the veto, lockout, adoption and `min_off`. This document keeps only a short summary of those and points there. The code matches `power-model.md` (the refactor is finished, see `milestones.md`, *Power-model refactor*): the `ours` marker on the `off` and `on` phases, adoption decided by one pure sequencer function, a typed lease `origin`, and one derived `HostStatus` per resource with the one-time events of a tick (`crates/sched-sequencer/src/status.rs`), which the report, the reason, the metrics and the toggle listener read. The names *drain* and `drain_host` still mean a requested shutdown in handlers and logs.
 
 ## Problem and goals
 
@@ -186,7 +186,7 @@ Kinds live in code and instances live in configuration, so adding a service that
 
 ## Safety invariants
 
-These hold regardless of policy or configuration, and every milestone's tests should check them. This is the one canonical list; the numbers are contiguous. Host power invariants follow the model in [`power-model.md`](power-model.md). Each item says whether the code enforces it today: **enforced** means `crates/sched-service/src/invariants.rs` checks it (or the property tests, where stated); **target** means it belongs to the `power-model.md` target model and the code does not enforce it yet (phases 2 to 5). Until phase 2 renumbers the code, the *Mapping* table below translates the old numbers.
+These hold regardless of policy or configuration, and every milestone's tests should check them. This is the one canonical list; the numbers are contiguous. Host power invariants follow the model in [`power-model.md`](power-model.md). Each item says whether the code enforces it today: **enforced** means `crates/sched-service/src/invariants.rs` checks it (or the property tests, where stated); an item marked otherwise says how it is held. Every item is built. The *Mapping* table below translates the numbers the code and the old documents used before the refactor renumbered them.
 
 **Models and the GPU**
 
@@ -225,7 +225,7 @@ These hold regardless of policy or configuration, and every milestone's tests sh
 
 ### Mapping from the old numbers
 
-Phase 2 renumbers `invariants.rs` and the module doc comment of `crates/sched-sequencer/src/lib.rs` with this table. "Old checker" is the number in the messages of `crates/sched-service/src/invariants.rs` (there is no 6, 7 or 10; eleven checks carry no number and each has a row below, listed by their message text); "old rule" is the numbered *Safety rules* list in the doc comment of `crates/sched-sequencer/src/lib.rs`; "old design" is this document's list before 2026-10-30.
+Phase 2 renumbered `invariants.rs` and the module doc comment of `crates/sched-sequencer/src/lib.rs` with this table. "Old checker" is the number in the messages of `crates/sched-service/src/invariants.rs` (there is no 6, 7 or 10; eleven checks carry no number and each has a row below, listed by their message text); "old rule" is the numbered *Safety rules* list in the doc comment of `crates/sched-sequencer/src/lib.rs`; "old design" is this document's list before 2026-10-30.
 
 | Old checker (`invariants.rs`) | New | Notes |
 | --- | --- | --- |
@@ -277,7 +277,7 @@ Phase 2 renumbers `invariants.rs` and the module doc comment of `crates/sched-se
 | 8 | 16 | |
 | 9 | 20 | |
 
-New invariants with no old number: 7 (ownership, as a rule; checked as the `ours` marker), 12 in its target form, 14 in its target form, 15 (adoption), 18's generation clause.
+New invariants with no old number: 7 (ownership, as a rule; checked as the `ours` marker), 12, 14, 15 (adoption), 18's generation clause.
 
 ## Open questions
 

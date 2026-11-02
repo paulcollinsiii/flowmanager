@@ -220,13 +220,13 @@ These are inferences made while rewriting the plan; confirm or change them.
 
 ### Power-model refactor (Oct 30, 2026)
 
-The host power features added during M4 (adoption, drain on release, `drain_host`, idle drain, exclusive host lease) were each reviewed only against themselves. The user accepted one host power model, `power-model.md` (decisions D1 to D6 and the ownership rule), which is now the authoritative description of host power; `architecture.md` summarises it and points there. The code still behaves as `power-model.md` section 1 describes until phases 2 to 5 land. Phases, each run through the three-role process:
+The host power features added during M4 (adoption, drain on release, `drain_host`, idle drain, exclusive host lease) were each reviewed only against themselves. The user accepted one host power model, `power-model.md` (decisions D1 to D6 and the ownership rule), which is now the authoritative description of host power; `architecture.md` summarises it and points there. The refactor is done: the code behaves as `power-model.md` describes. Phases, each run through the three-role process (all five done on `refactor/power-model`):
 
-1. **Model document** (documents only): `power-model.md` accepted; `architecture.md` power content and one canonical, contiguously numbered invariant list, with a mapping from the old numbers.
-2. **State types:** `Shutdown{cause, stage}`, `off_since`; drop `drain`, `mounts_veto`, `shutdown_confirmed_at` (`managed` became `ours` on `Off` and `On` in 4b); renumber the invariants in code.
-3. **One withdrawal, one veto:** shared drain and exclusive wind-down share the Withdrawing stage; the mount veto becomes a per-host veto, adding the GPU pod veto.
-4. **Vocabulary and adoption:** `off` / `off-now` on both host kinds; reclaim renamed lockout on any managed host; adoption in the sequencer with a typed origin; no `jobs_off` coupling.
-5. **HostStatus and reporting:** one derived status feeding `tick.rs`, `reason`, metrics and the toggle listener; README power section shrunk to the model.
+1. **Model document** (documents only) — done: `power-model.md` accepted; `architecture.md` power content and one canonical, contiguously numbered invariant list, with a mapping from the old numbers.
+2. **State types** — done: `Shutdown{cause, stage}`, `off_since`; drop `drain`, `mounts_veto`, `shutdown_confirmed_at` (`managed` became `ours` on `Off` and `On` in 4b); renumber the invariants in code.
+3. **One withdrawal, one veto** — done: shared drain and exclusive wind-down share the Withdrawing stage; the mount veto becomes a per-host veto, adding the GPU pod veto.
+4. **Vocabulary and adoption** — done (4a vocabulary and lockout, 4b ownership): `off` / `off-now` on both host kinds; reclaim renamed lockout on any managed host; adoption in the sequencer with a typed origin; no `jobs_off` coupling.
+5. **HostStatus and reporting** — done: one derived `HostStatus` per resource and one list of events (`sched_sequencer::status`) feeding the tick report, `reason`, the logs, the metrics and the toggle listener; the per-feature report fields and the `*_report` functions are gone; README power sections shrunk to the model, caveats in *Known blind spots*; `power-model.md` section 5 is the one hand-off for the homesvr agent.
 
 Breaking changes to logs, reason strings, metrics and state are accepted (D4, D5); each phase reports them for the homesvr hand-off (`power-model.md` section 5).
 
