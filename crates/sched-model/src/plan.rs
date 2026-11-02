@@ -11,7 +11,7 @@ use crate::time::Millis;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerWant {
-    /// A manual lease from a user request. The host is then managed: it is powered down
+    /// A manual lease from a user request. The host is then ours (`ours`): it is powered down
     /// again once nothing holds it.
     Manual,
     /// A workload class that may change power. Wakes a host that is off; a host that was

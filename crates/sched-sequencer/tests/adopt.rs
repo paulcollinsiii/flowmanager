@@ -213,7 +213,7 @@ fn an_exclusive_managed_host_found_up_is_adopted_like_a_shared_one() {
     );
     let gpu_up = snapshot(None, Some(true), &[]);
     assert_eq!(found(&config, &gpu_up, &SchedState::default()), vec![G]);
-    // Off after a shutdown we started (not managed), or a power-on that failed: adopted.
+    // Off after a shutdown we started (not ours), or a power-on that failed: adopted.
     let off = gpu_state("{ power: { phase: off }, mode: { phase: idle } }");
     assert_eq!(found(&config, &gpu_up, &off), vec![G]);
     let failed = gpu_state(

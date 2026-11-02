@@ -274,7 +274,7 @@ pub enum Veto {
     /// began.
     Vetoing { since: Millis },
     /// The wait outlasted the resource's `veto_timeout`. The scheduler stops: no shutdown,
-    /// an alert, no retry, and the host is no longer managed (as after a failed power
+    /// an alert, no retry, and the host is no longer ours (as after a failed power
     /// transition). It clears only when the host is seen down or its state is reset by a
     /// person (`resume`), or when a new manual request takes the host over again. `since` is
     /// when the scheduler gave up.

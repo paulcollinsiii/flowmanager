@@ -359,22 +359,24 @@ until the first tick (the backstop ticks within seconds).
 ### Versions, and recovering the persisted state
 
 Each document is stored as `{"version": N, "data": ...}`; this build reads and writes
-version 3 of `scheduler_state` and version 1 of `lease_book`, `job_book` and the others.
-Version 2 of `scheduler_state` replaced each resource's `drain`, `mounts_veto`,
+version 4 of `scheduler_state`, version 2 of `lease_book` and version 1 of `job_book` and the
+others. Version 2 of `scheduler_state` replaced each resource's `drain`, `mounts_veto`,
 `host_idle_since` and `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`;
 version 3 renamed the `reclaim` shutdown cause and wind-down flag to `lockout` and added
-`locked_down` (`planning/power-model.md`). **There is no migration for `scheduler_state`**
+`locked_down`; version 4 replaced the per-resource `managed` flag with `ours` on the `off` and
+`on` power phases (`planning/power-model.md`). **There is no migration for `scheduler_state`**
 (but see the operator step below for a stored reclaim lease). A
-`scheduler_state` of an *older* version (version 1 or 2, as the builds before wrote it) is read as
+`scheduler_state` of an *older* version (version 1, 2 or 3, as the builds before wrote it) is read as
 an absent document: the first tick logs one warning (`event="state_version_discarded"`: the
 version found, discarded, starting from observation) and starts from observation as
-described below, and the state it stores is version 3. Only `scheduler_state` is treated so
-(it is the only document whose version was bumped); the lease book and the job book are
-kept as they are. One consequence: a host that is up when the new build first ticks has no
-`managed` mark, so it is seen as found running (a shared host is adopted, see *Host leases,
-lockout and resume*; none is powered off by flowmanager on account of anything done before the
-deploy); a requested drain or a stopped shutdown under way is forgotten, and idle and
-`min_off` clocks start over. The `loading` and `draining` mode phases of the build before
+described below, and the state it stores is version 4. Only `scheduler_state` is treated so;
+the lease book and the job book are kept (the lease book is version 2 since phase 4b: every
+lease has an `origin`, `requested` or `adopted`; a version 1 book is read, with its adopted
+leases dropped, see *Host leases, lockout and resume*). One consequence: a host that is up
+when the new build first ticks is not ours, so it is seen as found running (a host under
+managed control is adopted, see *Host leases, lockout and resume*; none is powered off by
+flowmanager on account of anything done before the deploy); a requested drain or a stopped
+shutdown under way is forgotten, and idle and `min_off` clocks start over. The `loading` and `draining` mode phases of the build before
 queue-only switching are still read (`loading` as serving since the same instant, `draining`
 as idle). A document that cannot be decoded, or that has a *newer* version (written
 by a newer build, say, before a rollback), is not reset and does not fail the invocation
@@ -391,10 +393,12 @@ included). Instead:
 switching rejects the shipped config: a gate class (a requirement on an exclusive resource
 without a model) fails validation with "exclusive; a model is required", and a config
 without a pods source is refused as well. Deploy the previous binary with the previous
-config. A build before version 3 of `scheduler_state` cannot read the state this build
-writes (another version: an error tick until the document is discarded with
-`discard_state`), so discard `scheduler_state` when rolling back. Rolling forward again
-needs nothing: this build drops the older document by itself (see above).
+config. A build before version 4 of `scheduler_state` and version 2 of `lease_book` cannot
+read what this build writes (another version: an error tick until the documents are
+discarded with `discard_state`), so discard `scheduler_state` and `lease_book` when rolling
+back (the lease book drops every lease; job holds are re-derived from the job book). Rolling
+forward again needs nothing: this build drops the older state by itself and reads a
+version 1 lease book (see above).
 
 **Rolling back across scheduled jobs.** A build without scheduled jobs (the one before the
 `jobs:` key) rejects a config that has the `jobs:` section, so roll the config back with it
@@ -408,6 +412,19 @@ that flowmanager already created is not touched either way: it runs to its end u
 Kubernetes (the CronJob stays `suspend: true`). Rolling forward again finds `job_book` as it
 was left, which may be stale (a run that ended meanwhile), so a run in it ends from the readings
 as usual; discard it (`job_book`) if you want a clean start.
+
+**Upgrading to the build with the typed lease `origin` and `ours` (phase 4b): no operator
+step.** The lease book is version 2 (every lease has an `origin`); a version 1 book is read
+as it is, except that its adopted leases (a manual host lease whose id begins `adopted-host-`)
+are dropped, one warning each (`event="legacy_adopted_lease_dropped"`), because version 1
+marked them only by that id and they would otherwise read as leases a person asked for and
+wake their host again after it went down. Nothing is lost: `scheduler_state` is discarded in
+the same upgrade (version 4), so a host that is up is found running at the first tick and
+adopted afresh, now with `origin: adopted`, and a host that is down needs no lease. A person's
+leases, lockouts and job holds are kept. Leases written by this build read as before in a
+rollback only after the lease book is discarded (see above). One effect of the discarded
+state: a host a job woke before the upgrade is not ours afterwards, so it is adopted and stays
+up until a person switches it off.
 
 **Operator step before upgrading to the build that renamed reclaim to lockout.** A stored
 lease of kind `reclaim` (a reclaim someone left held) does not parse in this build, and the
@@ -694,7 +711,7 @@ harmless to repeat).
     `shutdown_stopped`, the step `wait ... shutdown_stopped` and
     `sched_resource_veto{state="stopped"} == 1` (alert on it). The host is **not** shut
     down, however long it stays like this and even after the pods are gone, and the
-    `managed` flag is dropped (as after a failed power transition). It leaves the stopped
+    host is no longer ours (as after a failed power transition). It leaves the stopped
     state when the host is observed down (a person shut it down), when a person calls
     `resume` for it, or when a new manual lease takes the host over again (the next idle
     period then decides afresh). The wait counts from the moment the shutdown is due, not
@@ -827,34 +844,45 @@ trusted network.
   veto and the power-off. The shutdown happens only with the mode idle (the model already
   withdrawn, so KEDA is scaling its pods down); an idle shutdown has no further wait for the
   pods to be gone beyond the veto: the only other delay is `idle_grace`.
-- **A host found running is adopted** (a changed default: it used to be left alone for ever,
-  so a host switched on by hand stayed up until a person shut it down). For a host (shared or exclusive) with
-  `power.control: managed`, when a fresh reading shows it up and flowmanager did not power it
-  on, it counts as held by the user and the tick mints the same manual host lease for it
-  (id `adopted-host-<resource>`, listed by `leases`). "Did not power it on" is read from the
-  previous state: no state (first start, discarded state), `on` and not managed (what an
-  older build stored for a host it found running, or what a tick that skipped adoption left;
-  not when a mount veto stopped the shutdown, a drain is under way or a job holds the host),
-  `off` and not managed (a power button, a manual
-  Wake-on-LAN, a host flowmanager shut down or one that went down by itself and came back,
-  adopted afresh each time; a host flowmanager powered on that blips down and back keeps its
-  `managed` flag and is *not* adopted, and an adopted host the person switched off by hand
-  loses it while that lease is held, so their next power-on is adopted. Two limits: after `release`,
-  or after a host flowmanager powered on went down for any length of time, a person's power-on cannot be
-  told from a blip and is not adopted), or a failed
-  power-on that a reading has now cleared. A host flowmanager powered on itself (a backup
-  job's hold, a lease acquired through the API) is `powering_on` and is not adopted, and a
-  restart with the persisted state adopts nothing (the host is already `on`). The lease is
-  minted before the planner looks, so the same tick sees it and takes responsibility for the
-  host (`managed`); the Home Assistant switch reads `on` for it, and switching it off
-  releases it like any manual host lease. An adopted lease is dropped when a fresh reading
-  shows the host down (the user switched it off by hand), so it is never woken again by a
-  lease nobody asked for. The tick report lists `adopted` and `adoptions_ended`, and the log
-  has `event="host_adopted"` and `event="host_adoption_ended"`. Under `control: manual`
-  nothing changes: the host is never adopted and never powered off. After a `resume` the
-  host is found running again and is adopted at the next tick. An exclusive host found running
-  (the GPU box switched on by hand) is adopted too, so it stays up until its lease is released
-  (or it is seen down); only then does the idle shutdown apply.
+- **Who owns a host, and a host found running** (`planning/power-model.md`, 2.1b). A host
+  flowmanager powers on is flowmanager's, whatever wanted it (a backup job's hold, a workload,
+  a manual lease): the power phase carries `ours` (on `off` and `on`; the `powering_on` phase
+  is ours by construction). A host that is `ours` goes down when nothing holds it, after
+  `idle_grace`, and a short blip (`on`, `off`, `on`) does not change that. A host something
+  else started is **adopted** (a changed default: it used to be left alone for ever). For a
+  host (shared or exclusive) with `power.control: managed`, when a fresh reading shows it up
+  and it is not ours, it counts as held by the user and the tick mints a manual host lease
+  for it with `origin: adopted` (id `adopted-host-<resource>`, listed by `leases`; the id is
+  only a name, the `origin` is what marks it). "Not ours" is read from the previous state, by
+  one pure function (`sched_sequencer::adopt::adopt`): no state (first start, discarded
+  state), `off` not ours (a power button, a manual Wake-on-LAN, a host flowmanager shut down
+  or one that went down by itself and came back, adopted afresh each time), `on` not ours (a
+  host switched from `control: manual` to `managed` while it was up, one whose stopped
+  shutdown a person cleared with `resume`), or a failed power-on that a reading has now
+  cleared (an alert is already out, a person decides). It is not adopted when it is
+  `powering_on`, when it is ours (a restart with the persisted state adopts nothing, and a
+  blip of a host flowmanager woke is not a start), when its shutdown was stopped by the veto
+  (a person decides with `resume`), when a manual host lease already holds it, or when it is
+  locked out. **A job's hold plays no part**: a host found running while a job holds it is
+  adopted at once and stays up after the job, while a host the job itself woke is ours, is
+  never adopted and goes down when the hold ends (unless a person's manual lease keeps it).
+  The lease is minted before the planner looks, so the same tick sees it; the adopted lease
+  is a manual want, so the host is ours from then on; the Home Assistant switch reads `on`
+  for it (its `origin` is `adopted` in the switch JSON, `requested` for a person's lease), and
+  switching it off releases it like any manual host lease. An adopted lease is dropped when a
+  fresh reading shows the host down (the user switched it off by hand): the host is then no
+  longer ours, so it is never woken again by a lease nobody asked for and the person's next
+  power-on is adopted afresh. A person's lease is never treated as adopted and never dropped
+  this way. Two limits: after `release`, or after a host flowmanager powered on went down
+  for any length of time, a person's power-on cannot be told from a blip and is not adopted.
+  Adoption does not depend on the job book: with an unreadable job book it still runs, and
+  the lease book is still written (see *Versions, and recovering the persisted state*). The
+  tick report lists `adopted` and `adoptions_ended`, and the log has `event="host_adopted"`
+  and `event="host_adoption_ended"`. Under `control: manual` nothing changes: the host is
+  never adopted and never powered off. After a `resume` the host is found running again and
+  is adopted at the next tick. An exclusive host found running (the GPU box switched on by
+  hand) is adopted too, so it stays up until its lease is released (or it is seen down); only
+  then does the idle shutdown apply.
 - **Drain on release** (`release_host_lease` with `"drain": "graceful"` or `"immediate"`;
   absent means the behaviour above). A person who switches a host off does not want queued
   work to hold it up. A drain releases the manual lease and records the request in the host's

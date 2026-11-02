@@ -4,11 +4,11 @@
 //! `veto_timeout` ran out (`Veto::Stopped`).
 //!
 //! Resuming forgets the resource's state, so the sequencer starts it afresh from what is
-//! observed (the same as a resource it has never seen): found running means up and not
-//! managed (it is never powered off by flowmanager on account of an earlier action; a shared
-//! host (shared or exclusive) under `control: managed` is then adopted at the next tick, like any host found
-//! running, so a person holds it until they switch it off), found
-//! down means off. Nothing is powered on or off by the request itself, and no other
+//! observed (the same as a resource it has never seen): found running means up and not ours
+//! (never powered off by flowmanager on account of an earlier action), and a host (shared or
+//! exclusive) under `control: managed` is then adopted at the next tick, like any host found
+//! running (so a person holds it until they switch it off); found down means off. Nothing is
+//! powered on or off by the request itself, and no other
 //! resource's state, nor the lease book, is touched. What the resource's own state held
 //! besides its power (its mode, which is idle while it is not up, and the classes still
 //! awaiting a recovery action after a kill, which no action in this build waits for) is

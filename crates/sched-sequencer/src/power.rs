@@ -360,7 +360,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                         // the allowed set in this very tick), and the shutdown goes on through
                         // the usual veto, which waits while pods still mount the host.
                         // A shared host never reaches here carrying a shutdown: one with a
-                        // withdrawal took the branch above, and a stopped one is not managed.
+                        // withdrawal took the branch above, and a stopped one is not ours.
                         let s = Shutdown::idle_withdrawn(now);
                         st.shutdown = Some(s);
                         drain_shutdown(cx, st, steps, s, 0);
@@ -447,7 +447,7 @@ fn veto_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, shutdown: 
         });
     let current = st.shutdown.unwrap_or(shutdown);
     if now.saturating_sub(since) >= timeout {
-        // The stopped state holds the host as for any shutdown (no longer managed, so no
+        // The stopped state holds the host as for any shutdown (no longer ours, so no
         // idle drain starts again).
         st.shutdown = Some(current.stopped(now));
         st.set_ours(false);

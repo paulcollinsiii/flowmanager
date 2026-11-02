@@ -1,6 +1,6 @@
 # Host power model: plan
 
-Status: **decisions complete; phase 1 (documents) written, phases 2, 3 and 4a (code) done on the branch (4a awaiting review); 4b and 5 not started**, branch `refactor/power-model`, based on main @ 689ab82.
+Status: **decisions complete; phase 1 (documents) written, phases 2, 3, 4a and 4b (code) done on the branch (4b awaiting review); 5 not started**, branch `refactor/power-model`, based on main @ 689ab82.
 All decisions are recorded in section 3 (2026-10-30).
 
 This document is the single description of how flowmanager owns and changes a host's
@@ -20,7 +20,7 @@ encode one lifecycle:
 | Field | Meaning in practice |
 | --- | --- |
 | `power` | `Off`, `PoweringOn`, `On`, `ShuttingDown`, `Failed{during}` |
-| `managed` | "flowmanager may power this down". Set by a power-on or a manual want; cleared by a shutdown, a failed transition, a mount-veto timeout and the end of an adoption |
+| `managed` (until phase 4b; now `ours` on `Off` and `On`, see 2.2) | "flowmanager may power this down". Set by a power-on or a manual want; cleared by a shutdown, a failed transition, a mount-veto timeout and the end of an adoption |
 | `host_idle_since` | start of the `idle_grace` clock |
 | `drain` | `{mode: graceful/immediate, origin: requested/idle, scaled_down, since}` |
 | `mounts_veto` | `Waiting{since}` / `Stopped{since}` (shared hosts with a mounts source) |
@@ -30,9 +30,11 @@ encode one lifecycle:
 `ManualModel` lease (`Manual`), a job's `SharedHold` and a busy `may_change_power` class
 (`Workload`). A reclaim removes the want.
 
-**Ownership, held in two places:** the `managed` flag, and, for a host found running, an
-*adopted* `ManualHost` lease minted by the service (`adopt.rs`, applied in `tick.rs`) with a
-magic id prefix.
+**Ownership, held in two places** (before phase 4b): the `managed` flag, and, for a host found
+running, an *adopted* `ManualHost` lease minted by the service (`adopt.rs`, applied in
+`tick.rs`) with a magic id prefix. Since 4b the first is the `ours` marker on `Off` and `On`,
+the second a lease with `origin: adopted`, and the adoption decision is one pure function in
+the sequencer (2.4).
 
 **Taking a host down, by kind:**
 
@@ -94,7 +96,9 @@ expiry). cuda-central relies on the `idle_grace` margin for its GPU pods to be g
 
 Tests that must exist after phase 4: a job-woken host shuts down after the job with no
 lease; the same host with a manual lease taken mid-job stays up; a host found running while
-a job holds it is adopted and stays up after the job (D6).
+a job holds it is adopted and stays up after the job (D6). They exist since 4b, end to end
+through the `Scheduler` tick with the real job machine
+(`crates/sched-service/src/jobs/scenarios/ownership.rs`).
 
 ### 2.2 State as types, not flags
 
@@ -143,6 +147,18 @@ otherwise: after a confirmed shutdown, after a failed transition, under manual c
 stopped veto, and when an adopted lease ends because the host went down. "Is this host found
 running?" then reads directly as "up, under managed control, and not `ours`", instead of
 guessing from a combination of other fields.
+
+*As built in 4b.* The stored shape is `{"phase":"off","ours":false}` and
+`{"phase":"on","since":N,"ours":true}` (always written). A hand-written state, such as a
+scenario file, may omit `ours`: it defaults to `false`, which is what omitting the old
+`managed` meant, so a host that must be ours says `ours: true` inside its `power` object.
+`powering_on`, `shutting_down` and `failed` refuse the key. `powering_on` seen up gives `on`
+ours; a blip keeps it; `shutting_down` seen down, a failed phase cleared either way and manual
+control give not ours; the veto timeout and the locked-down branch clear it; a manual want and
+a person's drain request set it. An adopted lease ended by the host going down clears `ours` and
+the idle clock in the previous state the tick decides from. `found_running` is: up, a power
+section under managed control, not `powering_on` or ours, no shutdown stopped by the veto, no
+manual host lease yet, no active lockout lease.
 
 ### 2.3 One vocabulary for both kinds
 
@@ -301,6 +317,19 @@ this document and checks the phase against it ("does this still fit the model").
      - The pure policy still in the service moves to the sequencer crate: the rules of
        `drain::request` and the lockout rule of `jobs::needs_up`.
      - The ownership tests of 2.1b.
+     - *As built in 4b.* `sched_sequencer::adopt::adopt(config, snapshot, prev, leases, now)`
+       returns `Adoption { leases, prev, adopted, ended }`: the lease book to use (adopted
+       leases of hosts seen down dropped, a lease minted for each host found running), the
+       previous state to decide from (hosts whose adoption ended: not ours, idle clock
+       cleared) and what was adopted and ended; `tick.rs` applies it and edits nothing.
+       `now` is the snapshot's time, passed explicitly for the lease's `granted_at`. A typed
+       `origin` (`requested`, the default, or `adopted`) is a field of every lease; the id
+       `adopted-host-<resource>` is only a name. `jobs_off` no longer touches adoption: the
+       lease book is stored on every tick, the job book and the job creation only when it was
+       readable. The rules of `drain::request` (`sched_sequencer::drain`) and `needs_up`
+       (`sched_sequencer::jobs`) are in the sequencer crate with their tests; the service
+       keeps `RecordedDrain` (the report view of a requested shutdown) and the Restate and
+       persistence glue.
 5. **HostStatus and reporting.** One derived status; `tick.rs` report weaving, `reason`,
    metrics and toggle `resource_state` consume it. README power section shrunk to the model
    plus tables, caveats moved to *Known blind spots*.
@@ -439,3 +468,31 @@ The homesvr agent owns these; each phase adds what it changed.
     (`POST /v1/resources/cuda-central/off`, `.../off-now`) and drop the "cuda-central is
     powered by hand" note. Sensors reading the lockout switch's `status` should expect
     `left_alone`.
+- **Phase 4b output changes (breaking, D5).** Ownership is a marker, adoption is one
+  sequencer function, a lease has a typed origin.
+  - *Persisted state.* `scheduler_state` is version 4 (older: discarded on read, start from
+    observation, leases and job book kept). The per-resource `managed` flag is gone; `power`
+    of phase `off` carries `ours` (`{"phase":"off","ours":bool}`) and of phase `on`
+    (`{"phase":"on","since":N,"ours":bool}`). A host that is up at the first tick after the
+    upgrade is not ours, so it is adopted; a host a job woke before the upgrade is adopted too
+    and stays up until a person switches it off.
+  - *Lease book.* `lease_book` is version 2: every lease has `origin` (`"requested"` or
+    `"adopted"`), written always, `requested` when absent in a hand-written lease. A version 1
+    book is read, with its adopted leases (a `manual_host` lease whose id begins
+    `adopted-host-`) dropped and one warning each (`event="legacy_adopted_lease_dropped"`);
+    this keeps a stored adopted lease from reading as a person's and waking the host after it
+    went down. Nothing is lost (the hosts that are up are adopted afresh at the first tick,
+    with `origin: adopted`). No operator step. A rollback needs the lease book discarded.
+  - *Behaviour (D6).* A host found running is adopted even while a job holds it (before: only
+    after the hold ended). A host a job woke is never adopted.
+  - *`jobs_off`.* Adoption (adopting, ending, the `adopted` and `adoptions_ended` report
+    fields, the `host_adopted` log events) now runs with an unreadable job book. With it the
+    lease book is stored as the tick decided it; only the job book and job creation are still
+    skipped (the job book's bytes are never written). Before, no adoption happened and the
+    lease book was not written.
+  - *HTTP JSON.* The `origin` field (`"requested"` or `"adopted"`) is new on every switch
+    entry (`/v1/resources/{r}`, `/v1/models/{m}`, `/v1/leases`) while a lease is held. A raw
+    `Lease` (in `TickReport.leases`, `last_decision`, Restate replies such as `LeaseGrant`)
+    has `origin`. Home Assistant can use it to tell an adopted lease from a person's.
+  - *Metrics, logs, reason, wait reasons.* No change. The invariant checker's message for 7
+    reads "powered off X, which flowmanager did not start (not ours)".

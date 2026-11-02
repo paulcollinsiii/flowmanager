@@ -492,7 +492,8 @@ pub struct Durable {
     #[serde(default)]
     pub jobs: JobBook,
     /// The stored job book could not be read: the job step is skipped (jobs and their holds
-    /// stay as they are) while scheduling the GPU and NFS goes on.
+    /// stay as they are, the job book is not written) while scheduling the GPU and NFS goes on.
+    /// Adoption still runs and the lease book is still stored, since adoption changes it.
     #[serde(default)]
     pub jobs_off: bool,
 }
@@ -2827,7 +2828,7 @@ mod tests {
         let r = s.tick(clock.now(), &mut d);
         assert!(r.adopted.contains(&gpu()), "{r:?}");
         // A host flowmanager powered on that is read down for a moment and then up again
-        // is not adopted (its `managed` flag is still set).
+        // is not adopted (it is still ours).
         d.leases.retain(|l| l.resource != gpu());
         let st = d.state.resources.get_mut(&gpu()).unwrap();
         st.power = PowerPhase::Off { ours: false };
@@ -3090,12 +3091,12 @@ mod tests {
 
     #[test]
     fn a_host_that_is_up_and_not_ours_is_adopted_once_unless_ours_or_stopped_by_the_veto() {
-        let stored = |shutdown: Option<sched_model::Shutdown>, managed: bool| {
+        let stored = |shutdown: Option<sched_model::Shutdown>, ours: bool| {
             let mut st = sched_model::ResourceState::new(PowerPhase::On {
                 since: Millis(1),
                 ours: false,
             });
-            st.set_ours(managed);
+            st.set_ours(ours);
             st.shutdown = shutdown;
             let mut d = Durable::default();
             d.state.resources.insert(nfs(), st);

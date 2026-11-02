@@ -376,12 +376,14 @@ config's ids (percent-encoded if needed). A body over 1 KiB is refused.
 A state answer, for example `GET /v1/models/llm`:
 
 ```json
-{"kind":"model","id":"llm","resource":"cuda-central","held":true,"state":"on",
+{"kind":"model","id":"llm","resource":"cuda-central","held":true,"state":"on","origin":"requested",
  "held_since_ms":1793027881869,"held_for_seconds":120,
  "status":"waiting_for_host","detail":"cuda-central is powering_on"}
 ```
 
-`held` (boolean) and `state` (`"on"` / `"off"`) are always there. `status` and `detail` are
+`held` (boolean) and `state` (`"on"` / `"off"`) are always there; while held, `origin` is
+`"adopted"` for a host lease flowmanager minted for a host it found running (it ends when the host
+is seen down) and `"requested"` for every other. `status` and `detail` are
 derived from the last tick's report and are **left out when they cannot be said**:
 
 - model: `active` (in the allowed set), `waiting_for_host` (its host is not up),
@@ -1121,6 +1123,15 @@ and allowing one needs a fresh "up" reading (`policy.host_reading_stale_after`, 
   (`wait ... the host is not up`), including a manual model lease. `managed` (flowmanager
   powers hosts) needs the `wake_on_lan` and `shutdown` sections of the resource and the
   secret files below; see "Power actions" in the README.
+- **Who owns a managed host** (`planning/power-model.md`, 2.1b): a host flowmanager powers on
+  (for a backup job's hold, a workload or a manual lease) is flowmanager's and is shut down
+  when nothing holds it any more, after `idle_grace`; a backup that woke basestar therefore
+  lets it power down when the job ends, and a manual lease taken meanwhile keeps it up. A host
+  something else started (power button, Wake-on-LAN, a host already up when flowmanager first
+  looked or after a reload from `manual`, one that came up after a timed-out power-on) is
+  adopted at once, even while a job holds it: an adopted lease (`origin: adopted` in the
+  toggle JSON of the host's switch) holds it up until released or the host is seen down.
+  Adoption also works when the stored job book cannot be read.
 - **Before a managed host is shut down** (`control: managed`; the example leaves both hosts
   `manual`): an NFS host is powered off only when no pod mounts it. The `basestar-mounts`
   source (section 4 has its RBAC) names the NFS server as the pods and PersistentVolumes
@@ -1257,7 +1268,7 @@ dropped. Discarding `lease_book` drops every lease (an LLM pin vanishes).
 **Roll the binary back together with the config.** The build before queue-only switching
 rejects the current config (a gate class: "exclusive; a model is required"; and a config
 without a pods source), so deploy the previous image with the previous ConfigMap. The
-persisted `scheduler_state` of this build is version 3: the build before it cannot read it (discard it with `discard_state` after rolling back), and this build drops an older (version 1 or 2) state by itself on the first tick and starts from observation (no migration). **There is one operator step on the upgrade that renamed reclaim to lockout:** a stored `reclaim` lease does not parse (the lease book is not versioned away), so every tick would publish nothing and the lease handlers would answer `503`. Clear every reclaim with the old build's `unreclaim` first, and rename `policy.reclaim_timeout` to `lockout_timeout` in the ConfigMap (the old key is refused); if it was missed, roll back and clear it, or `discard_state` the `lease_book` (drops every lease). See the README, *Versions, and recovering the persisted state*. A document written by a
+persisted `scheduler_state` of this build is version 4 and the `lease_book` version 2: the build before it cannot read them (discard both with `discard_state` after rolling back; the lease book drops every lease, job holds are re-derived), and this build drops an older (version 1, 2 or 3) state by itself on the first tick and starts from observation (no migration). **No operator step is needed for the typed lease `origin` (phase 4b)**: a version 1 lease book is read with its adopted leases (`adopted-host-<resource>`) dropped, one warning each (`legacy_adopted_lease_dropped`), and every host that is up is adopted afresh at the first tick; a person's leases, lockouts and job holds are kept. **There is one operator step on the upgrade that renamed reclaim to lockout:** a stored `reclaim` lease does not parse (the lease book is not versioned away), so every tick would publish nothing and the lease handlers would answer `503`. Clear every reclaim with the old build's `unreclaim` first, and rename `policy.reclaim_timeout` to `lockout_timeout` in the ConfigMap (the old key is refused); if it was missed, roll back and clear it, or `discard_state` the `lease_book` (drops every lease). See the README, *Versions, and recovering the persisted state*. A document written by a
 newer build that this one cannot decode makes ticks report an error and publish nothing
 (the scaler keeps what it had); the fix is the build that wrote it, or `discard_state`.
 After a rollback that changes handlers, re-register the deployment (section 2).

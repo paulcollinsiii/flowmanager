@@ -2579,7 +2579,7 @@ fn the_wait_is_bounded_and_then_the_scheduler_stops_without_a_shutdown_or_a_retr
 #[test]
 fn a_host_the_scheduler_stopped_on_is_never_shut_down_whatever_the_readings_say_later() {
     // The state is reached the way production reaches it: pods mount the host past the
-    // veto timeout and the scheduler gives up (this clears `managed`).
+    // veto timeout and the scheduler gives up (this clears `ours`).
     let stopped = Case::new()
         .nfs_state(&nfs_due(60 * MIN, Some(&waiting_since(30 * MIN))))
         .obs(mounts(2, 0))
@@ -4126,7 +4126,7 @@ fn a_lockout_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_on
 #[test]
 fn a_lockout_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
     // The veto stopped an idle shutdown (the host is unmanaged now). A lockout calls the
-    // power-off whatever `managed` says: only the stopped guard keeps it from powering the
+    // power-off whatever `ours` says: only the stopped guard keeps it from powering the
     // host off, and from hiding the stop by starting a fresh wait.
     let stopped = format!(
         "{{ power: {}, mode: {}, shutdown: {{ cause: {{ kind: idle }}, since: 1, withdrawal: not_needed, veto: {{ phase: stopped, since: 2 }} }} }}",
@@ -4369,7 +4369,7 @@ fn a_lockout_on_a_manual_host_that_is_off_never_settles_and_a_stale_settle_is_cl
         !locked_down(&d, N),
         "no managed shutdown, nothing to settle"
     );
-    // A flag stored while the power was managed is dropped once it is not.
+    // The marker stored while the power was managed is dropped once it is not.
     let stale = format!(
         "{{ power: {{ phase: \"off\" }}, mode: {}, locked_down: true }}",
         mode_idle()

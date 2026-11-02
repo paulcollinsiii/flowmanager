@@ -385,7 +385,7 @@ impl Scheduler {
 
     /// For a person who has fixed a host by hand: clears the failed power transition (or the
     /// shutdown stopped by mounting pods) of one resource, so it follows observation again
-    /// (found running means up and not managed). Other resources' state is untouched. A
+    /// (found running means up and not ours). Other resources' state is untouched. A
     /// resource that is not stopped is refused (409), an unknown one or one without a power
     /// section (400).
     #[handler]
