@@ -205,72 +205,6 @@ impl TickReport {
     }
 }
 
-/// Views of a report the tests assert on, each one a filter of `hosts` or `events`.
-#[cfg(test)]
-impl TickReport {
-    pub fn adopted(&self) -> Vec<ResourceId> {
-        self.events
-            .iter()
-            .filter_map(|e| match e {
-                HostEvent::Adopted { resource } => Some(resource.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn adoptions_ended(&self) -> Vec<ResourceId> {
-        self.events
-            .iter()
-            .filter_map(|e| match e {
-                HostEvent::AdoptionEnded { resource } => Some(resource.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn power_timeouts(&self) -> Vec<&HostEvent> {
-        self.events
-            .iter()
-            .filter(|e| matches!(e, HostEvent::PowerTimeout { .. }))
-            .collect()
-    }
-
-    pub fn veto_timeouts(&self) -> Vec<&HostEvent> {
-        self.events
-            .iter()
-            .filter(|e| matches!(e, HostEvent::VetoTimeout { .. }))
-            .collect()
-    }
-
-    pub fn power_failed(&self) -> Vec<&HostStatus> {
-        self.hosts
-            .iter()
-            .filter(|h| matches!(h.power, PowerPhase::Failed { .. }))
-            .collect()
-    }
-
-    /// Hosts whose shutdown the veto holds back or stopped.
-    pub fn veto_held(&self) -> Vec<&HostStatus> {
-        self.hosts.iter().filter(|h| h.veto().is_some()).collect()
-    }
-
-    /// Hosts whose automatic power-on waits for `min_off`.
-    pub fn min_off_waits(&self) -> Vec<&HostStatus> {
-        self.hosts
-            .iter()
-            .filter(|h| h.wait == Some(sched_model::WaitReason::MinOff) && h.min_off.is_some())
-            .collect()
-    }
-
-    /// The drains under way, with their host.
-    pub fn drains(&self) -> Vec<(&HostStatus, status::Drain)> {
-        self.hosts
-            .iter()
-            .filter_map(|h| h.drain().map(|d| (h, d)))
-            .collect()
-    }
-}
-
 /// What a tick reads from the scheduler's durable state, kept by the `Scheduler` object in
 /// Restate.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1137,6 +1071,70 @@ mod tests {
     use sched_sequencer::status::{BlockerState, VetoBlocker, VetoStatus};
 
     const T0: u64 = 10_000_000;
+
+    impl TickReport {
+        pub fn adopted(&self) -> Vec<ResourceId> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    HostEvent::Adopted { resource } => Some(resource.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        pub fn adoptions_ended(&self) -> Vec<ResourceId> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    HostEvent::AdoptionEnded { resource } => Some(resource.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        pub fn power_timeouts(&self) -> Vec<&HostEvent> {
+            self.events
+                .iter()
+                .filter(|e| matches!(e, HostEvent::PowerTimeout { .. }))
+                .collect()
+        }
+
+        pub fn veto_timeouts(&self) -> Vec<&HostEvent> {
+            self.events
+                .iter()
+                .filter(|e| matches!(e, HostEvent::VetoTimeout { .. }))
+                .collect()
+        }
+
+        pub fn power_failed(&self) -> Vec<&HostStatus> {
+            self.hosts
+                .iter()
+                .filter(|h| matches!(h.power, PowerPhase::Failed { .. }))
+                .collect()
+        }
+
+        /// Hosts whose shutdown the veto holds back or stopped.
+        pub fn veto_held(&self) -> Vec<&HostStatus> {
+            self.hosts.iter().filter(|h| h.veto().is_some()).collect()
+        }
+
+        /// Hosts whose automatic power-on waits for `min_off`.
+        pub fn min_off_waits(&self) -> Vec<&HostStatus> {
+            self.hosts
+                .iter()
+                .filter(|h| h.wait == Some(sched_model::WaitReason::MinOff) && h.min_off.is_some())
+                .collect()
+        }
+
+        /// The drains under way, with their host.
+        pub fn drains(&self) -> Vec<(&HostStatus, status::Drain)> {
+            self.hosts
+                .iter()
+                .filter_map(|h| h.drain().map(|d| (h, d)))
+                .collect()
+        }
+    }
 
     fn shared() -> (Arc<Shared>, Arc<ManualClock>) {
         shared_with(EXAMPLE_CONFIG)

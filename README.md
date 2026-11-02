@@ -567,7 +567,8 @@ applies. Why the model is shaped this way, and every rule it must keep, is in
 **How a request is carried out.** The sequencer emits `PowerOn` and `PowerOff` steps (never for
 a `manual` host) and the tick sends the resource's `Power` object (key: the resource id) a
 one-way request after storing the decision, so a retried or replayed tick sends it once. The
-object makes the call in a journaled step.
+object makes the call in a journaled step; a crash after the call but before its result is
+journaled makes Restate run the step once more, and both calls are harmless to repeat.
 
 - **Power on** is Wake-on-LAN sent by the router (flowmanager runs in the cluster and cannot
   broadcast on the LAN): `POST /api/wol/wol/set` to the OPNsense `os-wol` API with basic auth.
@@ -601,7 +602,9 @@ object makes the call in a journaled step.
   classes that need it are scaled down (an *idle* shutdown does it at once; an unreadable
   in-flight count waits for the timeout); on an exclusive host (cuda-central) the model is wound
   down by the mode machine. In-flight work gets `drain_timeout` (a class's `kill_timeout`;
-  `lockout_timeout` under a lockout), or nothing when the shutdown is `immediate`.
+  `lockout_timeout` under a lockout), or nothing when the shutdown is `immediate`. A graceful
+  one ends its wait when none of the classes that need the host has work in flight, or at
+  `drain_timeout` from the request, whichever is first; until then the step is `wait ... draining`.
 - **Vetoing.** Before any power-off a fresh reading must show nothing still uses the host
   (below). Bounded by `veto_timeout`.
 - **ShuttingDown.** The power-off was requested; the host is followed from its reachability
@@ -613,7 +616,9 @@ queued or in flight for a class that needs the host): the consumers are allowed 
 idle clock starts over. Unknown demand starts no shutdown. A shutdown a person *requested*
 overrides queued and in-flight work, never a lease: a job's hold or another lease keeps the host
 up (`wait ... drain_held`) and the shutdown follows when they are gone; only a new manual host
-lease cancels it.
+lease cancels it. A requested shutdown ends when the host is no longer up (or no longer under managed
+control). A managed shared host always has a `mounts` source, so a requested shutdown has no
+`idle_grace` wait before the veto.
 
 ### Who owns a host
 
@@ -687,7 +692,7 @@ pods are gone, and it is no longer ours. It leaves Stopped when the host is seen
 A power-on not observed up within `power_on_timeout` (default 10m), or a shutdown not observed
 down within `shutdown_timeout` (default 15m), moves the host to the **failed** phase and
 flowmanager alerts once. It then allows nothing on the host, takes **no power action for it
-again**, and `wait ... power_failed`; other resources keep scheduling. It leaves the phase when a
+again**, and `wait ... power_failed`; other resources keep scheduling. No lease or lockout clears it. It leaves the phase when a
 fresh reading shows the state the transition was after (also when a person fixes the host or sets
 `control: manual`) or on `resume`. A host that comes back up out of a failed power-on is found
 running and adopted. A **failed power request** (the call itself) is never retried either: it is

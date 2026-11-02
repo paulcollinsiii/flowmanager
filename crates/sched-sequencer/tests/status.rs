@@ -524,3 +524,25 @@ fn a_host_under_manual_control_or_without_a_power_section_is_reported_as_such() 
             .all(|h| h.resource == rid(N) || h.resource == rid(G))
     );
 }
+
+#[test]
+fn min_off_is_reported_only_for_a_host_under_managed_control() {
+    // The same minimum configured on the NFS host, but its power is `control: manual`.
+    let yaml = sched_model::test_support::EXAMPLE_CONFIG
+        .replace("      # min_off: 10m", "      min_off: 10m");
+    let manual = Config::from_yaml(&yaml).unwrap();
+    assert!(!manual.power_managed(&rid(N)));
+    let off = format!(
+        "{{ power: {{ phase: off }}, mode: {{ phase: idle }}, off_since: {} }}",
+        T - 60_000
+    );
+    let st = state(&off, &off);
+    let snap = snapshot(Some(0), &[]);
+    let r = run_with(&manual, &snap, &st, &st, &[], &[], &[]);
+    assert!(r.host(N).min_off.is_none() && !r.host(N).managed);
+    // Managed, the same state has it.
+    let managed_yaml = example_yaml_managed().replace("      # min_off: 10m", "      min_off: 10m");
+    let managed = Config::from_yaml(&managed_yaml).unwrap();
+    let r = run_with(&managed, &snap, &st, &st, &[], &[], &[]);
+    assert!(r.host(N).min_off.is_some());
+}

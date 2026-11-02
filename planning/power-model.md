@@ -215,6 +215,37 @@ is not killed and keeps its hold until it ends.
   - plus what a reader needs to place it: `kind`, `has_power`, `managed`, `ours`.
   It is derived for every resource in the decided state, not only those with a power section
   (the others are always up and the rest of their status is plain).
+
+  The types as built (`crates/sched-sequencer/src/status.rs`; all but `Drain` serialize into
+  `TickReport`):
+
+  ```rust
+  pub struct HostStatus {
+      resource: ResourceId, kind: ResourceKind, has_power: bool, managed: bool,
+      power: PowerPhase, ours: bool, mode: HostMode,
+      shutdown: Option<ShutdownStatus>,   // { cause: ShutdownCause, since, withdrawal: Withdrawal, veto: VetoStatus }
+      veto_readings: Vec<VetoReading>,
+      lease: Option<LeaseOrigin>,         // Requested | Adopted
+      lockout: Option<LockoutStatus>,
+      min_off: Option<MinOff>,            // { since: Option<Millis>, remaining: Millis, until: Millis }
+      wait: Option<WaitReason>, attention: bool,
+  }
+  pub enum HostMode { Idle, Serving { model }, WindingDown { model } }
+  pub enum VetoStatus { Clear, Waiting { since, blocking: Vec<VetoBlocker> }, Stopped { since, blocking: Vec<VetoBlocker> } }
+  pub struct VetoBlocker { reading: VetoReading, state: BlockerState /* InUse | Unknown */ }
+  pub enum LockoutStatus { Held, Withdrawing, LeftAlone }
+  pub enum HostEvent {
+      PowerTimeout { resource, during: PowerTransition, started_at: Option<Millis>, at: Millis },
+      VetoTimeout { resource, readings: Vec<VetoReading>, blocking: Vec<VetoBlocker>, waiting_since: Option<Millis>, at: Millis },
+      Adopted { resource }, AdoptionEnded { resource },
+  }
+  // Derived view, from HostStatus::drain(); not stored.
+  pub struct Drain { cause: DrainCause /* Requested | Idle */, mode: DrainMode, since: Millis, scaled_down: bool }
+  ```
+
+  A *drain* is only a host's requested or idle shutdown that has a withdrawal to report; a
+  lockout's shutdown is not a drain and is reported as `lockout` (and `locked_out` in the HTTP
+  JSON), so `drain.cause` is `requested` or `idle`, never `lockout`.
 - **One-time events** (`HostEvent`: a power timeout, a veto timeout, an adoption, an adoption
   ended) are derived in the same function from the previous and the next state (adoption from
   what `adopt` did before the tick), one list in `TickReport.events`. An event is an edge, a
@@ -451,7 +482,8 @@ Fields the sensors read (JSON of `/v1/resources/{r}`, `/v1/models/{m}`, `/v1/loc
 - `origin` (`"requested"` or `"adopted"`) is on every switch entry while a lease is held; it means
   only the lease's origin. Use it to tell an adopted lease from a person's.
 - **`drain.origin` is now `drain.cause`** (`requested` or `idle`; phase 5). The object is
-  `{mode, cause, since_ms, scaled_down}`.
+  `{mode, cause, since_ms, scaled_down}`. A lockout is not a drain: a locked-out host shows
+  `locked_out`, never `cause: lockout`.
 - `locked_out` (boolean, true while a lockout lease is held on that host) on the resource entries,
   with a `wait` entry `{"reason": "locked_out"}` (created even before the first tick); `state` reads
   `locked_out` instead of `off` while the last report does not show the host off and no lease is

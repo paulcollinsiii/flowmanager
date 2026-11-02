@@ -9,8 +9,9 @@
 //! - [`HostStatus`]: what is true of the host after the tick (a level: it is reported every
 //!   tick for as long as it holds);
 //! - [`HostEvent`]: what became true in this tick (an edge: a timeout firing, a failed
-//!   power-on, a veto stopping, an adoption). An event is derived from the previous and the
-//!   next state in one place, so alert-once behaviour has one definition; the service logs
+//!   power-on, a veto stopping, an adoption). A timeout is derived from the previous and the
+//!   next state, an adoption passed through from `adopt`, all in one place, so alert-once
+//!   behaviour has one definition; the service logs
 //!   and counts an event only when the tick is decided, never when it is replayed from the
 //!   journal.
 //!
@@ -318,7 +319,9 @@ pub struct Decided<'a> {
     pub ended: &'a [ResourceId],
 }
 
-/// The statuses of every resource in `next`, and the events between `prev` and `next`. Pure.
+/// The statuses of every resource in `next`, and the events of this tick: the adoptions that
+/// [`crate::adopt::adopt`] did before it (passed through, as `adopted` and `ended`), and the
+/// timeouts, which are derived here from the change between `prev` and `next`. Pure.
 pub fn derive(d: &Decided<'_>) -> (Vec<HostStatus>, Vec<HostEvent>) {
     let Decided {
         config,
