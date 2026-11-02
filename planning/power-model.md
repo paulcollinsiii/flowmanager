@@ -124,16 +124,25 @@ given work. It is a bool beside the `Shutdown` rather than a `Shutdown` stage be
 outlives the shutdown (which ends when the host is seen off) and applies to a host that is up
 with no shutdown at all.
 
-**The `managed` flag goes away.** Checked on 689ab82: outside tests it is written in eight
-places (set: power-on, a manual want, `drain_host`; cleared: shutdown, failed transition,
-mount-veto timeout, manual control, end of an adoption). Since adoption mints a lease, an up
-host under managed control has `managed = false` in only two lasting cases: the shutdown
-stopped on a veto timeout (now `Stage::Stopped`) and a host found running while a job holds
-it (adoption waits for the hold to end; see D6). A third, transient case (adoption skipped
-while the job book is unreadable) goes when phase 4 removes that coupling. So "may
-flowmanager power this down?" becomes "is the host up under managed control and not
-`Stopped`?", and the adoption predicate no longer has to guess why a host is in a given
-state.
+**The `managed` flag shrinks to a marker on `On` and `Off`.** An earlier draft said it goes
+away entirely; that traced only its writes and was wrong. Its reads (checked at 4de1266) show
+one fact the ownership rule (2.1b) needs and nothing else records: whether a host is
+flowmanager's. Three cases rest on it:
+
+- a host flowmanager woke that blips down and back is still flowmanager's, not found running,
+  so the fact must survive while the host is off;
+- a host switched from `control: manual` to `managed` while it is up is found running, not
+  flowmanager's to power down when idle;
+- a host whose stopped shutdown is cleared by `resume` is found running.
+
+So `PowerPhase` becomes `Off { ours: bool }` and `On { since, ours: bool }`, and the
+free-standing `managed` field goes. It cannot exist on `PoweringOn`, `ShuttingDown` or
+`Failed`, and no transition has to remember to clear it there. `ours` is set by flowmanager's
+own power-on and by a manual want. It is carried across a blip (`On` to `Off` to `On`) and false
+otherwise: after a confirmed shutdown, after a failed transition, under manual control, on a
+stopped veto, and when an adopted lease ends because the host went down. "Is this host found
+running?" then reads directly as "up, under managed control, and not `ours`", instead of
+guessing from a combination of other fields.
 
 ### 2.3 One vocabulary for both kinds
 
@@ -282,10 +291,16 @@ this document and checks the phase against it ("does this still fit the model").
        dropped when the host is seen down, as for any host, so a lockout shutdown also ends
        an adoption; a manual lease is never dropped. The lockout shutdown overrides the
        `idle_grace`, holds and leases, as the reclaim did.
-   - **4b. Ownership.** Adoption decided in the sequencer (pure) with a typed
-     `origin: adopted` on the lease (D3; the service only applies it), a host found running
-     adopted even while a job holds it (D6), adoption no longer skipped with an unreadable
-     job book (`jobs_off`), `managed` removed (2.2), and the ownership tests of 2.1b.
+   - **4b. Ownership.**
+     - Adoption decided entirely in the sequencer crate (pure), as one function the service
+       calls and applies. The service no longer edits the previous state itself.
+     - A typed `origin: adopted` on the lease replaces the id prefix (D3).
+     - A host found running is adopted even while a job holds it (D6).
+     - Adoption no longer skipped with an unreadable job book (`jobs_off`).
+     - `managed` replaced by `ours` on `On` and `Off` (2.2).
+     - The pure policy still in the service moves to the sequencer crate: the rules of
+       `drain::request` and the lockout rule of `jobs::needs_up`.
+     - The ownership tests of 2.1b.
 5. **HostStatus and reporting.** One derived status; `tick.rs` report weaving, `reason`,
    metrics and toggle `resource_state` consume it. README power section shrunk to the model
    plus tables, caveats moved to *Known blind spots*.
