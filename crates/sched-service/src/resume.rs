@@ -145,7 +145,7 @@ pub fn resume(
 
 fn phase(p: PowerPhase) -> &'static str {
     match p {
-        PowerPhase::Off => "off",
+        PowerPhase::Off { .. } => "off",
         PowerPhase::PoweringOn { .. } => "powering on",
         PowerPhase::On { .. } => "on",
         PowerPhase::ShuttingDown { .. } => "shutting down",
@@ -181,7 +181,10 @@ mod tests {
     }
 
     fn on() -> ResourceState {
-        ResourceState::new(PowerPhase::On { since: Millis(1) })
+        ResourceState::new(PowerPhase::On {
+            since: Millis(1),
+            ours: false,
+        })
     }
 
     #[test]
@@ -228,7 +231,7 @@ mod tests {
         for (st, text) in [
             (on(), "its power phase is on"),
             (
-                ResourceState::new(PowerPhase::Off),
+                ResourceState::new(PowerPhase::Off { ours: false }),
                 "its power phase is off",
             ),
             (

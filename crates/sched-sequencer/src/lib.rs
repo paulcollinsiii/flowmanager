@@ -13,6 +13,7 @@
 //! numbers.
 
 pub mod adopt;
+pub mod drain;
 mod exclusive;
 pub mod jobs;
 mod power;

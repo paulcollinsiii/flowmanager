@@ -1,90 +1,147 @@
-//! Adoption of a host found running: which hosts the user is taken to hold up, and which
-//! earlier adoptions are over.
+//! Adoption of a host found running: the ownership rule of `planning/power-model.md` (2.1b)
+//! as one pure function, [`adopt`].
 //!
-//! The sequencer is pure and leases live in the service, so it does not mint anything here:
-//! these two functions only say, from the previous state and a fresh reading, which hosts to
-//! adopt and which adopted leases to drop. The service applies them before the tick, so the
-//! tick's planner and sequencer see the result and a replayed tick sees the same.
+//! A host flowmanager powers on is flowmanager's (`ours`, on `PowerPhase::Off` and `On`) and
+//! goes down when nothing holds it. A host something else started is found running and
+//! adopted: the user is taken to hold it up, through a manual host lease with origin
+//! `adopted` that the service stores like any lease. The sequencer is pure and leases live in
+//! the service, so nothing is minted here: [`adopt`] says which leases to use, which previous
+//! state to decide from, and what was adopted and ended. The service applies the result
+//! before the tick, so the tick's planner and sequencer see it and a replayed tick sees the
+//! same.
 //!
-//! A host is found running when it (shared or exclusive) has a power section under `control: managed`,
-//! a fresh reading says it is up, and flowmanager did not power it on: the previous state
-//! has no entry for it (first start, discarded state), has it off (a power button, a manual
-//! Wake-on-LAN, a host that went down and came back), has it in a failed power-on that
-//! the reading has now cleared (whatever brought it up, the sequencer treats it as found
-//! running), or has it `on` but not managed (stored by a build that did not adopt, or kept
-//! so by a tick that skipped adoption), unless the scheduler left it so on purpose: a stopped
-//! veto, a drain, or a job's hold. A host in `powering_on` that is seen up is
-//! flowmanager's own and an `on` host it manages is not found again (a restart with persisted
-//! state adopts nothing), and under `control: manual` nothing is ever adopted. Nothing is
-//! adopted under a lockout either, on any kind of host: a locked-out host that boots is left
-//! alone, and once the lockout is cleared a host that is up is found running like any other.
+//! A host is found running ([`found_running`]) when it has a power section under
+//! `control: managed`, a fresh reading says it is up, and it is not ours: the previous state
+//! has no entry for it (first start, discarded state), has it off or up without the marker (a
+//! power button, a manual Wake-on-LAN, a host that went down after the person took it down, a
+//! host switched from manual to managed control while up, one whose stopped shutdown a person
+//! cleared with `resume`), or has it in a failed power-on that the reading has now cleared.
+//! It is never found when
+//!
+//! - it is `powering_on` or `ours` (a restart with persisted state adopts nothing, and a short
+//!   blip of a host flowmanager woke is not a new start),
+//! - its shutdown was stopped by the veto (a person decides: `resume`),
+//! - a manual host lease already holds it,
+//! - it is locked out, on either kind of host: a locked-out host that boots is left alone,
+//!   and once the lockout is cleared a host that is up is found running like any other.
+//!
+//! A job's hold plays no part: a host found running while a job holds it is adopted at once
+//! (D6), and one the job woke itself is ours and never found.
+//!
+//! An adopted lease ends when a fresh reading shows its host down ([`gone_down`]): the
+//! person (or a power cut) took it down, so the claim is over and the host is no longer ours,
+//! and their next power-on is adopted afresh. A host flowmanager woke that merely blips keeps
+//! `ours` and has no adopted lease to lose.
 
 use sched_model::{
-    ADOPTED_HOST_PREFIX, Config, Lease, LeaseId, LeaseKind, Millis, PowerPhase, ResourceId,
-    SchedState, Snapshot,
+    Config, Lease, LeaseId, LeaseKind, LeaseOrigin, Millis, PowerPhase, PowerTransition,
+    ResourceId, SchedState, Snapshot,
 };
 
-/// The id of the adopted lease of `resource`.
-pub fn adopted_id(resource: &ResourceId) -> LeaseId {
-    LeaseId::new(format!("{ADOPTED_HOST_PREFIX}{resource}"))
+/// The result of [`adopt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adoption {
+    /// The lease book the tick uses and the service stores: the input without the adopted
+    /// leases that ended, plus an adopted lease for each host adopted. Nothing else differs.
+    pub leases: Vec<Lease>,
+    /// The state the tick decides from: the input, with every host whose adopted lease ended
+    /// no longer ours and its idle clock cleared. Nothing else differs.
+    pub prev: SchedState,
+    /// Hosts adopted this tick.
+    pub adopted: Vec<ResourceId>,
+    /// Hosts whose adopted lease was dropped this tick because the host was seen down.
+    pub ended: Vec<ResourceId>,
 }
 
-/// The hosts to adopt at `snapshot.now`: found running (see the module) and holding no
-/// manual host lease yet (`leases` is the book the tick is about to use).
+/// Decides adoption at `now` (the time of `snapshot`) from the fresh readings, the previous
+/// state and the lease book the tick is about to use. Pure and deterministic.
+pub fn adopt(
+    config: &Config,
+    snapshot: &Snapshot,
+    prev: &SchedState,
+    leases: &[Lease],
+    now: Millis,
+) -> Adoption {
+    let gone = gone_down(config, snapshot, leases);
+    let ended: Vec<ResourceId> = leases
+        .iter()
+        .filter(|l| gone.contains(&l.id))
+        .map(|l| l.resource.clone())
+        .collect();
+    let mut leases: Vec<Lease> = leases
+        .iter()
+        .filter(|l| !gone.contains(&l.id))
+        .cloned()
+        .collect();
+    let mut prev = prev.clone();
+    for r in &ended {
+        if let Some(st) = prev.resources.get_mut(r) {
+            st.set_ours(false);
+            st.idle_since = None;
+        }
+    }
+    let adopted = found_running(config, snapshot, &prev, &leases, now);
+    leases.extend(adopted.iter().map(|r| adopted_lease(r, now)));
+    Adoption {
+        leases,
+        prev,
+        adopted,
+        ended,
+    }
+}
+
+/// The hosts found running at `now` (see the module) in the lease book `leases`.
 pub fn found_running(
     config: &Config,
     snapshot: &Snapshot,
     prev: &SchedState,
     leases: &[Lease],
+    now: Millis,
 ) -> Vec<ResourceId> {
     let max_age = config.policy().host_reading_stale_after;
     config
         .resources()
         .iter()
-        .filter(|r| r.power.is_some())
-        .filter(|r| config.power_managed(&r.id))
+        .filter(|r| r.power.is_some() && config.power_managed(&r.id))
         .filter(|r| snapshot.fresh_resource_up(config, &r.id, max_age) == Some(true))
         .filter(|r| match prev.resource(&r.id) {
             None => true,
-            Some(st) => match st.power {
-                // Off after a shutdown we started or a failed power-on is not managed; off with
-                // the flag still set is a host we powered on that went down for a moment
-                // (only `power_off` clears it), and it is not found running when it is back.
-                PowerPhase::Off => !st.managed,
-                PowerPhase::Failed {
-                    during: sched_model::PowerTransition::PoweringOn,
-                    ..
-                } => true,
-                // Up, not ours, and nothing says the scheduler left it so on purpose: a state
-                // an older build stored for a host found running, or one whose adoption was
-                // skipped (an unreadable job book). Not a host we powered on (managed), one
-                // whose shutdown is under way or was stopped by the veto (a shutdown), or
-                // one a job holds (a hold never takes a host over; it is adopted once the
-                // hold ends).
-                PowerPhase::On { .. } => {
-                    !st.managed
-                        && st.shutdown.is_none()
-                        && !leases.iter().any(|l| {
-                            l.resource == r.id && matches!(l.kind, LeaseKind::SharedHold { .. })
-                        })
-                }
-                _ => false,
-            },
+            Some(st) => {
+                let not_ours_and_up_or_off = matches!(
+                    st.power,
+                    PowerPhase::Off { ours: false }
+                        | PowerPhase::On { ours: false, .. }
+                        | PowerPhase::Failed {
+                            during: PowerTransition::PoweringOn,
+                            ..
+                        }
+                );
+                not_ours_and_up_or_off && !st.shutdown.is_some_and(|s| s.stopped_since().is_some())
+            }
         })
         .filter(|r| {
             !leases
                 .iter()
                 .any(|l| l.resource == r.id && l.kind == LeaseKind::ManualHost)
         })
-        // Under a lockout nothing is adopted: whatever boots the host (another OS, physical
-        // work) is left alone until the lockout is cleared; then it is found running.
-        .filter(|r| {
-            !leases
-                .iter()
-                .any(|l| l.resource == r.id && l.is_lockout() && l.is_active(snapshot.now))
-        })
+        .filter(|r| !lockout_held(config, leases, &r.id, now))
         .map(|r| r.id.clone())
         .collect()
+}
+
+/// Whether an active lockout lease holds `resource` locked out (a resource with a power
+/// section; a lockout lease on any other is ignored).
+pub fn lockout_held(config: &Config, leases: &[Lease], resource: &ResourceId, now: Millis) -> bool {
+    config.supports_lockout(resource)
+        && leases
+            .iter()
+            .any(|l| &l.resource == resource && l.is_lockout() && l.is_active(now))
+}
+
+/// The id of the adopted lease of `resource`. Only a name: whether a lease is adopted is its
+/// `origin`.
+pub fn adopted_id(resource: &ResourceId) -> LeaseId {
+    LeaseId::new(format!("adopted-host-{resource}"))
 }
 
 /// The adopted lease of `resource`, granted at `now`.
@@ -94,12 +151,12 @@ pub fn adopted_lease(resource: &ResourceId, now: Millis) -> Lease {
         resource: resource.clone(),
         kind: LeaseKind::ManualHost,
         granted_at: now,
+        origin: LeaseOrigin::Adopted,
     }
 }
 
-/// The adopted leases whose host a fresh reading shows down: the user (or a power cut) took
-/// it down, so the claim is over and the lease must not wake it again. Leases a person asked
-/// for are never listed.
+/// The adopted leases whose host a fresh reading shows down. Leases a person asked for are
+/// never listed.
 pub fn gone_down(config: &Config, snapshot: &Snapshot, leases: &[Lease]) -> Vec<LeaseId> {
     let max_age = config.policy().host_reading_stale_after;
     leases

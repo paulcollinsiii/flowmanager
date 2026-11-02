@@ -101,6 +101,7 @@ fn lease(kind: usize, now: u64, n: usize) -> Lease {
         resource: ResourceId::new(resource),
         kind,
         granted_at: Millis(now),
+        origin: sched_model::LeaseOrigin::Requested,
     }
 }
 
@@ -307,8 +308,8 @@ proptest! {
     ) {
         let config = example_config_managed();
         let mut sc = scenario(&frames);
-        let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1) });
-        st.managed = true;
+        let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1), ours: false });
+        st.set_ours(true);
         // An idle drain (the scheduler's own) is always immediate and already scaled down.
         let since = Millis(50_000_000 - ago);
         st.shutdown = Some(if idle {

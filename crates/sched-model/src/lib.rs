@@ -38,7 +38,7 @@ pub use job_state::{
     Trigger,
 };
 pub use jobs::{CronJobRef, JobNeed, JobSpec, MissedRun};
-pub use lease::{ADOPTED_HOST_PREFIX, Lease, LeaseKind, host_hold_count};
+pub use lease::{Lease, LeaseKind, LeaseOrigin, host_hold_count};
 pub use observation::{
     Fidelity, HostUse, JobRunReading, JobRunState, Observation, ObservedValue, ReadingUse, Snapshot,
 };

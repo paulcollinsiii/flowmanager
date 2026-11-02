@@ -66,9 +66,9 @@ type PhaseKey = (String, &'static str);
 /// A resource's power phase as a metric label, with when it began if the state says.
 fn power_phase(p: &PowerPhase) -> (&'static str, Option<Millis>) {
     match p {
-        PowerPhase::Off => ("off", None),
+        PowerPhase::Off { .. } => ("off", None),
         PowerPhase::PoweringOn { since } => ("powering_on", Some(*since)),
-        PowerPhase::On { since } => ("on", Some(*since)),
+        PowerPhase::On { since, .. } => ("on", Some(*since)),
         PowerPhase::ShuttingDown { since } => ("shutting_down", Some(*since)),
         PowerPhase::Failed { since, .. } => ("failed", Some(*since)),
     }
@@ -761,7 +761,10 @@ mod tests {
     fn the_veto_has_one_series_per_reading_with_waiting_only_on_the_blocking_one() {
         use sched_model::{PowerPhase, ResourceState, Shutdown};
         let m = Metrics::new();
-        let mut st = ResourceState::new(PowerPhase::On { since: Millis(1) });
+        let mut st = ResourceState::new(PowerPhase::On {
+            since: Millis(1),
+            ours: false,
+        });
         st.shutdown = Some(Shutdown::idle_without_consumers(Millis(2)).vetoing(Millis(3)));
         let mut state = SchedState::default();
         state.resources.insert("gpu".into(), st);
@@ -791,7 +794,10 @@ mod tests {
         assert!(!text.contains("reading=\"mounts\""), "{text}");
         assert!(!text.contains("mounts+pods"), "{text}");
         // And a stopped host shows stopped on every reading, blocking or not.
-        let mut st = ResourceState::new(PowerPhase::On { since: Millis(1) });
+        let mut st = ResourceState::new(PowerPhase::On {
+            since: Millis(1),
+            ours: false,
+        });
         st.shutdown = Some(
             Shutdown::idle_without_consumers(Millis(2))
                 .vetoing(Millis(3))
@@ -820,6 +826,7 @@ mod tests {
             resource: resource.into(),
             kind,
             granted_at: Millis(1_000),
+            origin: sched_model::LeaseOrigin::Requested,
         };
         let leases = vec![
             lease(
@@ -861,12 +868,14 @@ mod tests {
     fn the_min_off_gauge_counts_down_to_zero_and_drops_resources_without_a_minimum() {
         use sched_model::{PowerPhase, ResourceState};
         let m = Metrics::new();
-        let mut off = ResourceState::new(PowerPhase::Off);
+        let mut off = ResourceState::new(PowerPhase::Off { ours: false });
         off.off_since = Some(Millis(1_000));
         let mut s = SchedState::default();
         s.resources.insert("a".into(), off);
-        s.resources
-            .insert("b".into(), ResourceState::new(PowerPhase::Off));
+        s.resources.insert(
+            "b".into(),
+            ResourceState::new(PowerPhase::Off { ours: false }),
+        );
         let min = |id: &ResourceId| (id.as_str() != "c").then_some(Millis(61_000));
         m.set_min_off_remaining(&s, Millis(11_000), min);
         let text = m.render();
@@ -951,6 +960,7 @@ mod tests {
         let mut state = SchedState::default();
         let mut gpu = ResourceState::new(PowerPhase::On {
             since: Millis(1_000),
+            ours: false,
         });
         gpu.mode = ModePhase::Serving {
             model: "m1".into(),
@@ -959,9 +969,10 @@ mod tests {
             wind_down: None,
         };
         state.resources.insert("gpu".into(), gpu.clone());
-        state
-            .resources
-            .insert("nfs".into(), ResourceState::new(PowerPhase::Off));
+        state.resources.insert(
+            "nfs".into(),
+            ResourceState::new(PowerPhase::Off { ours: false }),
+        );
         m.set_phases(Millis(10_000), &state);
         let text = m.render();
         for needle in [
@@ -1039,7 +1050,10 @@ mod tests {
         for id in ["host", "plain"] {
             st.resources.insert(
                 ResourceId::new(id),
-                sched_model::ResourceState::new(PowerPhase::On { since: Millis(0) }),
+                sched_model::ResourceState::new(PowerPhase::On {
+                    since: Millis(0),
+                    ours: false,
+                }),
             );
         }
         m.set_power_failed(&st, |id| id.as_str() == "host");

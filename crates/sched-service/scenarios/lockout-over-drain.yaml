@@ -3,9 +3,8 @@ power_control: managed
 initial_state:
   resources:
     basestar-nfs:
-      power: { phase: "on", since: 92800000 }
+      power: { phase: "on", since: 92800000, ours: true }
       mode: { phase: idle }
-      managed: true
       shutdown: { cause: { kind: idle }, since: 99000000, withdrawal: done, veto: { phase: none } }
 frames:
   - at: 100000000

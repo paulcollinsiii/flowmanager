@@ -588,7 +588,7 @@ fn a_released_manual_lease_never_leads_to_a_power_off_under_manual_control() {
             log.join("\n")
         );
         let gpu = store.load().state.resource(&GPU.into()).cloned().unwrap();
-        assert!(gpu.is_on() && !gpu.managed, "{}", log.join("\n"));
+        assert!(gpu.is_on() && !gpu.ours(), "{}", log.join("\n"));
         if t > 170 {
             assert!(
                 published.allowed.models.contains(&ModelId::from("mineru")),

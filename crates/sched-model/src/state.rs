@@ -31,12 +31,27 @@ impl PowerTransition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PowerPhase {
-    Off,
+    /// Down. `ours` is whether the host is flowmanager's (see [`PowerPhase::On`]); it
+    /// survives a blip, so a host flowmanager woke that drops out and comes back is not found
+    /// running. A hand-written state that omits it means false: a host nothing woke.
+    Off {
+        #[serde(default)]
+        ours: bool,
+    },
     PoweringOn {
         since: Millis,
     },
+    /// Up. `ours` is whether flowmanager started this host and so powers it down when
+    /// nothing holds it (`planning/power-model.md`, 2.1b). Set by flowmanager's own power-on
+    /// (whatever wanted the host) and by a manual want; carried across a blip (`On`, `Off`,
+    /// `On`); false after a confirmed shutdown, a failed transition, under manual control, on
+    /// a stopped veto and when an adopted lease ends because the host went down. A host that
+    /// is up under managed control and not `ours` is found running (adopted). A hand-written
+    /// state that omits it means false.
     On {
         since: Millis,
+        #[serde(default)]
+        ours: bool,
     },
     ShuttingDown {
         since: Millis,
@@ -559,13 +574,6 @@ impl Shutdown {
 pub struct ResourceState {
     pub power: PowerPhase,
     pub mode: ModePhase,
-    /// Whether the scheduler may power this host down: set when it woke the host or took
-    /// over a manual request, never for a host merely found running. (Under `control: managed`
-    /// the service turns a shared host found running into a manual request by minting a manual
-    /// host lease for it, see `sched_sequencer::adopt`; the sequencer itself still never owns
-    /// a host it only found.)
-    #[serde(default)]
-    pub managed: bool,
     /// When the host last had nothing holding it (the start of the `idle_grace` clock).
     pub idle_since: Option<Millis>,
     /// Classes whose in-flight work was stopped and whose recovery action has not run.
@@ -593,7 +601,6 @@ impl ResourceState {
         ResourceState {
             power,
             mode: ModePhase::Idle,
-            managed: false,
             idle_since: None,
             pending_recovery: BTreeSet::new(),
             shutdown: None,
@@ -606,6 +613,24 @@ impl ResourceState {
         matches!(self.power, PowerPhase::On { .. })
     }
 
+    /// Whether the host is flowmanager's: it started it (or took a manual want for it) and
+    /// the marker has not been cleared since. Only `Off` and `On` carry it; every other phase
+    /// is not.
+    pub fn ours(&self) -> bool {
+        matches!(
+            self.power,
+            PowerPhase::Off { ours: true } | PowerPhase::On { ours: true, .. }
+        )
+    }
+
+    /// Sets the `ours` marker. Phases that cannot carry it are left as they are.
+    pub fn set_ours(&mut self, value: bool) {
+        match &mut self.power {
+            PowerPhase::Off { ours } | PowerPhase::On { ours, .. } => *ours = value,
+            _ => {}
+        }
+    }
+
     /// How much of `min_off` is left to wait at `now` before the host may be powered on
     /// again by itself: zero when the host is not off after a shutdown flowmanager started
     /// (found down, gone down by itself, or no shutdown stamp), when `min_off` is zero or when
@@ -613,7 +638,7 @@ impl ResourceState {
     /// wait never exceeds `min_off`.
     pub fn min_off_remaining(&self, min_off: Millis, now: Millis) -> Millis {
         match (self.power, self.off_since) {
-            (PowerPhase::Off, Some(at)) => min_off.saturating_sub(now.saturating_sub(at)),
+            (PowerPhase::Off { .. }, Some(at)) => min_off.saturating_sub(now.saturating_sub(at)),
             _ => Millis::ZERO,
         }
     }

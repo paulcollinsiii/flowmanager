@@ -12,15 +12,21 @@ use crate::Cx;
 pub(crate) fn initial(cx: &Cx, steps: &mut Vec<Step>) -> Option<ResourceState> {
     let now = cx.now();
     if cx.res.power.is_none() {
-        return Some(ResourceState::new(PowerPhase::On { since: now }));
+        return Some(ResourceState::new(PowerPhase::On {
+            since: now,
+            ours: false,
+        }));
     }
     match cx.snapshot.fresh_resource_up(
         cx.config,
         &cx.res.id,
         cx.config.policy().host_reading_stale_after,
     ) {
-        Some(true) => Some(ResourceState::new(PowerPhase::On { since: now })),
-        Some(false) => Some(ResourceState::new(PowerPhase::Off)),
+        Some(true) => Some(ResourceState::new(PowerPhase::On {
+            since: now,
+            ours: false,
+        })),
+        Some(false) => Some(ResourceState::new(PowerPhase::Off { ours: false })),
         None => {
             wait(cx, steps, WaitReason::StaleObservation);
             None
@@ -31,9 +37,13 @@ pub(crate) fn initial(cx: &Cx, steps: &mut Vec<Step>) -> Option<ResourceState> {
 /// Brings the power phase in line with a fresh reachability observation.
 ///
 /// Under `control: manual` the scheduler is never responsible for the host's power
-/// (`managed` is cleared, also in state persisted by a build or config that managed it), and
+/// (`ours` is cleared, also in state persisted by a build or config that managed it), and
 /// the phase is simply what is observed: on or off. A transitional phase left from managed
 /// control (powering on, shutting down) converges to the observed one.
+///
+/// `ours` follows the phase: a host flowmanager powered on is ours when it is seen up (the
+/// `powering_on` phase has no marker, it is ours by construction), and a blip (`on`, `off`,
+/// `on`) keeps it. It is not ours after a confirmed shutdown or a failed transition.
 pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     if cx.res.power.is_none() {
         return;
@@ -41,7 +51,7 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     let manual = !cx.config.power_managed(&cx.res.id);
     let was_failed = matches!(st.power, PowerPhase::Failed { .. });
     if manual {
-        st.managed = false;
+        st.set_ours(false);
         st.idle_since = None;
         st.shutdown = None;
     }
@@ -54,29 +64,41 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     );
     if let Some(up) = observed {
         st.power = match (st.power, up) {
-            (PowerPhase::On { since }, true) => PowerPhase::On { since },
-            (_, true) if manual => PowerPhase::On { since: now },
-            (_, false) if manual => PowerPhase::Off,
-            (PowerPhase::Off | PowerPhase::PoweringOn { .. }, true) => {
-                PowerPhase::On { since: now }
-            }
-            (PowerPhase::On { .. }, false) => PowerPhase::Off,
-            (PowerPhase::ShuttingDown { .. }, false) => PowerPhase::Off,
-            // The failed state clears only on the state the transition was after.
+            (PowerPhase::On { since, ours }, true) => PowerPhase::On { since, ours },
+            (_, true) if manual => PowerPhase::On {
+                since: now,
+                ours: false,
+            },
+            (_, false) if manual => PowerPhase::Off { ours: false },
+            (PowerPhase::Off { ours }, true) => PowerPhase::On { since: now, ours },
+            // Our own power-on completed.
+            (PowerPhase::PoweringOn { .. }, true) => PowerPhase::On {
+                since: now,
+                ours: true,
+            },
+            // A blip keeps the marker.
+            (PowerPhase::On { ours, .. }, false) => PowerPhase::Off { ours },
+            // A confirmed shutdown: the host is no longer ours.
+            (PowerPhase::ShuttingDown { .. }, false) => PowerPhase::Off { ours: false },
+            // The failed state clears only on the state the transition was after; whatever
+            // brought the host there is not flowmanager's action, so it is not ours.
             (
                 PowerPhase::Failed {
                     during: PowerTransition::PoweringOn,
                     ..
                 },
                 true,
-            ) => PowerPhase::On { since: now },
+            ) => PowerPhase::On {
+                since: now,
+                ours: false,
+            },
             (
                 PowerPhase::Failed {
                     during: PowerTransition::ShuttingDown,
                     ..
                 },
                 false,
-            ) => PowerPhase::Off,
+            ) => PowerPhase::Off { ours: false },
             (p, _) => p,
         };
     }
@@ -114,7 +136,7 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
     let min_off = cx.res.power.as_ref().map_or(Millis::ZERO, |p| p.min_off());
     st.off_since = match (st.power, st.off_since) {
         _ if manual || min_off == Millis::ZERO => None,
-        (PowerPhase::Off, _)
+        (PowerPhase::Off { .. }, _)
             if matches!(
                 before,
                 PowerPhase::ShuttingDown { .. }
@@ -126,14 +148,13 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         {
             Some(now)
         }
-        (PowerPhase::Off, Some(at)) => Some(at.min(now)),
+        (PowerPhase::Off { .. }, Some(at)) => Some(at.min(now)),
         _ => None,
     };
-    // A failed transition leaves the host not managed by an earlier action of ours: whatever
+    // A failed transition leaves the host not ours (cleared above as the phase leaves `failed`): whatever
     // brings it back (a person, a slow boot) is treated like a host found running, so no
     // automatic power-off follows until a new want powers it on through the normal path.
     if was_failed || matches!(st.power, PowerPhase::Failed { .. }) {
-        st.managed = false;
         st.idle_since = None;
     }
     if !st.is_on() {
@@ -151,9 +172,9 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         if st.shutdown.is_some_and(|s| s.is_lockout()) {
             st.shutdown = None;
         }
-    } else if matches!(st.power, PowerPhase::Off) {
+    } else if matches!(st.power, PowerPhase::Off { .. }) {
         st.locked_down = true;
-        st.managed = false;
+        st.set_ours(false);
         st.idle_since = None;
     }
 }
@@ -221,7 +242,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
         return;
     }
     match st.power {
-        PowerPhase::Off => {
+        PowerPhase::Off { .. } => {
             if acted {
                 return;
             }
@@ -244,7 +265,6 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 });
                 st.power = PowerPhase::PoweringOn { since: now };
                 st.off_since = None;
-                st.managed = true;
                 st.idle_since = None;
             } else if cx
                 .intent
@@ -277,7 +297,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 // later boot is left alone, not powered off, adopted or given work.
                 st.shutdown = None;
                 st.idle_since = None;
-                st.managed = false;
+                st.set_ours(false);
                 if !acted {
                     wait(cx, steps, WaitReason::LockedOut);
                 }
@@ -299,7 +319,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 return;
             }
             if want == Some(PowerWant::Manual) {
-                st.managed = true;
+                st.set_ours(true);
                 // A new manual request takes the host over again: an earlier stop (pods
                 // still used it) is over, and the next idle period decides afresh.
                 if st.shutdown.is_some_and(|s| s.stopped_since().is_some()) {
@@ -318,7 +338,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                 st.idle_since = None;
             }
             if let Some(s) = st.shutdown.filter(Shutdown::is_drain)
-                && st.managed
+                && st.ours()
                 && idle_mode
             {
                 if s.cause() == ShutdownCause::Idle && h.unknown {
@@ -328,7 +348,7 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
                     return;
                 }
                 drain_shutdown(cx, st, steps, s, h.count);
-            } else if st.managed && idle_mode && h.count == 0 {
+            } else if st.ours() && idle_mode && h.count == 0 {
                 if h.unknown {
                     wait(cx, steps, WaitReason::StaleDemand);
                     return;
@@ -385,8 +405,8 @@ fn manual_step(cx: &Cx, st: &ResourceState, steps: &mut Vec<Step>, acted: bool, 
         PowerPhase::PoweringOn { .. } => wait(cx, steps, WaitReason::PoweringOn),
         PowerPhase::ShuttingDown { .. } => wait(cx, steps, WaitReason::ShuttingDown),
         PowerPhase::Failed { .. } => wait(cx, steps, WaitReason::PowerFailed),
-        PowerPhase::Off if needed => wait(cx, steps, WaitReason::HostNotUp),
-        PowerPhase::Off => {}
+        PowerPhase::Off { .. } if needed => wait(cx, steps, WaitReason::HostNotUp),
+        PowerPhase::Off { .. } => {}
     }
 }
 
@@ -430,7 +450,7 @@ fn veto_clear(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, shutdown: 
         // The stopped state holds the host as for any shutdown (no longer managed, so no
         // idle drain starts again).
         st.shutdown = Some(current.stopped(now));
-        st.managed = false;
+        st.set_ours(false);
         st.idle_since = None;
         wait(cx, steps, WaitReason::ShutdownStopped);
     } else {
@@ -466,7 +486,6 @@ fn power_off(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, shutdown: S
         resource: cx.res.id.clone(),
     });
     st.power = PowerPhase::ShuttingDown { since: cx.now() };
-    st.managed = false;
     st.idle_since = None;
     st.mode = ModePhase::Idle;
 }

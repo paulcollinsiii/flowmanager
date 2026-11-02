@@ -36,8 +36,8 @@
 
 use sched_model::jobs::JOB_READ_SETTLE;
 use sched_model::{
-    CreateJob, JobEvent, JobEventKind, JobRecord, JobRunReading, JobRunState, JobSpec, LastRun,
-    Millis, Run, RunOutcome, RunPhase, Trigger,
+    Config, CreateJob, JobEvent, JobEventKind, JobRecord, JobRunReading, JobRunState, JobSpec,
+    LastRun, Lease, Millis, Run, RunOutcome, RunPhase, SchedState, Snapshot, Trigger, host_is_up,
 };
 
 /// A fresh reading of a job's Jobs.
@@ -632,5 +632,31 @@ pub fn trigger(rec: &mut JobRecord, spec: &JobSpec, now: Millis) -> Result<JobEv
     Ok(event(spec, now, now, JobEventKind::Triggered))
 }
 
+/// Whether every need of `spec` is up as the sequencer sees it: the input `needs_up` of the
+/// job machine ([`Inputs`]). A host whose power is failed, or whose shutdown flowmanager gave
+/// up on, does not count: the job is missed or alerted per its policy and flowmanager does not
+/// try to fix power. A host that is locked out (an active lockout lease in `leases`, on a host
+/// with a power section) does not count either, whether it is up or not: nothing schedules a
+/// locked-out host, so the job waits as for a host that is not up (its missed-run and
+/// catch-up rules apply as usual) and takes no hold beyond the waiting run's own.
+pub fn needs_up(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+    leases: &[Lease],
+    spec: &JobSpec,
+) -> bool {
+    spec.needs.iter().all(|n| {
+        let r = n.resource();
+        !crate::adopt::lockout_held(config, leases, r, snapshot.now)
+            && host_is_up(config, snapshot, state, r)
+            && !state
+                .resource(r)
+                .is_some_and(|s| s.shutdown.is_some_and(|x| x.stopped_since().is_some()))
+    })
+}
+
+#[cfg(test)]
+mod needs_up_tests;
 #[cfg(test)]
 mod tests;

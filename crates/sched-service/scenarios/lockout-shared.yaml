@@ -3,9 +3,8 @@ power_control: managed
 initial_state:
   resources:
     basestar-nfs:
-      power: { phase: "on", since: 92800000 }
+      power: { phase: "on", since: 92800000, ours: true }
       mode: { phase: idle }
-      managed: true
 frames:
   # Locked out while a job holds the host and a person leased it. In-flight work gets
   # lockout_timeout (the consumers keep running meanwhile); there is none, so the next tick

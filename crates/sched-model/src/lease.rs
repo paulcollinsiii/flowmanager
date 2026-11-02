@@ -7,9 +7,30 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{HolderId, LeaseId, ModelId, ResourceId};
 use crate::time::Millis;
 
-/// Prefix of the id of a manual host lease the scheduler minted for a host it found running
-/// (an "adopted" lease); the rest of the id is the resource.
-pub const ADOPTED_HOST_PREFIX: &str = "adopted-host-";
+/// Who made a lease: a person (through the API or the toggle listener) or the scheduler,
+/// which adopts a host it found running.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseOrigin {
+    /// Asked for by a person (and what an absent `origin` in a hand-written lease means).
+    #[default]
+    Requested,
+    /// A manual host lease the scheduler minted for a host it found running (see
+    /// `sched_sequencer::adopt`). It ends when the host is seen down.
+    Adopted,
+}
+
+impl LeaseOrigin {
+    /// The label used in JSON replies and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeaseOrigin::Requested => "requested",
+            LeaseOrigin::Adopted => "adopted",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +39,9 @@ pub struct Lease {
     pub resource: ResourceId,
     pub kind: LeaseKind,
     pub granted_at: Millis,
+    /// Who made the lease. Only a manual host lease is ever `adopted`.
+    #[serde(default)]
+    pub origin: LeaseOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -69,10 +93,9 @@ impl Lease {
     }
 
     /// Whether this is a manual host lease the scheduler minted for a host found running
-    /// (see [`ADOPTED_HOST_PREFIX`]) rather than one a person asked for.
+    /// (origin `adopted`) rather than one a person asked for.
     pub fn is_adopted_host(&self) -> bool {
-        matches!(self.kind, LeaseKind::ManualHost)
-            && self.id.as_str().starts_with(ADOPTED_HOST_PREFIX)
+        matches!(self.kind, LeaseKind::ManualHost) && self.origin == LeaseOrigin::Adopted
     }
 
     pub fn is_lockout(&self) -> bool {
@@ -112,6 +135,7 @@ mod tests {
             resource: ResourceId::new(res),
             kind,
             granted_at: Millis(0),
+            origin: LeaseOrigin::Requested,
         }
     }
 

@@ -3,7 +3,7 @@ power_control: managed
 min_off: 10m
 initial_state:
   resources:
-    basestar-nfs: { power: { phase: "on", since: 0 }, mode: { phase: idle }, managed: true }
+    basestar-nfs: { power: { phase: "on", since: 0, ours: true }, mode: { phase: idle } }
 frames:
   - at: 100000000
     observe:

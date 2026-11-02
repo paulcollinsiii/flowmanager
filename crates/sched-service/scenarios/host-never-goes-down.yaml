@@ -2,7 +2,7 @@ description: "A host that never goes down: after the shutdown request the NFS ho
 power_control: managed
 initial_state:
   resources:
-    basestar-nfs: { power: { phase: "on", since: 0 }, mode: { phase: idle }, managed: true }
+    basestar-nfs: { power: { phase: "on", since: 0, ours: true }, mode: { phase: idle } }
 frames:
   - at: 100000000
     observe:

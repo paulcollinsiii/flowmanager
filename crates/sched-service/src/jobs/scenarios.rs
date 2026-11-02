@@ -631,6 +631,7 @@ async fn a_failed_creation_is_alerted_once_and_tried_again_and_a_stray_job_hold_
             resource: "basestar-nfs".into(),
             kind,
             granted_at: Millis(0),
+            origin: sched_model::LeaseOrigin::Requested,
         });
     }
     w.ctx

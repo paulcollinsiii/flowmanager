@@ -521,7 +521,7 @@ pub fn check(
                 if !manual && min_off > Millis::ZERO {
                     let before = prev.resource(resource);
                     let confirmed = match before.map(|s| (s.power, s.off_since)) {
-                        Some((PowerPhase::Off, Some(at))) => Some(at),
+                        Some((PowerPhase::Off { .. }, Some(at))) => Some(at),
                         Some((
                             PowerPhase::ShuttingDown { .. }
                             | PowerPhase::Failed {
@@ -555,9 +555,9 @@ pub fn check(
                 }
                 let before = prev.resource(resource);
                 if !locked_out(config, snapshot, resource) {
-                    if !before.is_some_and(|s| s.managed) {
+                    if !before.is_some_and(|s| s.ours()) {
                         out.push(format!(
-                            "invariant 7: powered off unmanaged host {resource}"
+                            "invariant 7: powered off {resource}, which flowmanager did not start (not ours)"
                         ));
                     }
                     // 11. A shared host's consumers are scaled down before it is shut down: by a

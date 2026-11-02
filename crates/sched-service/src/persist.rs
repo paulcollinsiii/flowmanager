@@ -40,10 +40,17 @@ pub const EPOCH_KEY: &str = "backstop_epoch";
 /// `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`. There is no
 /// migration: a document of version 1 is an error (see [`decode`]) until it is discarded, and
 /// the sequencer then starts from observation. Version 3 (phase 4a) renamed the `reclaim`
-/// shutdown cause and wind-down flag to `lockout` and added `locked_down`.
-pub const STATE_VERSION: u32 = 3;
+/// shutdown cause and wind-down flag to `lockout` and added `locked_down`. Version 4 (phase 4b)
+/// replaced the per-resource `managed` flag with `ours` on the `off` and `on` phases.
+pub const STATE_VERSION: u32 = 4;
 /// Version of the [`LeaseBook`] document this build reads and writes.
-pub const LEASES_VERSION: u32 = 1;
+///
+/// Version 2 (phase 4b) gave every lease an `origin` (`requested` or `adopted`); version 1
+/// marked an adopted lease only by the prefix of its id (`adopted-host-`). A version 1 book is
+/// read (see [`decode_leases`]), with those leases dropped.
+pub const LEASES_VERSION: u32 = 2;
+/// How a lease id began in a version 1 lease book when the lease was adopted.
+const LEGACY_ADOPTED_PREFIX: &str = "adopted-host-";
 
 /// Version of the [`AttemptBook`] document this build reads and writes.
 pub const RECOVERY_VERSION: u32 = 1;
@@ -158,7 +165,32 @@ fn older_version(raw: Option<&[u8]>, current: u32) -> Option<u64> {
     }
 }
 
+/// Reads the lease book. A book of version 1 is read as it is, except that its adopted leases
+/// (a manual host lease whose id begins `adopted-host-`) are dropped, with one log line each:
+/// version 1 had no `origin`, so such a lease would otherwise read as one a person asked for
+/// and wake its host again after it went down. Nothing is lost by dropping them: the sequencer
+/// state is discarded on the same upgrade (version 4), every host that is up is found running
+/// and adopted afresh at the first tick, with an `adopted` origin, and one that is down needs
+/// no lease. Any other version is an error, as for every document.
 pub fn decode_leases(raw: Option<&[u8]>) -> Result<LeaseBook, StateError> {
+    if older_version(raw, LEASES_VERSION) == Some(1) {
+        let mut book: LeaseBook = decode(LEASES_KEY, 1, raw)?;
+        book.leases.retain(|l| {
+            let adopted = matches!(l.kind, sched_model::LeaseKind::ManualHost)
+                && l.id.as_str().starts_with(LEGACY_ADOPTED_PREFIX);
+            if adopted {
+                tracing::warn!(
+                    event = "legacy_adopted_lease_dropped",
+                    lease = %l.id,
+                    resource = %l.resource,
+                    "lease_book is version 1: the adopted lease {} is dropped (a host that is up is adopted afresh)",
+                    l.id
+                );
+            }
+            !adopted
+        });
+        return Ok(book);
+    }
     decode(LEASES_KEY, LEASES_VERSION, raw)
 }
 
@@ -205,12 +237,13 @@ mod tests {
     fn the_off_stamp_and_a_shutdown_survive_a_restart() {
         use sched_model::{Millis, PowerPhase, ResourceState};
         let mut s = CoreState::default();
-        let mut off = ResourceState::new(PowerPhase::Off);
+        let mut off = ResourceState::new(PowerPhase::Off { ours: false });
         off.off_since = Some(Millis(4_000));
         s.state.resources.insert("basestar-nfs".into(), off);
-        s.state
-            .resources
-            .insert("cuda-central".into(), ResourceState::new(PowerPhase::Off));
+        s.state.resources.insert(
+            "cuda-central".into(),
+            ResourceState::new(PowerPhase::Off { ours: false }),
+        );
         let bytes = encode_state(&s);
         assert_eq!(decode_state(Some(&bytes)).unwrap(), s);
         let text = String::from_utf8(bytes).unwrap();

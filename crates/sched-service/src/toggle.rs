@@ -999,7 +999,7 @@ fn model_status(
 
 fn power_name(p: &PowerPhase) -> &'static str {
     match p {
-        PowerPhase::Off => "off",
+        PowerPhase::Off { .. } => "off",
         PowerPhase::PoweringOn { .. } => "powering_on",
         PowerPhase::On { .. } => "on",
         PowerPhase::ShuttingDown { .. } => "shutting_down",
@@ -1089,7 +1089,7 @@ fn lockout_status(
             "host_failed",
             format!("a power transition of {resource} failed; resume it once the host is fixed"),
         ),
-        PowerPhase::Off => (
+        PowerPhase::Off { .. } => (
             "powered_off",
             format!("{resource} is off and is not woken while locked out"),
         ),
@@ -1241,7 +1241,7 @@ pub fn resource_state(
         let off = report
             .as_ref()
             .and_then(|r| r.state.resource(resource))
-            .is_some_and(|st| matches!(st.power, PowerPhase::Off));
+            .is_some_and(|st| matches!(st.power, PowerPhase::Off { .. }));
         if held.is_none() && !off && m.get("state") != Some(&json!("draining")) {
             m.insert("state".into(), json!("locked_out"));
         }
@@ -1981,7 +1981,10 @@ mod tests {
         );
         assert_eq!(v["state"], "off", "{v}");
         assert!(v.get("drain").is_none(), "{v}");
-        st.power = PowerPhase::On { since: Millis(2) };
+        st.power = PowerPhase::On {
+            since: Millis(2),
+            ours: false,
+        };
         rep.state.resources.insert(nfs.clone(), st);
         let v = resource_state(
             &config,
@@ -2159,6 +2162,7 @@ mod tests {
             resource: nfs.clone(),
             kind: LeaseKind::ManualHost,
             granted_at: Millis(0),
+            origin: sched_model::LeaseOrigin::Requested,
         };
         let state_of = |rep: &TickReport, held: Option<&Lease>, locked: bool| {
             let v = resource_state(
@@ -2179,10 +2183,13 @@ mod tests {
             rep.clone()
         };
         // On and locked out, no lease: not `off`.
-        let on = set(PowerPhase::On { since: Millis(1) });
+        let on = set(PowerPhase::On {
+            since: Millis(1),
+            ours: false,
+        });
         assert_eq!(state_of(&on, None, true), json!("locked_out"));
         // The same host seen off: `off` (the truth), locked out or not.
-        let off = set(PowerPhase::Off);
+        let off = set(PowerPhase::Off { ours: false });
         assert_eq!(state_of(&off, None, true), json!("off"));
         // A held lease keeps its own meaning, `on`, even while the host is up and locked out.
         assert_eq!(state_of(&on, Some(&lease), true), json!("on"));
@@ -2343,7 +2350,10 @@ mod tests {
             |rep: &TickReport| model_status(rep, &lease, &"llm".into(), &"cuda-central".into());
         let gpu: ResourceId = "cuda-central".into();
 
-        let mut st = ResourceState::new(PowerPhase::On { since: Millis(1) });
+        let mut st = ResourceState::new(PowerPhase::On {
+            since: Millis(1),
+            ours: false,
+        });
         st.mode = ModePhase::Serving {
             model: "mineru".into(),
             since: Millis(1),
@@ -2574,6 +2584,7 @@ mod tests {
             resource: "cuda-central".into(),
             kind: LeaseKind::Lockout,
             granted_at: Millis(1),
+            origin: sched_model::LeaseOrigin::Requested,
         };
         let gpu: ResourceId = "cuda-central".into();
         let r = rig(&example_yaml_managed());
@@ -2597,12 +2608,18 @@ mod tests {
         rep.leases.push(lease.clone());
         rep.reason = "locked_out".into();
         for (power, want) in [
-            (PowerPhase::Off, "powered_off"),
+            (PowerPhase::Off { ours: false }, "powered_off"),
             (
                 PowerPhase::ShuttingDown { since: Millis(1) },
                 "shutting_down",
             ),
-            (PowerPhase::On { since: Millis(1) }, "pending"),
+            (
+                PowerPhase::On {
+                    since: Millis(1),
+                    ours: false,
+                },
+                "pending",
+            ),
         ] {
             rep.state
                 .resources
@@ -2635,7 +2652,10 @@ mod tests {
         rep.veto_held.clear();
         rep.state.resources.insert(
             nfs.clone(),
-            ResourceState::new(PowerPhase::On { since: Millis(1) }),
+            ResourceState::new(PowerPhase::On {
+                since: Millis(1),
+                ours: false,
+            }),
         );
         let v = resource_state(
             &config,

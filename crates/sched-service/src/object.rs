@@ -218,14 +218,17 @@ pub async fn tick<C: ObjectCtx>(shared: &Arc<Shared>, ctx: &C) -> Result<TickRep
             reported: outcome.reported.clone(),
         }),
     );
+    // The lease book is stored on every tick: adoption changes it (a lease adopted, one ended)
+    // whether or not the job book could be read. With an unreadable job book the job step did
+    // not run, so the job holds in it are exactly as read; only the adopted leases differ.
+    ctx.set_raw(
+        LEASES_KEY,
+        persist::encode_leases(&LeaseBook {
+            next: next_lease,
+            leases: outcome.leases.clone(),
+        }),
+    );
     if !jobs_off {
-        ctx.set_raw(
-            LEASES_KEY,
-            persist::encode_leases(&LeaseBook {
-                next: next_lease,
-                leases: outcome.leases.clone(),
-            }),
-        );
         ctx.set_raw(persist::JOBS_KEY, persist::encode_jobs(&outcome.jobs));
         create_jobs(shared, ctx, &mut outcome).await?;
     }
@@ -467,8 +470,9 @@ pub async fn release_host_lease<C: ObjectCtx>(
                 let mut core = core;
                 let config = s.config.current();
                 let now = s.clock.now();
-                let r = drain::request(&mut core, &config, &resource, mode, now);
-                (core, r == drain::Requested::Recorded)
+                let r =
+                    sched_sequencer::drain::request(&mut core.state, &config, &resource, mode, now);
+                (core, r == sched_sequencer::drain::Requested::Recorded)
             })
             .await?;
         if recorded {
@@ -541,7 +545,13 @@ pub async fn drain_host<C: ObjectCtx>(
             let now = s.clock.now();
             LeaseBook::check_host(&config, &req.resource)?;
             let released = book.release_manual_host(&req.resource).is_ok();
-            drain::request(&mut core, &config, &req.resource, req.drain, now);
+            sched_sequencer::drain::request(
+                &mut core.state,
+                &config,
+                &req.resource,
+                req.drain,
+                now,
+            );
             let drain = core
                 .state
                 .resource(&req.resource)
@@ -1924,7 +1934,7 @@ mod tests {
         assert!(r.power_failed.is_empty(), "{r:?}");
         assert!(r.adopted.contains(&"cuda-central".into()), "{r:?}");
         let gpu = r.state.resource(&"cuda-central".into()).unwrap();
-        assert!(gpu.is_on() && gpu.managed, "{gpu:?}");
+        assert!(gpu.is_on() && gpu.ours(), "{gpu:?}");
         assert!(
             ctx.powers.lock().unwrap().is_empty(),
             "resuming powers nothing by itself"

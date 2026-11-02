@@ -213,7 +213,7 @@ fn nfs_down_makes_classes_unrunnable() {
         .resources
         .get_mut(&"basestar-nfs".into())
         .unwrap()
-        .power = sched_model::PowerPhase::Off;
+        .power = sched_model::PowerPhase::Off { ours: false };
     assert_eq!(target(&f), None);
 }
 

@@ -19,6 +19,7 @@ fn lease(id: &str, res: &str, kind: LeaseKind) -> Lease {
         resource: ResourceId::new(res),
         kind,
         granted_at: Millis(0),
+        origin: sched_model::LeaseOrigin::Requested,
     }
 }
 
@@ -88,13 +89,13 @@ fn power_off(res: &str) -> Step {
     }
 }
 
-const MANAGED_NFS: &str = "    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 1 }\n";
+const MANAGED_NFS: &str = "    basestar-nfs: { power: { phase: \"on\", since: 0, ours: true }, mode: { phase: idle }, idle_since: 1 }\n";
 
 /// The NFS host shutting down under a lockout whose consumers were withdrawn `done` or still
 /// `pending`, started at `since`.
 fn nfs_lockout_shutdown(withdrawal: &str, since: u64) -> SchedState {
     prev(&format!(
-        "    basestar-nfs: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }}, managed: true, shutdown: {{ cause: {{ kind: lockout }}, since: {since}, withdrawal: {withdrawal}, veto: {{ phase: none }} }} }}\n"
+        "    basestar-nfs: {{ power: {{ phase: \"on\", since: 0, ours: true }}, mode: {{ phase: idle }}, shutdown: {{ cause: {{ kind: lockout }}, since: {since}, withdrawal: {withdrawal}, veto: {{ phase: none }} }} }}\n"
     ))
 }
 
@@ -810,7 +811,7 @@ fn recovery_for_a_class_that_is_not_allowed_or_has_no_failed_items_is_a_violatio
 #[test]
 fn a_power_step_or_a_silent_exit_from_the_failed_power_state_is_a_violation() {
     let failed = prev(&format!(
-        "    cuda-central: {{ power: {{ phase: failed, since: {}, during: powering_on }}, mode: {{ phase: idle }}, managed: true }}\n",
+        "    cuda-central: {{ power: {{ phase: failed, since: {}, during: powering_on }}, mode: {{ phase: idle }} }}\n",
         NOW - MIN
     ));
     // The host is observed down: nothing it was waiting for. A new power-on is a violation,
@@ -990,7 +991,7 @@ fn serving_requested(model: &str, mode: &str, ago: u64, wind_down: Option<u64>) 
         format!(", wind_down: {{ since: {s}, timeout: 600000, lockout: false }}")
     });
     prev(&format!(
-        "    cuda-central: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: serving, model: {model}, since: 1{wd} }}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, since: {}, withdrawal: pending, veto: {{ phase: none }} }} }}\n    basestar-nfs: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }} }}\n",
+        "    cuda-central: {{ power: {{ phase: \"on\", since: 0, ours: true }}, mode: {{ phase: serving, model: {model}, since: 1{wd} }}, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, since: {}, withdrawal: pending, veto: {{ phase: none }} }} }}\n    basestar-nfs: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }} }}\n",
         NOW - ago
     ))
 }
@@ -1082,7 +1083,7 @@ fn the_checker_still_catches_a_kill_before_a_graceful_shutdowns_drain_timeout() 
         "a cancelled request forces nothing: {v:?}"
     );
     let idle_shutdown = prev(
-        "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: mineru, since: 1 }, managed: true, shutdown: { cause: { kind: idle }, since: 1, withdrawal: not_needed, veto: { phase: none } } }\n",
+        "    cuda-central: { power: { phase: \"on\", since: 0, ours: true }, mode: { phase: serving, model: mineru, since: 1 }, shutdown: { cause: { kind: idle }, since: 1, withdrawal: not_needed, veto: { phase: none } } }\n",
     );
     let v = run(&world, &idle_shutdown, vec![kill()]);
     assert!(

@@ -189,6 +189,7 @@ impl LeaseBook {
                 model: model.clone(),
             },
             granted_at: now,
+            origin: sched_model::LeaseOrigin::Requested,
         };
         self.leases.push(lease.clone());
         Ok(LeaseGrant {
@@ -260,6 +261,7 @@ impl LeaseBook {
             resource: resource.clone(),
             kind,
             granted_at: now,
+            origin: sched_model::LeaseOrigin::Requested,
         };
         self.leases.push(lease.clone());
         LeaseGrant {

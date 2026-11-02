@@ -19,9 +19,9 @@ use std::collections::BTreeSet;
 
 use sched_model::{
     Config, CreateJob, HolderId, JobBook, JobEvent, JobId, LastRun, Lease, LeaseId, LeaseKind,
-    Millis, Run, RunPhase, SchedState, Snapshot, Trigger, host_is_up,
+    Millis, Run, RunPhase, SchedState, Snapshot, Trigger,
 };
-use sched_sequencer::jobs::{Inputs, Reading, advance};
+use sched_sequencer::jobs::{Inputs, Reading, advance, needs_up};
 use serde::{Deserialize, Serialize};
 
 /// The prefix of the holder of a job's holds.
@@ -44,33 +44,6 @@ pub struct JobsStep {
     pub events: Vec<JobEvent>,
     /// Jobs to create, in job order.
     pub creates: Vec<CreateJob>,
-}
-
-/// Whether every need of `spec` is up as the sequencer sees it. A host whose power is failed,
-/// or whose shutdown flowmanager gave up on, does not count: the job is missed or alerted per
-/// its policy and flowmanager does not try to fix power. A host that is locked out (an active
-/// lockout lease in `leases`, on a host with a power section) does not count either, whether it
-/// is up or not: nothing schedules a locked-out host, so the job waits as for a host that is
-/// not up (its missed-run and catch-up rules apply as usual) and takes no hold beyond the
-/// waiting run's own.
-pub fn needs_up(
-    config: &Config,
-    snapshot: &Snapshot,
-    state: &SchedState,
-    leases: &[Lease],
-    spec: &sched_model::JobSpec,
-) -> bool {
-    spec.needs.iter().all(|n| {
-        let r = n.resource();
-        !(config.supports_lockout(r)
-            && leases
-                .iter()
-                .any(|l| &l.resource == r && l.is_lockout() && l.is_active(snapshot.now)))
-            && host_is_up(config, snapshot, state, r)
-            && !state
-                .resource(r)
-                .is_some_and(|s| s.shutdown.is_some_and(|x| x.stopped_since().is_some()))
-    })
 }
 
 /// Moves every configured job to `now` and reconciles the holds in `leases`.
@@ -149,6 +122,7 @@ pub fn reconcile_holds(config: &Config, book: &JobBook, leases: &mut Vec<Lease>,
                         holder: holder(&spec.id),
                     },
                     granted_at: now,
+                    origin: sched_model::LeaseOrigin::Requested,
                 });
             }
         }
@@ -235,104 +209,3 @@ pub fn summaries(config: &Config, book: &JobBook) -> Vec<JobSummary> {
 
 #[cfg(test)]
 mod scenarios;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sched_model::test_support::example_config;
-    use sched_model::{PowerPhase, ResourceState, Shutdown};
-
-    #[test]
-    fn a_locked_out_host_is_not_up_for_a_job_whatever_its_kind_and_power() {
-        let config = example_config();
-        let mut spec = config.jobs()[0].clone();
-        let snapshot = Snapshot::default();
-        let lock = |res: &str| Lease {
-            id: LeaseId::new("lockout-1"),
-            resource: res.into(),
-            kind: LeaseKind::Lockout,
-            granted_at: Millis(0),
-        };
-        // A job only needs a shared host in a validated config; the rule is by host, so it is
-        // also checked with a need on the exclusive host (hand-built).
-        for res in ["basestar-nfs", "cuda-central"] {
-            spec.needs = vec![sched_model::JobNeed::Nfs {
-                resource: res.into(),
-            }];
-            let mut state = SchedState::default();
-            state.resources.insert(
-                res.into(),
-                ResourceState::new(PowerPhase::On { since: Millis(1) }),
-            );
-            assert!(needs_up(&config, &snapshot, &state, &[], &spec), "{res}");
-            assert!(
-                !needs_up(&config, &snapshot, &state, &[lock(res)], &spec),
-                "{res}: locked out"
-            );
-            // A lockout of another host does not matter.
-            let other = if res == "basestar-nfs" {
-                "cuda-central"
-            } else {
-                "basestar-nfs"
-            };
-            assert!(needs_up(&config, &snapshot, &state, &[lock(other)], &spec));
-        }
-    }
-
-    #[test]
-    fn a_lockout_lease_on_a_resource_without_a_power_section_does_not_stop_a_job() {
-        // After a config reload took the NFS host's power section away it is always on: a
-        // lockout lease left in the book means nothing there (the sequencer reports it as
-        // unsupported), so a job needing it still starts.
-        let y = sched_model::test_support::EXAMPLE_CONFIG;
-        let marker = "  - id: basestar-nfs\n    kind: shared\n";
-        let start = y.find(marker).unwrap() + marker.len();
-        let end = y.find("\nmodels:").unwrap();
-        let y = format!("{}{}", &y[..start], &y[end..]).replace("    may_change_power: true\n", "");
-        let config = Config::from_yaml(&y).unwrap();
-        let spec = config.jobs()[0].clone();
-        let nfs = spec.needs[0].resource().clone();
-        assert!(!config.supports_lockout(&nfs));
-        let lock = Lease {
-            id: LeaseId::new("lockout-1"),
-            resource: nfs.clone(),
-            kind: LeaseKind::Lockout,
-            granted_at: Millis(0),
-        };
-        let mut state = SchedState::default();
-        state
-            .resources
-            .insert(nfs, ResourceState::new(PowerPhase::On { since: Millis(1) }));
-        assert!(needs_up(
-            &config,
-            &Snapshot::default(),
-            &state,
-            &[lock],
-            &spec
-        ));
-    }
-
-    #[test]
-    fn a_host_that_is_on_but_whose_shutdown_flowmanager_gave_up_on_is_not_up_for_a_job() {
-        let config = example_config();
-        let spec = config.jobs()[0].clone();
-        let nfs = spec.needs[0].resource().clone();
-        let snapshot = Snapshot::default();
-        let mut st = ResourceState::new(PowerPhase::On { since: Millis(1) });
-        let mut state = SchedState::default();
-        state.resources.insert(nfs.clone(), st.clone());
-        assert!(needs_up(&config, &snapshot, &state, &[], &spec), "on: up");
-        // Waiting for the mounts to go away is still up (a shutdown is merely held back).
-        st.shutdown = Some(Shutdown::idle_withdrawn(Millis(2)).vetoing(Millis(2)));
-        state.resources.insert(nfs.clone(), st.clone());
-        assert!(needs_up(&config, &snapshot, &state, &[], &spec));
-        // Stopped: the host is On, but flowmanager stopped managing it; a job does not start.
-        st.shutdown = Some(
-            Shutdown::idle_withdrawn(Millis(2))
-                .vetoing(Millis(2))
-                .stopped(Millis(3)),
-        );
-        state.resources.insert(nfs, st);
-        assert!(!needs_up(&config, &snapshot, &state, &[], &spec));
-    }
-}

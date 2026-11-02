@@ -67,7 +67,7 @@ fn state(yaml: &str) -> SchedState {
 }
 
 const IDLE: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n";
-const MANAGED_NFS: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 1 }\n";
+const MANAGED_NFS: &str = "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    basestar-nfs: { power: { phase: \"on\", since: 0, ours: true }, mode: { phase: idle }, idle_since: 1 }\n";
 
 const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
 const GPU_AND_NFS: [&str; 2] = ["cuda-central", "basestar-nfs"];
@@ -329,6 +329,7 @@ fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
         resource: ResourceId::new("basestar-nfs"),
         kind: sched_model::LeaseKind::ManualHost,
         granted_at: Millis(0),
+        origin: sched_model::LeaseOrigin::Requested,
     };
     // Only the probe reports on basestar-nfs; the cluster watch does not.
     let mut o: Vec<_> = authoritative(None)

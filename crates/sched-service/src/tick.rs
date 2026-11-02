@@ -502,9 +502,9 @@ impl Durable {
     pub fn apply(&mut self, outcome: &TickOutcome) {
         self.state = outcome.report.state.clone();
         self.reported = outcome.reported.clone();
+        self.leases = outcome.leases.clone();
         if !self.jobs_off {
             self.jobs = outcome.jobs.clone();
-            self.leases = outcome.leases.clone();
         }
     }
 }
@@ -832,7 +832,7 @@ impl Shared {
         // The scheduled jobs move first: their holds enter the lease book before the planner
         // looks at it, so a job that comes due is seen by the very tick that notices it. If
         // the stored job book was unreadable the step is skipped and nothing about jobs moves.
-        let (jobs, mut all_leases, job_events, creates) = if durable.jobs_off {
+        let (jobs, job_leases, job_events, creates) = if durable.jobs_off {
             (
                 durable.jobs.clone(),
                 durable.leases.clone(),
@@ -850,37 +850,18 @@ impl Shared {
             );
             (s.book, s.leases, s.events, s.creates)
         };
-        // Hosts found running are taken to be held by the user: a manual host lease is minted
-        // for each (before the planner looks, so this very tick sees it), and one that was
-        // minted for a host now seen down is dropped (it must not wake the host again). Both
-        // follow from the previous state and fresh readings alone. Skipped with the job step,
-        // when the lease book is not written back.
-        let (mut adopted, mut adoptions_ended) = (Vec::new(), Vec::new());
-        // The previous state this tick starts from: a host whose adopted lease ends because it
-        // was seen down is no longer ours (the person took it down), so a later power-on of
-        // theirs is found running and adopted afresh, while a host flowmanager powered on
-        // itself that merely blips down and back (managed stays true) is not.
-        let mut prev_state = durable.state.clone();
-        if !durable.jobs_off {
-            let gone = sched_sequencer::adopt::gone_down(&config, &snapshot, &all_leases);
-            adoptions_ended = all_leases
-                .iter()
-                .filter(|l| gone.contains(&l.id))
-                .map(|l| l.resource.clone())
-                .collect();
-            all_leases.retain(|l| !gone.contains(&l.id));
-            for r in &adoptions_ended {
-                if let Some(st) = prev_state.resources.get_mut(r) {
-                    st.managed = false;
-                    st.idle_since = None;
-                }
-            }
-            adopted =
-                sched_sequencer::adopt::found_running(&config, &snapshot, &prev_state, &all_leases);
-            for r in &adopted {
-                all_leases.push(sched_sequencer::adopt::adopted_lease(r, now));
-            }
-        }
+        // Ownership (`planning/power-model.md`, 2.1b): the sequencer decides which hosts found
+        // running are adopted (a manual host lease with origin `adopted`, before the planner
+        // looks, so this very tick sees it) and which adopted leases end because the host was
+        // seen down, and gives back the lease book and the previous state to use. This applies
+        // it; it edits nothing itself. It runs with an unreadable job book too: the lease book
+        // is stored either way (see `object::tick`).
+        let sched_sequencer::adopt::Adoption {
+            leases: all_leases,
+            prev: prev_state,
+            adopted,
+            ended: adoptions_ended,
+        } = sched_sequencer::adopt::adopt(&config, &snapshot, &durable.state, &job_leases, now);
         let (leases, ignored_leases) = leases::effective(&config, &all_leases);
         snapshot.leases = leases.clone();
         // Sources that can never report: nothing observes them in this build and, `observe`
@@ -1659,6 +1640,7 @@ mod tests {
                 model: "llm".into(),
             },
             granted_at: Millis(T0),
+            origin: sched_model::LeaseOrigin::Requested,
         }
     }
 
@@ -1814,6 +1796,7 @@ mod tests {
                         model: "gone".into(),
                     },
                     granted_at: Millis(T0),
+                    origin: sched_model::LeaseOrigin::Requested,
                 },
             ],
             ..Durable::default()
@@ -1890,8 +1873,8 @@ mod tests {
             "{r:?}"
         );
         let gpu = d.state.resource(&"cuda-central".into()).unwrap();
-        assert_eq!(gpu.power, sched_model::PowerPhase::Off);
-        assert!(!gpu.managed);
+        assert_eq!(gpu.power, sched_model::PowerPhase::Off { ours: false });
+        assert!(!gpu.ours());
     }
     #[test]
     fn a_tick_never_runs_before_an_observation_it_can_read() {
@@ -2202,8 +2185,11 @@ mod tests {
         let (s, clock) = shared_with(&sched_model::test_support::example_yaml_managed());
         let mut d = Durable::default();
         for (id, managed) in [("cuda-central", false), ("basestar-nfs", true)] {
-            let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
-            st.managed = managed;
+            let mut st = sched_model::ResourceState::new(PowerPhase::On {
+                since: Millis(1),
+                ours: false,
+            });
+            st.set_ours(managed);
             st.idle_since = managed.then_some(Millis(1));
             d.state.resources.insert(ResourceId::new(id), st);
         }
@@ -2341,8 +2327,11 @@ mod tests {
         let (s, clock) = shared_with(&sched_model::test_support::example_yaml_managed());
         let mut d = Durable::default();
         for (id, managed) in [("cuda-central", true), ("basestar-nfs", false)] {
-            let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
-            st.managed = managed;
+            let mut st = sched_model::ResourceState::new(PowerPhase::On {
+                since: Millis(1),
+                ours: false,
+            });
+            st.set_ours(managed);
             st.idle_since = managed.then_some(Millis(1));
             d.state.resources.insert(ResourceId::new(id), st);
         }
@@ -2705,12 +2694,12 @@ mod tests {
             "the planner saw it"
         );
         let st = d.state.resource(&nfs()).unwrap();
-        assert!(st.managed && st.is_on(), "{st:?}");
+        assert!(st.ours() && st.is_on(), "{st:?}");
         // The GPU host is `control: manual` in this fixture: never adopted.
         assert!(
             d.state
                 .resource(&"cuda-central".into())
-                .is_some_and(|s| !s.managed)
+                .is_some_and(|s| !s.ours())
         );
         // Once only.
         clock.advance(Millis(60_000));
@@ -2732,13 +2721,16 @@ mod tests {
             !r.steps.iter().any(|s| matches!(s, Step::PowerOn { .. })),
             "{r:?}"
         );
-        assert_eq!(d.state.resource(&nfs()).unwrap().power, PowerPhase::Off);
+        assert_eq!(
+            d.state.resource(&nfs()).unwrap().power,
+            PowerPhase::Off { ours: false }
+        );
         // Brought back: adopted afresh.
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert_eq!(r.adopted, vec![nfs()], "{r:?}");
-        assert!(d.state.resource(&nfs()).unwrap().managed);
+        assert!(d.state.resource(&nfs()).unwrap().ours());
     }
 
     #[test]
@@ -2746,13 +2738,13 @@ mod tests {
         let (s, clock) = managed_world();
         let mut d = Durable::default();
         let mut st = sched_model::ResourceState::new(PowerPhase::PoweringOn { since: Millis(1) });
-        st.managed = true;
+        st.set_ours(true);
         d.state.resources.insert(nfs(), st);
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(r.adopted.is_empty(), "{r:?}");
         assert!(d.leases.is_empty());
-        assert!(d.state.resource(&nfs()).unwrap().managed);
+        assert!(d.state.resource(&nfs()).unwrap().ours());
         // A restart: a new process with the persisted state and an empty cache.
         let (s2, clock2, d2) = restart_managed(&d);
         clock2.set(clock.now());
@@ -2809,7 +2801,7 @@ mod tests {
         };
         assert_eq!(host_lease(&d), 1, "{:?}", d.leases);
         let st = d.state.resource(&gpu()).unwrap();
-        assert!(st.managed && st.is_on(), "{st:?}");
+        assert!(st.ours() && st.is_on(), "{st:?}");
         // Once only.
         clock.advance(Millis(60_000));
         world(&s, Some(0));
@@ -2838,8 +2830,8 @@ mod tests {
         // is not adopted (its `managed` flag is still set).
         d.leases.retain(|l| l.resource != gpu());
         let st = d.state.resources.get_mut(&gpu()).unwrap();
-        st.power = PowerPhase::Off;
-        st.managed = true;
+        st.power = PowerPhase::Off { ours: false };
+        st.set_ours(true);
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
@@ -2855,6 +2847,7 @@ mod tests {
             resource: res.clone(),
             kind: sched_model::LeaseKind::Lockout,
             granted_at: Millis(0),
+            origin: sched_model::LeaseOrigin::Requested,
         };
         let (s, clock) = managed_world_all();
         let mut d = Durable::default();
@@ -2932,8 +2925,8 @@ mod tests {
         // The GPU host is down: queued work, a failed item and an interactive session do not
         // wake it.
         let off = || {
-            let mut st = sched_model::ResourceState::new(PowerPhase::Off);
-            st.managed = false;
+            let mut st = sched_model::ResourceState::new(PowerPhase::Off { ours: false });
+            st.set_ours(false);
             st
         };
         d.state.resources.insert(gpu(), off());
@@ -2951,6 +2944,7 @@ mod tests {
                 expires_at: Millis(clock.now().as_u64() + 3_600_000),
             },
             granted_at: clock.now(),
+            origin: sched_model::LeaseOrigin::Requested,
         });
         let r = s.tick(clock.now(), &mut d);
         assert!(
@@ -2968,6 +2962,7 @@ mod tests {
             resource: gpu(),
             kind: sched_model::LeaseKind::ManualHost,
             granted_at: clock.now(),
+            origin: sched_model::LeaseOrigin::Requested,
         });
         clock.advance(Millis(10_000));
         down(&s);
@@ -3020,20 +3015,15 @@ mod tests {
         assert!(r.drains.is_empty());
 
         let (s, clock, mut d) = adopted_with_work();
-        let mut core = crate::persist::CoreState {
-            state: d.state.clone(),
-            ..Default::default()
-        };
         let config = s.config.current();
-        let rec = crate::drain::request(
-            &mut core,
+        let rec = sched_sequencer::drain::request(
+            &mut d.state,
             &config,
             &nfs(),
             sched_model::DrainMode::Immediate,
             clock.now(),
         );
-        assert_eq!(rec, crate::drain::Requested::Recorded);
-        d.state = core.state;
+        assert_eq!(rec, sched_sequencer::drain::Requested::Recorded);
         let r = s.tick(clock.now(), &mut d);
         assert!(
             r.steps.contains(&Step::PowerOff { resource: nfs() }),
@@ -3061,7 +3051,10 @@ mod tests {
         world(&s2, Some(0));
         nfs_probe(&s2, false);
         let r = s2.tick(clock2.now(), &mut d2);
-        assert_eq!(d2.state.resource(&nfs()).unwrap().power, PowerPhase::Off);
+        assert_eq!(
+            d2.state.resource(&nfs()).unwrap().power,
+            PowerPhase::Off { ours: false }
+        );
         assert!(r.drains.is_empty(), "{r:?}");
         assert_eq!(d2.state.resource(&nfs()).unwrap().shutdown, None);
     }
@@ -3069,19 +3062,14 @@ mod tests {
     #[test]
     fn a_manual_lease_taken_during_a_drain_cancels_it() {
         let (s, clock, mut d) = adopted_with_work();
-        let mut core = crate::persist::CoreState {
-            state: d.state.clone(),
-            ..Default::default()
-        };
         let config = s.config.current();
-        crate::drain::request(
-            &mut core,
+        sched_sequencer::drain::request(
+            &mut d.state,
             &config,
             &nfs(),
             sched_model::DrainMode::Graceful,
             clock.now(),
         );
-        d.state = core.state;
         // Work is queued, nothing in flight: the graceful drain would scale down at once,
         // but a manual lease arrives first.
         d.leases.push(Lease {
@@ -3089,6 +3077,7 @@ mod tests {
             resource: nfs(),
             kind: sched_model::LeaseKind::ManualHost,
             granted_at: clock.now(),
+            origin: sched_model::LeaseOrigin::Requested,
         });
         let r = s.tick(clock.now(), &mut d);
         assert_eq!(d.state.resource(&nfs()).unwrap().shutdown, None);
@@ -3103,8 +3092,11 @@ mod tests {
     fn a_host_an_older_build_stored_as_on_and_unmanaged_is_adopted_once_unless_left_so_on_purpose()
     {
         let stored = |shutdown: Option<sched_model::Shutdown>, managed: bool| {
-            let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
-            st.managed = managed;
+            let mut st = sched_model::ResourceState::new(PowerPhase::On {
+                since: Millis(1),
+                ours: false,
+            });
+            st.set_ours(managed);
             st.shutdown = shutdown;
             let mut d = Durable::default();
             d.state.resources.insert(nfs(), st);
@@ -3116,7 +3108,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert_eq!(r.adopted, vec![nfs()], "{r:?}");
-        assert!(d.state.resource(&nfs()).unwrap().managed);
+        assert!(d.state.resource(&nfs()).unwrap().ours());
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
@@ -3154,14 +3146,14 @@ mod tests {
         assert!(r.adopted.is_empty() && d.leases.is_empty(), "{r:?}");
         // The state is stored as on and unmanaged all the same.
         let st = d.state.resource(&nfs()).unwrap();
-        assert!(st.is_on() && !st.managed);
+        assert!(st.is_on() && !st.ours());
         // The book is readable again: the host is adopted then.
         d.jobs_off = false;
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert_eq!(r.adopted, vec![nfs()], "{r:?}");
-        assert!(d.state.resource(&nfs()).unwrap().managed);
+        assert!(d.state.resource(&nfs()).unwrap().ours());
     }
 
     #[test]
@@ -3170,8 +3162,11 @@ mod tests {
         for with_drain in [false, true] {
             let (s, clock) = managed_world();
             let mut d = Durable::default();
-            let mut st = sched_model::ResourceState::new(PowerPhase::On { since: Millis(1) });
-            st.managed = true;
+            let mut st = sched_model::ResourceState::new(PowerPhase::On {
+                since: Millis(1),
+                ours: false,
+            });
+            st.set_ours(true);
             if with_drain {
                 st.shutdown = Some(sched_model::Shutdown::requested(
                     sched_model::DrainMode::Graceful,
@@ -3204,10 +3199,10 @@ mod tests {
             let r = s.tick(clock.now(), &mut d);
             assert_eq!(
                 d.state.resource(&nfs()).unwrap().power,
-                PowerPhase::Off,
+                PowerPhase::Off { ours: false },
                 "{r:?}"
             );
-            assert!(d.state.resource(&nfs()).unwrap().managed);
+            assert!(d.state.resource(&nfs()).unwrap().ours());
             clock.advance(Millis(10_000));
             world(&s, Some(0));
             let r = s.tick(clock.now(), &mut d);
@@ -3215,7 +3210,7 @@ mod tests {
                 r.adopted.is_empty() && d.leases.is_empty(),
                 "{with_drain}: {r:?}"
             );
-            assert!(d.state.resource(&nfs()).unwrap().managed);
+            assert!(d.state.resource(&nfs()).unwrap().ours());
             // The shutdown proceeds as before: after idle_grace (10m in the example), none
             // earlier.
             clock.advance(Millis(9 * 60_000));
@@ -3257,6 +3252,7 @@ mod tests {
                 holder: "backup".into(),
             },
             granted_at: clock.now(),
+            origin: sched_model::LeaseOrigin::Requested,
         });
         world(&s, Some(0));
         nfs_probe(&s, false);
@@ -3358,12 +3354,14 @@ mod tests {
                         holder: "backup".into(),
                     },
                     granted_at: clock.now(),
+                    origin: sched_model::LeaseOrigin::Requested,
                 }),
                 "manual" => d.leases.push(Lease {
                     id: "manual-host-1".into(),
                     resource: nfs(),
                     kind: sched_model::LeaseKind::ManualHost,
                     granted_at: clock.now(),
+                    origin: sched_model::LeaseOrigin::Requested,
                 }),
                 _ => ocr_demand(&s, 4),
             }
