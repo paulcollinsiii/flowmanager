@@ -973,3 +973,88 @@ async fn a_skip_run_that_waits_out_its_window_for_min_off_is_missed_and_the_host
     assert_eq!(w.counter("backup", "missed"), "1");
     assert!(w.kube.calls.lock().unwrap().is_empty());
 }
+
+impl World {
+    /// Locks `basestar-nfs` out (or clears it) through the handlers, and commits.
+    async fn lockout(&self, on: bool) {
+        let req = || object::ResourceRequest {
+            resource: "basestar-nfs".into(),
+        };
+        if on {
+            object::lockout(&self.shared, &self.ctx, req())
+                .await
+                .unwrap();
+        } else {
+            object::clear_lockout(&self.shared, &self.ctx, req())
+                .await
+                .unwrap();
+        }
+        self.ctx.commit();
+    }
+}
+
+#[tokio::test]
+async fn a_due_job_does_not_start_on_a_locked_out_host_that_is_up_and_waits_as_for_a_down_one() {
+    // catch_up (the example's backup): the host is up, but locked out.
+    let w = World::example();
+    w.tick(SUN + H, true, false).await;
+    w.lockout(true).await;
+    let r = w.tick(DUE, true, false).await;
+    assert!(r.job_events.is_empty(), "{r:?}");
+    assert!(w.kube.calls.lock().unwrap().is_empty(), "no Job is created");
+    // Waiting: the run's own hold only, inert under the lockout (the planner wants no power
+    // for a locked-out host and the lockout overrides holds).
+    assert_eq!(w.holds(), vec![hold()]);
+    for k in 1..=3 {
+        let r = w.tick(DUE + k * MIN, true, false).await;
+        assert!(r.job_events.is_empty(), "{r:?}");
+    }
+    // The catch-up rules apply as for a host that is not up: one alert at the end of the window.
+    let r = w.tick(DUE + 30 * MIN, true, false).await;
+    assert_eq!(kinds(&r), vec!["backup:start_late"]);
+    assert!(w.kube.calls.lock().unwrap().is_empty());
+    // Cleared: the catch-up run goes ahead (the host is up).
+    w.lockout(false).await;
+    let r = w.tick(DUE + 31 * MIN, true, false).await;
+    assert_eq!(
+        kinds(&r),
+        vec!["backup:started", "backup:caught_up"],
+        "{r:?}"
+    );
+    assert_eq!(w.kube.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_skip_job_on_a_locked_out_host_is_missed_at_the_end_of_its_window() {
+    let skip = EXAMPLE_CONFIG.replace("missed_run: catch_up", "missed_run: skip");
+    let w = World::new(&skip);
+    w.tick(SUN + H, true, false).await;
+    w.lockout(true).await;
+    w.tick(DUE, true, false).await;
+    assert_eq!(w.holds(), vec![hold()]);
+    let r = w.tick(DUE + 30 * MIN, true, false).await;
+    assert_eq!(kinds(&r), vec!["backup:missed"], "{r:?}");
+    assert!(w.holds().is_empty());
+    assert!(w.kube.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_job_already_running_when_the_lockout_arrives_keeps_running_and_keeps_its_hold() {
+    let mut w = World::example();
+    w.tick(SUN + H, true, false).await;
+    let r = w.tick(DUE, true, false).await;
+    assert_eq!(kinds(&r), vec!["backup:started"]);
+    w.lockout(true).await;
+    for k in 1..4 {
+        let r = w.tick(DUE + k * MIN, true, true).await;
+        assert!(r.job_events.is_empty(), "{r:?}");
+        // Not killed, no Job deleted or recreated, and the hold stays until the run ends;
+        // the lockout still shuts the host down (the veto waits for the job's pods).
+        assert_eq!(w.holds(), vec![hold()]);
+    }
+    assert_eq!(w.kube.calls.lock().unwrap().len(), 1);
+    w.states.insert(NAME.into(), JobRunState::Complete);
+    let r = w.tick(DUE + 5 * MIN, true, true).await;
+    assert_eq!(kinds(&r), vec!["backup:succeeded"]);
+    assert!(w.holds().is_empty());
+}
