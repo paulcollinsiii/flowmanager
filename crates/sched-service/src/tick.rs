@@ -363,6 +363,9 @@ pub struct Shared {
     /// Creates the Jobs of scheduled jobs; `None` until the binary sets one (jobs then fail to
     /// start, visibly, rather than being skipped).
     job_backend: std::sync::RwLock<Option<Arc<dyn sched_actuate::JobBackend>>>,
+    /// Test seam: makes the core refuse to decide, which cannot otherwise happen here.
+    #[cfg(test)]
+    refuse_to_decide: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -380,6 +383,8 @@ impl Shared {
             last_report: Mutex::new(None),
             power_failures: Mutex::new(BTreeMap::new()),
             job_backend: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            refuse_to_decide: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -581,6 +586,25 @@ impl Shared {
         self.cache().retain_sources(&config);
     }
 
+    /// The core: plan, then sequence. A test can make it refuse.
+    fn core(
+        &self,
+        config: &sched_model::Config,
+        snapshot: &sched_model::Snapshot,
+        state: &SchedState,
+    ) -> Result<(sched_model::Intent, sched_sequencer::Decision), crate::core::CoreError> {
+        #[cfg(test)]
+        if self.refuse_to_decide.load(Ordering::SeqCst) {
+            return Err(crate::core::CoreError::Tick(
+                sched_sequencer::TickError::GenerationMismatch {
+                    config: 0,
+                    snapshot: 1,
+                },
+            ));
+        }
+        decide(config, snapshot, state)
+    }
+
     /// Decides one tick at `now` from the cache and `durable`. Publishes nothing: see
     /// [`Shared::publish`]. The config handle is taken once, so the whole tick sees one
     /// generation.
@@ -702,7 +726,7 @@ impl Shared {
             events,
             power_request_failures,
             error,
-        ) = match decide(&config, &snapshot, &prev_state) {
+        ) = match self.core(&config, &snapshot, &prev_state) {
             Ok((intent, decision)) => {
                 // Power wishes of hosts under manual control are never acted on; the
                 // reason does not list them.
@@ -744,20 +768,33 @@ impl Shared {
                     None,
                 )
             }
-            // The previous state stays, and so does the previous publication. There is no
-            // decision to describe: no statuses and no events.
-            Err(e) => (
-                vec![reason::KIND_ERROR.to_string()],
-                format!("no decision: {e}"),
-                Vec::new(),
-                AllowedSet::default(),
-                prev_state.clone(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                self.power_request_failures(&prev_state),
-                Some(e.to_string()),
-            ),
+            // The previous state stays, and so does the previous publication. Nothing was
+            // decided: the statuses describe the carried state at this tick's time, with no
+            // wait (no steps) and no events (nothing became true).
+            Err(e) => {
+                let (hosts, _) = status::derive(&Decided {
+                    config: &config,
+                    snapshot: &snapshot,
+                    prev: &prev_state,
+                    next: &prev_state,
+                    steps: &[],
+                    now,
+                    adopted: &[],
+                    ended: &[],
+                });
+                (
+                    vec![reason::KIND_ERROR.to_string()],
+                    format!("no decision: {e}"),
+                    Vec::new(),
+                    AllowedSet::default(),
+                    prev_state.clone(),
+                    Vec::new(),
+                    hosts,
+                    Vec::new(),
+                    self.power_request_failures(&prev_state),
+                    Some(e.to_string()),
+                )
+            }
         };
         let report = TickReport {
             config_generation: config.generation(),
@@ -821,11 +858,9 @@ impl Shared {
         self.metrics.set_input_ages(&ages);
         self.metrics.set_phases(r.at, &r.state);
         self.metrics.set_manual_lease_ages(r.at, &r.leases);
-        // The per-host gauges come from the statuses; a failed tick has none, and the gauges
-        // keep what the last decided tick set.
-        if r.error.is_none() {
-            self.metrics.set_host_gauges(&r.hosts);
-        }
+        // The per-host gauges come from the statuses (a failed tick's are those of the carried
+        // state).
+        self.metrics.set_host_gauges(&r.hosts);
         if !replayed {
             for event in &r.events {
                 match event {
@@ -2434,8 +2469,163 @@ mod tests {
         assert_eq!(back, r);
     }
 
+    /// A shared and an exclusive host in the given carried states, the example config with a
+    /// `min_off` of 10 minutes, and a core that refuses to decide.
+    fn failing_core(
+        nfs: sched_model::ResourceState,
+        gpu: sched_model::ResourceState,
+    ) -> (Arc<Shared>, Arc<ManualClock>, Durable) {
+        let yaml = sched_model::test_support::example_yaml_managed()
+            .replace("      # min_off: 10m", "      min_off: 10m");
+        let (s, clock) = shared_with(&yaml);
+        let mut d = Durable::default();
+        d.state
+            .resources
+            .insert(ResourceId::new("basestar-nfs"), nfs);
+        d.state
+            .resources
+            .insert(ResourceId::new("cuda-central"), gpu);
+        clock.set(Millis(T0));
+        world(&s, Some(0));
+        s.refuse_to_decide.store(true, Ordering::SeqCst);
+        (s, clock, d)
+    }
+
     #[test]
-    fn a_failed_tick_has_no_statuses_and_no_events() {
+    fn a_failed_tick_still_says_what_a_person_must_attend_to() {
+        use crate::toggle::{lockout_state, model_state, resource_state};
+        let mut nfs = sched_model::ResourceState::new(PowerPhase::On {
+            since: Millis(1),
+            ours: true,
+        });
+        nfs.shutdown = Some(
+            sched_model::Shutdown::idle_without_consumers(Millis(2))
+                .vetoing(Millis(3))
+                .stopped(Millis(4)),
+        );
+        let gpu = sched_model::ResourceState::new(PowerPhase::Failed {
+            since: Millis(5),
+            during: PowerTransition::ShuttingDown,
+        });
+        let (s, _, mut d) = failing_core(nfs, gpu);
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        assert!(r.error.is_some(), "{r:?}");
+        // Nothing became true: no events, and nothing counted.
+        assert!(r.events.is_empty(), "{:?}", r.events);
+        let text = s.metrics.render();
+        assert!(!text.contains("sched_power_timeouts_total{"), "{text}");
+        assert!(!text.contains("sched_veto_timeouts_total{"), "{text}");
+        assert_eq!(r.hosts.len(), 2);
+        let (nfs, gpu): (ResourceId, ResourceId) = ("basestar-nfs".into(), "cuda-central".into());
+        let config = s.config.current();
+        let now = Millis(T0 + 1_000);
+        let v = resource_state(&config, &nfs, None, false, None, &Some(r.clone()), now);
+        assert_eq!(v["needs_attention"], true, "{v}");
+        assert_eq!(v["power"]["phase"], "on", "{v}");
+        assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_veto", "{v}");
+        assert_eq!(v["wait"][0]["stopped"], true, "{v}");
+        let v = resource_state(&config, &gpu, None, false, None, &Some(r.clone()), now);
+        assert_eq!(v["needs_attention"], true, "{v}");
+        assert_eq!(v["power"]["phase"], "failed", "{v}");
+        // The status words of a switch read the carried state, not "no state yet".
+        let lease = |id: &str, kind| sched_model::Lease {
+            id: id.into(),
+            resource: "cuda-central".into(),
+            kind,
+            granted_at: Millis(1),
+            origin: sched_model::LeaseOrigin::Requested,
+        };
+        let model = lease(
+            "m",
+            sched_model::LeaseKind::ManualModel {
+                model: "llm".into(),
+            },
+        );
+        let mut rep = r.clone();
+        rep.leases.push(model.clone());
+        let v = model_state(
+            &"llm".into(),
+            &gpu,
+            Some(&model),
+            Some(false),
+            &Some(rep),
+            now,
+        );
+        assert_eq!(v["status"], "host_failed", "{v}");
+        // A host that is powering on waits; one that is off is powered off under a lockout.
+        let waiting = sched_model::ResourceState::new(PowerPhase::PoweringOn { since: Millis(1) });
+        let off = sched_model::ResourceState::new(PowerPhase::Off { ours: false });
+        let (s, _, mut d) = failing_core(off, waiting);
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        let mut rep = r.clone();
+        rep.leases.push(model.clone());
+        let v = model_state(
+            &"llm".into(),
+            &gpu,
+            Some(&model),
+            Some(false),
+            &Some(rep),
+            now,
+        );
+        assert_eq!(v["status"], "waiting_for_host", "{v}");
+        let lock = lease("l", sched_model::LeaseKind::Lockout);
+        let mut lock_nfs = lock.clone();
+        lock_nfs.resource = nfs.clone();
+        let mut rep = r;
+        rep.leases.push(lock_nfs.clone());
+        let v = lockout_state(&config, &nfs, Some(&lock_nfs), &Some(rep), now);
+        assert_eq!(v["status"], "powered_off", "{v}");
+    }
+
+    #[test]
+    fn a_failed_tick_keeps_the_min_off_gauge_counting_down() {
+        let mut nfs = sched_model::ResourceState::new(PowerPhase::Off { ours: false });
+        nfs.off_since = Some(Millis(T0 - 4 * 60_000));
+        // Managed and with a minimum: counted. The GPU host has none configured.
+        let gpu = sched_model::ResourceState::new(PowerPhase::Off { ours: false });
+        let (s, _, mut d) = failing_core(nfs, gpu);
+        let gauge = |s: &Shared| {
+            s.metrics
+                .render()
+                .lines()
+                .find(|l| l.starts_with("sched_resource_min_off_remaining_seconds{"))
+                .map(|l| l.to_string())
+        };
+        let r = s.tick(Millis(T0), &mut d);
+        assert!(r.error.is_some());
+        assert_eq!(
+            gauge(&s).as_deref(),
+            Some("sched_resource_min_off_remaining_seconds{resource=\"basestar-nfs\"} 360")
+        );
+        let r = s.tick(Millis(T0 + 60_000), &mut d);
+        assert!(r.error.is_some());
+        assert_eq!(
+            gauge(&s).as_deref(),
+            Some("sched_resource_min_off_remaining_seconds{resource=\"basestar-nfs\"} 300")
+        );
+        // No wait from a step (there are none), though the gauge is a level.
+        assert!(r.host(&"basestar-nfs".into()).unwrap().wait.is_none());
+    }
+
+    #[test]
+    fn a_failed_tick_recomputes_the_veto_gauge_from_the_carried_state_and_this_snapshot() {
+        let (s, clock, mut d) = due_nfs();
+        world(&s, Some(2));
+        s.tick(Millis(T0 + 1_000), &mut d);
+        assert_eq!(veto_gauge(&s, "waiting"), "1");
+        // The pods are gone, but the core refuses: the carried shutdown still waits, and no
+        // reading blocks it any more.
+        clock.set(Millis(T0 + 2_000));
+        world(&s, Some(0));
+        s.refuse_to_decide.store(true, Ordering::SeqCst);
+        let r = s.tick(Millis(T0 + 2_000), &mut d);
+        assert!(r.error.is_some());
+        assert_eq!(veto_gauge(&s, "waiting"), "0");
+        assert!(r.events.is_empty());
+    }
+
+    #[test]
+    fn a_report_without_a_state_has_no_statuses() {
         let (s, _) = shared();
         let r = s.state_error(
             Millis(T0),
@@ -2444,40 +2634,6 @@ mod tests {
         assert!(r.error.is_some());
         assert!(r.hosts.is_empty() && r.events.is_empty(), "{r:?}");
         assert!(r.power_request_failures.is_empty());
-        // Its published form leaves the gauges the last decided tick set.
-        s.publish(
-            &TickOutcome {
-                report: r,
-                reported: BTreeSet::new(),
-                jobs: JobBook::default(),
-                leases: vec![],
-                creates: vec![],
-                duration_us: 0,
-            },
-            false,
-        );
-        assert!(s.published_allowed().is_none());
-    }
-
-    #[test]
-    fn a_failed_tick_leaves_the_host_gauges_as_the_last_decided_tick_set_them() {
-        let (s, _, mut d) = due_nfs();
-        world(&s, Some(2));
-        s.tick(Millis(T0 + 1_000), &mut d);
-        assert_eq!(veto_gauge(&s, "waiting"), "1");
-        let failed = s.state_error(Millis(T0 + 2_000), &[("k".to_string(), "p".to_string())]);
-        s.publish(
-            &TickOutcome {
-                report: failed,
-                reported: BTreeSet::new(),
-                jobs: JobBook::default(),
-                leases: vec![],
-                creates: vec![],
-                duration_us: 0,
-            },
-            false,
-        );
-        assert_eq!(veto_gauge(&s, "waiting"), "1");
     }
 
     #[test]
