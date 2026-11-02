@@ -886,6 +886,9 @@ fn switch(
         json!(if held.is_some() { "on" } else { "off" }),
     );
     if let Some(l) = held {
+        // Who made the lease: a host lease flowmanager minted for a host it found running is
+        // `adopted` (it ends when the host is seen down); every other is `requested`.
+        m.insert("origin".into(), json!(l.origin.as_str()));
         m.insert("held_since_ms".into(), json!(l.granted_at.as_u64()));
         m.insert(
             "held_for_seconds".into(),
@@ -1802,6 +1805,8 @@ mod tests {
             (s, &v["held"], &v["resource_kind"]),
             (200, &json!(true), &json!("shared"))
         );
+        // A person's lease reads as requested, never adopted.
+        assert_eq!(v["origin"], json!("requested"), "{v}");
         assert_eq!(r.post("/v1/resources/basestar-nfs", "on").await.0, 200);
         assert_eq!(r.lease_count(), 1);
         assert_eq!(
@@ -1870,6 +1875,7 @@ mod tests {
             (200, &json!(true), &json!("on")),
             "{v}"
         );
+        assert_eq!(v["origin"], json!("adopted"), "{v}");
         let drain = |r: &Rig| {
             let core = crate::persist::decode_state(
                 r.backend.ctx.stored(crate::persist::STATE_KEY).as_deref(),

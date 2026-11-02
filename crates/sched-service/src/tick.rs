@@ -3089,8 +3089,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_that_is_up_and_not_ours_is_adopted_once_unless_ours_or_stopped_by_the_veto()
-    {
+    fn a_host_that_is_up_and_not_ours_is_adopted_once_unless_ours_or_stopped_by_the_veto() {
         let stored = |shutdown: Option<sched_model::Shutdown>, managed: bool| {
             let mut st = sched_model::ResourceState::new(PowerPhase::On {
                 since: Millis(1),

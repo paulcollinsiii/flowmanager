@@ -22,6 +22,8 @@ use crate::persist;
 use crate::power::PowerAction;
 use crate::tick::{Shared, TickReport};
 
+mod ownership;
+
 const MIN: u64 = 60_000;
 const H: u64 = 60 * MIN;
 const D: u64 = 24 * H;
