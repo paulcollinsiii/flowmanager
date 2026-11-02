@@ -255,8 +255,12 @@ fn wait_text(reason: WaitReason) -> &'static str {
         WaitReason::StaleDemand => {
             "a demand observation needed to prove no work is in flight is missing or stale"
         }
-        WaitReason::LockedOut => "the resource is locked out",
-        WaitReason::LockoutUnsupported => "a lockout names a resource that cannot be locked out",
+        WaitReason::LockedOut => {
+            "the resource is locked out: flowmanager keeps away from it until the lockout is cleared"
+        }
+        WaitReason::LockoutUnsupported => {
+            "a lockout names a resource without a power section, which cannot be locked out"
+        }
         WaitReason::HostNotUp => "the host is not up",
         WaitReason::PoweringOn => "the host is powering on",
         WaitReason::ShuttingDown => "the host is shutting down",

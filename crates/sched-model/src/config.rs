@@ -342,7 +342,8 @@ pub struct PolicyConfig {
     pub interactive_ttl: Millis,
     /// How long in-flight jobs may run after a manual model lease cuts batch work short.
     pub drain_timeout: Millis,
-    /// How long in-flight jobs may run after a lockout. Defaults to `drain_timeout`.
+    /// How long in-flight jobs may run after a lockout, on a shared or an exclusive host.
+    /// Defaults to `drain_timeout`.
     #[serde(default)]
     pub lockout_timeout: Option<Millis>,
 }

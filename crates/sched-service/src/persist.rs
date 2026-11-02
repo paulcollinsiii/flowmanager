@@ -235,6 +235,14 @@ mod tests {
         // Version 2 stored a shutdown cause `reclaim` and a wind-down flag `reclaim`.
         let v2 = br#"{"version":2,"data":{"state":{"resources":{"b":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"shutdown":{"cause":{"kind":"reclaim"},"since":1,"withdrawal":"not_needed","veto":{"phase":"none"}}}}},"reported":["x"]}}"#;
         assert_eq!(decode_state(Some(v2)).unwrap(), CoreState::default());
+        // The lease book is not versioned away: a stored `reclaim` lease (kind renamed
+        // `lockout` in phase 4a, no alias) is an error until it is cleared.
+        let reclaim_lease = br#"{"version":1,"data":{"next":1,"leases":[{"id":"reclaim-1","resource":"cuda-central","kind":{"type":"reclaim"},"granted_at":1}]}}"#;
+        assert!(decode_leases(Some(reclaim_lease)).is_err());
+        let renamed = String::from_utf8_lossy(reclaim_lease)
+            .replace("reclaim", "lockout")
+            .into_bytes();
+        assert!(decode_leases(Some(&renamed)).is_ok());
         // Only the sequencer state is treated so: the other documents stay strict.
         assert!(decode_leases(Some(br#"{"version":0,"data":{}}"#)).is_err());
     }

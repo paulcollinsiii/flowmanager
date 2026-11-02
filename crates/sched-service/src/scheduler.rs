@@ -17,8 +17,8 @@
 //!   and bumps an epoch kept in the object's state, so a chain started earlier (before a
 //!   restart, say) sees a stale epoch and ends instead of doubling the ticks.
 //! - `acquire_host_lease` / `release_host_lease`: a manual lease on a host with a power section (an NFS
-//!   server, or a GPU host): it powers a managed host on and keeps it up. `lockout` / `clear_lockout`: take an
-//!   exclusive resource with a power section back, and give it up again. `resume`: for a
+//!   server, or a GPU host): it powers a managed host on and keeps it up. `lockout` / `clear_lockout`: lock a
+//!   host with a power section out (shared or exclusive), and clear it again. `resume`: for a
 //!   person who fixed a host by hand, clears what flowmanager stopped at on one resource (a
 //!   failed power transition, or a shutdown stopped by mounting pods) so it follows
 //!   observation again. Like the lease handlers they are reachable through the ingress, which
@@ -357,11 +357,11 @@ impl Scheduler {
         ))
     }
 
-    /// Lockouts an exclusive resource with a power section: intake stops, its work is cut
-    /// off after the lockout timeout, the host is shut down (if its power is managed) and it
-    /// is not woken until `clear_lockout`. Asking again returns the same lease; a resource that
-    /// cannot be locked out (shared, or without a power section) or an unknown one is refused
-    /// (400).
+    /// Locks out a resource with a power section (shared or exclusive): intake stops, its work
+    /// is cut off after the lockout timeout, the host is shut down once (if its power is
+    /// managed) and nothing wakes, adopts or schedules it until `clear_lockout`. Asking again
+    /// returns the same lease; a resource without a power section or an unknown one is
+    /// refused (400).
     #[handler]
     async fn lockout(
         &self,

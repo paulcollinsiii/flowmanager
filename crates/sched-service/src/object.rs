@@ -387,7 +387,7 @@ pub async fn acquire_host_lease<C: ObjectCtx>(
     .await
 }
 
-/// Lockouts an exclusive resource (see `LeaseBook::acquire_lockout`).
+/// Locks out a host with a power section (see `LeaseBook::acquire_lockout`).
 pub async fn lockout<C: ObjectCtx>(
     shared: &Arc<Shared>,
     ctx: &C,

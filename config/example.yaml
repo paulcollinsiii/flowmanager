@@ -16,6 +16,9 @@ policy:
   # except a busy `none` class) is cut off this long after the wind-down starts, unless a
   # class sets its own kill_timeout. Cutting off means the model is withdrawn.
   drain_timeout: 10m
+  # How long in-flight work may run after a lockout (on any host, shared or exclusive) before
+  # it is cut off. Defaults to drain_timeout. (Called reclaim_timeout before phase 4a.)
+  # lockout_timeout: 10m
 
 resources:
   - id: cuda-central
@@ -40,7 +43,9 @@ resources:
       # (acquire_host_lease), a manual model lease, or a class with may_change_power: queued
       # work never wakes it. A host lease keeps it up and pins no model (the queues still
       # choose); releasing it is a plain release (no drain): once idle the model is withdrawn
-      # and idle_grace later the host is shut down. A lockout is the forced "off now". A host
+      # and idle_grace later the host is shut down. `off` / `off-now` (release_host_lease with a
+      # drain, drain_host) take it down despite queued work, as for a shared host, and a lockout
+      # (lockout_timeout) takes it down and keeps flowmanager away from it until cleared. A host
       # found running is adopted like a shared one (held by the user until released).
       control: manual
       # Under managed control, how long the host may take to be observed up after a

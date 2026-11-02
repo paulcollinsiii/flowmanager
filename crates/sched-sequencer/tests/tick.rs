@@ -4372,3 +4372,28 @@ fn a_lockout_on_a_manual_host_withdraws_the_consumers_but_never_powers_it_off() 
         "nothing is ever settled without managed control"
     );
 }
+
+#[test]
+fn a_lockout_on_a_resource_without_a_power_section_is_ignored_and_reported() {
+    // A config reload can take the power section away from a locked-out host: the lease
+    // stays in the book, and the sequencer says it does nothing.
+    let y = managed_yaml();
+    let marker = "  - id: basestar-nfs\n    kind: shared\n";
+    let start = y.find(marker).unwrap() + marker.len();
+    let end = y.find("\nmodels:").unwrap();
+    let y = format!("{}{}", &y[..start], &y[end..]).replace("    may_change_power: true\n", "");
+    assert_ne!(y, managed_yaml());
+    let mut c = lockout_nfs(Case::new()).lease(lease_on("r", N, "{ type: lockout }"));
+    c.config = Config::from_yaml(&y).unwrap();
+    let d = c.run();
+    assert!(
+        d.steps.contains(&wait(N, WaitReason::LockoutUnsupported)),
+        "{:?}",
+        d.steps
+    );
+    assert!(!d.steps.contains(&Step::PowerOff { resource: rid(N) }));
+    assert!(
+        ngx_allowed(&d),
+        "an always-on resource's consumers keep running"
+    );
+}

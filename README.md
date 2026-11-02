@@ -604,7 +604,7 @@ harmless to repeat).
   host under `control: managed` that means it is **adopted** (see *Host leases, lockout and
   resume*): a manual host lease is minted, which takes responsibility for the host, and
   releasing it (plus the idle grace) powers the host off. Any other found-running host is
-  powered off only by an explicit lockout, or a manual lease that is held and then released.
+  powered off only by an explicit `off` / `off-now` or lockout, or a manual lease that is held and then released.
   The timeouts are measured on the wall clock only, with no fresh reading required, so a
   scheduler restart or a long outage can raise the alert before a fresh reading could show
   the host in the state wanted (a known trade-off; the failed phase then clears on that
@@ -724,8 +724,8 @@ counted under `unknown`).
 | `acquire_model_lease` | yes | Acquires a manual model lease. |
 | `release_lease` | yes | Releases a lease by id. |
 | `acquire_host_lease` | yes | Acquires a manual lease on a host with a power section, shared or exclusive (`{"resource": "basestar-nfs"}`). |
-| `release_host_lease` | yes | Releases the manual host lease of a resource (`{"resource": ...}`); with `"drain": "graceful"` or `"immediate"` it also takes a shared host down despite queued work (see *Host leases*; refused for an exclusive host, whose release is always plain). |
-| `lockout` | yes | Lockouts an exclusive resource with a power section (`{"resource": "cuda-central"}`). |
+| `release_host_lease` | yes | Releases the manual host lease of a resource (`{"resource": ...}`); with `"drain": "graceful"` or `"immediate"` it also takes the host (shared or exclusive) down despite queued work (see *Host leases*). |
+| `lockout` | yes | Locks out a resource with a power section, shared or exclusive (`{"resource": "cuda-central"}`). |
 | `jobs` | yes (shared) | Every configured scheduled job with its state (see *Scheduled jobs*). |
 | `trigger_job` | yes | Starts a run of a scheduled job now (`{"id": "backup"}`); `409` while the previous instance is pending or running, `404` for an unknown job. |
 | `clear_lockout` | yes | Releases the lockout of a resource (`{"resource": ...}`). |
@@ -803,12 +803,16 @@ trusted network.
   it up: the queues still choose the model, nothing is pinned (a manual *model* lease pins one).
   Nothing else powers an exclusive managed host on except a manual host or model lease or a class
   with `may_change_power`: queued work, failed items, an interactive session and a job whose needs
-  are on a shared host leave it down. Releasing is always a plain release: there is no drain on an
-  exclusive host (`release_host_lease` with `drain`, and `drain_host`, are refused with `400`),
-  queued or in-flight work holds the host until it is idle, and `idle_grace` after the model is
-  withdrawn it is shut down. The forced "off now" for a GPU is the lockout. The shutdown happens
-  only with the mode idle (the model already withdrawn, so KEDA is scaling its pods down), and
-  there is no further wait for the pods to be gone: the only delay between the two is `idle_grace`.
+  are on a shared host leave it down. A plain release (`release_host_lease` without `drain`)
+  leaves queued or in-flight work holding the host until it is idle, and `idle_grace` after the
+  model is withdrawn it is shut down. `release_host_lease` with `drain`, and `drain_host`, work
+  on an exclusive host as on a shared one (the same `off` / `off-now` vocabulary on every host
+  with a power section): the host is asked to go down despite queued work, and the model is
+  wound down by the mode machine (graceful: in-flight work gets exactly `drain_timeout` from
+  the request; immediate: at once; a busy unpreemptible class does not hold it), then the
+  veto and the power-off. The shutdown happens only with the mode idle (the model already
+  withdrawn, so KEDA is scaling its pods down); an idle shutdown has no further wait for the
+  pods to be gone beyond the veto: the only other delay is `idle_grace`.
 - **A host found running is adopted** (a changed default: it used to be left alone for ever,
   so a host switched on by hand stayed up until a person shut it down). For a host (shared or exclusive) with
   `power.control: managed`, when a fresh reading shows it up and flowmanager did not power it
@@ -897,11 +901,23 @@ trusted network.
 - **A manual model lease on a host that is off** already wakes a managed host (the planner
   asks for the power of any resource a manual lease names), and the model is allowed once the
   host is observed up; there is no separate GPU lease.
-- **Lockout** (`lockout` / `clear_lockout`): the existing `Lockout` lease, for an exclusive
-  resource with a power section only (`400` otherwise, as for any resource it cannot apply
-  to). Until released, intake stops, in-flight work gets `lockout_timeout` and is then cut
-  off, the model is withdrawn, a `managed` host is shut down (a `manual` one is left for a
-  person) and it is not woken. Ids are `lockout-<n>`; asking again returns the lease.
+- **Lockout** (`lockout` / `clear_lockout`; called reclaim before phase 4a): "flowmanager,
+  keep away from this host until I clear it". Valid on any resource with a power section,
+  shared or exclusive (`400` otherwise). Until cleared, intake stops, in-flight work gets
+  `lockout_timeout` (`policy.lockout_timeout`, default `drain_timeout`) and is then cut off (an
+  exclusive host's model is wound down; a shared host's consumers are scaled down, as in a
+  drain), then the usual veto and the power-off, whatever holds the host: a job's hold, a
+  manual or adopted lease (the lease is neither cancelled nor deleted by a lockout; it simply
+  wants nothing while the lockout stands) or queued work. A `manual`-control host is left for a
+  person to power off. Nothing wakes or schedules a locked-out host: no workload, job hold or
+  lease. **The lockout shuts the host down once.** After the host has been seen off under it
+  (also a lockout taken while the host was already off), flowmanager leaves it alone: if
+  something else boots it (another OS, physical work) it is not powered off again, not
+  adopted and not given work (`wait ... locked_out`; `locked_down` in its stored state),
+  until the lockout is cleared. Clearing it while the host is up makes it a host found
+  running (adopted, as above); while it is off, the host is woken only if something wants it,
+  a manual lease included. On basestar a lockout deliberately blocks the backup job. Ids are
+  `lockout-<n>`; asking again returns the lease.
 - **`resume`**: for a person who has fixed a host by hand. It applies to a resource in the
   failed power phase, or whose shutdown was stopped by mounting pods, and forgets that
   resource's state so the sequencer starts it afresh from observation, as for a resource it
@@ -942,10 +958,10 @@ CA); the token and the network policy are the controls. Open WebUI itself is not
 
 | Request | Meaning |
 | --- | --- |
-| `GET /v1/leases` | every model, powered resource and lockoutable resource with its state, and `needs_attention` |
+| `GET /v1/leases` | every model, powered resource and (under `lockouts`) every resource with a power section with its state, and `needs_attention` |
 | `GET /v1/models/{model}`, `POST .../on`, `.../off` | the manual model lease (on = held, not "loaded") |
-| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release`, `POST .../resume` | the manual host lease (a host found running reads on, see *adopted*); on a shared host `off` releases it with a graceful drain and `off-now` with an immediate one; on an exclusive host `off` is a plain release and `off-now` is refused (`400`); `release` plainly with no drain (`404` if none is held; the reply reads `on` while the host is up); `resume` clears a stopped power phase |
-| `GET /v1/lockouts/{resource}`, `POST .../on`, `.../off` | `lockout` / `clear_lockout` of an exclusive resource with a power section |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release`, `POST .../resume` | the manual host lease (a host found running reads on, see *adopted*); on every host, shared or exclusive, `off` releases it with a graceful requested shutdown and `off-now` with an immediate one; `release` plainly with no drain (`404` if none is held; the reply reads `on` while the host is up); `resume` clears a stopped power phase |
+| `GET /v1/lockouts/{resource}`, `POST .../on`, `.../off` | `lockout` / `clear_lockout` of a resource with a power section (replaces `/v1/reclaims/{resource}`) |
 
 `POST /v1/<kind>/{name}` with the body `ON` or `OFF` is the same as `/on` and `/off`. On and
 off are idempotent (off when not held is a success), and nobody sees a lease id. Each request
@@ -955,7 +971,7 @@ with its status (`400` unsuitable resource, `409` another model leased or nothin
 `404` unknown name or path; a `404` from Restate is a `502`, never an answer). The token is checked
 before a body is read. A state read has `held` and `state`, and, when the last tick's report
 supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draining`, `locked out`,
-`host_failed`, `pending`; a lockout also `left_for_person` on a `control: manual` host), `power`,
+`host_failed`, `pending`; a lockout also `left_for_person` on a `control: manual` host, and `left_alone` for a host that booted after the lockout shut it down), `power`,
 `wait` and `needs_attention` (the failed power phase or mounts-stopped shutdown also seen in
 `sched_resource_power_failed` and `sched_resource_veto`); a field that cannot be derived is
 left out. Every on/off/resume request and every refused request logs one `event="toggle"` line
