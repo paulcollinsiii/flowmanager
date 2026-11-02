@@ -4469,3 +4469,51 @@ fn a_lockout_taking_over_a_withdrawn_drain_keeps_it_withdrawn_and_makes_it_its_o
         assert!(!ngx_allowed(&d), "{name}");
     }
 }
+
+#[test]
+fn a_lockout_takes_over_a_requested_shutdown_of_an_exclusive_host_and_clearing_it_drops_the_request()
+ {
+    let c = || {
+        Case::new()
+            .gpu_state(&gpu_requested(
+                &serving("mineru", 20 * MIN),
+                "graceful",
+                9 * MIN,
+                "pending",
+            ))
+            .obs(pods("mineru", 1, 1, 0))
+            .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+    };
+    // Locked out while a graceful request is 9 minutes old: the shutdown is the lockout's,
+    // from this tick, and the model is still wound down (nothing is killed yet: in-flight
+    // work gets lockout_timeout from the takeover).
+    let d = with_lockout_timeout(c().lockout()).run();
+    let s = shutdown_of(&d, G).unwrap();
+    assert!(s.is_lockout(), "{s:?}");
+    assert_eq!(s.since(), sched_model::Millis(T));
+    assert!(!d.steps.contains(&kill("paperless-ocr")), "{:?}", d.steps);
+    // Cleared: the request does not outlive the lockout.
+    let d2 = c().run_at(&d.state, T + MIN);
+    assert!(shutdown_of(&d2, G).is_none(), "{:?}", shutdown_of(&d2, G));
+    assert!(!d2.steps.contains(&Step::PowerOff { resource: rid(G) }));
+    // An immediate request whose withdrawal is pending stays the person's.
+    let imm = Case::new()
+        .gpu_state(&gpu_requested(
+            &serving("mineru", 20 * MIN),
+            "immediate",
+            1,
+            "pending",
+        ))
+        .obs(pods("mineru", 1, 1, 0))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 2, 1, 0))
+        .lockout();
+    let d = imm.run();
+    assert!(
+        matches!(
+            shutdown_of(&d, G).unwrap().cause(),
+            sched_model::ShutdownCause::Requested { .. }
+        ),
+        "{:?}",
+        shutdown_of(&d, G)
+    );
+}

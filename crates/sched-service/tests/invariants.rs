@@ -177,6 +177,33 @@ fn powering_off_a_locked_out_shared_host_needs_its_withdrawal_and_the_lockout_ti
 }
 
 #[test]
+fn a_withdrawal_already_done_before_the_tick_needs_no_new_lockout_wait() {
+    // Work in flight, the lockout (re)started a second ago, and the withdrawal was already
+    // done in the previous state (a drain the lockout took over): the power-off is fine. The
+    // same decision from a withdrawal still pending is the violation above.
+    let mut obs = zero_pods_and_up(&["basestar-nfs"]);
+    obs.extend(idle_demand().into_iter().filter(|o| {
+        !matches!(&o.value, sched_model::ObservedValue::Demand { class, .. } if class.as_str() == "paperless-ocr")
+    }));
+    obs.push(busy("paperless-ocr", "paperless-ocr-pending"));
+    obs.push(nfs_mounts_zero());
+    let s = snap(obs, nfs_leases_under_lockout());
+    let decision = || Decision {
+        steps: vec![power_off("basestar-nfs")],
+        allowed: Default::default(),
+        state: nfs_lockout_shutdown("done", NOW - 1000),
+    };
+    let v = check_with(&s, &nfs_lockout_shutdown("done", NOW - 5000), &decision());
+    assert!(v.is_empty(), "{v:?}");
+    let v = check_with(
+        &s,
+        &nfs_lockout_shutdown("pending", NOW - 5000),
+        &decision(),
+    );
+    assert!(v.iter().any(|m| m.contains("lockout_timeout")), "{v:?}");
+}
+
+#[test]
 fn a_locked_out_host_seen_off_under_the_lockout_is_never_powered_on_or_off_again() {
     for (res, state) in [
         (

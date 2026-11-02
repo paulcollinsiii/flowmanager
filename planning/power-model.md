@@ -158,6 +158,21 @@ it off. Clearing the lockout returns the host to the normal model: it is woken o
 something wants it. On basestar it deliberately blocks the backup job (for a physical move,
 say): a due run does not start while the host is locked out, up or not (it waits as for a host that is not up, so its `missed_run` rules apply); a run already in progress is not killed and keeps its hold, which the lockout overrides (the veto waits for its pods, bounded by `veto_timeout`). `off-now` differs in that anything may wake the host again afterwards.
 
+**A lockout takes over a shutdown in progress**, on either kind of host. The shutdown becomes
+the lockout's (cause `lockout`): a withdrawal still pending gives in-flight work
+`lockout_timeout` counted from the takeover, whatever cause the shutdown had; a withdrawal
+already done stays done. An `immediate` requested shutdown whose withdrawal is still pending
+stays the person's. Because the shutdown is the lockout's, clearing the lockout drops it: a
+person's earlier `off` does not outlive the lockout.
+
+**A due job under a lockout.** The job does not start, the host up or not. Its run waits as
+for a host that is not up, and keeps its own hold (`hold-job-<id>-<resource>`): the hold is
+inert while the lockout stands (nothing is woken for it, and the lockout overrides it). When
+the lockout clears, the hold is an ordinary job hold again: it may wake a host that is down so
+the run can catch up (per the job's `missed_run` rules), after which the host is flowmanager's
+(2.1b) and powers down when the job is done. A run already running when the lockout arrives
+is not killed and keeps its hold until it ends.
+
 ### 2.4 Who decides what
 
 - **Adoption** moves into the sequencer as a pure ownership decision, and still results in
@@ -372,16 +387,19 @@ The homesvr agent owns these; each phase adds what it changed.
       `job_events` show no `started`, `start_late` and `missed` follow the job's
       `missed_run` policy as usual, and a `started` (with `caught_up`) comes once the lockout
       is cleared. The waiting run's own hold (`hold-job-<id>-<resource>`) exists as for a
-      down host but is inert under the lockout. A run already running is not killed and
+      down host but is inert under the lockout; when the lockout clears it may wake a host
+      that is down so the run can catch up, after which the host is flowmanager's and
+      powers down when the job is done. A run already running is not killed and
       keeps its hold; the lockout shuts the host down regardless (the veto waits for the
       job's pods, bounded by `veto_timeout`). The invariant checker sees only the
       sequencer's decision, not job starts, so this is covered by service tests, not by
       invariant 14.
-    - *A lockout taking over a drain on a shared host* makes the shutdown the lockout's:
-      `shutdown.cause` is `lockout` (it stays `requested` for an exclusive host and for an
+    - *A lockout taking over a shutdown in progress* (any host, shared or exclusive) makes
+      it the lockout's: `shutdown.cause` is `lockout` (it stays `requested` for an
       immediate request whose withdrawal is still pending). A pending graceful withdrawal
       restarts at the takeover with `lockout_timeout` (`shutdown.since` is the takeover
-      time); a done one stays done.
+      time); a done one stays done. Clearing the lockout drops the shutdown, so an earlier
+      `off` on an exclusive host no longer survives it (it used to).
     - *Toggle replies for a resource.* `GET` and `POST` on `/v1/resources/{r}[/...]` and the
       `resources` entries of `/v1/leases` have a new boolean `locked_out` (true while a
       lockout lease is held on that host). While true the `wait` array has an entry

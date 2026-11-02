@@ -723,7 +723,12 @@ mod tests {
         while i < seen.len() {
             let s = seen[i];
             i += 1;
-            let mut next = vec![s.withdrawn(), s.vetoing(Millis(5)), s.stopped(Millis(6))];
+            let mut next = vec![
+                s.withdrawn(),
+                s.vetoing(Millis(5)),
+                s.stopped(Millis(6)),
+                s.under_lockout(Millis(1)),
+            ];
             next.extend(s.without_veto());
             next.extend(s.taken_over(DrainMode::Graceful));
             next.extend(s.taken_over(DrainMode::Immediate));

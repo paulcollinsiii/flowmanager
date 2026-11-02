@@ -280,6 +280,39 @@ mod tests {
     }
 
     #[test]
+    fn a_lockout_lease_on_a_resource_without_a_power_section_does_not_stop_a_job() {
+        // After a config reload took the NFS host's power section away it is always on: a
+        // lockout lease left in the book means nothing there (the sequencer reports it as
+        // unsupported), so a job needing it still starts.
+        let y = sched_model::test_support::EXAMPLE_CONFIG;
+        let marker = "  - id: basestar-nfs\n    kind: shared\n";
+        let start = y.find(marker).unwrap() + marker.len();
+        let end = y.find("\nmodels:").unwrap();
+        let y = format!("{}{}", &y[..start], &y[end..]).replace("    may_change_power: true\n", "");
+        let config = Config::from_yaml(&y).unwrap();
+        let spec = config.jobs()[0].clone();
+        let nfs = spec.needs[0].resource().clone();
+        assert!(!config.supports_lockout(&nfs));
+        let lock = Lease {
+            id: LeaseId::new("lockout-1"),
+            resource: nfs.clone(),
+            kind: LeaseKind::Lockout,
+            granted_at: Millis(0),
+        };
+        let mut state = SchedState::default();
+        state
+            .resources
+            .insert(nfs, ResourceState::new(PowerPhase::On { since: Millis(1) }));
+        assert!(needs_up(
+            &config,
+            &Snapshot::default(),
+            &state,
+            &[lock],
+            &spec
+        ));
+    }
+
+    #[test]
     fn a_host_that_is_on_but_whose_shutdown_flowmanager_gave_up_on_is_not_up_for_a_job() {
         let config = example_config();
         let spec = config.jobs()[0].clone();

@@ -930,7 +930,12 @@ trusted network.
   adopted and not given work (`wait ... locked_out`; `locked_down` in its stored state),
   until the lockout is cleared. Clearing it while the host is up makes it a host found
   running (adopted, as above); while it is off, the host is woken only if something wants it,
-  a manual lease included. On basestar a lockout deliberately blocks the backup job: a due run does not start while the host is locked out, up or not (it waits as for a host that is not up, so its `missed_run` rules apply), while a run already in progress is not killed and keeps its hold until it ends. Ids are
+  a manual lease included. On basestar a lockout deliberately blocks the backup job: a due run does not start while the host is locked out, up or not (it waits as for a host that is not up, so its `missed_run` rules apply), while a run already in progress is not killed and keeps its hold until it ends. A waiting
+  run keeps its own hold, which is inert during the lockout; when the lockout clears it may wake
+  a host that is down so the run can catch up, after which the host is flowmanager's and powers
+  down when the job is done. A lockout also takes over a shutdown already in progress (an
+  earlier `off`), on either kind of host: in-flight work gets `lockout_timeout` from the
+  takeover, and clearing the lockout drops that earlier `off`. Ids are
   `lockout-<n>`; asking again returns the lease.
 - **`resume`**: for a person who has fixed a host by hand. It applies to a resource in the
   failed power phase, or whose shutdown was stopped by mounting pods, and forgets that

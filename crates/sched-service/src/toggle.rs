@@ -2146,6 +2146,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_state_of_a_locked_out_host_reads_locked_out_only_when_it_is_not_seen_off_and_not_held()
+     {
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        r.tick().await;
+        let config = r.shared.config.current();
+        let nfs: ResourceId = "basestar-nfs".into();
+        let mut rep = r.shared.last_report().unwrap();
+        let lease = Lease {
+            id: LeaseId::new("manual-host-1"),
+            resource: nfs.clone(),
+            kind: LeaseKind::ManualHost,
+            granted_at: Millis(0),
+        };
+        let state_of = |rep: &TickReport, held: Option<&Lease>, locked: bool| {
+            let v = resource_state(
+                &config,
+                &nfs,
+                held,
+                locked,
+                None,
+                &Some(rep.clone()),
+                Millis(5_000),
+            );
+            v["state"].clone()
+        };
+        let mut set = |power: PowerPhase| {
+            rep.state
+                .resources
+                .insert(nfs.clone(), sched_model::ResourceState::new(power));
+            rep.clone()
+        };
+        // On and locked out, no lease: not `off`.
+        let on = set(PowerPhase::On { since: Millis(1) });
+        assert_eq!(state_of(&on, None, true), json!("locked_out"));
+        // The same host seen off: `off` (the truth), locked out or not.
+        let off = set(PowerPhase::Off);
+        assert_eq!(state_of(&off, None, true), json!("off"));
+        // A held lease keeps its own meaning, `on`, even while the host is up and locked out.
+        assert_eq!(state_of(&on, Some(&lease), true), json!("on"));
+        // Not locked out: unchanged.
+        assert_eq!(state_of(&on, None, false), json!("off"));
+    }
+
+    #[tokio::test]
     async fn the_replies_for_a_locked_out_host_say_so_and_never_read_off_while_it_is_on() {
         for host in ["basestar-nfs", "cuda-central"] {
             let r = rig(&example_yaml_managed());
