@@ -1552,6 +1552,9 @@ mod tests {
             Route::Switch(Kind::Lockout, "gpu".into(), Act::Get)
         );
         assert_eq!(route(&p, "/v1/lockouts/gpu/resume"), Route::NotFound);
+        // The route this one replaced no longer exists.
+        assert_eq!(route(&p, "/v1/reclaims/gpu/on"), Route::NotFound);
+        assert_eq!(route(&g, "/v1/reclaims/gpu"), Route::NotFound);
         assert_eq!(
             route(&g, "/v1/resources/nfs/on"),
             Route::MethodNotAllowed("POST")

@@ -46,6 +46,8 @@ scenarios! {
     manual_nfs_lease => "manual-nfs-lease.yaml",
     job_hold_power_cycle => "job-hold-power-cycle.yaml",
     lockout => "lockout.yaml",
+    lockout_shared => "lockout-shared.yaml",
+    lockout_cleared_while_off => "lockout-cleared-while-off.yaml",
     manual_llm_lease => "manual-llm-lease.yaml",
     interactive_pin => "interactive-pin.yaml",
     readiness_precedence => "readiness-precedence.yaml",
@@ -68,5 +70,5 @@ scenarios! {
 fn every_scenario_file_has_a_test() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
     let count = std::fs::read_dir(dir).unwrap().count();
-    assert_eq!(count, 21, "add new scenario files to the scenarios! list");
+    assert_eq!(count, 23, "add new scenario files to the scenarios! list");
 }

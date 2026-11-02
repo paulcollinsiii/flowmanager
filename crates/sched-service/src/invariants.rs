@@ -168,8 +168,9 @@ fn active(kind: &LeaseKind, now: Millis) -> bool {
 }
 
 fn locked_out(config: &Config, snap: &Snapshot, res: &ResourceId) -> bool {
+    // A lockout applies to any resource with a power section, shared or exclusive.
     let spec = config.resource(res);
-    spec.is_some_and(|r| r.kind == ResourceKind::Exclusive && r.power.is_some())
+    spec.is_some_and(|r| r.power.is_some())
         && snap.leases.iter().any(|l| {
             &l.resource == res && matches!(l.kind, LeaseKind::Lockout) && active(&l.kind, snap.now)
         })
@@ -320,7 +321,18 @@ pub fn check(
                     "invariant 3: allowed class {class} while {r} is not up"
                 ));
             }
-            if locked_out(config, snapshot, r) {
+            // A shared host's consumers keep running while its lockout gives in-flight work
+            // its timeout (the withdrawal is pending); an exclusive host's classes never do.
+            let withdrawing = config
+                .resource(r)
+                .is_some_and(|s| s.kind == ResourceKind::Shared)
+                && decision.state.resource(r).is_some_and(|s| {
+                    s.shutdown.is_some_and(|x| {
+                        x.cause() == sched_model::ShutdownCause::Lockout
+                            && x.withdrawal() == sched_model::Withdrawal::Pending
+                    })
+                });
+            if locked_out(config, snapshot, r) && !withdrawing {
                 out.push(format!(
                     "invariant 3: allowed class {class} on locked out {r}"
                 ));
@@ -533,8 +545,8 @@ pub fn check(
                     out.push(format!("invariant 14: powered on locked out {resource}"));
                 }
             }
-            // 5, 6, 7, 10, 11, 13. Power-off needs no holds (a lockout of an exclusive powered resource
-            // is the only exception), idle grace, management, and fresh observations.
+            // 5, 6, 7, 10, 11, 13, 14. Power-off needs no holds (a lockout of a host with a
+            // power section is the only exception), idle grace, management, and fresh observations.
             Step::PowerOff { resource } => {
                 if !managed_power(config, resource) {
                     out.push(format!(
@@ -620,6 +632,46 @@ pub fn check(
                         out.push(format!(
                             "invariant 10: powered off {resource} before idle grace ended"
                         ));
+                    }
+                } else {
+                    // 14. A lockout overrides holds, leases, work and grace, but shuts the host
+                    // down once: never again after it was seen off under the lockout (a later
+                    // boot is left alone).
+                    if before.is_some_and(|s| s.locked_down) {
+                        out.push(format!(
+                            "invariant 14: powered off locked out {resource} after it was seen off under the lockout"
+                        ));
+                    }
+                    // 11. A shared host's consumers are withdrawn first, and in-flight work was
+                    // given `lockout_timeout` (or none was in flight).
+                    if config
+                        .resource(resource)
+                        .is_some_and(|r| r.kind == ResourceKind::Shared)
+                    {
+                        let withdrawn = decision
+                            .state
+                            .resource(resource)
+                            .and_then(|s| s.shutdown)
+                            .filter(|s| s.is_drain() && s.consumers_withdrawn());
+                        match withdrawn {
+                            None => out.push(format!(
+                                "invariant 11: powered off locked out shared {resource} with no withdrawal of its consumers first"
+                            )),
+                            Some(d) => {
+                                let waited = d.cause() != sched_model::ShutdownCause::Lockout
+                                    || now.saturating_sub(d.since()) >= policy.lockout_timeout()
+                                    || config
+                                        .classes()
+                                        .iter()
+                                        .filter(|c| c.demand.is_some() && needs(c, resource))
+                                        .all(|c| demand(config, snapshot, c).is_some_and(|x| !x.1));
+                                if !waited {
+                                    out.push(format!(
+                                        "invariant 11: powered off locked out shared {resource} before its in-flight work had lockout_timeout"
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 if !host_up(config, snapshot, resource, safety) {

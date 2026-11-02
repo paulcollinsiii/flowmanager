@@ -39,8 +39,9 @@ pub const EPOCH_KEY: &str = "backstop_epoch";
 /// Version 2 replaced the per-resource `drain`, `mounts_veto`, `host_idle_since` and
 /// `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`. There is no
 /// migration: a document of version 1 is an error (see [`decode`]) until it is discarded, and
-/// the sequencer then starts from observation.
-pub const STATE_VERSION: u32 = 2;
+/// the sequencer then starts from observation. Version 3 (phase 4a) renamed the `reclaim`
+/// shutdown cause and wind-down flag to `lockout` and added `locked_down`.
+pub const STATE_VERSION: u32 = 3;
 /// Version of the [`LeaseBook`] document this build reads and writes.
 pub const LEASES_VERSION: u32 = 1;
 
@@ -197,7 +198,7 @@ mod tests {
         assert_eq!(decode_state(None).unwrap(), CoreState::default());
         assert_eq!(decode_leases(None).unwrap(), LeaseBook::default());
         let text = String::from_utf8(encode_state(&s)).unwrap();
-        assert!(text.starts_with("{\"version\":2,\"data\":"), "{text}");
+        assert!(text.starts_with("{\"version\":3,\"data\":"), "{text}");
     }
 
     #[test]
@@ -213,7 +214,7 @@ mod tests {
         let bytes = encode_state(&s);
         assert_eq!(decode_state(Some(&bytes)).unwrap(), s);
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.starts_with("{\"version\":2,\"data\":"), "{text}");
+        assert!(text.starts_with("{\"version\":3,\"data\":"), "{text}");
         assert_eq!(text.matches("\"off_since\":4000").count(), 1, "{text}");
         // A shutdown, in the stage it has reached, is part of the stored state.
         s.state
@@ -231,16 +232,19 @@ mod tests {
         // `shutdown_confirmed_at`; this build neither reads nor converts them.
         let old = br#"{"version":1,"data":{"state":{"resources":{"b":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"drain":{"mode":"graceful","since":9}}}},"reported":["x"]}}"#;
         assert_eq!(decode_state(Some(old)).unwrap(), CoreState::default());
+        // Version 2 stored a shutdown cause `reclaim` and a wind-down flag `reclaim`.
+        let v2 = br#"{"version":2,"data":{"state":{"resources":{"b":{"power":{"phase":"on","since":1},"mode":{"phase":"idle"},"shutdown":{"cause":{"kind":"reclaim"},"since":1,"withdrawal":"not_needed","veto":{"phase":"none"}}}}},"reported":["x"]}}"#;
+        assert_eq!(decode_state(Some(v2)).unwrap(), CoreState::default());
         // Only the sequencer state is treated so: the other documents stay strict.
         assert!(decode_leases(Some(br#"{"version":0,"data":{}}"#)).is_err());
     }
 
     #[test]
     fn a_state_of_a_newer_version_is_still_an_error() {
-        let newer = br#"{"version":3,"data":{"state":{},"reported":[]}}"#;
+        let newer = br#"{"version":4,"data":{"state":{},"reported":[]}}"#;
         let e = decode_state(Some(newer)).unwrap_err();
         assert_eq!(e.key, STATE_KEY);
-        assert!(e.problem.contains("version 3"), "{e}");
+        assert!(e.problem.contains("version 4"), "{e}");
     }
 
     #[test]
@@ -259,17 +263,17 @@ mod tests {
 
     #[test]
     fn unknown_versions_garbage_and_unversioned_values_are_errors_not_resets() {
-        let newer = br#"{"version":3,"data":{"state":{},"reported":[],"later_field":1}}"#;
+        let newer = br#"{"version":4,"data":{"state":{},"reported":[],"later_field":1}}"#;
         let e = decode_state(Some(newer)).unwrap_err();
         assert_eq!(e.key, STATE_KEY);
-        assert!(e.problem.contains("version 3"), "{e}");
+        assert!(e.problem.contains("version 4"), "{e}");
         let e = decode_state(Some(b"not json")).unwrap_err();
         assert!(e.problem.contains("not a versioned document"), "{e}");
         // What the unversioned first cut stored.
         let e = decode_leases(Some(br#"{"next":1,"leases":[]}"#)).unwrap_err();
         assert!(e.problem.contains("no version"), "{e}");
         // The right version with a field this build does not know.
-        let e = decode_state(Some(br#"{"version":2,"data":{"surprise":true}}"#)).unwrap_err();
-        assert!(e.problem.contains("cannot decode version 2"), "{e}");
+        let e = decode_state(Some(br#"{"version":3,"data":{"surprise":true}}"#)).unwrap_err();
+        assert!(e.problem.contains("cannot decode version 3"), "{e}");
     }
 }

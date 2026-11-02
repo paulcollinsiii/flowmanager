@@ -2848,6 +2848,83 @@ mod tests {
     }
 
     #[test]
+    fn a_lockout_shuts_either_kind_of_host_down_once_adopts_nothing_and_clearing_it_finds_a_running_host()
+     {
+        let lockout = |res: &ResourceId| sched_model::Lease {
+            id: sched_model::LeaseId::new(format!("lockout-{res}")),
+            resource: res.clone(),
+            kind: sched_model::LeaseKind::Lockout,
+            granted_at: Millis(0),
+        };
+        let (s, clock) = managed_world_all();
+        let mut d = Durable::default();
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.adopted.contains(&gpu()) && r.adopted.contains(&nfs()),
+            "{r:?}"
+        );
+        // Locked out while both are up and adopted (a manual lease each): the lease is no
+        // excuse. The exclusive host has no model to wind down; the shared host withdraws.
+        d.leases.push(lockout(&gpu()));
+        d.leases.push(lockout(&nfs()));
+        let mut off_steps = 0;
+        for _ in 0..3 {
+            clock.advance(Millis(5_000));
+            world(&s, Some(0));
+            let r = s.tick(clock.now(), &mut d);
+            off_steps += r
+                .steps
+                .iter()
+                .filter(|s| matches!(s, Step::PowerOff { .. }))
+                .count();
+        }
+        assert_eq!(off_steps, 2, "each host is shut down once");
+        // Both are seen down: settled under the lockout.
+        clock.advance(Millis(5_000));
+        world(&s, Some(0));
+        gpu_reading(&s, false);
+        nfs_probe(&s, false);
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            d.state.resource(&gpu()).unwrap().locked_down
+                && d.state.resource(&nfs()).unwrap().locked_down,
+            "{r:?}"
+        );
+        // Something else boots them: no power-off, no power-on, nothing adopted, no work.
+        for _ in 0..2 {
+            clock.advance(Millis(60_000));
+            world(&s, Some(2));
+            let r = s.tick(clock.now(), &mut d);
+            assert!(r.adopted.is_empty(), "{r:?}");
+            assert!(
+                !r.steps
+                    .iter()
+                    .any(|s| matches!(s, Step::PowerOff { .. } | Step::PowerOn { .. })),
+                "{r:?}"
+            );
+            assert!(
+                d.leases.iter().all(|l| !l.is_adopted_host()),
+                "{:?}",
+                d.leases
+            );
+            assert!(d.state.resource(&gpu()).unwrap().is_on());
+            assert!(d.state.resource(&nfs()).unwrap().is_on());
+        }
+        // Cleared while both are up: found running, adopted like any other host.
+        d.leases.retain(|l| !l.is_lockout());
+        clock.advance(Millis(60_000));
+        world(&s, Some(0));
+        let r = s.tick(clock.now(), &mut d);
+        assert!(
+            r.adopted.contains(&gpu()) && r.adopted.contains(&nfs()),
+            "{r:?}"
+        );
+        assert!(!d.state.resource(&gpu()).unwrap().locked_down);
+        assert!(!d.state.resource(&nfs()).unwrap().locked_down);
+    }
+
+    #[test]
     fn only_a_host_lease_powers_an_exclusive_managed_host_on_and_the_queues_still_choose_the_model()
     {
         let (s, clock) = managed_world_all();

@@ -90,26 +90,131 @@ fn power_off(res: &str) -> Step {
 
 const MANAGED_NFS: &str = "    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, managed: true, idle_since: 1 }\n";
 
-#[test]
-fn a_lockout_does_not_excuse_powering_off_a_held_shared_host() {
-    let leases = vec![
+/// The NFS host shutting down under a lockout whose consumers were withdrawn `done` or still
+/// `pending`, started at `since`.
+fn nfs_lockout_shutdown(withdrawal: &str, since: u64) -> SchedState {
+    prev(&format!(
+        "    basestar-nfs: {{ power: {{ phase: \"on\", since: 0 }}, mode: {{ phase: idle }}, managed: true, shutdown: {{ cause: {{ kind: lockout }}, since: {since}, withdrawal: {withdrawal}, veto: {{ phase: none }} }} }}\n"
+    ))
+}
+
+fn nfs_mounts_zero() -> sched_model::Observation {
+    sched_model::Observation {
+        source: "basestar-mounts".into(),
+        observed_at: Millis(NOW),
+        fidelity: sched_model::Fidelity::Polled,
+        value: sched_model::ObservedValue::ResourceMounts {
+            resource: "basestar-nfs".into(),
+            pods: 0,
+        },
+    }
+}
+
+fn nfs_leases_under_lockout() -> Vec<Lease> {
+    vec![
         lease("r", "basestar-nfs", LeaseKind::Lockout),
         lease(
             "h",
             "basestar-nfs",
             LeaseKind::SharedHold { holder: "x".into() },
         ),
-    ];
-    let v = run(
-        &snap(zero_pods_and_up(&["basestar-nfs"]), leases),
+        lease("m", "basestar-nfs", LeaseKind::ManualHost),
+    ]
+}
+
+fn nfs_world(leases: Vec<Lease>) -> Snapshot {
+    let mut obs = zero_pods_and_up(&["basestar-nfs"]);
+    obs.extend(idle_demand());
+    obs.push(nfs_mounts_zero());
+    snap(obs, leases)
+}
+
+#[test]
+fn a_lockout_on_a_shared_host_excuses_holds_and_leases_once_its_consumers_are_withdrawn() {
+    let s = nfs_world(nfs_leases_under_lockout());
+    let v = check_with(
+        &s,
+        &nfs_lockout_shutdown("pending", 1),
+        &Decision {
+            steps: vec![power_off("basestar-nfs")],
+            allowed: Default::default(),
+            state: nfs_lockout_shutdown("done", 1),
+        },
+    );
+    assert!(v.is_empty(), "{v:?}");
+}
+
+#[test]
+fn powering_off_a_locked_out_shared_host_needs_its_withdrawal_and_the_lockout_timeout() {
+    // No withdrawal in the decision's state.
+    let v = check_with(
+        &nfs_world(nfs_leases_under_lockout()),
         &prev(MANAGED_NFS),
-        vec![power_off("basestar-nfs")],
+        &decision(vec![power_off("basestar-nfs")]),
     );
     assert!(
         v.iter()
-            .any(|m| m.contains("invariant 10") && m.contains("lease holds")),
+            .any(|m| m.contains("invariant 11") && m.contains("withdrawal")),
         "{v:?}"
     );
+    // Withdrawn, but work is in flight and the lockout is younger than lockout_timeout.
+    let mut obs = zero_pods_and_up(&["basestar-nfs"]);
+    obs.extend(idle_demand().into_iter().filter(|o| {
+        !matches!(&o.value, sched_model::ObservedValue::Demand { class, .. } if class.as_str() == "paperless-ocr")
+    }));
+    obs.push(busy("paperless-ocr", "paperless-ocr-pending"));
+    obs.push(nfs_mounts_zero());
+    let v = check_with(
+        &snap(obs, nfs_leases_under_lockout()),
+        &nfs_lockout_shutdown("pending", NOW - 1000),
+        &Decision {
+            steps: vec![power_off("basestar-nfs")],
+            allowed: Default::default(),
+            state: nfs_lockout_shutdown("done", NOW - 1000),
+        },
+    );
+    assert!(v.iter().any(|m| m.contains("lockout_timeout")), "{v:?}");
+}
+
+#[test]
+fn a_locked_out_host_seen_off_under_the_lockout_is_never_powered_on_or_off_again() {
+    for (res, state) in [
+        (
+            "basestar-nfs",
+            "    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, locked_down: true }\n",
+        ),
+        (
+            "cuda-central",
+            "    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: idle }, locked_down: true }\n",
+        ),
+    ] {
+        let leases = vec![lease("r", res, LeaseKind::Lockout)];
+        let v = run(
+            &snap(zero_pods_and_up(&[res]), leases.clone()),
+            &prev(state),
+            vec![power_off(res)],
+        );
+        assert!(
+            v.iter()
+                .any(|m| m.contains("invariant 14") && m.contains("seen off")),
+            "{res}: {v:?}"
+        );
+        // And never powered on while locked out, whatever kind of host it is.
+        let v = run(
+            &snap(vec![], leases),
+            &prev(
+                &state
+                    .replace("\"on\", since: 0", "\"off\"")
+                    .replace("phase: \"off\"", "phase: off"),
+            ),
+            vec![power_on(res)],
+        );
+        assert!(
+            v.iter()
+                .any(|m| m.contains("invariant 14") && m.contains("powered on locked out")),
+            "{res}: {v:?}"
+        );
+    }
 }
 
 #[test]

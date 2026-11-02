@@ -1,0 +1,69 @@
+description: "A lockout on the shared host overrides a job hold and a manual lease: its consumers are withdrawn, the host is shut down once, and a later boot is left alone (not powered off, nothing allowed on it) until the lockout is cleared; the manual lease was never removed, so it then keeps the host up."
+power_control: managed
+initial_state:
+  resources:
+    basestar-nfs:
+      power: { phase: "on", since: 92800000 }
+      mode: { phase: idle }
+      managed: true
+frames:
+  # Locked out while a job holds the host and a person leased it. In-flight work gets
+  # lockout_timeout (the consumers keep running meanwhile); there is none, so the next tick
+  # withdraws them.
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 0, in_flight: 0 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    leases:
+      - { id: lockout-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: lockout } }
+      - { id: hold-1, resource: basestar-nfs, granted_at: 99000000, kind: { type: shared_hold, holder: backup } }
+      - { id: manual-host-1, resource: basestar-nfs, granted_at: 99000000, kind: { type: manual_host } }
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: draining }]
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
+  - at: 100005000
+    refresh: true
+    expect:
+      steps: [{ type: power_off, resource: basestar-nfs }]
+      allowed: { models: [], classes: [] }
+  - at: 100030000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: locked_out }]
+      allowed: { models: [], classes: [] }
+  # An hour later something else boots it (another OS, say): not powered off again, no work.
+  - at: 103600000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: locked_out }]
+      allowed: { models: [], classes: [] }
+  - at: 107200000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: basestar-nfs, reason: locked_out }]
+      allowed: { models: [], classes: [] }
+  # The lockout is cleared (the manual lease and the hold are still there): the host, up, is
+  # not powered off, and its consumers are allowed again.
+  - at: 107300000
+    refresh: true
+    leases:
+      - { id: hold-1, resource: basestar-nfs, granted_at: 99000000, kind: { type: shared_hold, holder: backup } }
+      - { id: manual-host-1, resource: basestar-nfs, granted_at: 99000000, kind: { type: manual_host } }
+    expect:
+      steps: []
+      allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }

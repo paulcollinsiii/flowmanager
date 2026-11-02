@@ -1,0 +1,42 @@
+description: "A lockout taken while the exclusive host is off just keeps it off, though a manual lease and queued work want it up; clearing it while the host is off wakes it for the manual lease (a lockout never removes the lease)."
+power_control: managed
+initial_state:
+  resources:
+    cuda-central:
+      power: { phase: "off" }
+      mode: { phase: idle }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: false } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 3, in_flight: 0, oldest_ready_at: 90000000 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    leases:
+      - { id: lockout-1, resource: cuda-central, granted_at: 100000000, kind: { type: lockout } }
+      - { id: manual-host-1, resource: cuda-central, granted_at: 99000000, kind: { type: manual_host } }
+    expect:
+      steps: [{ type: wait, resource: cuda-central, reason: locked_out }]
+      allowed: { models: [], classes: [paperless-ngx, immich-server] }
+  - at: 103600000
+    refresh: true
+    expect:
+      steps: [{ type: wait, resource: cuda-central, reason: locked_out }]
+      allowed: { models: [], classes: [paperless-ngx, immich-server] }
+  # Cleared: the manual lease is still there and wakes the host.
+  - at: 103700000
+    refresh: true
+    leases:
+      - { id: manual-host-1, resource: cuda-central, granted_at: 99000000, kind: { type: manual_host } }
+    expect:
+      steps: [{ type: power_on, resource: cuda-central }]
+      allowed: { models: [], classes: [paperless-ngx, immich-server] }
