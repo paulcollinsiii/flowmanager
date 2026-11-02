@@ -243,6 +243,7 @@ mod tests {
     use sched_model::test_support::{EXAMPLE_CONFIG, example_yaml_managed};
     use sched_model::{Fidelity, ObservedValue};
     use sched_observe::Report;
+    use sched_sequencer::status::HostEvent;
 
     use super::*;
     use crate::clock::ManualClock;
@@ -717,7 +718,7 @@ mod tests {
             "{}",
             r.reason
         );
-        assert!(r.power_failed.is_empty() && r.power_timeouts.is_empty());
+        assert!(r.power_failed().is_empty() && r.power_timeouts().is_empty());
         assert_eq!(
             gauge(&s, "cuda-central", "powering_on").as_deref(),
             Some("0")
@@ -728,9 +729,12 @@ mod tests {
         down_with_lease(&s);
         let r = object::tick(&s, &ctx).await.unwrap();
         ctx.commit();
-        assert_eq!(r.power_timeouts.len(), 1, "{r:?}");
-        assert_eq!(r.power_timeouts[0].resource.as_str(), "cuda-central");
-        assert_eq!(r.power_failed.len(), 1);
+        assert_eq!(r.power_timeouts().len(), 1, "{r:?}");
+        assert!(
+            matches!(r.power_timeouts()[0], HostEvent::PowerTimeout { resource, .. } if resource.as_str() == "cuda-central"),
+            "{r:?}"
+        );
+        assert_eq!(r.power_failed().len(), 1);
         assert!(
             r.kinds.contains(&"power_failed".to_string()),
             "{:?}",
@@ -761,8 +765,8 @@ mod tests {
             down_with_lease(&s);
             let r = object::tick(&s, &ctx).await.unwrap();
             ctx.commit();
-            assert!(r.power_timeouts.is_empty());
-            assert_eq!(r.power_failed.len(), 1);
+            assert!(r.power_timeouts().is_empty());
+            assert_eq!(r.power_failed().len(), 1);
             assert!(
                 !r.steps.iter().any(|st| matches!(
                     st,
@@ -790,7 +794,7 @@ mod tests {
         });
         let r = object::tick(&s, &ctx).await.unwrap();
         ctx.commit();
-        assert!(r.power_failed.is_empty(), "{r:?}");
+        assert!(r.power_failed().is_empty(), "{r:?}");
         assert!(r.power_request_failures.is_empty(), "{r:?}");
         assert_eq!(
             gauge(&s, "cuda-central", "powering_on").as_deref(),

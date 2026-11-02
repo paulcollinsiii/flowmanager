@@ -1732,7 +1732,7 @@ mod tests {
         // The host is found running and adopted; the person's switch-off releases that lease.
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
-        assert_eq!(r.adopted.len(), 1, "{r:?}");
+        assert_eq!(r.adopted().len(), 1, "{r:?}");
         let drain_of = |ctx: &FakeCtx| {
             persist::decode_state(ctx.stored(STATE_KEY).as_deref())
                 .unwrap()
@@ -1771,8 +1771,8 @@ mod tests {
         // The next tick reports it and does not adopt the host again.
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
-        assert_eq!(r.drains.len(), 1, "{r:?}");
-        assert!(r.adopted.is_empty(), "{r:?}");
+        assert_eq!(r.drains().len(), 1, "{r:?}");
+        assert!(r.adopted().is_empty(), "{r:?}");
         // Without a drain mode nothing is recorded; a second release is a 404.
         let (s, _) = process_managed();
         let ctx = FakeCtx::default();
@@ -1901,7 +1901,7 @@ mod tests {
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
         assert_eq!(
-            r.power_failed.len(),
+            r.power_failed().len(),
             1,
             "stays failed while the host is up: {r:?}"
         );
@@ -1931,8 +1931,8 @@ mod tests {
         world(&s, 0);
         let r = tick(&s, &ctx).await.unwrap();
         ctx.commit();
-        assert!(r.power_failed.is_empty(), "{r:?}");
-        assert!(r.adopted.contains(&"cuda-central".into()), "{r:?}");
+        assert!(r.power_failed().is_empty(), "{r:?}");
+        assert!(r.adopted().contains(&"cuda-central".into()), "{r:?}");
         let gpu = r.state.resource(&"cuda-central".into()).unwrap();
         assert!(gpu.is_on() && gpu.ours(), "{gpu:?}");
         assert!(

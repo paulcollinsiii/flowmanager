@@ -79,7 +79,7 @@ fn offs(w: &World) -> usize {
 }
 
 fn adopted_nfs(r: &TickReport) -> bool {
-    r.adopted.contains(&nfs())
+    r.adopted().contains(&nfs())
 }
 
 /// Basestar off and unowned, the backup due: the due tick wakes it, the next one sees it up
@@ -237,7 +237,10 @@ async fn a_host_that_comes_up_after_a_timed_out_power_on_is_adopted_even_under_a
 async fn a_host_switched_from_manual_to_managed_control_while_up_is_adopted() {
     let w = World::new(EXAMPLE_CONFIG);
     let r = w.tick_idle(SUN + H, true, false).await;
-    assert!(r.adopted.is_empty(), "manual control adopts nothing: {r:?}");
+    assert!(
+        r.adopted().is_empty(),
+        "manual control adopts nothing: {r:?}"
+    );
     assert!(host_leases(&w).is_empty());
     assert!(!ours(&w));
     let managed = example_yaml_managed();
@@ -251,7 +254,7 @@ async fn a_host_switched_from_manual_to_managed_control_while_up_is_adopted() {
     assert!(ours(&w), "the adopted lease is a manual want");
     // Once only.
     let r = w.tick_idle(SUN + H + 2 * MIN, true, false).await;
-    assert!(r.adopted.is_empty(), "{r:?}");
+    assert!(r.adopted().is_empty(), "{r:?}");
 }
 
 #[tokio::test]
@@ -327,13 +330,13 @@ async fn adoption_works_with_an_unreadable_job_book_and_survives_the_next_tick()
     );
     // The next tick reads that lease back: nothing is adopted twice.
     let r = w.tick_idle(SUN + H + MIN, true, false).await;
-    assert!(r.adopted.is_empty(), "{r:?}");
+    assert!(r.adopted().is_empty(), "{r:?}");
     assert_eq!(host_leases(&w).len(), 1);
     assert!(ours(&w));
     // Seen down, the adopted lease ends in the stored book too; seen up again it is adopted
     // afresh. The job book is still not touched.
     let r = w.tick_idle(SUN + H + 2 * MIN, false, false).await;
-    assert_eq!(r.adoptions_ended, vec![nfs()], "{r:?}");
+    assert_eq!(r.adoptions_ended(), vec![nfs()], "{r:?}");
     assert!(host_leases(&w).is_empty());
     let r = w.tick_idle(SUN + H + 3 * MIN, true, false).await;
     assert!(adopted_nfs(&r), "{r:?}");

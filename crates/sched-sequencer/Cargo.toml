@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 sched-model = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

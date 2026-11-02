@@ -914,8 +914,11 @@ async fn a_job_hold_during_min_off_waits_and_a_catch_up_run_alerts_at_the_window
         "{:?}",
         r.steps
     );
-    assert_eq!(r.min_off_waits.len(), 1, "{r:?}");
-    assert_eq!(r.min_off_waits[0].remaining, Millis(44 * MIN));
+    assert_eq!(r.min_off_waits().len(), 1, "{r:?}");
+    assert_eq!(
+        r.min_off_waits()[0].min_off.map(|m| m.remaining),
+        Some(Millis(44 * MIN))
+    );
     assert!(
         r.reason.contains("waiting for min_off, 2640s left"),
         "{}",
@@ -962,16 +965,16 @@ async fn a_skip_run_that_waits_out_its_window_for_min_off_is_missed_and_the_host
     w.tick(DUE - MIN, false, false).await;
     let r = w.tick(DUE, false, false).await;
     assert_eq!(w.holds(), vec![hold()]);
-    assert_eq!(r.min_off_waits.len(), 1, "{r:?}");
+    assert_eq!(r.min_off_waits().len(), 1, "{r:?}");
     // The window (30m) ends inside the wait (45m): dropped as missed, the hold released.
     let r = w.tick(DUE + 30 * MIN, false, false).await;
     assert_eq!(kinds(&r), vec!["backup:missed"], "{r:?}");
     assert!(w.holds().is_empty());
     // Nothing wants the host any more: no wait is reported and it is not powered on.
     let r = w.tick(DUE + 31 * MIN, false, false).await;
-    assert!(r.min_off_waits.is_empty(), "{r:?}");
+    assert!(r.min_off_waits().is_empty(), "{r:?}");
     let r = w.tick(DUE + 50 * MIN, false, false).await;
-    assert!(r.min_off_waits.is_empty(), "{r:?}");
+    assert!(r.min_off_waits().is_empty(), "{r:?}");
     assert_eq!(power_ons(&w), 0);
     assert_eq!(w.counter("backup", "missed"), "1");
     assert!(w.kube.calls.lock().unwrap().is_empty());

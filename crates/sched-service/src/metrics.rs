@@ -8,9 +8,10 @@ use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Opts, Registry, TextEncoder,
 };
-use sched_model::{Millis, ModePhase, PowerPhase, PowerTransition, ResourceId, SchedState};
+use sched_model::{Millis, ModePhase, PowerPhase, PowerTransition, SchedState};
 
 use sched_observe::ObserverState;
+use sched_sequencer::status::{HostStatus, VetoStatus};
 
 use crate::cache::InputAge;
 
@@ -558,80 +559,60 @@ impl Metrics {
             .inc();
     }
 
-    /// Sets `sched_resource_power_failed` from the state: 1 for the transition a resource
-    /// is failed in, 0 for the other; resources that left the state lose their series. Only
-    /// resources for which `can_fail` holds (those with a power section) get a series.
-    pub fn set_power_failed(&self, state: &SchedState, can_fail: impl Fn(&ResourceId) -> bool) {
+    /// Sets the per-host gauges from the statuses of a decided tick: `sched_resource_power_failed`,
+    /// `sched_resource_veto` and `sched_resource_min_off_remaining_seconds`. A resource that
+    /// is no longer among the statuses, or no longer qualifies for a series, loses it.
+    pub fn set_host_gauges(&self, hosts: &[HostStatus]) {
+        self.set_power_failed(hosts);
+        self.set_veto(hosts);
+        self.set_min_off_remaining(hosts);
+    }
+
+    /// `sched_resource_power_failed`: 1 for the transition a host is failed in, 0 for the
+    /// other. Only hosts with a power section get a series.
+    fn set_power_failed(&self, hosts: &[HostStatus]) {
         let mut known = self
             .power_failed_resources
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for (id, st) in state.resources.iter().filter(|(id, _)| can_fail(id)) {
+        let mut now_known = HashSet::new();
+        for h in hosts.iter().filter(|h| h.has_power) {
             for t in [PowerTransition::PoweringOn, PowerTransition::ShuttingDown] {
-                let failed = matches!(st.power, PowerPhase::Failed { during, .. } if during == t);
+                let failed = matches!(h.power, PowerPhase::Failed { during, .. } if during == t);
                 self.power_failed
-                    .with_label_values(&[id.as_str(), t.as_str()])
+                    .with_label_values(&[h.resource.as_str(), t.as_str()])
                     .set(if failed { 1.0 } else { 0.0 });
             }
+            now_known.insert(h.resource.to_string());
         }
-        known.retain(|id| {
-            let keep = state
-                .resources
-                .keys()
-                .any(|k| k.as_str() == id && can_fail(k));
-            if !keep {
-                for t in [PowerTransition::PoweringOn, PowerTransition::ShuttingDown] {
-                    let _ = self
-                        .power_failed
-                        .remove_label_values(&[id.as_str(), t.as_str()]);
-                }
+        for gone in known.difference(&now_known) {
+            for t in [PowerTransition::PoweringOn, PowerTransition::ShuttingDown] {
+                let _ = self
+                    .power_failed
+                    .remove_label_values(&[gone.as_str(), t.as_str()]);
             }
-            keep
-        });
-        known.extend(
-            state
-                .resources
-                .keys()
-                .filter(|k| can_fail(k))
-                .map(|k| k.to_string()),
-        );
+        }
+        *known = now_known;
     }
 
-    /// Counts a shutdown whose veto wait timed out (see the metric's help). `reading` is the
-    /// resource's readings joined for a label (see `VetoReading::label`).
-    pub fn veto_timeout(&self, resource: &str, reading: &str) {
-        self.veto_timeouts
-            .with_label_values(&[resource, reading])
-            .inc();
-    }
-
-    /// Sets `sched_resource_veto` from the state: one series per reading that applies to a
-    /// resource (`readings`: `mounts`, `pods`; none for a host with no veto) and state.
-    /// `waiting` is 1 while the shutdown waits and that reading is one of the blockers
-    /// (`blocking`); `stopped` is 1 on every reading of a host whose veto stopped (the stop is
-    /// the host's, whichever reading held it). Readings that no longer apply lose their series.
-    pub fn set_veto(
-        &self,
-        state: &SchedState,
-        readings: impl Fn(&ResourceId) -> Vec<&'static str>,
-        blocking: impl Fn(&ResourceId, &str) -> bool,
-    ) {
+    /// `sched_resource_veto`: one series per reading that applies to a host (`mounts`,
+    /// `pods`; none for a host with no veto) and state. `waiting` is 1 while the shutdown
+    /// waits and that reading is one of the blockers; `stopped` is 1 on every reading of a
+    /// host whose veto stopped (the stop is the host's, whichever reading held it).
+    fn set_veto(&self, hosts: &[HostStatus]) {
         let mut known = self.veto_labels.lock().unwrap_or_else(|e| e.into_inner());
         let mut now_known = HashSet::new();
-        for (id, st) in state.resources.iter() {
-            let waiting = st.shutdown.is_some_and(|s| s.vetoing_since().is_some());
-            let stopped = st.shutdown.is_some_and(|s| s.stopped_since().is_some());
-            for reading in readings(id) {
-                let on = [
-                    ("waiting", waiting && blocking(id, reading)),
-                    ("stopped", stopped),
-                ];
-                for (name, on) in on {
+        for h in hosts {
+            let waiting = matches!(h.veto(), Some(VetoStatus::Waiting { .. }));
+            let stopped = h.stopped();
+            for reading in &h.veto_readings {
+                let blocked = h.blocking().iter().any(|b| b.reading == *reading);
+                for (name, on) in [("waiting", waiting && blocked), ("stopped", stopped)] {
                     self.veto_gauge
-                        .with_label_values(&[id.as_str(), reading, name])
+                        .with_label_values(&[h.resource.as_str(), reading.as_str(), name])
                         .set(if on { 1.0 } else { 0.0 });
                 }
-                now_known.insert((id.to_string(), reading.to_string()));
+                now_known.insert((h.resource.to_string(), reading.as_str().to_string()));
             }
         }
         for (id, label) in known.difference(&now_known) {
@@ -644,32 +625,33 @@ impl Metrics {
         *known = now_known;
     }
 
-    /// Sets `sched_resource_min_off_remaining_seconds` from the state at `now`: per resource
-    /// for which `min_off` gives a minimum (managed, above zero), the seconds left of it;
-    /// resources without one lose their series.
-    pub fn set_min_off_remaining(
-        &self,
-        state: &SchedState,
-        now: Millis,
-        min_off: impl Fn(&ResourceId) -> Option<Millis>,
-    ) {
+    /// `sched_resource_min_off_remaining_seconds`: per host with a `min_off` (managed, above
+    /// zero), the seconds left of it.
+    fn set_min_off_remaining(&self, hosts: &[HostStatus]) {
         let mut known = self
             .min_off_resources
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut now_known = HashSet::new();
-        for (id, st) in &state.resources {
-            let Some(m) = min_off(id) else { continue };
-            let left = st.min_off_remaining(m, now);
+        for h in hosts {
+            let Some(m) = h.min_off else { continue };
             self.min_off_remaining
-                .with_label_values(&[id.as_str()])
-                .set(left.as_u64() as f64 / 1000.0);
-            now_known.insert(id.to_string());
+                .with_label_values(&[h.resource.as_str()])
+                .set(m.remaining.as_u64() as f64 / 1000.0);
+            now_known.insert(h.resource.to_string());
         }
         for gone in known.difference(&now_known) {
             let _ = self.min_off_remaining.remove_label_values(&[gone.as_str()]);
         }
         *known = now_known;
+    }
+
+    /// Counts a shutdown whose veto wait timed out (see the metric's help). `reading` is the
+    /// resource's readings joined for a label (see `VetoReading::label`).
+    pub fn veto_timeout(&self, resource: &str, reading: &str) {
+        self.veto_timeouts
+            .with_label_values(&[resource, reading])
+            .inc();
     }
 
     /// Counts one toggle-listener request; `endpoint` and `outcome` are from the fixed sets
@@ -757,22 +739,70 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn the_veto_has_one_series_per_reading_with_waiting_only_on_the_blocking_one() {
-        use sched_model::{PowerPhase, ResourceState, Shutdown};
-        let m = Metrics::new();
-        let mut st = ResourceState::new(PowerPhase::On {
+    use sched_model::{Shutdown, VetoReading};
+    use sched_sequencer::status::{BlockerState, ShutdownStatus, VetoBlocker};
+
+    /// A status as the sequencer would derive it: a host with a power section under managed
+    /// control, in `power`, with no lease, lockout or wait.
+    fn host(id: &str, power: PowerPhase) -> HostStatus {
+        HostStatus {
+            resource: id.into(),
+            kind: sched_model::ResourceKind::Shared,
+            has_power: true,
+            managed: true,
+            power,
+            ours: false,
+            mode: sched_sequencer::status::HostMode::Idle,
+            shutdown: None,
+            veto_readings: vec![],
+            lease: None,
+            lockout: None,
+            min_off: None,
+            wait: None,
+            attention: false,
+        }
+    }
+
+    /// The shutdown as reported, its veto read off the model's `Shutdown`.
+    fn shutdown(s: Shutdown, blocking: Vec<VetoBlocker>) -> Option<ShutdownStatus> {
+        Some(ShutdownStatus {
+            cause: s.cause(),
+            since: s.since(),
+            withdrawal: s.withdrawal(),
+            veto: if let Some(since) = s.vetoing_since() {
+                VetoStatus::Waiting { since, blocking }
+            } else if let Some(since) = s.stopped_since() {
+                VetoStatus::Stopped { since, blocking }
+            } else {
+                VetoStatus::Clear
+            },
+        })
+    }
+
+    fn on() -> PowerPhase {
+        PowerPhase::On {
             since: Millis(1),
             ours: false,
-        });
-        st.shutdown = Some(Shutdown::idle_without_consumers(Millis(2)).vetoing(Millis(3)));
-        let mut state = SchedState::default();
-        state.resources.insert("gpu".into(), st);
-        m.set_veto(
-            &state,
-            |_| vec!["mounts", "pods"],
-            |_, reading| reading == "pods",
+        }
+    }
+
+    fn pods_blocking() -> Vec<VetoBlocker> {
+        vec![VetoBlocker {
+            reading: VetoReading::Pods,
+            state: BlockerState::InUse,
+        }]
+    }
+
+    #[test]
+    fn the_veto_has_one_series_per_reading_with_waiting_only_on_the_blocking_one() {
+        let m = Metrics::new();
+        let mut h = host("gpu", on());
+        h.veto_readings = vec![VetoReading::Mounts, VetoReading::Pods];
+        h.shutdown = shutdown(
+            Shutdown::idle_without_consumers(Millis(2)).vetoing(Millis(3)),
+            pods_blocking(),
         );
+        m.set_host_gauges(std::slice::from_ref(&h));
         let text = m.render();
         let line = |reading: &str, s: &str| {
             text.lines()
@@ -789,22 +819,20 @@ mod tests {
         assert_eq!(line("mounts", "waiting"), "0", "{text}");
         assert_eq!(line("pods", "stopped"), "0", "{text}");
         // The reading that no longer applies loses its series.
-        m.set_veto(&state, |_| vec!["pods"], |_, _| true);
+        h.veto_readings = vec![VetoReading::Pods];
+        m.set_host_gauges(std::slice::from_ref(&h));
         let text = m.render();
         assert!(!text.contains("reading=\"mounts\""), "{text}");
         assert!(!text.contains("mounts+pods"), "{text}");
         // And a stopped host shows stopped on every reading, blocking or not.
-        let mut st = ResourceState::new(PowerPhase::On {
-            since: Millis(1),
-            ours: false,
-        });
-        st.shutdown = Some(
+        h.veto_readings = vec![VetoReading::Mounts, VetoReading::Pods];
+        h.shutdown = shutdown(
             Shutdown::idle_without_consumers(Millis(2))
                 .vetoing(Millis(3))
                 .stopped(Millis(4)),
+            vec![],
         );
-        state.resources.insert("gpu".into(), st);
-        m.set_veto(&state, |_| vec!["mounts", "pods"], |_, _| false);
+        m.set_host_gauges(std::slice::from_ref(&h));
         let text = m.render();
         assert_eq!(
             text.lines()
@@ -866,18 +894,28 @@ mod tests {
 
     #[test]
     fn the_min_off_gauge_counts_down_to_zero_and_drops_resources_without_a_minimum() {
-        use sched_model::{PowerPhase, ResourceState};
+        use sched_sequencer::status::MinOff;
         let m = Metrics::new();
-        let mut off = ResourceState::new(PowerPhase::Off { ours: false });
-        off.off_since = Some(Millis(1_000));
-        let mut s = SchedState::default();
-        s.resources.insert("a".into(), off);
-        s.resources.insert(
-            "b".into(),
-            ResourceState::new(PowerPhase::Off { ours: false }),
-        );
-        let min = |id: &ResourceId| (id.as_str() != "c").then_some(Millis(61_000));
-        m.set_min_off_remaining(&s, Millis(11_000), min);
+        // "a" went down at 1s; "b" was found down. `min_off` is 61s.
+        let min_off = |since: Option<u64>, now: u64| {
+            let remaining = match since {
+                Some(s) => Millis(61_000).saturating_sub(Millis(now - s)),
+                None => Millis::ZERO,
+            };
+            Some(MinOff {
+                since: since.map(Millis),
+                remaining,
+                until: Millis(now).saturating_add(remaining),
+            })
+        };
+        let hosts_at = |now: u64| {
+            let mut a = host("a", PowerPhase::Off { ours: false });
+            a.min_off = min_off(Some(1_000), now);
+            let mut b = host("b", PowerPhase::Off { ours: false });
+            b.min_off = min_off(None, now);
+            vec![a, b]
+        };
+        m.set_host_gauges(&hosts_at(11_000));
         let text = m.render();
         assert!(
             text.contains("sched_resource_min_off_remaining_seconds{resource=\"a\"} 51"),
@@ -887,13 +925,17 @@ mod tests {
             text.contains("sched_resource_min_off_remaining_seconds{resource=\"b\"} 0"),
             "{text}"
         );
-        m.set_min_off_remaining(&s, Millis(70_000), min);
+        m.set_host_gauges(&hosts_at(70_000));
         assert!(
             m.render()
                 .contains("sched_resource_min_off_remaining_seconds{resource=\"a\"} 0")
         );
         // Without a minimum (disabled, or no longer managed) the series goes away.
-        m.set_min_off_remaining(&s, Millis(70_000), |_| None);
+        let mut none = hosts_at(70_000);
+        for h in &mut none {
+            h.min_off = None;
+        }
+        m.set_host_gauges(&none);
         assert!(
             !m.render()
                 .contains("sched_resource_min_off_remaining_seconds{")
@@ -1046,17 +1088,9 @@ mod tests {
     #[test]
     fn the_power_failed_gauge_covers_only_resources_that_can_fail() {
         let m = Metrics::new();
-        let mut st = SchedState::default();
-        for id in ["host", "plain"] {
-            st.resources.insert(
-                ResourceId::new(id),
-                sched_model::ResourceState::new(PowerPhase::On {
-                    since: Millis(0),
-                    ours: false,
-                }),
-            );
-        }
-        m.set_power_failed(&st, |id| id.as_str() == "host");
+        let mut plain = host("plain", on());
+        plain.has_power = false;
+        m.set_host_gauges(&[host("host", on()), plain]);
         let text = m.render();
         let lines = |r: &str| {
             text.lines()

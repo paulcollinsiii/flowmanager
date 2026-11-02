@@ -3745,6 +3745,7 @@ name = "sched-sequencer"
 version = "0.1.0"
 dependencies = [
  "sched-model",
+ "serde",
  "serde_json",
 ]
 

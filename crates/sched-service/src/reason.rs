@@ -3,14 +3,13 @@
 use std::collections::BTreeSet;
 
 use sched_model::{
-    Intent, Millis, ModelId, PowerTransition, PowerWant, ResourceId, Step, WaitReason,
+    Intent, Millis, ModelId, PowerPhase, PowerTransition, PowerWant, ResourceId, Step, WaitReason,
 };
 use sched_observe::ObserverState;
+use sched_sequencer::status::{HostEvent, HostStatus, VetoStatus, blockers_label, readings_label};
 
 use crate::cache::InputAge;
-use crate::tick::{
-    MinOffWait, PowerFailed, PowerRequestFailure, PowerTimeout, VetoHeld, VetoTimeout,
-};
+use crate::tick::PowerRequestFailure;
 
 /// The metric label of a step. A fixed set, so label cardinality is bounded.
 pub fn step_kind(step: &Step) -> &'static str {
@@ -55,21 +54,34 @@ pub const KIND_DEMAND_UNPOLLED: &str = "demand_unpolled";
 /// or shutdown timed out and flowmanager stopped. Never [`KIND_IDLE`].
 pub const KIND_POWER_FAILED: &str = "power_failed";
 
-/// Adds the power failures to a decision's kinds and reason: each resource in the failed
-/// state (with what a person must do), each timeout raised in this tick, and each power
-/// request whose call failed (so a failed request is never read as a success).
-pub fn with_power(
+/// Metric label for a tick in which a resource's shutdown wait for unmounting pods timed out
+/// and flowmanager stopped: the host stays up and a person must act.
+pub const KIND_SHUTDOWN_STOPPED: &str = "shutdown_stopped";
+
+/// Adds what the hosts' statuses and the tick's events say to a decision's kinds and reason,
+/// in this order: each power request whose call failed (so a failed request is never read as
+/// a success), each power timeout of this tick, each host in the failed power state (with
+/// what a person must do), each veto timeout of this tick, each host whose shutdown the veto
+/// holds back or stopped, and each power-on held back by `min_off` (how long it has left).
+pub fn with_hosts(
     mut kinds: Vec<String>,
     mut reason: String,
-    failed: &[PowerFailed],
-    timeouts: &[PowerTimeout],
+    hosts: &[HostStatus],
+    events: &[HostEvent],
     request_failures: &[PowerRequestFailure],
 ) -> (Vec<String>, String) {
-    if !failed.is_empty() {
+    let failed = |h: &HostStatus| match h.power {
+        PowerPhase::Failed { since, during } => Some((since, during)),
+        _ => None,
+    };
+    if hosts.iter().any(|h| failed(h).is_some()) {
         kinds.push(KIND_POWER_FAILED.to_string());
-        kinds.sort();
-        kinds.dedup();
     }
+    if hosts.iter().any(HostStatus::stopped) {
+        kinds.push(KIND_SHUTDOWN_STOPPED.to_string());
+    }
+    kinds.sort();
+    kinds.dedup();
     for f in request_failures {
         reason.push_str(&format!(
             "; power {} of {} FAILED at {}ms: {} (not retried; the host's state is followed from its reachability and the transition times out)",
@@ -79,85 +91,76 @@ pub fn with_power(
             f.error
         ));
     }
-    for t in timeouts {
-        reason.push_str(&format!(
-            "; ALERT: {} of {} timed out in this tick",
-            t.during.as_str(),
-            t.resource
-        ));
+    for e in events {
+        if let HostEvent::PowerTimeout {
+            resource, during, ..
+        } = e
+        {
+            reason.push_str(&format!(
+                "; ALERT: {} of {} timed out in this tick",
+                during.as_str(),
+                resource
+            ));
+        }
     }
-    for f in failed {
-        let wanted = match f.during {
+    for h in hosts {
+        let Some((since, during)) = failed(h) else {
+            continue;
+        };
+        let wanted = match during {
             PowerTransition::PoweringOn => "up",
             PowerTransition::ShuttingDown => "down",
         };
         reason.push_str(&format!(
             "; {} is in the FAILED power state since {}ms ({} timed out): nothing is allowed on it, no power action will be taken for it by flowmanager, and it clears when the host is observed {wanted} or a person acts (control: manual also clears it)",
-            f.resource,
-            f.since.as_u64(),
-            f.during.as_str()
+            h.resource,
+            since.as_u64(),
+            during.as_str()
         ));
     }
-    (kinds, reason)
-}
-
-/// Metric label for a tick in which a resource's shutdown wait for unmounting pods timed out
-/// and flowmanager stopped: the host stays up and a person must act.
-pub const KIND_SHUTDOWN_STOPPED: &str = "shutdown_stopped";
-
-/// Adds the held-back shutdowns to a decision's kinds and reason: each resource waiting for
-/// the veto to clear (a pod still using the host, or a reading of it missing), each wait that
-/// timed out in this tick, and each resource where flowmanager stopped.
-pub fn with_veto(
-    mut kinds: Vec<String>,
-    mut reason: String,
-    held: &[VetoHeld],
-    timeouts: &[VetoTimeout],
-) -> (Vec<String>, String) {
-    if held.iter().any(|h| h.stopped) {
-        kinds.push(KIND_SHUTDOWN_STOPPED.to_string());
-        kinds.sort();
-        kinds.dedup();
-    }
-    for t in timeouts {
-        reason.push_str(&format!(
-            "; ALERT: the shutdown of {} waited for the veto ({}) to clear until veto_timeout ran out in this tick",
-            t.resource,
-            crate::tick::blockers_label(&t.blocking)
-        ));
-    }
-    for h in held {
-        if h.stopped {
+    for e in events {
+        if let HostEvent::VetoTimeout {
+            resource, blocking, ..
+        } = e
+        {
             reason.push_str(&format!(
+                "; ALERT: the shutdown of {} waited for the veto ({}) to clear until veto_timeout ran out in this tick",
+                resource,
+                blockers_label(blocking)
+            ));
+        }
+    }
+    for h in hosts {
+        match h.veto() {
+            Some(VetoStatus::Stopped { since, .. }) => reason.push_str(&format!(
                 "; {} was NOT shut down: it was still in use (or its use was unknown; veto {}) when veto_timeout ran out at {}ms; flowmanager stopped, the host stays up, and it will not shut it down by itself again until a person acts (resume), it is seen down, or a new manual request takes it over",
                 h.resource,
-                h.readings.join("+"),
-                h.since.as_u64()
-            ));
-        } else {
-            reason.push_str(&format!(
+                readings_label(&h.veto_readings),
+                since.as_u64()
+            )),
+            Some(VetoStatus::Waiting { since, blocking }) => reason.push_str(&format!(
                 "; the shutdown of {} is held back since {}ms by the veto ({}): a pod mounts its NFS server or runs its models, or the reading is unknown (unknown counts as in use)",
                 h.resource,
-                h.since.as_u64(),
-                crate::tick::blockers_label(&h.blocking)
+                since.as_u64(),
+                blockers_label(blocking)
+            )),
+            _ => {}
+        }
+    }
+    for h in hosts {
+        if let (Some(WaitReason::MinOff), Some(m)) = (h.wait, h.min_off)
+            && let Some(since) = m.since
+        {
+            reason.push_str(&format!(
+                "; {} is wanted but was shut down by flowmanager and seen down at {}ms: waiting for min_off, {}s left (power-on decided again at {}ms; a manual lease would not wait)",
+                h.resource,
+                since.as_u64(),
+                m.remaining.as_u64().div_ceil(1000),
+                m.until.as_u64()
             ));
         }
     }
     (kinds, reason)
-}
-
-/// Adds the power-ons held back by `min_off` to a decision's reason: how long each has left.
-pub fn with_min_off(mut reason: String, waits: &[MinOffWait]) -> String {
-    for w in waits {
-        reason.push_str(&format!(
-            "; {} is wanted but was shut down by flowmanager and seen down at {}ms: waiting for min_off, {}s left (power-on decided again at {}ms; a manual lease would not wait)",
-            w.resource,
-            w.since.as_u64(),
-            w.remaining.as_u64().div_ceil(1000),
-            w.until.as_u64()
-        ));
-    }
-    reason
 }
 
 /// Classes whose demand is unknown, by why. None of them is "zero demand".

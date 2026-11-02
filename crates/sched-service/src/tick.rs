@@ -23,12 +23,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sched_model::{
-    AllowedSet, Capability, ClassId, Config, CreateJob, DrainMode, JobBook, JobEvent, Lease,
-    LeaseId, Millis, ModelId, PowerPhase, PowerTransition, PublishedAllowed, ReadingUse,
-    ResourceId, SchedState, Shutdown, ShutdownCause, Snapshot, SourceId, Step, WaitReason,
+    AllowedSet, Capability, ClassId, CreateJob, JobBook, JobEvent, Lease, LeaseId, Millis, ModelId,
+    PowerPhase, PowerTransition, PublishedAllowed, ResourceId, SchedState, SourceId, Step,
     class_work,
 };
 use sched_observe::{ObserverState, Report, observer_state};
+use sched_sequencer::status::{
+    self, Decided, HostEvent, HostStatus, blockers_label, readings_label,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -98,27 +100,6 @@ impl InputReport {
     }
 }
 
-/// A resource in the failed power state, in a [`TickReport`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PowerFailed {
-    pub resource: ResourceId,
-    /// The transition that timed out.
-    pub during: PowerTransition,
-    /// When the timeout expired.
-    pub since: Millis,
-}
-
-/// A power transition that timed out in this tick: the alert (see the `power_timeout` log
-/// event and `sched_power_timeouts_total`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PowerTimeout {
-    pub resource: ResourceId,
-    pub during: PowerTransition,
-    /// When the transition began, if the previous state said.
-    pub started_at: Option<Millis>,
-    pub at: Millis,
-}
-
 /// A power request whose call failed, as the `Power` object reported it to this process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerRequestFailure {
@@ -127,161 +108,6 @@ pub struct PowerRequestFailure {
     pub at: Millis,
     pub error: String,
 }
-
-/// The resources failed in `next`, and those that entered the failed state since `prev`.
-fn power_report(prev: &SchedState, next: &SchedState) -> (Vec<PowerFailed>, Vec<PowerTimeout>) {
-    let mut failed = Vec::new();
-    let mut timeouts = Vec::new();
-    for (id, st) in &next.resources {
-        let PowerPhase::Failed { since, during } = st.power else {
-            continue;
-        };
-        failed.push(PowerFailed {
-            resource: id.clone(),
-            during,
-            since,
-        });
-        let before = prev.resource(id).map(|p| p.power);
-        if !matches!(before, Some(PowerPhase::Failed { .. })) {
-            timeouts.push(PowerTimeout {
-                resource: id.clone(),
-                during,
-                started_at: match before {
-                    Some(PowerPhase::PoweringOn { since } | PowerPhase::ShuttingDown { since }) => {
-                        Some(since)
-                    }
-                    _ => None,
-                },
-                at: since,
-            });
-        }
-    }
-    (failed, timeouts)
-}
-
-/// A reading of the veto that is not showing the host unused, in a [`TickReport`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VetoBlocker {
-    /// `mounts` (pods mounting the host's NFS server) or `pods` (pods of its models).
-    pub reading: String,
-    /// `in_use` (a fresh reading shows a pod) or `unknown` (no fresh reading; counts as in use).
-    pub state: String,
-}
-
-impl VetoBlocker {
-    /// `mounts:in_use`, `pods:unknown`, as joined in logs and reasons.
-    fn label(&self) -> String {
-        format!("{}:{}", self.reading, self.state)
-    }
-}
-
-pub fn blockers_label(blocking: &[VetoBlocker]) -> String {
-    blocking
-        .iter()
-        .map(VetoBlocker::label)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// A resource whose shutdown is held back by the veto (a pod still uses the host, or the
-/// reading is unknown), in a [`TickReport`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VetoHeld {
-    pub resource: ResourceId,
-    /// The readings the veto of this resource consults: `mounts` (pods mounting its NFS
-    /// server), `pods` (pods of its models).
-    pub readings: Vec<String>,
-    /// The readings that are not showing the host unused as of this tick's snapshot (empty
-    /// for a stopped host once the pods are gone: it stays stopped all the same).
-    pub blocking: Vec<VetoBlocker>,
-    /// When the wait began (`stopped` false), or when flowmanager gave up (`stopped` true).
-    pub since: Millis,
-    /// The wait outlasted `veto_timeout`: flowmanager stopped, the host stays up, and a
-    /// person must act.
-    pub stopped: bool,
-}
-
-/// A veto wait that timed out in this tick: the alert (see the `shutdown_veto_timeout` log
-/// event and `sched_veto_timeouts_total`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VetoTimeout {
-    pub resource: ResourceId,
-    /// The readings the veto of this resource consults (see [`VetoHeld::readings`]).
-    pub readings: Vec<String>,
-    /// The readings that were still blocking when the wait ran out.
-    pub blocking: Vec<VetoBlocker>,
-    /// When the wait began, if the previous state said.
-    pub waiting_since: Option<Millis>,
-    pub at: Millis,
-}
-
-/// The resources whose shutdown is held back in `next`, and those that were stopped in this
-/// tick (they were not in `prev`). `snapshot` is the one the tick decided on: it says which
-/// readings are blocking.
-fn veto_report(
-    config: &Config,
-    snapshot: &Snapshot,
-    prev: &SchedState,
-    next: &SchedState,
-) -> (Vec<VetoHeld>, Vec<VetoTimeout>) {
-    let mut held = Vec::new();
-    let mut timeouts = Vec::new();
-    let readings = |id: &ResourceId| -> Vec<String> {
-        config
-            .veto_readings(id)
-            .iter()
-            .map(|r| r.as_str().to_string())
-            .collect()
-    };
-    let blocking = |id: &ResourceId| -> Vec<VetoBlocker> {
-        snapshot
-            .host_use(config, id, config.policy().host_reading_stale_after)
-            .blocking()
-            .into_iter()
-            .map(|(reading, state)| VetoBlocker {
-                reading: reading.as_str().to_string(),
-                state: match state {
-                    ReadingUse::InUse => "in_use".to_string(),
-                    _ => "unknown".to_string(),
-                },
-            })
-            .collect()
-    };
-    for (id, st) in &next.resources {
-        let Some(shutdown) = st.shutdown else {
-            continue;
-        };
-        if let Some(since) = shutdown.vetoing_since() {
-            held.push(VetoHeld {
-                resource: id.clone(),
-                readings: readings(id),
-                blocking: blocking(id),
-                since,
-                stopped: false,
-            });
-        } else if let Some(since) = shutdown.stopped_since() {
-            held.push(VetoHeld {
-                resource: id.clone(),
-                readings: readings(id),
-                blocking: blocking(id),
-                since,
-                stopped: true,
-            });
-            let before = prev.resource(id).and_then(|p| p.shutdown);
-            if before.is_none_or(|b| b.stopped_since().is_none()) {
-                timeouts.push(VetoTimeout {
-                    resource: id.clone(),
-                    readings: readings(id),
-                    blocking: blocking(id),
-                    waiting_since: before.and_then(|b| b.vetoing_since()),
-                    at: since,
-                });
-            }
-        }
-    }
-    (held, timeouts)
-}
-
 /// One class's queue counts in a [`TickReport`], as the planner read them in this tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueReport {
@@ -295,87 +121,6 @@ pub struct QueueReport {
     pub oldest_ready_age_ms: Option<u64>,
     /// False when the reading is missing or stale (the counts are then zero, not measured).
     pub known: bool,
-}
-
-/// A resource whose automatic power-on waits for `min_off`, in a [`TickReport`]: flowmanager
-/// shut the host down and saw it down, and a want arrived before the minimum off time passed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MinOffWait {
-    pub resource: ResourceId,
-    /// When the host was seen down after flowmanager shut it down.
-    pub since: Millis,
-    /// The instant the wait ends (the earliest a power-on can be decided).
-    pub until: Millis,
-    /// How long is left at the tick's time.
-    pub remaining: Millis,
-}
-
-/// The `min_off` waits of a decision: one per resource whose step is that wait.
-fn min_off_report(
-    config: &Config,
-    state: &SchedState,
-    steps: &[Step],
-    now: Millis,
-) -> Vec<MinOffWait> {
-    steps
-        .iter()
-        .filter_map(|s| match s {
-            Step::Wait {
-                resource,
-                reason: WaitReason::MinOff,
-            } => {
-                let st = state.resource(resource)?;
-                let min_off = config.resource(resource)?.power.as_ref()?.min_off();
-                let remaining = st.min_off_remaining(min_off, now);
-                Some(MinOffWait {
-                    resource: resource.clone(),
-                    since: st.off_since?,
-                    until: now.saturating_add(remaining),
-                    remaining,
-                })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// A drain under way on a host, in a [`TickReport`]: a person released its manual lease and
-/// asked for it to go down. The shutdown itself waits (or not) as the tick's steps say.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DrainReport {
-    pub resource: ResourceId,
-    /// `graceful` or `immediate`.
-    pub mode: String,
-    /// When the drain was requested.
-    pub since: Millis,
-    /// Whether the host's consumers have been scaled down (left the allowed set).
-    pub scaled_down: bool,
-    /// `requested` (a person asked) or `idle` (the scheduler started it when the host went idle).
-    pub origin: String,
-}
-
-/// The drains in `state`.
-fn drain_report(state: &SchedState) -> Vec<DrainReport> {
-    state
-        .resources
-        .iter()
-        .filter_map(|(id, st)| {
-            let s = st.shutdown.filter(Shutdown::is_drain)?;
-            // An idle drain scales the consumers down at once.
-            let mode = match s.cause() {
-                ShutdownCause::Requested { mode } => mode,
-                ShutdownCause::Idle => DrainMode::Immediate,
-                ShutdownCause::Lockout => return None,
-            };
-            Some(DrainReport {
-                resource: id.clone(),
-                mode: mode.as_str().to_string(),
-                since: s.since(),
-                scaled_down: s.consumers_withdrawn(),
-                origin: s.cause().origin()?.to_string(),
-            })
-        })
-        .collect()
 }
 
 /// What a tick decided, for logs and for the `last_decision` handler.
@@ -423,42 +168,21 @@ pub struct TickReport {
     /// The sequencer state after this tick (unchanged from before if the tick failed).
     #[serde(default)]
     pub state: SchedState,
-    /// Resources in the failed power state: a power-on or shutdown outlasted its timeout and
-    /// flowmanager stopped (it never retries; a person must act). Allowed: nothing on them.
+    /// The status of every resource after this tick (see `sched_sequencer::status`): the one
+    /// derived answer to what each host is doing, which the reason, the metrics, the logs
+    /// and the toggle listener read. Empty when the tick failed.
     #[serde(default)]
-    pub power_failed: Vec<PowerFailed>,
-    /// Power transitions that timed out in this very tick (the alert fires once, then the
-    /// resource stays in `power_failed`).
+    pub hosts: Vec<HostStatus>,
+    /// What became true in this very tick and is alerted once: a power transition or a veto
+    /// wait timing out, a host adopted, an adoption ended. Empty when the tick failed. A
+    /// replayed tick carries the same events and does not alert or count them again.
     #[serde(default)]
-    pub power_timeouts: Vec<PowerTimeout>,
+    pub events: Vec<HostEvent>,
     /// Power requests that failed (the call to the router or the host), for resources still
     /// powering on, shutting down or failed. A failed request is not retried; the host is
     /// followed from its reachability and the transition times out.
     #[serde(default)]
     pub power_request_failures: Vec<PowerRequestFailure>,
-    /// Resources whose shutdown is held back because pods mount their NFS server (or the
-    /// count is unknown): waiting, bounded by `veto_timeout`, or stopped after it ran out
-    /// (the host stays up; flowmanager does not retry; a person must act).
-    #[serde(default)]
-    pub veto_held: Vec<VetoHeld>,
-    /// Shutdown waits that timed out in this very tick (the alert fires once, then the
-    /// resource stays in `veto_held` as stopped).
-    #[serde(default)]
-    pub veto_timeouts: Vec<VetoTimeout>,
-    /// Resources whose automatic power-on is held back for `min_off` after a shutdown
-    /// flowmanager started: the time left per resource. A manual lease never waits.
-    #[serde(default)]
-    pub min_off_waits: Vec<MinOffWait>,
-    /// Managed hosts found running in this tick that were adopted: a manual host lease was
-    /// minted for each, so the user is taken to hold them up.
-    #[serde(default)]
-    pub adopted: Vec<ResourceId>,
-    /// Hosts whose adopted lease was dropped in this tick because the host was seen down.
-    #[serde(default)]
-    pub adoptions_ended: Vec<ResourceId>,
-    /// Hosts with a drain under way (see `sched_model::Drain`), from the state after this tick.
-    #[serde(default)]
-    pub drains: Vec<DrainReport>,
     /// What the scheduled jobs did in this tick (alerts among them).
     #[serde(default)]
     pub job_events: Vec<JobEvent>,
@@ -472,6 +196,79 @@ pub struct TickReport {
     /// Whether observations changed since the previous tick of this process.
     pub input_changed: bool,
     pub error: Option<String>,
+}
+
+impl TickReport {
+    /// The status of `resource` after this tick, if the tick decided and the resource exists.
+    pub fn host(&self, resource: &ResourceId) -> Option<&HostStatus> {
+        self.hosts.iter().find(|h| &h.resource == resource)
+    }
+}
+
+/// Views of a report the tests assert on, each one a filter of `hosts` or `events`.
+#[cfg(test)]
+impl TickReport {
+    pub fn adopted(&self) -> Vec<ResourceId> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                HostEvent::Adopted { resource } => Some(resource.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn adoptions_ended(&self) -> Vec<ResourceId> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                HostEvent::AdoptionEnded { resource } => Some(resource.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn power_timeouts(&self) -> Vec<&HostEvent> {
+        self.events
+            .iter()
+            .filter(|e| matches!(e, HostEvent::PowerTimeout { .. }))
+            .collect()
+    }
+
+    pub fn veto_timeouts(&self) -> Vec<&HostEvent> {
+        self.events
+            .iter()
+            .filter(|e| matches!(e, HostEvent::VetoTimeout { .. }))
+            .collect()
+    }
+
+    pub fn power_failed(&self) -> Vec<&HostStatus> {
+        self.hosts
+            .iter()
+            .filter(|h| matches!(h.power, PowerPhase::Failed { .. }))
+            .collect()
+    }
+
+    /// Hosts whose shutdown the veto holds back or stopped.
+    pub fn veto_held(&self) -> Vec<&HostStatus> {
+        self.hosts.iter().filter(|h| h.veto().is_some()).collect()
+    }
+
+    /// Hosts whose automatic power-on waits for `min_off`.
+    pub fn min_off_waits(&self) -> Vec<&HostStatus> {
+        self.hosts
+            .iter()
+            .filter(|h| h.wait == Some(sched_model::WaitReason::MinOff) && h.min_off.is_some())
+            .collect()
+    }
+
+    /// The drains under way, with their host.
+    pub fn drains(&self) -> Vec<(&HostStatus, status::Drain)> {
+        self.hosts
+            .iter()
+            .filter_map(|h| h.drain().map(|d| (h, d)))
+            .collect()
+    }
 }
 
 /// What a tick reads from the scheduler's durable state, kept by the `Scheduler` object in
@@ -702,15 +499,9 @@ impl Shared {
             leases: vec![],
             ignored_leases: vec![],
             state: SchedState::default(),
-            power_failed: vec![],
-            power_timeouts: vec![],
+            hosts: vec![],
+            events: vec![],
             power_request_failures: vec![],
-            veto_held: vec![],
-            veto_timeouts: vec![],
-            min_off_waits: vec![],
-            adopted: vec![],
-            adoptions_ended: vec![],
-            drains: vec![],
             job_events: vec![],
             jobs: vec![],
             inputs: vec![],
@@ -900,66 +691,73 @@ impl Shared {
                 gaps.unknown.push(c.id.clone());
             }
         }
-        let (kinds, reason, steps, allowed, state, forced, error) =
-            match decide(&config, &snapshot, &prev_state) {
-                Ok((intent, decision)) => {
-                    // Power wishes of hosts under manual control are never acted on; the
-                    // reason does not list them.
-                    let mut shown = intent.clone();
-                    shown.power_up.retain(|r, _| config.power_managed(r));
-                    (
-                        reason::kinds(&decision.steps, &gaps, !reason::pinned(&intent).is_empty())
-                            .into_iter()
-                            .map(String::from)
-                            .collect(),
-                        reason::reason(&shown, &decision.steps, &gaps),
-                        decision.steps,
-                        decision.allowed,
-                        decision.state,
-                        intent.forced.iter().cloned().collect(),
-                        None,
-                    )
-                }
-                // The previous state stays, and so does the previous publication.
-                Err(e) => (
-                    vec![reason::KIND_ERROR.to_string()],
-                    format!("no decision: {e}"),
-                    Vec::new(),
-                    AllowedSet::default(),
-                    prev_state.clone(),
-                    Vec::new(),
-                    Some(e.to_string()),
-                ),
-            };
-        let (power_failed, power_timeouts) = power_report(&durable.state, &state);
-        let power_request_failures = self.power_request_failures(&state);
-        let (veto_held, veto_timeouts) = veto_report(&config, &snapshot, &durable.state, &state);
-        let drains = drain_report(&state);
-        let (kinds, reason) = if error.is_none() {
-            reason::with_power(
-                kinds,
-                reason,
-                &power_failed,
-                &power_timeouts,
-                &power_request_failures,
-            )
-        } else {
-            (kinds, reason)
-        };
-        let (kinds, reason) = if error.is_none() {
-            reason::with_veto(kinds, reason, &veto_held, &veto_timeouts)
-        } else {
-            (kinds, reason)
-        };
-        let min_off_waits = if error.is_none() {
-            min_off_report(&config, &state, &steps, now)
-        } else {
-            Vec::new()
-        };
-        let reason = if min_off_waits.is_empty() {
-            reason
-        } else {
-            reason::with_min_off(reason, &min_off_waits)
+        let (
+            kinds,
+            reason,
+            steps,
+            allowed,
+            state,
+            forced,
+            hosts,
+            events,
+            power_request_failures,
+            error,
+        ) = match decide(&config, &snapshot, &prev_state) {
+            Ok((intent, decision)) => {
+                // Power wishes of hosts under manual control are never acted on; the
+                // reason does not list them.
+                let mut shown = intent.clone();
+                shown.power_up.retain(|r, _| config.power_managed(r));
+                let (hosts, events) = status::derive(&Decided {
+                    config: &config,
+                    snapshot: &snapshot,
+                    prev: &durable.state,
+                    next: &decision.state,
+                    steps: &decision.steps,
+                    now,
+                    adopted: &adopted,
+                    ended: &adoptions_ended,
+                });
+                let kinds =
+                    reason::kinds(&decision.steps, &gaps, !reason::pinned(&intent).is_empty())
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                let power_request_failures = self.power_request_failures(&decision.state);
+                let (kinds, reason) = reason::with_hosts(
+                    kinds,
+                    reason::reason(&shown, &decision.steps, &gaps),
+                    &hosts,
+                    &events,
+                    &power_request_failures,
+                );
+                (
+                    kinds,
+                    reason,
+                    decision.steps,
+                    decision.allowed,
+                    decision.state,
+                    intent.forced.iter().cloned().collect(),
+                    hosts,
+                    events,
+                    power_request_failures,
+                    None,
+                )
+            }
+            // The previous state stays, and so does the previous publication. There is no
+            // decision to describe: no statuses and no events.
+            Err(e) => (
+                vec![reason::KIND_ERROR.to_string()],
+                format!("no decision: {e}"),
+                Vec::new(),
+                AllowedSet::default(),
+                prev_state.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                self.power_request_failures(&prev_state),
+                Some(e.to_string()),
+            ),
         };
         let report = TickReport {
             config_generation: config.generation(),
@@ -981,17 +779,11 @@ impl Shared {
             leases,
             ignored_leases,
             state,
-            power_failed,
-            power_timeouts,
+            hosts,
+            events,
             power_request_failures,
-            veto_held,
-            veto_timeouts,
-            min_off_waits,
             inputs: ages.iter().map(InputReport::from).collect(),
             queues,
-            adopted,
-            adoptions_ended,
-            drains,
             job_events,
             jobs: crate::jobs::summaries(&config, &jobs),
             input_changed: changed,
@@ -1029,51 +821,38 @@ impl Shared {
         self.metrics.set_input_ages(&ages);
         self.metrics.set_phases(r.at, &r.state);
         self.metrics.set_manual_lease_ages(r.at, &r.leases);
-        let config = self.config.current();
-        self.metrics.set_power_failed(&r.state, |id| {
-            config.resource(id).is_some_and(|res| res.power.is_some())
-        });
-        self.metrics.set_veto(
-            &r.state,
-            |id| {
-                config
-                    .veto_readings(id)
-                    .iter()
-                    .map(|r| r.as_str())
-                    .collect()
-            },
-            |id, reading| {
-                r.veto_held
-                    .iter()
-                    .any(|h| &h.resource == id && h.blocking.iter().any(|b| b.reading == reading))
-            },
-        );
-        self.metrics.set_min_off_remaining(&r.state, r.at, |id| {
-            config
-                .resource(id)
-                .filter(|_| config.power_managed(id))
-                .and_then(|res| res.power.as_ref())
-                .map(|p| p.min_off())
-                .filter(|m| *m > Millis::ZERO)
-        });
-        if !replayed {
-            for t in &r.veto_timeouts {
-                // One count per reading that was still blocking (all that apply if the
-                // snapshot shows none, which a timeout never does).
-                let readings = if t.blocking.is_empty() {
-                    t.readings.clone()
-                } else {
-                    t.blocking.iter().map(|b| b.reading.clone()).collect()
-                };
-                for reading in readings {
-                    self.metrics.veto_timeout(t.resource.as_str(), &reading);
-                }
-            }
+        // The per-host gauges come from the statuses; a failed tick has none, and the gauges
+        // keep what the last decided tick set.
+        if r.error.is_none() {
+            self.metrics.set_host_gauges(&r.hosts);
         }
         if !replayed {
-            for t in &r.power_timeouts {
-                self.metrics
-                    .power_timeout(t.resource.as_str(), t.during.as_str());
+            for event in &r.events {
+                match event {
+                    HostEvent::VetoTimeout {
+                        resource,
+                        readings,
+                        blocking,
+                        ..
+                    } => {
+                        // One count per reading that was still blocking (all that apply if
+                        // the snapshot shows none, which a timeout never does).
+                        let labels: Vec<&str> = if blocking.is_empty() {
+                            readings.iter().map(|r| r.as_str()).collect()
+                        } else {
+                            blocking.iter().map(|b| b.reading.as_str()).collect()
+                        };
+                        for reading in labels {
+                            self.metrics.veto_timeout(resource.as_str(), reading);
+                        }
+                    }
+                    HostEvent::PowerTimeout {
+                        resource, during, ..
+                    } => self
+                        .metrics
+                        .power_timeout(resource.as_str(), during.as_str()),
+                    HostEvent::Adopted { .. } | HostEvent::AdoptionEnded { .. } => {}
+                }
             }
         }
         self.metrics.set_jobs(&r.jobs);
@@ -1121,6 +900,95 @@ fn log_job_event(e: &sched_model::JobEvent, replayed: bool) {
     }
 }
 
+/// Logs one host event. The alert-grade ones (`power_timeout`, `shutdown_veto_timeout`) are
+/// errors for the tick that decided them. A replay (the decision came back from the journal)
+/// logs the same fact at info level under the name plus `_replayed`, so a log-based alert
+/// fires once.
+fn log_host_event(e: &HostEvent, at: Millis, replayed: bool) {
+    match e {
+        HostEvent::Adopted { resource: h } => tracing::info!(
+            event = "host_adopted",
+            resource = %h,
+            at_ms = at.as_u64(),
+            replayed,
+            "{h} was found running and flowmanager did not power it on: it is held by the user (a manual host lease was minted; switching the host off releases it)"
+        ),
+        HostEvent::AdoptionEnded { resource: h } => tracing::info!(
+            event = "host_adoption_ended",
+            resource = %h,
+            at_ms = at.as_u64(),
+            replayed,
+            "{h} was seen down: its adopted lease is dropped, so it is not woken again"
+        ),
+        HostEvent::PowerTimeout {
+            resource,
+            during,
+            started_at,
+            at,
+        } => {
+            let wanted = match during {
+                PowerTransition::PoweringOn => "up",
+                PowerTransition::ShuttingDown => "down",
+            };
+            if replayed {
+                tracing::info!(
+                    event = "power_timeout_replayed",
+                    resource = %resource,
+                    during = during.as_str(),
+                    started_at_ms = ?started_at.map(Millis::as_u64),
+                    at_ms = at.as_u64(),
+                    "replayed tick: {} of {} timed out (alerted when first decided); it is not retried",
+                    during.as_str(),
+                    resource,
+                );
+            } else {
+                tracing::error!(
+                    event = "power_timeout",
+                    resource = %resource,
+                    during = during.as_str(),
+                    started_at_ms = ?started_at.map(Millis::as_u64),
+                    at_ms = at.as_u64(),
+                    "ALERT: {} of {} did not complete in time; flowmanager stops here and will not retry any power action for it: nothing is allowed on it until it is observed {} or a person acts",
+                    during.as_str(),
+                    resource,
+                    wanted,
+                );
+            }
+        }
+        HostEvent::VetoTimeout {
+            resource,
+            readings,
+            blocking,
+            waiting_since,
+            at,
+        } => {
+            if replayed {
+                tracing::info!(
+                    event = "shutdown_veto_timeout_replayed",
+                    resource = %resource,
+                    readings = %readings_label(readings),
+                    blocking = %blockers_label(blocking),
+                    waiting_since_ms = ?waiting_since.map(Millis::as_u64),
+                    at_ms = at.as_u64(),
+                    "replayed tick: the shutdown of {} timed out waiting for the veto to clear (alerted when first decided); it is not retried",
+                    resource,
+                );
+            } else {
+                tracing::error!(
+                    event = "shutdown_veto_timeout",
+                    resource = %resource,
+                    readings = %readings_label(readings),
+                    blocking = %blockers_label(blocking),
+                    waiting_since_ms = ?waiting_since.map(Millis::as_u64),
+                    at_ms = at.as_u64(),
+                    "ALERT: {} was still in use (or its use was unknown) after veto_timeout; flowmanager did NOT shut it down and stops here: it will not retry by itself, the host stays up until a person acts (or a new manual request takes it over)",
+                    resource,
+                );
+            }
+        }
+    }
+}
+
 fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
     let kinds = r.kinds.join(",");
     if r.error.is_some() {
@@ -1154,43 +1022,29 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
         unsupported_demand = ?ids(&r.unsupported_demand),
         unpolled_demand = ?ids(&r.unpolled_demand),
         drains = ?r
-            .drains
+            .hosts
             .iter()
-            .map(|d| format!("{}:{}:{}:{}", d.resource, d.origin, d.mode, if d.scaled_down { "scaled_down" } else { "running" }))
+            .filter_map(|h| {
+                let d = h.drain()?;
+                Some(format!("{}:{}:{}:{}", h.resource, d.cause.as_str(), d.mode.as_str(), if d.scaled_down { "scaled_down" } else { "running" }))
+            })
             .collect::<Vec<_>>(),
         "tick"
     );
-    for h in &r.adopted {
-        tracing::info!(
-            event = "host_adopted",
-            resource = %h,
-            at_ms = r.at.as_u64(),
-            replayed,
-            "{h} was found running and flowmanager did not power it on: it is held by the user (a manual host lease was minted; switching the host off releases it)"
-        );
-    }
-    for h in &r.adoptions_ended {
-        tracing::info!(
-            event = "host_adoption_ended",
-            resource = %h,
-            at_ms = r.at.as_u64(),
-            replayed,
-            "{h} was seen down: its adopted lease is dropped, so it is not woken again"
-        );
-    }
-    for d in &r.drains {
+    for h in &r.hosts {
+        let Some(d) = h.drain() else { continue };
         tracing::info!(
             event = "drain",
-            resource = %d.resource,
-            mode = %d.mode,
-            origin = %d.origin,
+            resource = %h.resource,
+            mode = d.mode.as_str(),
+            cause = d.cause.as_str(),
             since_ms = d.since.as_u64(),
             scaled_down = d.scaled_down,
             replayed,
             "{} drain of {} ({}): {}",
-            d.origin,
-            d.resource,
-            d.mode,
+            d.cause.as_str(),
+            h.resource,
+            d.mode.as_str(),
             if d.scaled_down { "consumers scaled down, shutting down once nothing holds the host" } else { "in-flight work is still given its drain_timeout" }
         );
     }
@@ -1215,65 +1069,8 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
             );
         }
     }
-    for t in &r.power_timeouts {
-        let wanted = match t.during {
-            PowerTransition::PoweringOn => "up",
-            PowerTransition::ShuttingDown => "down",
-        };
-        // The alert-grade event is for the tick that decided it. A replay (the decision came
-        // back from the journal) logs the same fact at info level under another event name,
-        // so a log-based alert fires once.
-        if replayed {
-            tracing::info!(
-                event = "power_timeout_replayed",
-                resource = %t.resource,
-                during = t.during.as_str(),
-                started_at_ms = ?t.started_at.map(Millis::as_u64),
-                at_ms = t.at.as_u64(),
-                "replayed tick: {} of {} timed out (alerted when first decided); it is not retried",
-                t.during.as_str(),
-                t.resource,
-            );
-        } else {
-            tracing::error!(
-                event = "power_timeout",
-                resource = %t.resource,
-                during = t.during.as_str(),
-                started_at_ms = ?t.started_at.map(Millis::as_u64),
-                at_ms = t.at.as_u64(),
-                "ALERT: {} of {} did not complete in time; flowmanager stops here and will not retry any power action for it: nothing is allowed on it until it is observed {} or a person acts",
-                t.during.as_str(),
-                t.resource,
-                wanted,
-            );
-        }
-    }
-    for t in &r.veto_timeouts {
-        // As for power timeouts: the alert-grade event is for the tick that decided it; a
-        // replay logs the same fact at info level under another event name.
-        if replayed {
-            tracing::info!(
-                event = "shutdown_veto_timeout_replayed",
-                resource = %t.resource,
-                readings = %t.readings.join("+"),
-                blocking = %blockers_label(&t.blocking),
-                waiting_since_ms = ?t.waiting_since.map(Millis::as_u64),
-                at_ms = t.at.as_u64(),
-                "replayed tick: the shutdown of {} timed out waiting for the veto to clear (alerted when first decided); it is not retried",
-                t.resource,
-            );
-        } else {
-            tracing::error!(
-                event = "shutdown_veto_timeout",
-                resource = %t.resource,
-                readings = %t.readings.join("+"),
-                blocking = %blockers_label(&t.blocking),
-                waiting_since_ms = ?t.waiting_since.map(Millis::as_u64),
-                at_ms = t.at.as_u64(),
-                "ALERT: {} was still in use (or its use was unknown) after veto_timeout; flowmanager did NOT shut it down and stops here: it will not retry by itself, the host stays up until a person acts (or a new manual request takes it over)",
-                t.resource,
-            );
-        }
+    for e in &r.events {
+        log_host_event(e, r.at, replayed);
     }
     for e in &r.job_events {
         log_job_event(e, replayed);
@@ -1301,7 +1098,8 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
     use sched_model::test_support::EXAMPLE_CONFIG;
-    use sched_model::{Fidelity, ObservedValue};
+    use sched_model::{Fidelity, ObservedValue, VetoReading};
+    use sched_sequencer::status::{BlockerState, VetoBlocker, VetoStatus};
 
     const T0: u64 = 10_000_000;
 
@@ -2263,20 +2061,20 @@ mod tests {
         let r = s.tick(Millis(T0 + 1_000), &mut d);
         assert_eq!(r.error, None);
         assert_eq!(r.steps, vec![wait(sched_model::WaitReason::VetoInUse)]);
+        assert_eq!(r.veto_held().len(), 1, "{r:?}");
+        let h = r.host(&"basestar-nfs".into()).unwrap();
+        assert_eq!(h.veto_readings, vec![VetoReading::Mounts]);
         assert_eq!(
-            r.veto_held,
-            vec![VetoHeld {
-                resource: "basestar-nfs".into(),
-                readings: vec!["mounts".to_string()],
-                blocking: vec![VetoBlocker {
-                    reading: "mounts".to_string(),
-                    state: "in_use".to_string()
-                }],
+            h.veto(),
+            Some(&VetoStatus::Waiting {
                 since: Millis(T0 + 1_000),
-                stopped: false
-            }]
+                blocking: vec![VetoBlocker {
+                    reading: VetoReading::Mounts,
+                    state: BlockerState::InUse
+                }],
+            })
         );
-        assert!(r.veto_timeouts.is_empty());
+        assert!(r.veto_timeouts().is_empty());
         assert!(r.reason.contains("held back"), "{}", r.reason);
         assert_eq!(veto_gauge(&s, "waiting"), "1");
         assert_eq!(veto_gauge(&s, "stopped"), "0");
@@ -2290,8 +2088,15 @@ mod tests {
             r.steps,
             vec![wait(sched_model::WaitReason::ShutdownStopped)]
         );
-        assert_eq!(r.veto_timeouts.len(), 1, "{r:?}");
-        assert_eq!(r.veto_timeouts[0].waiting_since, Some(Millis(T0 + 1_000)));
+        assert_eq!(r.veto_timeouts().len(), 1, "{r:?}");
+        assert!(
+            matches!(
+                r.veto_timeouts()[0],
+                HostEvent::VetoTimeout { waiting_since, .. }
+                    if *waiting_since == Some(Millis(T0 + 1_000))
+            ),
+            "{r:?}"
+        );
         assert!(r.kinds.contains(&"shutdown_stopped".to_string()), "{r:?}");
         assert!(r.reason.contains("ALERT"), "{}", r.reason);
         assert!(r.reason.contains("NOT shut down"), "{}", r.reason);
@@ -2313,8 +2118,8 @@ mod tests {
             r.steps,
             vec![wait(sched_model::WaitReason::ShutdownStopped)]
         );
-        assert!(r.veto_timeouts.is_empty(), "{r:?}");
-        assert!(r.veto_held[0].stopped);
+        assert!(r.veto_timeouts().is_empty(), "{r:?}");
+        assert!(r.veto_held()[0].stopped());
         assert!(
             s.metrics.render().contains(
                 "sched_veto_timeouts_total{reading=\"mounts\",resource=\"basestar-nfs\"} 1"
@@ -2403,18 +2208,18 @@ mod tests {
             "{:?}",
             r.steps
         );
+        assert_eq!(r.veto_held().len(), 1, "{r:?}");
+        let h = r.host(&"cuda-central".into()).unwrap();
+        assert_eq!(h.veto_readings, vec![VetoReading::Pods]);
         assert_eq!(
-            r.veto_held,
-            vec![VetoHeld {
-                resource: "cuda-central".into(),
-                readings: vec!["pods".to_string()],
-                blocking: vec![VetoBlocker {
-                    reading: "pods".to_string(),
-                    state: "in_use".to_string()
-                }],
+            h.veto(),
+            Some(&VetoStatus::Waiting {
                 since: Millis(T0 + 1_000),
-                stopped: false
-            }]
+                blocking: vec![VetoBlocker {
+                    reading: VetoReading::Pods,
+                    state: BlockerState::InUse
+                }],
+            })
         );
         assert_eq!(gpu_veto_gauge(&s, "waiting"), "1");
         assert_eq!(gpu_veto_gauge(&s, "stopped"), "0");
@@ -2429,8 +2234,14 @@ mod tests {
             "{:?}",
             r.steps
         );
-        assert_eq!(r.veto_timeouts.len(), 1, "{r:?}");
-        assert_eq!(r.veto_timeouts[0].readings, vec!["pods".to_string()]);
+        assert_eq!(r.veto_timeouts().len(), 1, "{r:?}");
+        assert!(
+            matches!(
+                r.veto_timeouts()[0],
+                HostEvent::VetoTimeout { readings, .. } if *readings == [VetoReading::Pods]
+            ),
+            "{r:?}"
+        );
         assert_eq!(gpu_veto_gauge(&s, "stopped"), "1");
         assert!(
             s.metrics.render().contains(
@@ -2446,8 +2257,8 @@ mod tests {
             "{:?}",
             r.steps
         );
-        assert!(r.veto_timeouts.is_empty(), "{r:?}");
-        assert!(r.veto_held[0].stopped);
+        assert!(r.veto_timeouts().is_empty(), "{r:?}");
+        assert!(r.veto_held()[0].stopped());
     }
 
     #[test]
@@ -2465,10 +2276,10 @@ mod tests {
         );
         assert!(!r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })));
         assert_eq!(
-            r.veto_held[0].blocking,
-            vec![VetoBlocker {
-                reading: "pods".to_string(),
-                state: "unknown".to_string()
+            r.veto_held()[0].blocking(),
+            [VetoBlocker {
+                reading: VetoReading::Pods,
+                state: BlockerState::Unknown
             }]
         );
         assert!(r.reason.contains("pods:unknown"), "{}", r.reason);
@@ -2481,7 +2292,7 @@ mod tests {
             "{:?}",
             r.steps
         );
-        assert!(r.veto_held.is_empty());
+        assert!(r.veto_held().is_empty());
         assert_eq!(gpu_veto_gauge(&s, "waiting"), "0");
     }
 
@@ -2496,7 +2307,7 @@ mod tests {
         s.seed_reported(&d.reported);
         let outcome = s.decide(Millis(at), &d);
         assert_eq!(
-            outcome.report.veto_timeouts.len(),
+            outcome.report.veto_timeouts().len(),
             1,
             "{:?}",
             outcome.report
@@ -2544,7 +2355,7 @@ mod tests {
                 resource: "basestar-nfs".into()
             }]
         );
-        assert!(r.veto_held.is_empty());
+        assert!(r.veto_held().is_empty());
         assert_eq!(veto_gauge(&s, "waiting"), "0");
     }
 
@@ -2686,7 +2497,7 @@ mod tests {
         let mut d = Durable::default();
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        assert_eq!(r.adopted(), vec![nfs()], "{r:?}");
         let adopted: Vec<_> = d.leases.iter().filter(|l| l.is_adopted_host()).collect();
         assert_eq!(adopted.len(), 1, "{:?}", d.leases);
         assert_eq!(adopted[0].resource, nfs());
@@ -2707,7 +2518,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.adopted.is_empty() && r.adoptions_ended.is_empty(),
+            r.adopted().is_empty() && r.adoptions_ended().is_empty(),
             "{r:?}"
         );
         assert_eq!(d.leases.len(), 1);
@@ -2716,7 +2527,7 @@ mod tests {
         world(&s, Some(0));
         nfs_probe(&s, false);
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adoptions_ended, vec![nfs()], "{r:?}");
+        assert_eq!(r.adoptions_ended(), vec![nfs()], "{r:?}");
         assert!(d.leases.is_empty(), "{:?}", d.leases);
         assert!(
             !r.steps.iter().any(|s| matches!(s, Step::PowerOn { .. })),
@@ -2730,7 +2541,7 @@ mod tests {
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        assert_eq!(r.adopted(), vec![nfs()], "{r:?}");
         assert!(d.state.resource(&nfs()).unwrap().ours());
     }
 
@@ -2743,7 +2554,7 @@ mod tests {
         d.state.resources.insert(nfs(), st);
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert!(r.adopted.is_empty(), "{r:?}");
+        assert!(r.adopted().is_empty(), "{r:?}");
         assert!(d.leases.is_empty());
         assert!(d.state.resource(&nfs()).unwrap().ours());
         // A restart: a new process with the persisted state and an empty cache.
@@ -2752,7 +2563,7 @@ mod tests {
         let mut d2 = d2;
         world(&s2, Some(0));
         let r = s2.tick(clock2.now(), &mut d2);
-        assert!(r.adopted.is_empty(), "{r:?}");
+        assert!(r.adopted().is_empty(), "{r:?}");
         assert!(d2.leases.is_empty());
     }
 
@@ -2791,7 +2602,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.adopted.contains(&gpu()) && r.adopted.contains(&nfs()),
+            r.adopted().contains(&gpu()) && r.adopted().contains(&nfs()),
             "{r:?}"
         );
         let host_lease = |d: &Durable| {
@@ -2808,7 +2619,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.adopted.is_empty() && r.adoptions_ended.is_empty(),
+            r.adopted().is_empty() && r.adoptions_ended().is_empty(),
             "{r:?}"
         );
         // Seen down by hand: the claim ends and the host is not woken.
@@ -2816,7 +2627,7 @@ mod tests {
         world(&s, Some(0));
         gpu_reading(&s, false);
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adoptions_ended, vec![gpu()], "{r:?}");
+        assert_eq!(r.adoptions_ended(), vec![gpu()], "{r:?}");
         assert_eq!(host_lease(&d), 0);
         assert!(
             !r.steps.iter().any(|s| matches!(s, Step::PowerOn { .. })),
@@ -2826,7 +2637,7 @@ mod tests {
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert!(r.adopted.contains(&gpu()), "{r:?}");
+        assert!(r.adopted().contains(&gpu()), "{r:?}");
         // A host flowmanager powered on that is read down for a moment and then up again
         // is not adopted (it is still ours).
         d.leases.retain(|l| l.resource != gpu());
@@ -2836,7 +2647,7 @@ mod tests {
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert!(!r.adopted.contains(&gpu()), "{r:?}");
+        assert!(!r.adopted().contains(&gpu()), "{r:?}");
         assert_eq!(host_lease(&d), 0);
     }
 
@@ -2855,7 +2666,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.adopted.contains(&gpu()) && r.adopted.contains(&nfs()),
+            r.adopted().contains(&gpu()) && r.adopted().contains(&nfs()),
             "{r:?}"
         );
         // Locked out while both are up and adopted (a manual lease each): the lease is no
@@ -2890,7 +2701,7 @@ mod tests {
             clock.advance(Millis(60_000));
             world(&s, Some(2));
             let r = s.tick(clock.now(), &mut d);
-            assert!(r.adopted.is_empty(), "{r:?}");
+            assert!(r.adopted().is_empty(), "{r:?}");
             assert!(
                 !r.steps
                     .iter()
@@ -2911,7 +2722,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.adopted.contains(&gpu()) && r.adopted.contains(&nfs()),
+            r.adopted().contains(&gpu()) && r.adopted().contains(&nfs()),
             "{r:?}"
         );
         assert!(!d.state.resource(&gpu()).unwrap().locked_down);
@@ -2986,7 +2797,7 @@ mod tests {
         let mut d = Durable::default();
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert!(r.adopted.is_empty() && d.leases.is_empty(), "{r:?}");
+        assert!(r.adopted().is_empty() && d.leases.is_empty(), "{r:?}");
     }
 
     /// The managed example, basestar adopted and up, with 5 paperless-ocr items queued and
@@ -3013,7 +2824,7 @@ mod tests {
             !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
             "{r:?}"
         );
-        assert!(r.drains.is_empty());
+        assert!(r.drains().is_empty());
 
         let (s, clock, mut d) = adopted_with_work();
         let config = s.config.current();
@@ -3030,9 +2841,9 @@ mod tests {
             r.steps.contains(&Step::PowerOff { resource: nfs() }),
             "{r:?}"
         );
-        assert_eq!(r.drains.len(), 1, "{r:?}");
-        assert!(r.drains[0].scaled_down && r.drains[0].mode == "immediate");
-        assert_eq!(r.drains[0].origin, "requested");
+        assert_eq!(r.drains().len(), 1, "{r:?}");
+        assert!(r.drains()[0].1.scaled_down && r.drains()[0].1.mode.as_str() == "immediate");
+        assert_eq!(r.drains()[0].1.cause.as_str(), "requested");
         let nfs_consumers: Vec<_> = r
             .allowed_classes
             .iter()
@@ -3056,7 +2867,7 @@ mod tests {
             d2.state.resource(&nfs()).unwrap().power,
             PowerPhase::Off { ours: false }
         );
-        assert!(r.drains.is_empty(), "{r:?}");
+        assert!(r.drains().is_empty(), "{r:?}");
         assert_eq!(d2.state.resource(&nfs()).unwrap().shutdown, None);
     }
 
@@ -3082,7 +2893,7 @@ mod tests {
         });
         let r = s.tick(clock.now(), &mut d);
         assert_eq!(d.state.resource(&nfs()).unwrap().shutdown, None);
-        assert!(r.drains.is_empty());
+        assert!(r.drains().is_empty());
         assert!(
             !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
             "{r:?}"
@@ -3107,17 +2918,17 @@ mod tests {
         let mut d = stored(None, false);
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        assert_eq!(r.adopted(), vec![nfs()], "{r:?}");
         assert!(d.state.resource(&nfs()).unwrap().ours());
         clock.advance(Millis(60_000));
         world(&s, Some(0));
-        assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
+        assert!(s.tick(clock.now(), &mut d).adopted().is_empty());
         assert_eq!(d.leases.len(), 1);
         // A host we powered on: ours, not adopted.
         let (s, clock) = managed_world();
         let mut d = stored(None, true);
         world(&s, Some(0));
-        assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
+        assert!(s.tick(clock.now(), &mut d).adopted().is_empty());
         assert!(d.leases.is_empty());
         // A shutdown stopped by mounting pods: left as it is.
         let (s, clock) = managed_world();
@@ -3130,7 +2941,7 @@ mod tests {
             false,
         );
         world(&s, Some(1));
-        assert!(s.tick(clock.now(), &mut d).adopted.is_empty());
+        assert!(s.tick(clock.now(), &mut d).adopted().is_empty());
         assert!(d.leases.is_empty());
     }
 
@@ -3143,7 +2954,7 @@ mod tests {
         };
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adopted, vec![nfs()], "{r:?}");
+        assert_eq!(r.adopted(), vec![nfs()], "{r:?}");
         // The lease is part of what the tick says to keep, and `apply` takes it in.
         assert_eq!(d.leases.len(), 1);
         assert!(d.leases[0].is_adopted_host());
@@ -3152,14 +2963,14 @@ mod tests {
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
-        assert!(r.adopted.is_empty(), "{r:?}");
+        assert!(r.adopted().is_empty(), "{r:?}");
         assert_eq!(d.leases.len(), 1);
         // The host goes down: the adopted lease ends, jobs still off.
         clock.advance(Millis(60_000));
         world(&s, Some(0));
         nfs_probe(&s, false);
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.adoptions_ended, vec![nfs()], "{r:?}");
+        assert_eq!(r.adoptions_ended(), vec![nfs()], "{r:?}");
         assert!(d.leases.is_empty());
         assert!(!d.state.resource(&nfs()).unwrap().ours());
     }
@@ -3199,7 +3010,7 @@ mod tests {
                 );
             }
             let r = s.tick(clock.now(), &mut d);
-            assert!(r.adopted.is_empty(), "{r:?}");
+            assert!(r.adopted().is_empty(), "{r:?}");
             // Down for one tick, then up again.
             clock.advance(Millis(10_000));
             world(&s, Some(0));
@@ -3215,7 +3026,7 @@ mod tests {
             world(&s, Some(0));
             let r = s.tick(clock.now(), &mut d);
             assert!(
-                r.adopted.is_empty() && d.leases.is_empty(),
+                r.adopted().is_empty() && d.leases.is_empty(),
                 "{with_drain}: {r:?}"
             );
             assert!(d.state.resource(&nfs()).unwrap().ours());
@@ -3235,7 +3046,7 @@ mod tests {
                 r.steps.contains(&Step::PowerOff { resource: nfs() }),
                 "{with_drain}: {r:?}"
             );
-            assert!(r.adopted.is_empty());
+            assert!(r.adopted().is_empty());
         }
     }
 
@@ -3274,7 +3085,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.adopted.is_empty() && nfs_consumers_allowed(&s, &r),
+            r.adopted().is_empty() && nfs_consumers_allowed(&s, &r),
             "{r:?}"
         );
         (s, clock, d)
@@ -3288,7 +3099,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.drains.is_empty() && nfs_consumers_allowed(&s, &r),
+            r.drains().is_empty() && nfs_consumers_allowed(&s, &r),
             "{r:?}"
         );
         // The job ends: the idle clock starts; the consumers run until idle_grace (10m).
@@ -3297,7 +3108,7 @@ mod tests {
         world(&s, Some(0));
         let r = s.tick(clock.now(), &mut d);
         assert!(
-            r.drains.is_empty() && nfs_consumers_allowed(&s, &r),
+            r.drains().is_empty() && nfs_consumers_allowed(&s, &r),
             "{r:?}"
         );
         // Grace over with pods still mounting: the idle drain starts, the consumers leave the
@@ -3305,9 +3116,12 @@ mod tests {
         clock.advance(Millis(10 * 60_000));
         world(&s, Some(2));
         let r = s.tick(clock.now(), &mut d);
-        assert_eq!(r.drains.len(), 1, "{r:?}");
+        assert_eq!(r.drains().len(), 1, "{r:?}");
         assert_eq!(
-            (r.drains[0].origin.as_str(), r.drains[0].mode.as_str()),
+            (
+                r.drains()[0].1.cause.as_str(),
+                r.drains()[0].1.mode.as_str()
+            ),
             ("idle", "immediate")
         );
         assert!(!nfs_consumers_allowed(&s, &r), "{:?}", r.allowed_classes);
@@ -3321,7 +3135,7 @@ mod tests {
         clock2.set(Millis(clock.now().as_u64() + 30_000));
         world(&s2, Some(2));
         let r = s2.tick(clock2.now(), &mut d2);
-        assert_eq!(r.drains.len(), 1, "{r:?}");
+        assert_eq!(r.drains().len(), 1, "{r:?}");
         assert!(!nfs_consumers_allowed(&s2, &r));
         // The pods are gone: shut down.
         clock2.advance(Millis(30_000));
@@ -3336,7 +3150,7 @@ mod tests {
         world(&s2, Some(0));
         nfs_probe(&s2, false);
         let r = s2.tick(clock2.now(), &mut d2);
-        assert!(r.drains.is_empty(), "{r:?}");
+        assert!(r.drains().is_empty(), "{r:?}");
         assert_eq!(d2.state.resource(&nfs()).unwrap().shutdown, None);
     }
 
@@ -3351,7 +3165,7 @@ mod tests {
             clock.advance(Millis(10 * 60_000));
             world(&s, Some(2));
             let r = s.tick(clock.now(), &mut d);
-            assert_eq!(r.drains.len(), 1, "{how}: {r:?}");
+            assert_eq!(r.drains().len(), 1, "{how}: {r:?}");
             clock.advance(Millis(30_000));
             world(&s, Some(2));
             match how {
@@ -3374,7 +3188,7 @@ mod tests {
                 _ => ocr_demand(&s, 4),
             }
             let r = s.tick(clock.now(), &mut d);
-            assert!(r.drains.is_empty(), "{how}: {r:?}");
+            assert!(r.drains().is_empty(), "{how}: {r:?}");
             assert_eq!(d.state.resource(&nfs()).unwrap().shutdown, None);
             assert!(nfs_consumers_allowed(&s, &r), "{how}: consumers are back");
             assert_eq!(d.state.resource(&nfs()).unwrap().idle_since, None);
@@ -3388,7 +3202,7 @@ mod tests {
         for _ in 0..6 {
             world(&s, Some(0));
             let r = s.tick(clock.now(), &mut d);
-            assert!(r.drains.is_empty(), "{r:?}");
+            assert!(r.drains().is_empty(), "{r:?}");
             assert!(
                 !r.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
                 "{r:?}"
