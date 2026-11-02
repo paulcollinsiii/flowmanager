@@ -129,7 +129,7 @@ fn switch(
     if next.is_some() && !fresh_up(cx) {
         return waiting(cx, steps, WaitReason::StaleObservation);
     }
-    steps.push(Step::DrainModel {
+    steps.push(Step::WithdrawModel {
         resource: cx.res.id.clone(),
         model: old.clone(),
     });

@@ -39,7 +39,7 @@ frames:
   - at: 101300000
     refresh: true
     expect:
-      steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: llm }]
+      steps: [{ type: pause_intake, class: paperless-ocr }, { type: withdraw_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: llm }]
       allowed: { models: [llm], classes: [paperless-ngx, immich-server, paperless-gpt, paperless-tagging, speakr-summarization, interactive-llm] }
   - at: 101305000
     refresh: true

@@ -65,5 +65,5 @@ frames:
   - at: 100780000
     refresh: true
     expect:
-      steps: [{ type: pause_intake, class: speakr-transcription }, { type: drain_model, resource: cuda-central, model: whisperx }]
+      steps: [{ type: pause_intake, class: speakr-transcription }, { type: withdraw_model, resource: cuda-central, model: whisperx }]
       allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }

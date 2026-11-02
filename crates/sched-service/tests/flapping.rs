@@ -178,7 +178,7 @@ fn simulate(config: &Config, bytes: &[u8], periods: &[usize; 7]) -> Vec<Tick> {
                     pods.insert(m, (1, 0));
                     pod_events.push((t + 2, m, (1, 1)));
                 }
-                Step::DrainModel { model, .. } => {
+                Step::WithdrawModel { model, .. } => {
                     let m = MODELS.iter().find(|x| **x == model.as_str()).unwrap();
                     pod_events.retain(|e| e.1 != *m);
                     pod_events.push((t + 2, m, (0, 0)));
@@ -348,7 +348,7 @@ fn check_bounds(config: &Config, log: &[Tick]) -> Summary {
                         );
                     }
                 }
-                Step::DrainModel { model, .. } => {
+                Step::WithdrawModel { model, .. } => {
                     sum.drains += 1;
                     let m = model.as_str();
                     if let Some(at) = allowed_at.get(m) {

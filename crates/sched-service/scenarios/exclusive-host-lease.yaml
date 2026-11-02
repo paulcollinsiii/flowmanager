@@ -46,7 +46,7 @@ frames:
     refresh: true
     expect:
       steps:
-        - { type: drain_model, resource: cuda-central, model: mineru }
+        - { type: withdraw_model, resource: cuda-central, model: mineru }
         - { type: pause_intake, class: paperless-ocr }
   - at: 103000000
     refresh: true

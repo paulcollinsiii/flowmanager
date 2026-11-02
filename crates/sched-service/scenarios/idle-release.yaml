@@ -31,7 +31,7 @@ frames:
   - at: 100600000
     refresh: true
     expect:
-      steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }]
+      steps: [{ type: pause_intake, class: paperless-ocr }, { type: withdraw_model, resource: cuda-central, model: mineru }]
       allowed: { models: [], classes: [paperless-ngx, immich-server, paperless-gpt] }
   # Nothing is wanted and the GPU host was not powered by the scheduler, so it stays up.
   - at: 100605000

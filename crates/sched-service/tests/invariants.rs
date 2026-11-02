@@ -415,7 +415,7 @@ fn allow(model: &str) -> Step {
 }
 
 fn withdraw(model: &str) -> Step {
-    Step::DrainModel {
+    Step::WithdrawModel {
         resource: ResourceId::new("cuda-central"),
         model: ModelId::new(model),
     }
@@ -1013,14 +1013,20 @@ fn a_graceful_requested_shutdown_of_an_exclusive_host_winds_down_without_a_viola
     let (d, v) =
         sequencer_and_checker(&world, &serving_requested("llm", "graceful", 9 * MIN, None));
     assert!(v.is_empty(), "{v:?} {:?}", d.steps);
-    assert!(!d.steps.iter().any(|s| matches!(s, Step::DrainModel { .. })));
+    assert!(
+        !d.steps
+            .iter()
+            .any(|s| matches!(s, Step::WithdrawModel { .. }))
+    );
     let (d, v) = sequencer_and_checker(
         &world,
         &serving_requested("llm", "graceful", 10 * MIN, None),
     );
     assert!(v.is_empty(), "{v:?} {:?}", d.steps);
     assert!(
-        d.steps.iter().any(|s| matches!(s, Step::DrainModel { .. })),
+        d.steps
+            .iter()
+            .any(|s| matches!(s, Step::WithdrawModel { .. })),
         "{:?}",
         d.steps
     );

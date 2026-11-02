@@ -284,8 +284,8 @@ fn allow(m: &str) -> Step {
         model: mid(m),
     }
 }
-fn drain(m: &str) -> Step {
-    Step::DrainModel {
+fn withdraw(m: &str) -> Step {
+    Step::WithdrawModel {
         resource: rid(G),
         model: mid(m),
     }
@@ -480,7 +480,7 @@ fn an_allowed_model_serves_from_the_tick_it_is_allowed() {
     let at = c.run_fresh_at(&d.state, T + 5 * MIN);
     assert_steps(
         &at,
-        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![pause("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "min_dwell after the allow",
     );
 }
@@ -559,7 +559,7 @@ fn a_switch_withdraws_the_old_model_and_allows_the_new_one_in_the_same_tick() {
     let d = serve().target(Some("llm")).run();
     assert_steps(
         &d,
-        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![pause("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "switch",
     );
     assert_eq!(d.allowed.models, [mid("llm")].into(), "never both");
@@ -582,7 +582,11 @@ fn a_switch_withdraws_the_old_model_and_allows_the_new_one_in_the_same_tick() {
     assert_eq!(d.allowed.models, [mid("mineru")].into());
     // Releasing (no target) withdraws alone, and needs no reading.
     let d = serve().target(None).obs(up(G, true, 31_000)).run();
-    assert_steps(&d, vec![pause("paperless-ocr"), drain("mineru")], "release");
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), withdraw("mineru")],
+        "release",
+    );
     assert!(d.allowed.models.is_empty());
     assert!(matches!(mode_of(&d, G), ModePhase::Idle));
 }
@@ -610,10 +614,10 @@ fn a_model_removed_from_the_config_leaves_the_allowed_set_at_the_next_tick() {
     };
     // Inside min_dwell, its pods still up: it goes now, and the next model comes in.
     let d = removed(Some("mineru")).run();
-    assert_steps(&d, vec![drain("whisperx"), allow("mineru")], "replaced");
+    assert_steps(&d, vec![withdraw("whisperx"), allow("mineru")], "replaced");
     assert_eq!(d.allowed.models, [mid("mineru")].into());
     let d = removed(None).run();
-    assert_steps(&d, vec![drain("whisperx")], "withdrawn");
+    assert_steps(&d, vec![withdraw("whisperx")], "withdrawn");
     assert!(d.allowed.models.is_empty() && matches!(mode_of(&d, G), ModePhase::Idle));
     // Nothing is left to wait for afterwards.
     let next = removed(None).run_at(&d.state, T + 1000);
@@ -700,7 +704,7 @@ fn switching_away_from_a_serving_model() {
     let d = serve(5 * MIN).target(Some("llm")).run();
     assert_steps(
         &d,
-        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![pause("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "at min_dwell with nothing in flight",
     );
 
@@ -752,12 +756,12 @@ fn switching_away_from_a_serving_model() {
         !before
             .steps
             .iter()
-            .any(|s| matches!(s, Step::KillInFlight { .. } | Step::DrainModel { .. }))
+            .any(|s| matches!(s, Step::KillInFlight { .. } | Step::WithdrawModel { .. }))
     );
     let late = feed().run_fresh_at(&d.state, T + 10 * MIN);
     assert_steps(
         &late,
-        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![kill("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "cut off at drain_timeout",
     );
 
@@ -768,7 +772,7 @@ fn switching_away_from_a_serving_model() {
         .run();
     assert_steps(
         &d,
-        vec![pause("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![pause("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "ready but not in flight does not block",
     );
 
@@ -847,7 +851,7 @@ fn forced_switches_give_in_flight_work_its_timeout() {
     let after = c.run_fresh_at(&d.state, T + 10 * MIN);
     assert_steps(
         &after,
-        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![kill("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "at the timeout",
     );
     assert!(
@@ -889,7 +893,7 @@ fn lockout_uses_lockout_timeout_and_class_kill_timeout() {
     );
     assert_steps(
         &c.run_at(&d.state, T + MIN),
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "class timeout elapsed",
     );
 
@@ -912,7 +916,7 @@ fn lockout_uses_lockout_timeout_and_class_kill_timeout() {
     );
     assert_steps(
         &c.run_at(&d.state, T + 2 * MIN),
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "lockout timeout elapsed",
     );
 }
@@ -962,7 +966,7 @@ fn lockout_shuts_the_host_down_overriding_holds_and_grace() {
     let d = c.obs(pods("mineru", 1, 0, 0)).run();
     assert_steps(
         &d,
-        vec![pause("paperless-ocr"), drain("mineru")],
+        vec![pause("paperless-ocr"), withdraw("mineru")],
         "a just-allowed model is withdrawn at once",
     );
 
@@ -1301,7 +1305,7 @@ fn an_unforced_switch_is_cut_off_at_the_class_timeout() {
     let after = busy().run_fresh_at(&d.state, T + MIN);
     assert_steps(
         &after,
-        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![kill("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "at the class's kill_timeout, long before drain_timeout",
     );
 }
@@ -1337,7 +1341,7 @@ fn a_continuously_fed_serving_class_cannot_hold_the_resource() {
             assert!(
                 !d.steps
                     .iter()
-                    .any(|s| matches!(s, Step::KillInFlight { .. } | Step::DrainModel { .. })),
+                    .any(|s| matches!(s, Step::KillInFlight { .. } | Step::WithdrawModel { .. })),
                 "{fed} ({preempt_note}) switched at +{m}m: {:?}",
                 d.steps
             );
@@ -1347,7 +1351,7 @@ fn a_continuously_fed_serving_class_cannot_hold_the_resource() {
         let d = tick(&d.state, start + 10 * MIN);
         assert_steps(
             &d,
-            vec![kill(fed), drain("llm"), allow("mineru")],
+            vec![kill(fed), withdraw("llm"), allow("mineru")],
             &format!("{fed} cut off exactly at drain_timeout"),
         );
     }
@@ -1400,7 +1404,11 @@ fn a_busy_class_that_cannot_be_preempted_still_blocks_without_a_timeout() {
     let freed = busy(0).run_fresh_at(&held.state, T + 61 * MIN);
     assert_steps(
         &freed,
-        vec![kill("speakr-summarization"), drain("llm"), allow("mineru")],
+        vec![
+            kill("speakr-summarization"),
+            withdraw("llm"),
+            allow("mineru"),
+        ],
         "released: the elapsed timeout applies",
     );
 }
@@ -1438,7 +1446,11 @@ fn per_class_timeouts_also_apply_unforced() {
     let d3 = busy().run_fresh_at(&d2.state, T + 10 * MIN);
     assert_steps(
         &d3,
-        vec![kill("speakr-summarization"), drain("llm"), allow("mineru")],
+        vec![
+            kill("speakr-summarization"),
+            withdraw("llm"),
+            allow("mineru"),
+        ],
         "the other at drain_timeout",
     );
 }
@@ -1595,7 +1607,7 @@ fn each_class_is_stopped_when_its_own_timeout_expires() {
     let d3 = busy().run_at(&d2.state, T + 10 * MIN);
     assert_steps(
         &d3,
-        vec![kill("speakr-summarization"), drain("llm")],
+        vec![kill("speakr-summarization"), withdraw("llm")],
         "the slower class at its own timeout",
     );
 }
@@ -1737,7 +1749,7 @@ fn a_cause_change_restarts_the_clock_only_when_lockout_flips() {
     assert_eq!(shape(&d1b), (ms(T), Some(ms(10 * MIN)), false));
     assert_steps(
         &base(0).run_fresh_at(&d1b.state, T + 10 * MIN),
-        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![kill("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "the original cut-off still holds after the lease came and went",
     );
 
@@ -1753,7 +1765,7 @@ fn a_cause_change_restarts_the_clock_only_when_lockout_flips() {
     assert_steps(&d2b, vec![wait(G, WaitReason::InFlightWork)], "not yet");
     assert_steps(
         &base(2).run_fresh_at(&d2b.state, T + 7 * MIN),
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "lockout timeout over",
     );
 
@@ -1767,7 +1779,7 @@ fn a_cause_change_restarts_the_clock_only_when_lockout_flips() {
     );
     assert_steps(
         &base(0).run_fresh_at(&d3.state, T + 16 * MIN),
-        vec![kill("paperless-ocr"), drain("mineru"), allow("llm")],
+        vec![kill("paperless-ocr"), withdraw("mineru"), allow("llm")],
         "fresh drain_timeout over",
     );
 
@@ -2680,7 +2692,7 @@ fn a_managed_gpu_host_is_never_powered_off_while_a_model_is_allowed_and_only_aft
     // powered off in the same tick (nor is the idle clock of the host running yet).
     let d = c.run();
     assert!(
-        d.steps.contains(&drain("mineru"))
+        d.steps.contains(&withdraw("mineru"))
             && !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
         "{d:?}"
     );
@@ -3429,7 +3441,7 @@ fn an_exclusive_host_held_by_a_host_lease_stays_up_idle_and_goes_down_after_the_
         .lease(host);
     let mut d = c.run();
     assert!(
-        d.steps.contains(&Step::DrainModel {
+        d.steps.contains(&Step::WithdrawModel {
             resource: rid(G),
             model: mid("llm")
         }),
@@ -3446,7 +3458,7 @@ fn an_exclusive_host_held_by_a_host_lease_stays_up_idle_and_goes_down_after_the_
     let mut c = Case::new().gpu_state(&gpu).target(None);
     let mut d = c.run();
     assert!(
-        d.steps.contains(&Step::DrainModel {
+        d.steps.contains(&Step::WithdrawModel {
             resource: rid(G),
             model: mid("llm")
         }) && no_power_step(&d),
@@ -3529,7 +3541,7 @@ fn a_graceful_shutdown_of_an_exclusive_host_gives_in_flight_work_drain_timeout_t
     let d2 = c.run_fresh_at(&d.state, T + 10 * MIN);
     assert_steps(
         &d2,
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "the timeout cuts the work off and the model leaves",
     );
     assert_eq!(mode_of(&d2, G), ModePhase::Idle);
@@ -3563,7 +3575,7 @@ fn an_immediate_shutdown_of_an_exclusive_host_cuts_work_off_at_once_whatever_its
         vec![
             pause("paperless-ocr"),
             kill("paperless-ocr"),
-            drain("mineru"),
+            withdraw("mineru"),
         ],
         "cut off and withdrawn in the first tick",
     );
@@ -3613,7 +3625,7 @@ fn a_requested_shutdown_is_forced_so_a_busy_unpreemptible_class_does_not_hold_it
             c.run_fresh_at(&d.state, T + timed_out_after)
         };
         assert!(
-            d.steps.contains(&drain("llm")) && d.steps.contains(&kill("interactive-llm")),
+            d.steps.contains(&withdraw("llm")) && d.steps.contains(&kill("interactive-llm")),
             "{mode}: {:?}",
             d.steps
         );
@@ -4025,7 +4037,7 @@ fn a_graceful_request_gives_exactly_drain_timeout_from_the_request() {
     let d2 = c.run_fresh_at(&d.state, T + 10 * MIN);
     assert_steps(
         &d2,
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "exactly drain_timeout",
     );
 
@@ -4049,7 +4061,7 @@ fn a_graceful_request_gives_exactly_drain_timeout_from_the_request() {
     let d3 = c.run_fresh_at(&d.state, T + 10 * MIN);
     assert_steps(
         &d3,
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "at drain_timeout",
     );
 
@@ -4072,7 +4084,7 @@ fn a_graceful_request_gives_exactly_drain_timeout_from_the_request() {
     let d1 = c.run_fresh_at(&d.state, T + MIN);
     assert_steps(
         &d1,
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "10 minutes in",
     );
 }
@@ -4115,7 +4127,7 @@ fn a_lockout_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_on
     let d2 = c.run_fresh_at(&d.state, T + 2 * MIN);
     assert_steps(
         &d2,
-        vec![kill("paperless-ocr"), drain("mineru")],
+        vec![kill("paperless-ocr"), withdraw("mineru")],
         "lockout_timeout, not drain_timeout",
     );
     // Immediate beside a lockout cuts off at once.

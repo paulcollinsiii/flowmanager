@@ -38,7 +38,7 @@ frames:
   - at: 100600000
     refresh: true
     expect:
-      steps: [{ type: kill_in_flight, class: speakr-transcription }, { type: drain_model, resource: cuda-central, model: whisperx }]
+      steps: [{ type: kill_in_flight, class: speakr-transcription }, { type: withdraw_model, resource: cuda-central, model: whisperx }]
       allowed: { models: [], classes: [paperless-ngx, immich-server] }
   # Next tick: the host shuts down, overriding idle grace. Nothing waits for pods: whisperX
   # has left the allowed set and no model is allowed.

@@ -28,7 +28,7 @@ use sched_model::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     /// At most one resource-scoped step per resource (a switch is the one pair: the
-    /// `DrainModel` of the old model and the `AllowModel` of the new one), plus class-scoped
+    /// `WithdrawModel` of the old model and the `AllowModel` of the new one), plus class-scoped
     /// steps (`PauseIntake`, `KillInFlight`, `RunRecovery`).
     pub steps: Vec<Step>,
     pub allowed: AllowedSet,

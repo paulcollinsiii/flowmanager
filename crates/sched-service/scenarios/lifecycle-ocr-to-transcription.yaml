@@ -58,7 +58,7 @@ frames:
     observe:
       - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 2, in_flight: 0, oldest_ready_at: 103500000 } }
     expect:
-      steps: [{ type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }]
+      steps: [{ type: withdraw_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }]
       allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   - at: 103615000
     refresh: true

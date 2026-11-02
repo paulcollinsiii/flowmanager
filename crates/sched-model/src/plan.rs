@@ -105,7 +105,7 @@ pub enum Step {
         reason: WaitReason,
     },
     /// Allow a model: it enters the allowed set (KEDA then scales it up). In a switch this
-    /// comes with the `DrainModel` of the previous model in the same tick; the new pod stays
+    /// comes with the `WithdrawModel` of the previous model in the same tick; the new pod stays
     /// pending in Kubernetes until the old one has released the GPU.
     AllowModel {
         resource: ResourceId,
@@ -113,7 +113,7 @@ pub enum Step {
     },
     /// Withdraw a model's allowance: it leaves the allowed set, and KEDA scales its pods
     /// down. Nothing waits for them to be gone.
-    DrainModel {
+    WithdrawModel {
         resource: ResourceId,
         model: ModelId,
     },
@@ -146,7 +146,7 @@ impl Step {
         match self {
             Step::Wait { resource, .. }
             | Step::AllowModel { resource, .. }
-            | Step::DrainModel { resource, .. }
+            | Step::WithdrawModel { resource, .. }
             | Step::PowerOn { resource }
             | Step::PowerOff { resource } => Some(resource),
             Step::PauseIntake { .. } | Step::KillInFlight { .. } | Step::RunRecovery { .. } => None,

@@ -1167,7 +1167,7 @@ Scrape `:9090/metrics` (`/healthz` answers `ok`). The complete set, checked agai
 scrape and the registrations in `metrics.rs` (labelled counters appear after their first
 event):
 
-- `sched_tick_decisions_total{kind}`: ticks by decision kind (`allow_model`, `drain_model`,
+- `sched_tick_decisions_total{kind}`: ticks by decision kind (`allow_model`, `withdraw_model`,
   `pause_intake`, `power_on`, `power_off`, `kill_in_flight`, `run_recovery`, `wait`, `idle`,
   `error`, `pinned`, `shutdown_stopped`, `power_failed`, `demand_unknown`, `demand_unsupported`, `demand_unpolled`).
 - `sched_persisted_state_errors_total{key}`: a tick or lease request could not read a

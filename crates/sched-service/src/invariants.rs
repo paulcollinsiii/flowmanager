@@ -439,8 +439,8 @@ pub fn check(
     for (r, list) in &acting {
         let switch = matches!(
             list.as_slice(),
-            [Step::DrainModel { model: a, .. }, Step::AllowModel { model: b, .. }]
-                | [Step::AllowModel { model: b, .. }, Step::DrainModel { model: a, .. }]
+            [Step::WithdrawModel { model: a, .. }, Step::AllowModel { model: b, .. }]
+                | [Step::AllowModel { model: b, .. }, Step::WithdrawModel { model: a, .. }]
                 if a != b
         );
         if list.len() > 1 && !switch {
@@ -469,7 +469,7 @@ pub fn check(
                 if let Some(old) = prev.resource(resource).and_then(|s| s.mode.allowed_model())
                     && old != model
                     && !decision.steps.iter().any(|s| {
-                        matches!(s, Step::DrainModel { resource: r, model: m } if r == resource && m == old)
+                        matches!(s, Step::WithdrawModel { resource: r, model: m } if r == resource && m == old)
                     })
                 {
                     out.push(format!(
@@ -800,7 +800,7 @@ pub fn check(
             // 16. Withdrawing a serving model needs a settled model or a declared-safe class.
             // A model the config no longer has on the resource is withdrawn at once: none of
             // its work is known any more.
-            Step::DrainModel { resource, model } => {
+            Step::WithdrawModel { resource, model } => {
                 if !model_of(config, resource, model) {
                     continue;
                 }

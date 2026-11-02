@@ -223,8 +223,9 @@ is not killed and keeps its hold until it ends.
   same events and the service alerts (logs at error level, counts) only when it decided the tick,
   logging a replay at info level under `..._replayed` and counting nothing: the alert-once rule
   has one definition, in `publish`.
-- **A failed tick** (the core refused to decide) has no statuses and no events; the per-host
-  gauges keep what the last decided tick set.
+- **A failed tick** (the core refused to decide) carries the statuses of the carried previous
+  state at the tick's time (no wait, since no step was decided) and no events; the gauges and
+  the toggle JSON are computed from them as for any tick.
 - **The toggle listener** routes and translates only: it formats statuses (the status text of a
   switch, the `drain` and `wait` objects, `needs_attention`) and holds no status logic beyond
   that. It does not branch on resource kind.
@@ -480,13 +481,16 @@ Metrics (names, values and labels; phase 5 changed none, see the end of this gro
 - `sched_manual_lease_age_seconds{kind="reclaim"}` is `kind="lockout"`;
   `sched_toggle_requests_total{endpoint}` values `reclaim_get`, `reclaim_on`, `reclaim_off`,
   `reclaim_set` are `lockout_get`, `lockout_on`, `lockout_off`, `lockout_set`.
-- **Phase 5:** no metric name, label or value changed. One behavioural note: the per-host gauges
+- **Phase 5:** no metric name, label or value changed; the per-host gauges
   (`sched_resource_power_failed`, `sched_resource_veto`, `sched_resource_min_off_remaining_seconds`)
-  are set from the statuses of a decided tick; on a tick that failed to decide (a state that cannot
-  be read, not a normal event) they keep what the last decided tick set, where before they were
-  recomputed from the unchanged state (so `min_off_remaining` does not count down during such a
-  tick). The alert-once counters (`sched_power_timeouts_total`, `sched_veto_timeouts_total`) count
-  exactly as before, once per timeout, never for a replayed tick.
+  keep updating on a tick that failed to decide, from the carried state, as before. The alert-once
+  counters (`sched_power_timeouts_total`, `sched_veto_timeouts_total`) count exactly as before, once
+  per timeout, never for a replayed tick.
+- **Decision kind rename:** the step `DrainModel` is `WithdrawModel`, so the kind label
+  `sched_tick_decisions_total{kind="drain_model"}` is `kind="withdraw_model"` (also in
+  `TickReport.steps` JSON as `type: withdraw_model` and in scenario YAML). "Drain" now means only a
+  host's requested or idle shutdown. Update dashboards and alerts that name `drain_model`. (The model
+  switch status string `draining` that Home Assistant reads is unchanged.)
 
 Logs (for log-based alerts and queries):
 
@@ -522,7 +526,7 @@ Logs (for log-based alerts and queries):
   `since` and the `blocking` readings}, `veto_readings`, `lease` origin, `lockout`, `min_off`
   {`since`, `remaining`, `until`}, `wait`, `attention`) and `events` (a list tagged by `event`:
   `power_timeout`, `veto_timeout`, `adopted`, `adoption_ended`). `power_request_failures` stays. A
-  failed tick has empty `hosts` and `events`. The reason text, the kinds (`power_failed`,
+  failed tick has `hosts` of the carried state and empty `events`. The reason text, the kinds (`power_failed`,
   `shutdown_stopped`) and their order are unchanged.
 - `Lease` JSON (`TickReport.leases`, `last_decision`, Restate replies such as `LeaseGrant`) has
   `origin`.

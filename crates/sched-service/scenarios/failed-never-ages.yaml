@@ -49,7 +49,7 @@ frames:
   - at: 105600000
     refresh: true
     expect:
-      steps: [{ type: pause_intake, class: paperless-ocr }, { type: drain_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }]
+      steps: [{ type: pause_intake, class: paperless-ocr }, { type: withdraw_model, resource: cuda-central, model: mineru }, { type: allow_model, resource: cuda-central, model: whisperx }]
       allowed: { models: [whisperx], classes: [paperless-ngx, immich-server, paperless-gpt, speakr-transcription] }
   # The pod is up and ready a minute later: now the re-queue goes out.
   - at: 105660000

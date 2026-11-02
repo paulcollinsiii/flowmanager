@@ -95,7 +95,7 @@ fn switches(config: &Config, blip_every: u64, hours: u64) -> Vec<u64> {
         };
         let (_, decision) = decide(config, &snap, &state).unwrap();
         if decision.steps.iter().any(
-            |s| matches!(s, Step::DrainModel { model, .. } if *model == ModelId::new("mineru")),
+            |s| matches!(s, Step::WithdrawModel { model, .. } if *model == ModelId::new("mineru")),
         ) {
             out.push(t * TICK / MIN);
         }

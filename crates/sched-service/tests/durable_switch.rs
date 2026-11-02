@@ -342,7 +342,7 @@ fn a_switch_is_one_tick_and_resumes_safely_after_a_restart_in_the_middle_of_it()
         // 1. At most one model of the exclusive resource.
         assert!(gpu_models(&published).len() <= 1, "t={t}\n{}", dump());
         // 2. The switch is one tick: mineru out and whisperx in together, never both.
-        let drained = r.steps.contains(&Step::DrainModel {
+        let drained = r.steps.contains(&Step::WithdrawModel {
             resource: GPU.into(),
             model: "mineru".into(),
         });
@@ -489,7 +489,7 @@ fn a_manual_lease_forces_a_switch_and_an_unexecuted_kill_does_not_stall_it() {
         if r.steps.contains(&kill) {
             assert!(r.not_executed.contains(&kill), "{}", dump());
             assert!(
-                r.steps.contains(&Step::DrainModel {
+                r.steps.contains(&Step::WithdrawModel {
                     resource: GPU.into(),
                     model: "mineru".into()
                 }) && r.steps.contains(&Step::AllowModel {

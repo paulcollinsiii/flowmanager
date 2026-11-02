@@ -16,7 +16,7 @@ pub fn step_kind(step: &Step) -> &'static str {
     match step {
         Step::Wait { .. } => "wait",
         Step::AllowModel { .. } => "allow_model",
-        Step::DrainModel { .. } => "drain_model",
+        Step::WithdrawModel { .. } => "withdraw_model",
         Step::PowerOn { .. } => "power_on",
         Step::PowerOff { .. } => "power_off",
         Step::PauseIntake { .. } => "pause_intake",
@@ -233,7 +233,7 @@ pub fn not_executed_note(step: &Step) -> Option<&'static str> {
         Step::PauseIntake { .. } => Some(NOT_EXECUTED_PAUSE),
         Step::Wait { .. }
         | Step::AllowModel { .. }
-        | Step::DrainModel { .. }
+        | Step::WithdrawModel { .. }
         | Step::PowerOn { .. }
         | Step::PowerOff { .. }
         | Step::RunRecovery { .. } => None,
@@ -312,7 +312,10 @@ enum KillOutcome {
 /// a withdrawal, a wait on in-flight work (other classes block), or any other wait (the
 /// switch itself waits).
 fn kill_outcome(steps: &[Step]) -> KillOutcome {
-    if steps.iter().any(|s| matches!(s, Step::DrainModel { .. })) {
+    if steps
+        .iter()
+        .any(|s| matches!(s, Step::WithdrawModel { .. }))
+    {
         return KillOutcome::Withdrawn;
     }
     for s in steps {
@@ -357,7 +360,7 @@ pub fn step_reason(step: &Step, intent: &Intent) -> String {
         Step::AllowModel { resource, model } => {
             format!("allow {model} on {resource}: {}", wants(resource))
         }
-        Step::DrainModel { resource, model } => {
+        Step::WithdrawModel { resource, model } => {
             format!(
                 "withdraw {model} on {resource}: {} (it leaves the allowed set now; nothing waits for its pods)",
                 wants(resource)
@@ -625,7 +628,7 @@ mod tests {
             Step::KillInFlight {
                 class: "paperless-ocr".into(),
             },
-            Step::DrainModel {
+            Step::WithdrawModel {
                 resource: "cuda-central".into(),
                 model: "mineru".into(),
             },
@@ -689,7 +692,7 @@ mod tests {
         // Withdrawing a model is carried out (published), so its reason carries no note.
         let withdraw = reason(
             &intent(),
-            &[Step::DrainModel {
+            &[Step::WithdrawModel {
                 resource: "cuda-central".into(),
                 model: "mineru".into(),
             }],

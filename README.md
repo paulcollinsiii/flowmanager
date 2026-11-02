@@ -714,7 +714,7 @@ alone), the manual lease and its origin, the `min_off` left, the wait reason and
 must attend. The `events` of the report are what became true in that very tick and is alerted
 once: a power or veto timeout, an adoption, an adoption ended. A replayed tick carries the same
 events and logs them under `..._replayed` at info level without counting them again. A failed
-tick has neither. A drain under way (a requested or idle shutdown withdrawing the consumers) is
+tick has the statuses of the carried state and no events. A drain under way (a requested or idle shutdown withdrawing the consumers) is
 logged every tick as `event="drain"` (`cause`, `mode`, `scaled_down`) and in the `tick` line's
 `drains` field; a request is logged as `event="drain_requested"`. The metrics are listed under
 *Metrics*; the HTTP view is in *Toggle listener*.
@@ -1124,7 +1124,7 @@ Notes:
   (`sched_rejected_reports_total`).
 - **Decision kinds**: `sched_tick_decisions_total{kind}` counts ticks (once per distinct
   kind in a tick), not actions; ticks run on every change and on the backstop. Kinds
-  include the step kinds (`allow_model`, `drain_model`, `pause_intake`, `power_on`,
+  include the step kinds (`allow_model`, `withdraw_model`, `pause_intake`, `power_on`,
   `power_off`, `kill_in_flight`, `run_recovery`, `wait`), `idle`, `error`, `shutdown_stopped` (a
   shutdown stopped after pods kept mounting the host), `power_failed` (a
   resource is in the failed power phase), `pinned` (a
