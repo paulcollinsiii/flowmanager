@@ -151,9 +151,10 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         (PowerPhase::Off { .. }, Some(at)) => Some(at.min(now)),
         _ => None,
     };
-    // A failed transition leaves the host not ours (cleared above as the phase leaves `failed`): whatever
-    // brings it back (a person, a slow boot) is treated like a host found running, so no
-    // automatic power-off follows until a new want powers it on through the normal path.
+    // A failed transition leaves the host not ours (cleared above as the phase leaves
+    // `failed`): whatever brings it back (a person, a slow boot) is treated like a host found
+    // running, so no automatic power-off follows until a new want powers it on through the
+    // normal path.
     if was_failed || matches!(st.power, PowerPhase::Failed { .. }) {
         st.idle_since = None;
     }

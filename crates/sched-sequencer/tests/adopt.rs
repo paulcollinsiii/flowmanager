@@ -300,6 +300,26 @@ fn a_locked_out_host_is_never_adopted_on_either_kind_until_the_lockout_is_cleare
     }
 }
 
+#[test]
+fn a_not_ours_host_with_a_lockout_shutdown_left_over_is_adopted_the_tick_the_lockout_is_gone() {
+    let config = example_config_managed();
+    let up = snapshot(Some(true), None, &[]);
+    // The previous state still carries the lockout's shutdown; the lockout lease is gone.
+    let left_over = state(
+        "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, shutdown: { cause: { kind: lockout }, since: 5, withdrawal: pending, veto: { phase: none } } }",
+    );
+    assert_eq!(found(&config, &up, &left_over), vec![N]);
+    // While the lockout lease stands nothing is adopted.
+    let lock = "{ id: l, resource: basestar-nfs, granted_at: 1, kind: { type: lockout } }";
+    let locked = snapshot(Some(true), None, &[lock]);
+    assert!(found_with(&config, &locked, &left_over, &locked.leases).is_empty());
+    // A stopped veto still blocks adoption.
+    let stopped = state(
+        "{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, shutdown: { cause: { kind: lockout }, since: 5, withdrawal: done, veto: { phase: stopped, since: 6 } } }",
+    );
+    assert!(found(&config, &up, &stopped).is_empty());
+}
+
 fn adopt_at(
     config: &Config,
     snap: &Snapshot,

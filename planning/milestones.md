@@ -223,7 +223,7 @@ These are inferences made while rewriting the plan; confirm or change them.
 The host power features added during M4 (adoption, drain on release, `drain_host`, idle drain, exclusive host lease) were each reviewed only against themselves. The user accepted one host power model, `power-model.md` (decisions D1 to D6 and the ownership rule), which is now the authoritative description of host power; `architecture.md` summarises it and points there. The code still behaves as `power-model.md` section 1 describes until phases 2 to 5 land. Phases, each run through the three-role process:
 
 1. **Model document** (documents only): `power-model.md` accepted; `architecture.md` power content and one canonical, contiguously numbered invariant list, with a mapping from the old numbers.
-2. **State types:** `Shutdown{cause, stage}`, `off_since`; drop `managed`, `drain`, `mounts_veto`, `shutdown_confirmed_at`; renumber the invariants in code.
+2. **State types:** `Shutdown{cause, stage}`, `off_since`; drop `drain`, `mounts_veto`, `shutdown_confirmed_at` (`managed` became `ours` on `Off` and `On` in 4b); renumber the invariants in code.
 3. **One withdrawal, one veto:** shared drain and exclusive wind-down share the Withdrawing stage; the mount veto becomes a per-host veto, adding the GPU pod veto.
 4. **Vocabulary and adoption:** `off` / `off-now` on both host kinds; reclaim renamed lockout on any managed host; adoption in the sequencer with a typed origin; no `jobs_off` coupling.
 5. **HostStatus and reporting:** one derived status feeding `tick.rs`, `reason`, metrics and the toggle listener; README power section shrunk to the model.

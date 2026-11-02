@@ -91,6 +91,13 @@ pub fn adopt(
 }
 
 /// The hosts found running at `now` (see the module) in the lease book `leases`.
+///
+/// Only a shutdown stopped by the veto blocks adoption of a not-ours host that is up; any
+/// other shutdown does not. The reachable case: the tick a lockout lease disappears while a
+/// lockout shutdown is under way (the lockout's shutdown is still in the previous state, the
+/// host is not ours). The host is adopted at that tick, where the build before 4b waited one
+/// tick (the sequencer drops the lockout's shutdown first). The adopted lease then cancels the
+/// leftover shutdown as any manual want does.
 pub fn found_running(
     config: &Config,
     snapshot: &Snapshot,

@@ -494,5 +494,9 @@ The homesvr agent owns these; each phase adds what it changed.
     entry (`/v1/resources/{r}`, `/v1/models/{m}`, `/v1/leases`) while a lease is held. A raw
     `Lease` (in `TickReport.leases`, `last_decision`, Restate replies such as `LeaseGrant`)
     has `origin`. Home Assistant can use it to tell an adopted lease from a person's.
+  - *A host adopted the tick a lockout is cleared.* Only a shutdown stopped by the veto blocks
+    adoption of a not-ours host that is up (before, any shutdown did). So a not-ours host
+    carrying the lockout's shutdown is adopted at the very tick its lockout lease disappears;
+    the build before waited one tick. The adopted lease then cancels the leftover shutdown.
   - *Metrics, logs, reason, wait reasons.* No change. The invariant checker's message for 7
     reads "powered off X, which flowmanager did not start (not ours)".

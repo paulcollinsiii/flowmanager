@@ -936,7 +936,7 @@ trusted network.
   `drain_host` or switch-off on a host with an idle drain turns it into a requested drain
   (start and scale-down kept). The drain ends when the host is seen down. Not changed: `control:
   manual` hosts, exclusive hosts (the GPU host is shut down directly after its wind-down), and
-  hosts that are not managed (not ours). Visible as `origin` in `drains` of the tick report and
+  hosts that are not ours. Visible as `origin` in `drains` of the tick report and
   `last_decision`, in the `drain` log line, in the `tick` line's `drains` field and as `origin`
   in the Home Assistant state of the host. It is the `shutdown` of the host's stored state
   with cause `idle`; rolling back is as for a requested drain (`discard_state`).
@@ -968,7 +968,7 @@ trusted network.
 - **`resume`**: for a person who has fixed a host by hand. It applies to a resource in the
   failed power phase, or whose shutdown was stopped by mounting pods, and forgets that
   resource's state so the sequencer starts it afresh from observation, as for a resource it
-  has not seen: found running is up and *not managed* (flowmanager will not power it off on
+  has not seen: found running is up and *not ours* (flowmanager will not power it off on
   account of an earlier action; a host under `control: managed`, shared or exclusive, is then adopted, see
   above), found down is off. It powers nothing on or off itself, does
   not touch any other resource's state or the leases, and is logged at warn level

@@ -1112,8 +1112,8 @@ fn power_down_rules() {
         "unknown demand holds, visibly",
     );
 
-    let unmanaged = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle } }";
-    let d = Case::new().nfs_state(unmanaged).run();
+    let not_ours = "{ power: { phase: \"on\", since: 0 }, mode: { phase: idle } }";
+    let d = Case::new().nfs_state(not_ours).run();
     assert_steps(&d, vec![], "a host found running is never powered down");
 
     // No model is allowed (mode idle): the veto reads the host's models' pods (the pods
@@ -4125,7 +4125,7 @@ fn a_lockout_beside_a_graceful_request_keeps_its_own_timeout_and_an_immediate_on
 
 #[test]
 fn a_lockout_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
-    // The veto stopped an idle shutdown (the host is unmanaged now). A lockout calls the
+    // The veto stopped an idle shutdown (the host is not ours now). A lockout calls the
     // power-off whatever `ours` says: only the stopped guard keeps it from powering the
     // host off, and from hiding the stop by starting a fresh wait.
     let stopped = format!(
@@ -4237,6 +4237,22 @@ fn a_lockout_shuts_a_shared_host_down_despite_a_job_hold_and_a_manual_lease() {
         .nfs_state(&nfs_lockout_pending(1))
         .run();
     assert_steps(&d, vec![wait(N, WaitReason::VetoInUse)], "veto");
+}
+
+#[test]
+fn a_host_seen_off_under_a_lockout_is_no_longer_ours() {
+    // The host is ours (flowmanager woke it) and goes down under the lockout.
+    let c = lockout_nfs(Case::new())
+        .obs(up(N, false, 0))
+        .nfs_state(&format!(
+            "{{ power: {}, mode: {} }}",
+            on_ours(),
+            mode_idle()
+        ));
+    let d = c.run();
+    assert!(locked_down(&d, N));
+    assert!(matches!(power_of(&d, N), PowerPhase::Off { ours: false }));
+    assert!(!nfs_state_of(&d).ours(), "{:?}", nfs_state_of(&d));
 }
 
 #[test]
