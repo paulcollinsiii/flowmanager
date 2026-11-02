@@ -4356,6 +4356,25 @@ fn a_lockout_shuts_an_exclusive_host_down_once_and_leaves_a_later_boot_alone() {
 }
 
 #[test]
+fn a_lockout_on_a_manual_host_that_is_off_never_settles_and_a_stale_settle_is_cleared() {
+    let mut c = Case::new().obs(up(N, false, 0)).nfs_state(&nfs_off(None));
+    c.config = example_config();
+    let c = lockout_nfs(c);
+    let d = c.run();
+    assert!(
+        !locked_down(&d, N),
+        "no managed shutdown, nothing to settle"
+    );
+    // A flag stored while the power was managed is dropped once it is not.
+    let stale = format!(
+        "{{ power: {{ phase: \"off\" }}, mode: {}, locked_down: true }}",
+        mode_idle()
+    );
+    let d = c.clone().nfs_state(&stale).run();
+    assert!(!locked_down(&d, N));
+}
+
+#[test]
 fn a_lockout_on_a_manual_host_withdraws_the_consumers_but_never_powers_it_off() {
     let mut c = Case::new();
     c.config = example_config();

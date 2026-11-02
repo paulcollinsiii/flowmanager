@@ -136,6 +136,30 @@ mod tests {
     }
 
     #[test]
+    fn a_request_under_a_lockout_records_nothing() {
+        let (config, now) = (example_config_managed(), Millis(9));
+        // The lockout's own shutdown under way (shared host: withdrawal pending).
+        let mut c = core(PowerPhase::On { since: Millis(1) });
+        let lockout = Shutdown::lockout_withdrawing(Millis(2));
+        c.state.resources.get_mut(&nfs()).unwrap().shutdown = Some(lockout);
+        for mode in [DrainMode::Graceful, DrainMode::Immediate] {
+            let r = request(&mut c, &config, &nfs(), mode, now);
+            assert_eq!(r, Requested::NotApplicable);
+            assert_eq!(state(&c).shutdown, Some(lockout), "not taken over");
+        }
+        // The lockout's one shutdown done and the host booted again: left alone.
+        let mut c = core(PowerPhase::On { since: Millis(1) });
+        c.state.resources.get_mut(&nfs()).unwrap().locked_down = true;
+        let r = request(&mut c, &config, &nfs(), DrainMode::Immediate, now);
+        assert_eq!(r, Requested::NotApplicable);
+        assert_eq!(state(&c).shutdown, None);
+        // Without a lockout the same host takes the request.
+        let mut c = core(PowerPhase::On { since: Millis(1) });
+        let r = request(&mut c, &config, &nfs(), DrainMode::Immediate, now);
+        assert_eq!(r, Requested::Recorded);
+    }
+
+    #[test]
     fn a_drain_is_recorded_on_a_host_that_is_up_and_takes_it_over() {
         let mut c = core(PowerPhase::On { since: Millis(1) });
         // An idle shutdown the scheduler gave up on (pods still mounted): tried afresh.

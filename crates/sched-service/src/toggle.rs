@@ -636,6 +636,7 @@ impl Toggle {
                     &config,
                     &r.id,
                     find_host(&leases, &r.id),
+                    is_locked_out(&config, &leases, &r.id),
                     None,
                     &report,
                     now,
@@ -740,10 +741,12 @@ impl Toggle {
             // translates and the sequencer decides.
             Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?.drain)),
         };
+        let locked = is_locked_out(&config, &self.backend.leases().await?, &id);
         Ok(resource_state(
             &config,
             &id,
             held.as_ref(),
+            locked,
             ack,
             &self.shared.last_report(),
             self.shared.clock.now(),
@@ -780,10 +783,12 @@ impl Toggle {
             self.gone_after(e, &lease.id).await?;
         }
         let report = self.shared.last_report();
+        let locked = is_locked_out(config, &self.backend.leases().await?, id);
         let mut v = resource_state(
             config,
             id,
             None,
+            locked,
             Some(None),
             &report,
             self.shared.clock.now(),
@@ -1002,6 +1007,11 @@ fn power_name(p: &PowerPhase) -> &'static str {
     }
 }
 
+/// Whether a lockout is held on `resource` (and means something there: it has a power section).
+fn is_locked_out(config: &Config, leases: &[Lease], resource: &ResourceId) -> bool {
+    config.supports_lockout(resource) && find_lockout(leases, resource).is_some()
+}
+
 fn find_lockout<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Lease> {
     leases
         .iter()
@@ -1138,11 +1148,16 @@ fn lockout_status(
 /// a drain is under way (a switch-off asked for the host to go down): its mode and whether
 /// the consumers are already scaled down. `requested` is the drain a request has just recorded
 /// (the last tick has not seen it yet); while one is under way the switch is not off: `held` is
-/// false and `state` is `draining`.
+/// false and `state` is `draining`. `locked_out` (from the lease book) says a lockout is held
+/// on the host: the reply then has `locked_out: true` and a `wait` entry `locked_out`, whatever
+/// was just asked (a request is still recorded or refused as before: the lockout decides what
+/// happens to the host), and `state` reads `locked_out` instead of `off` while the last report
+/// does not show the host off.
 pub fn resource_state(
     config: &Config,
     resource: &ResourceId,
     held: Option<&Lease>,
+    locked_out: bool,
     requested: Option<Option<crate::drain::RecordedDrain>>,
     report: &Option<TickReport>,
     now: Millis,
@@ -1212,6 +1227,24 @@ pub fn resource_state(
             "needs_attention".into(),
             json!(attention(r, resource, &st.power)),
         );
+    }
+    m.insert("locked_out".into(), json!(locked_out));
+    if locked_out {
+        let mut waits = match m.remove("wait") {
+            Some(Value::Array(w)) => w,
+            _ => Vec::new(),
+        };
+        waits.push(json!({ "reason": "locked_out" }));
+        m.insert("wait".into(), Value::Array(waits));
+        // Not `off` while the host is not seen off: the lockout is shutting it down, or
+        // leaving it alone after another boot.
+        let off = report
+            .as_ref()
+            .and_then(|r| r.state.resource(resource))
+            .is_some_and(|st| matches!(st.power, PowerPhase::Off));
+        if held.is_none() && !off && m.get("state") != Some(&json!("draining")) {
+            m.insert("state".into(), json!("locked_out"));
+        }
     }
     Value::Object(m)
 }
@@ -1937,18 +1970,42 @@ mod tests {
         }];
         let mut st = sched_model::ResourceState::new(PowerPhase::ShuttingDown { since: Millis(2) });
         rep.state.resources.insert(nfs.clone(), st.clone());
-        let v = resource_state(&config, &nfs, None, None, &Some(rep.clone()), Millis(9));
+        let v = resource_state(
+            &config,
+            &nfs,
+            None,
+            false,
+            None,
+            &Some(rep.clone()),
+            Millis(9),
+        );
         assert_eq!(v["state"], "off", "{v}");
         assert!(v.get("drain").is_none(), "{v}");
         st.power = PowerPhase::On { since: Millis(2) };
         rep.state.resources.insert(nfs.clone(), st);
-        let v = resource_state(&config, &nfs, None, None, &Some(rep.clone()), Millis(9));
+        let v = resource_state(
+            &config,
+            &nfs,
+            None,
+            false,
+            None,
+            &Some(rep.clone()),
+            Millis(9),
+        );
         assert_eq!(
             (&v["state"], &v["drain"]["mode"]),
             (&json!("draining"), &json!("graceful")),
             "{v}"
         );
-        let v = resource_state(&config, &nfs, None, Some(None), &Some(rep), Millis(9));
+        let v = resource_state(
+            &config,
+            &nfs,
+            None,
+            false,
+            Some(None),
+            &Some(rep),
+            Millis(9),
+        );
         assert_eq!(v["state"], "off", "{v}");
         assert!(v.get("drain").is_none(), "{v}");
     }
@@ -2086,6 +2143,54 @@ mod tests {
         assert_eq!((s, v.get("drain").is_none()), (200, true), "{v}");
         let (s, v) = r.post("/v1/resources/cuda-central/off", "").await;
         assert_eq!((s, v.get("drain").is_none()), (200, true), "{v}");
+    }
+
+    #[tokio::test]
+    async fn the_replies_for_a_locked_out_host_say_so_and_never_read_off_while_it_is_on() {
+        for host in ["basestar-nfs", "cuda-central"] {
+            let r = rig(&example_yaml_managed());
+            r.hosts_up(true);
+            r.tick().await;
+            let path = format!("/v1/resources/{host}");
+            let (_, v) = r.get(&path).await;
+            assert_eq!(v["locked_out"], false, "{host}: {v}");
+            assert!(!v["wait"].to_string().contains("locked_out"), "{host}: {v}");
+            assert_eq!(r.post(&format!("/v1/lockouts/{host}/on"), "").await.0, 200);
+            r.tick().await;
+            // GET says it, and the host is on.
+            let (s, v) = r.get(&path).await;
+            assert_eq!((s, &v["locked_out"]), (200, &json!(true)), "{host}: {v}");
+            assert!(v["wait"].to_string().contains("locked_out"), "{host}: {v}");
+            // off and off-now: 200 as before, but the answer says the lockout and does not
+            // read `off` while the host is on (the lockout, not the request, decides).
+            for act in ["off", "off-now"] {
+                let (s, v) = r.post(&format!("{path}/{act}"), "").await;
+                assert_eq!(s, 200, "{host} {act}: {v}");
+                assert_eq!(v["locked_out"], true, "{host} {act}: {v}");
+                assert!(
+                    v["wait"].to_string().contains("locked_out"),
+                    "{host} {act}: {v}"
+                );
+                assert_ne!(v["state"], "off", "{host} {act}: {v}");
+                assert!(v.get("drain").is_none() || v["state"] == "draining", "{v}");
+            }
+            // The listing carries it too, for this host only.
+            let (_, list) = r.get("/v1/leases").await;
+            for x in list["resources"].as_array().unwrap() {
+                assert_eq!(x["locked_out"], x["id"] == host, "{host}: {x}");
+            }
+            // `on` takes the lease (it does not cancel the lockout) and says so.
+            let (s, v) = r.post(&format!("{path}/on"), "").await;
+            assert_eq!(
+                (s, &v["held"], &v["locked_out"]),
+                (200, &json!(true), &json!(true))
+            );
+            // Cleared: the replies are the ordinary ones again.
+            assert_eq!(r.post(&format!("/v1/lockouts/{host}/off"), "").await.0, 200);
+            let (_, v) = r.get(&path).await;
+            assert_eq!(v["locked_out"], false, "{host}: {v}");
+            assert!(!v["wait"].to_string().contains("locked_out"), "{host}: {v}");
+        }
     }
 
     #[tokio::test]
@@ -2487,7 +2592,15 @@ mod tests {
             nfs.clone(),
             ResourceState::new(PowerPhase::On { since: Millis(1) }),
         );
-        let v = resource_state(&config, &nfs, None, None, &Some(rep.clone()), Millis(5_000));
+        let v = resource_state(
+            &config,
+            &nfs,
+            None,
+            false,
+            None,
+            &Some(rep.clone()),
+            Millis(5_000),
+        );
         assert_eq!(v["needs_attention"], false);
         rep.veto_held.push(crate::tick::VetoHeld {
             readings: vec!["mounts".to_string()],
@@ -2496,7 +2609,7 @@ mod tests {
             since: Millis(1),
             stopped: true,
         });
-        let v = resource_state(&config, &nfs, None, None, &Some(rep), Millis(5_000));
+        let v = resource_state(&config, &nfs, None, false, None, &Some(rep), Millis(5_000));
         assert_eq!(v["needs_attention"], true);
         assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_veto");
     }
