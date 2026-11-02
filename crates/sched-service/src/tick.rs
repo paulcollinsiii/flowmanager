@@ -1098,7 +1098,7 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
     use sched_model::test_support::EXAMPLE_CONFIG;
-    use sched_model::{Fidelity, ObservedValue, VetoReading};
+    use sched_model::{Fidelity, ObservedValue, PowerTransition, VetoReading};
     use sched_sequencer::status::{BlockerState, VetoBlocker, VetoStatus};
 
     const T0: u64 = 10_000_000;
@@ -2326,6 +2326,158 @@ mod tests {
                 "sched_veto_timeouts_total{reading=\"mounts\",resource=\"basestar-nfs\"} 1"
             )
         );
+    }
+
+    /// A shared host whose power-on has outlasted its timeout and that reads down.
+    fn nfs_powering_on_too_long() -> (Arc<Shared>, Arc<ManualClock>, Durable) {
+        let (s, clock, mut d) = due_nfs();
+        let mut st = sched_model::ResourceState::new(PowerPhase::PoweringOn {
+            since: Millis(T0 - 20 * 60_000),
+        });
+        st.idle_since = None;
+        d.state
+            .resources
+            .insert(ResourceId::new("basestar-nfs"), st);
+        clock.set(Millis(T0));
+        world(&s, Some(0));
+        push(
+            &s,
+            "basestar-probe",
+            vec![ObservedValue::ResourceUp {
+                resource: "basestar-nfs".into(),
+                up: false,
+            }],
+        );
+        (s, clock, d)
+    }
+
+    fn timeouts_counted(s: &Shared) -> bool {
+        s.metrics
+            .render()
+            .lines()
+            .any(|l| l.starts_with("sched_power_timeouts_total{") && l.ends_with(" 1"))
+    }
+
+    #[test]
+    fn a_power_timeout_is_one_event_and_a_replayed_tick_does_not_count_it_again() {
+        let (s, _, mut d) = nfs_powering_on_too_long();
+        s.seed_reported(&d.reported);
+        let outcome = s.decide(Millis(T0), &d);
+        let r = &outcome.report;
+        assert_eq!(r.error, None, "{r:?}");
+        // (The GPU host of this setup is found running and adopted in the same tick.)
+        assert_eq!(r.adopted(), vec![ResourceId::new("cuda-central")]);
+        assert!(
+            matches!(
+                r.power_timeouts()[..],
+                [HostEvent::PowerTimeout { resource, during: PowerTransition::PoweringOn, started_at: Some(Millis(started)), .. }]
+                    if resource.as_str() == "basestar-nfs" && *started == T0 - 20 * 60_000
+            ),
+            "{:?}",
+            r.events
+        );
+        let nfs: ResourceId = "basestar-nfs".into();
+        assert!(r.host(&nfs).unwrap().attention);
+        assert!(
+            r.kinds.contains(&"power_failed".to_string()),
+            "{:?}",
+            r.kinds
+        );
+        assert!(
+            r.reason
+                .contains("ALERT: powering_on of basestar-nfs timed out in this tick")
+        );
+        // The journal gave the decision back: published again, not counted again.
+        s.publish(&outcome, true);
+        assert!(!timeouts_counted(&s), "{}", s.metrics.render());
+        s.publish(&outcome, false);
+        assert!(timeouts_counted(&s), "{}", s.metrics.render());
+        // The tick after it: still failed, no new event, so nothing more to alert.
+        d.apply(&outcome);
+        clock_tick(&s, &mut d, T0 + 1_000);
+    }
+
+    /// One more tick against `d` at `at`, after which the host must still read failed with
+    /// no event.
+    fn clock_tick(s: &Shared, d: &mut Durable, at: u64) {
+        let r = s.tick(Millis(at), d);
+        assert!(r.events.is_empty(), "{:?}", r.events);
+        let h = r.host(&"basestar-nfs".into()).unwrap();
+        assert_eq!((h.phase(), h.attention), ("failed", true));
+        assert!(!r.reason.contains("timed out in this tick"), "{}", r.reason);
+        assert!(r.reason.contains("FAILED power state"), "{}", r.reason);
+    }
+
+    #[test]
+    fn a_report_carries_one_status_per_resource_and_survives_the_journal() {
+        let (s, _, mut d) = due_nfs();
+        world(&s, Some(2));
+        let r = s.tick(Millis(T0 + 1_000), &mut d);
+        let kinds: Vec<_> = r
+            .hosts
+            .iter()
+            .map(|h| (h.resource.as_str(), h.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("basestar-nfs", sched_model::ResourceKind::Shared),
+                ("cuda-central", sched_model::ResourceKind::Exclusive)
+            ]
+        );
+        let nfs = r.host(&"basestar-nfs".into()).unwrap();
+        assert!(nfs.ours && nfs.managed && nfs.is_up());
+        assert_eq!(nfs.wait, Some(sched_model::WaitReason::VetoInUse));
+        // Nothing ticked twice: the whole report round-trips as the journal stores it.
+        let json = serde_json::to_string(&r).unwrap();
+        let back: TickReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn a_failed_tick_has_no_statuses_and_no_events() {
+        let (s, _) = shared();
+        let r = s.state_error(
+            Millis(T0),
+            &[("scheduler_state".to_string(), "bad".to_string())],
+        );
+        assert!(r.error.is_some());
+        assert!(r.hosts.is_empty() && r.events.is_empty(), "{r:?}");
+        assert!(r.power_request_failures.is_empty());
+        // Its published form leaves the gauges the last decided tick set.
+        s.publish(
+            &TickOutcome {
+                report: r,
+                reported: BTreeSet::new(),
+                jobs: JobBook::default(),
+                leases: vec![],
+                creates: vec![],
+                duration_us: 0,
+            },
+            false,
+        );
+        assert!(s.published_allowed().is_none());
+    }
+
+    #[test]
+    fn a_failed_tick_leaves_the_host_gauges_as_the_last_decided_tick_set_them() {
+        let (s, _, mut d) = due_nfs();
+        world(&s, Some(2));
+        s.tick(Millis(T0 + 1_000), &mut d);
+        assert_eq!(veto_gauge(&s, "waiting"), "1");
+        let failed = s.state_error(Millis(T0 + 2_000), &[("k".to_string(), "p".to_string())]);
+        s.publish(
+            &TickOutcome {
+                report: failed,
+                reported: BTreeSet::new(),
+                jobs: JobBook::default(),
+                leases: vec![],
+                creates: vec![],
+                duration_us: 0,
+            },
+            false,
+        );
+        assert_eq!(veto_gauge(&s, "waiting"), "1");
     }
 
     #[test]

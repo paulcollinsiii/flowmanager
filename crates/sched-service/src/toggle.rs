@@ -1998,6 +1998,9 @@ mod tests {
             (&json!("draining"), &json!("graceful")),
             "{v}"
         );
+        // The drain says who started it as `cause`; `origin` is only a lease's.
+        assert_eq!(v["drain"]["cause"], json!("requested"), "{v}");
+        assert!(v["drain"].get("origin").is_none(), "{v}");
         let v = resource_state(
             &config,
             &nfs,
