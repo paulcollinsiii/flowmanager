@@ -359,14 +359,16 @@ until the first tick (the backstop ticks within seconds).
 ### Versions, and recovering the persisted state
 
 Each document is stored as `{"version": N, "data": ...}`; this build reads and writes
-version 2 of `scheduler_state` and version 1 of `lease_book`, `job_book` and the others.
+version 3 of `scheduler_state` and version 1 of `lease_book`, `job_book` and the others.
 Version 2 of `scheduler_state` replaced each resource's `drain`, `mounts_veto`,
-`host_idle_since` and `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`
-(`planning/power-model.md`). **There is no migration, and no operator step on upgrade.** A
-`scheduler_state` of an *older* version (version 1, as the build before wrote it) is read as
+`host_idle_since` and `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`;
+version 3 renamed the `reclaim` shutdown cause and wind-down flag to `lockout` and added
+`locked_down` (`planning/power-model.md`). **There is no migration for `scheduler_state`**
+(but see the operator step below for a stored reclaim lease). A
+`scheduler_state` of an *older* version (version 1 or 2, as the builds before wrote it) is read as
 an absent document: the first tick logs one warning (`event="state_version_discarded"`: the
 version found, discarded, starting from observation) and starts from observation as
-described below, and the state it stores is version 2. Only `scheduler_state` is treated so
+described below, and the state it stores is version 3. Only `scheduler_state` is treated so
 (it is the only document whose version was bumped); the lease book and the job book are
 kept as they are. One consequence: a host that is up when the new build first ticks has no
 `managed` mark, so it is seen as found running (a shared host is adopted, see *Host leases,
@@ -389,7 +391,7 @@ included). Instead:
 switching rejects the shipped config: a gate class (a requirement on an exclusive resource
 without a model) fails validation with "exclusive; a model is required", and a config
 without a pods source is refused as well. Deploy the previous binary with the previous
-config. A build before version 2 of `scheduler_state` cannot read the state this build
+config. A build before version 3 of `scheduler_state` cannot read the state this build
 writes (another version: an error tick until the document is discarded with
 `discard_state`), so discard `scheduler_state` when rolling back. Rolling forward again
 needs nothing: this build drops the older document by itself (see above).
@@ -406,6 +408,18 @@ that flowmanager already created is not touched either way: it runs to its end u
 Kubernetes (the CronJob stays `suspend: true`). Rolling forward again finds `job_book` as it
 was left, which may be stale (a run that ended meanwhile), so a run in it ends from the readings
 as usual; discard it (`job_book`) if you want a clean start.
+
+**Operator step before upgrading to the build that renamed reclaim to lockout.** A stored
+lease of kind `reclaim` (a reclaim someone left held) does not parse in this build, and the
+lease book is not versioned away like `scheduler_state`: `decode_leases` fails, every tick then
+publishes nothing (the scaler keeps what it had) and the lease handlers and `leases` answer
+`503`. Before the upgrade, list the leases (`leases`) and clear every reclaim with the old
+build's `unreclaim` (`{"resource": "cuda-central"}`). Also rename `policy.reclaim_timeout` to
+`lockout_timeout` in the config (the old key is refused at load). If the upgrade was done
+first, recover as below: either roll back, clear the reclaim with `unreclaim`, and roll
+forward again, or discard `lease_book` (`discard_state`, which drops every lease, manual
+ones included; job holds are re-derived from the job book) and take the leases you still
+want again.
 
 To recover, either deploy the build that wrote the document, or discard it. Discarding
 `scheduler_state` restarts the sequencer from observation: no model is allowed until the
@@ -916,7 +930,7 @@ trusted network.
   adopted and not given work (`wait ... locked_out`; `locked_down` in its stored state),
   until the lockout is cleared. Clearing it while the host is up makes it a host found
   running (adopted, as above); while it is off, the host is woken only if something wants it,
-  a manual lease included. On basestar a lockout deliberately blocks the backup job. Ids are
+  a manual lease included. On basestar a lockout deliberately blocks the backup job: a due run does not start while the host is locked out, up or not (it waits as for a host that is not up, so its `missed_run` rules apply), while a run already in progress is not killed and keeps its hold until it ends. Ids are
   `lockout-<n>`; asking again returns the lease.
 - **`resume`**: for a person who has fixed a host by hand. It applies to a resource in the
   failed power phase, or whose shutdown was stopped by mounting pods, and forgets that
@@ -1262,6 +1276,18 @@ Notes:
 ## Known blind spots
 
 Read these before trusting a "no demand" or "idle" line, or a phase.
+
+- **A lockout shuts a host down once, which has two consequences.** The one shutdown is
+  remembered as `locked_down` in the stored sequencer state (set when the host is seen off
+  while locked out), after which a host that is up is left alone until the lockout is cleared.
+  - *A transient false "off" reading* during a lockout's withdrawal counts as the host seen
+    off, so a host that is really up is then left alone instead of being shut down. The
+    lockout switch shows it as `left_alone`. Reachability debouncing (the readings need to
+    agree for a while) makes it unlikely; it is not prevented.
+  - *A state discard, or a restart without state,* during a lockout shuts an up host down a
+    second time: `locked_down` lives in the state, the lockout lease survives it, and the
+    sequencer starts afresh from observation (`discard_state`, a new Restate deployment, or a
+    stored state of an older version).
 
 - **Kill steps are not executed.** Power steps (only under `power.control: managed`) and
   recovery are carried out: see *Power actions* and *Recovery actions*. The sequencer

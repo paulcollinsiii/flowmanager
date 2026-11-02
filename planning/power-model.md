@@ -156,7 +156,7 @@ manual lease. It is valid on any managed host. While locked out the host may be 
 something else (another OS, physical work on it); flowmanager neither adopts it nor powers
 it off. Clearing the lockout returns the host to the normal model: it is woken only if
 something wants it. On basestar it deliberately blocks the backup job (for a physical move,
-say). `off-now` differs in that anything may wake the host again afterwards.
+say): a due run does not start while the host is locked out, up or not (it waits as for a host that is not up, so its `missed_run` rules apply); a run already in progress is not killed and keeps its hold, which the lockout overrides (the veto waits for its pods, bounded by `veto_timeout`). `off-now` differs in that anything may wake the host again afterwards.
 
 ### 2.4 Who decides what
 
@@ -288,7 +288,7 @@ The homesvr agent owns these; each phase adds what it changed.
   the stale "cuda-central is powered by hand" dashboard note.
 - Grafana and alerts: every breaking log, reason or metric change listed in phase reports (D5).
 - **Phase 2 and 3 output changes (breaking, D5).** Phase 4 and 5 will add theirs here.
-  - *Persisted state.* `scheduler_state` is version 2. A state of an older version is
+  - *Persisted state.* `scheduler_state` was version 2 after phases 2 and 3 (phase 4a makes it 3, below). A state of an older version is
     discarded on read and the sequencer starts afresh from observation (leases and the job
     book are kept); nothing to migrate. Its shape changed in version 2: per resource `drain`,
     `mounts_veto`, `host_idle_since` and `shutdown_confirmed_at` are gone, replaced by
@@ -366,6 +366,30 @@ The homesvr agent owns these; each phase adds what it changed.
     after its one shutdown now reports `locked_out` every tick (before: `power_off` again every
     tick while a reclaim was held and the host seen up). `reason` text: ", reclaim [..]" is
     ", lockout [..]" and the wait texts say "locked out".
+  - *Fix round (jobs, takeover, replies).*
+    - *Jobs.* A scheduled job whose needs include a locked-out host does not start (the
+      host up or not): its run waits in `Waiting` as for a host that is not up, so
+      `job_events` show no `started`, `start_late` and `missed` follow the job's
+      `missed_run` policy as usual, and a `started` (with `caught_up`) comes once the lockout
+      is cleared. The waiting run's own hold (`hold-job-<id>-<resource>`) exists as for a
+      down host but is inert under the lockout. A run already running is not killed and
+      keeps its hold; the lockout shuts the host down regardless (the veto waits for the
+      job's pods, bounded by `veto_timeout`). The invariant checker sees only the
+      sequencer's decision, not job starts, so this is covered by service tests, not by
+      invariant 14.
+    - *A lockout taking over a drain on a shared host* makes the shutdown the lockout's:
+      `shutdown.cause` is `lockout` (it stays `requested` for an exclusive host and for an
+      immediate request whose withdrawal is still pending). A pending graceful withdrawal
+      restarts at the takeover with `lockout_timeout` (`shutdown.since` is the takeover
+      time); a done one stays done.
+    - *Toggle replies for a resource.* `GET` and `POST` on `/v1/resources/{r}[/...]` and the
+      `resources` entries of `/v1/leases` have a new boolean `locked_out` (true while a
+      lockout lease is held on that host). While true the `wait` array has an entry
+      `{"reason": "locked_out"}` (created even before the first tick), and `state` reads
+      `locked_out` instead of `off` while the last report does not show the host off and no
+      lease is held (`draining` and `on` keep their meaning). Status codes are unchanged
+      (`off`, `off-now` and `on` still answer 200: the request is recorded or ignored as
+      before and the reply now says the lockout decides).
   - *Intent and TickReport JSON.* `intent.reclaim` is `intent.lockout` (where the intent is
     serialized: `last_decision`, scenario files).
   - *Metrics.* `sched_manual_lease_age_seconds{kind="reclaim"}` is `kind="lockout"`;
