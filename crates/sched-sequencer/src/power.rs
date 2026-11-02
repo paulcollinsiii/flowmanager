@@ -502,6 +502,15 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
         st.shutdown = None;
         return;
     }
+    // A lockout taking over a drain on a shared host makes it the lockout's own (see
+    // `Shutdown::under_lockout`): a pending withdrawal gives in-flight work `lockout_timeout`
+    // from now, whichever cause the drain had; a done one stays done. An exclusive host's
+    // request is kept as it is: its withdrawal is the mode machine's, which keeps an
+    // `immediate` request immediate under a lockout.
+    if cx.res.kind == ResourceKind::Shared && cx.locked_out() {
+        s = s.under_lockout(cx.now());
+        st.shutdown = Some(s);
+    }
     // An exclusive host's withdrawal is the mode machine's (see `withdrawal_step`).
     if cx.res.kind == ResourceKind::Shared
         && s.withdrawal() == Withdrawal::Pending

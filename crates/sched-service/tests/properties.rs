@@ -48,7 +48,7 @@ fn raw() -> impl Strategy<Value = Raw> {
             prop::option::weighted(0.7, (0u64..4, 0u64..3, 0u64..4_000_000, 0u64..3)),
             6,
         ),
-        prop::option::weighted(0.3, prop::collection::vec(0usize..8, 0..4)),
+        prop::option::weighted(0.3, prop::collection::vec(0usize..9, 0..4)),
         prop::bool::weighted(0.6),
     )
         .prop_map(|(dt, pods, up, mounts, demand, leases, refresh)| Raw {
@@ -87,6 +87,7 @@ fn lease(kind: usize, now: u64, n: usize) -> Lease {
             },
         ),
         6 => ("cuda-central", LeaseKind::Lockout),
+        7 => ("basestar-nfs", LeaseKind::Lockout),
         _ => (
             "cuda-central",
             LeaseKind::Interactive {

@@ -4397,3 +4397,56 @@ fn a_lockout_on_a_resource_without_a_power_section_is_ignored_and_reported() {
         "an always-on resource's consumers keep running"
     );
 }
+
+#[test]
+fn a_lockout_taking_over_a_pending_requested_drain_gives_in_flight_work_lockout_timeout_from_then()
+{
+    let busy = || with_lockout_timeout(lockout_nfs(nfs_busy()));
+    // A graceful drain asked for 9 minutes ago is 1 minute from its own drain_timeout; the
+    // lockout (lockout_timeout 2m) takes over now: the consumers keep running, the shutdown is
+    // the lockout's, counted from this tick.
+    let d = busy().nfs_state(&nfs_draining("graceful", 9 * MIN)).run();
+    assert_steps(&d, vec![wait(N, WaitReason::Draining)], "taken over");
+    let s = shutdown_of(&d, N).unwrap();
+    assert!(s.is_lockout() && s.withdrawal() == sched_model::Withdrawal::Pending);
+    assert_eq!(s.since(), sched_model::Millis(T));
+    assert!(ngx_allowed(&d), "the consumers are not cut off at once");
+    // Then it runs its course as the lockout's: the timeout, from the takeover.
+    let d = busy().nfs_state(&nfs_lockout_pending(2 * MIN - 1)).run();
+    assert!(ngx_allowed(&d));
+    let d = busy().nfs_state(&nfs_lockout_pending(2 * MIN)).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "due");
+    // An immediate request is still immediate under a lockout.
+    let d = busy().nfs_state(&nfs_draining("immediate", 1)).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "immediate");
+    assert!(!ngx_allowed(&d));
+}
+
+#[test]
+fn a_lockout_taking_over_a_withdrawn_drain_keeps_it_withdrawn_and_makes_it_its_own() {
+    // A requested drain whose consumers are already out, and an idle drain (always out).
+    let requested_done = format!(
+        "{{ power: {}, mode: {}, managed: true, shutdown: {{ cause: {{ kind: requested, mode: graceful }}, since: {}, withdrawal: done, veto: {{ phase: none }} }} }}",
+        on(),
+        mode_idle(),
+        T - 5 * MIN
+    );
+    for (name, state) in [
+        ("requested", requested_done),
+        ("idle", nfs_due(60 * MIN, Some("{ phase: none }"))),
+    ] {
+        let manual = lease_on("m", N, "{ type: manual_host }");
+        let d = lockout_nfs(nfs_busy())
+            .lease(manual)
+            .nfs_state(&state)
+            .run();
+        assert_steps(
+            &d,
+            vec![Step::PowerOff { resource: rid(N) }],
+            &format!("{name}: no new wait"),
+        );
+        let s = shutdown_of(&d, N).unwrap();
+        assert!(s.is_lockout() && s.consumers_withdrawn(), "{name}: {s:?}");
+        assert!(!ngx_allowed(&d), "{name}");
+    }
+}

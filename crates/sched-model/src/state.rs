@@ -397,6 +397,36 @@ impl Shutdown {
         }
     }
 
+    /// The shutdown a lockout taking over `self` at `now` becomes, for a host whose
+    /// consumers are withdrawn by scaling them down (a shared host): the lockout's own, so
+    /// the state says whose it is. A withdrawal still pending restarts its clock at `now`
+    /// (in-flight work gets `lockout_timeout` from when the lockout takes over, whatever
+    /// the earlier cause); one already done stays done, with its veto progress and start.
+    /// Unchanged: one that is already the lockout's, one with no withdrawal (nothing to
+    /// carry: a stopped idle shutdown stays stopped), and an `immediate` requested one whose
+    /// withdrawal is still pending (it is done on the next step and the lockout adds nothing).
+    pub fn under_lockout(self, now: Millis) -> Shutdown {
+        let immediate = matches!(
+            self.cause,
+            ShutdownCause::Requested {
+                mode: DrainMode::Immediate
+            }
+        );
+        match (self.is_drain(), self.cause, self.withdrawal) {
+            (false, _, _) | (_, ShutdownCause::Lockout, _) => self,
+            (_, _, Withdrawal::Pending) if immediate => self,
+            (_, _, Withdrawal::Pending) => Shutdown {
+                cause: ShutdownCause::Lockout,
+                since: now,
+                ..self
+            },
+            _ => Shutdown {
+                cause: ShutdownCause::Lockout,
+                ..self
+            },
+        }
+    }
+
     /// Whether a lockout forced this shutdown.
     pub fn is_lockout(&self) -> bool {
         self.cause == ShutdownCause::Lockout

@@ -658,7 +658,13 @@ pub fn check(
                                 "invariant 11: powered off locked out shared {resource} with no withdrawal of its consumers first"
                             )),
                             Some(d) => {
-                                let waited = d.cause() != sched_model::ShutdownCause::Lockout
+                                // A withdrawal already done before this tick (a drain the
+                                // lockout took over) stays done and needs no new wait.
+                                let was_done = before
+                                    .and_then(|s| s.shutdown)
+                                    .is_some_and(|x| x.consumers_withdrawn());
+                                let waited = was_done
+                                    || d.cause() != sched_model::ShutdownCause::Lockout
                                     || now.saturating_sub(d.since()) >= policy.lockout_timeout()
                                     || config
                                         .classes()

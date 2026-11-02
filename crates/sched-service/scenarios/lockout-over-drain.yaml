@@ -1,0 +1,29 @@
+description: "A lockout taking over an idle drain already under way on the shared host (consumers already withdrawn, work queued meanwhile): it becomes the lockout's and the host is shut down despite the queued work, with no invariant 12 violation."
+power_control: managed
+initial_state:
+  resources:
+    basestar-nfs:
+      power: { phase: "on", since: 92800000 }
+      mode: { phase: idle }
+      managed: true
+      shutdown: { cause: { kind: idle }, since: 99000000, withdrawal: done, veto: { phase: none } }
+frames:
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: true } }
+      - { source: basestar-mounts, value: { type: resource_mounts, resource: basestar-nfs, pods: 0 } }
+      - { source: paperless-ocr-pending, value: { type: demand, class: paperless-ocr, ready: 3, in_flight: 0, oldest_ready_at: 99000000 } }
+      - { source: paperless-post-ocr, value: { type: demand, class: paperless-tagging, ready: 0, in_flight: 0 } }
+      - { source: speakr-pending, value: { type: demand, class: speakr-transcription, ready: 0, in_flight: 0 } }
+      - { source: speakr-summaries, value: { type: demand, class: speakr-summarization, ready: 0, in_flight: 0 } }
+      - { source: immich-queues, value: { type: demand, class: immich-ml, ready: 0, in_flight: 0 } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    leases:
+      - { id: lockout-1, resource: basestar-nfs, granted_at: 100000000, kind: { type: lockout } }
+    expect:
+      steps: [{ type: allow_model, resource: cuda-central, model: mineru }, { type: power_off, resource: basestar-nfs }]
