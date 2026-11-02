@@ -142,6 +142,20 @@ pub(crate) fn reconcile(cx: &Cx, st: &mut ResourceState) {
         // A shutdown ends when the host is no longer up: seen off, or on its way there.
         st.shutdown = None;
     }
+    // A lockout shuts the host down once. Seen off under a lockout (also a lockout taken
+    // while the host is off), it is done: the host is left alone, whatever boots it later,
+    // until the lockout is cleared. Flowmanager is not responsible for it any more either.
+    if manual || !cx.locked_out() {
+        st.locked_down = false;
+        // A shutdown the lockout forced is over with it; the host, if up, is found running.
+        if st.shutdown.is_some_and(|s| s.is_lockout()) {
+            st.shutdown = None;
+        }
+    } else if matches!(st.power, PowerPhase::Off) {
+        st.locked_down = true;
+        st.managed = false;
+        st.idle_since = None;
+    }
 }
 
 pub(crate) fn wait(cx: &Cx, steps: &mut Vec<Step>, reason: WaitReason) {
@@ -258,15 +272,30 @@ pub(crate) fn step(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>, acted
             }
         }
         PowerPhase::On { .. } => {
+            if cx.locked_out() && st.locked_down {
+                // The lockout's one shutdown is done (the host was seen off under it): a
+                // later boot is left alone, not powered off, adopted or given work.
+                st.shutdown = None;
+                st.idle_since = None;
+                st.managed = false;
+                if !acted {
+                    wait(cx, steps, WaitReason::LockedOut);
+                }
+                return;
+            }
             if acted {
                 return;
             }
             let idle_mode = matches!(st.mode, ModePhase::Idle);
             if cx.locked_out() {
-                // No `idle` check: a lockout exists only for an exclusive resource, whose mode
-                // step has run just before this (the host is on) and always acts while a model
-                // is allowed (`acted`, returned above), so a host that gets here has no model.
-                power_off(cx, st, steps, Shutdown::lockout(now));
+                if cx.res.kind == ResourceKind::Exclusive {
+                    // No `idle` check: the mode step has run just before this (the host is
+                    // on) and always acts while a model is allowed (`acted`, returned
+                    // above), so a host that gets here has no model.
+                    power_off(cx, st, steps, Shutdown::lockout_without_consumers(now));
+                } else {
+                    shared_lockout(cx, st, steps);
+                }
                 return;
             }
             if want == Some(PowerWant::Manual) {
@@ -483,8 +512,9 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
     }
 }
 
-/// Whether a requested shutdown's wait for in-flight work is over: it is `immediate`, or
-/// `policy.drain_timeout` has passed since the request, or `work_done` (nothing in flight).
+/// Whether a shutdown's wait for in-flight work is over: it is `immediate`, or the timeout
+/// has passed since the shutdown started (`policy.drain_timeout`, or `policy.lockout_timeout`
+/// while the host is locked out), or `work_done` (nothing in flight).
 fn graceful_wait_over(cx: &Cx, s: Shutdown, work_done: bool) -> bool {
     let waited = cx.now().saturating_sub(s.since());
     let immediate = matches!(
@@ -493,7 +523,34 @@ fn graceful_wait_over(cx: &Cx, s: Shutdown, work_done: bool) -> bool {
             mode: DrainMode::Immediate
         }
     );
-    immediate || waited >= cx.config.policy().drain_timeout || work_done
+    let policy = cx.config.policy();
+    let timeout = if cx.locked_out() {
+        policy.lockout_timeout()
+    } else {
+        policy.drain_timeout
+    };
+    immediate || waited >= timeout || work_done
+}
+
+/// The lockout of a shared host that is up under managed control: the consumers are
+/// withdrawn (in-flight work gets `lockout_timeout`, see [`drain_step`]), then the veto and
+/// the power-off, whatever leases or work hold the host. A drain already under way (idle or
+/// requested) is carried on as the lockout's; one the veto gave up on stays stopped.
+fn shared_lockout(cx: &Cx, st: &mut ResourceState, steps: &mut Vec<Step>) {
+    st.idle_since = None;
+    if st.shutdown.is_some_and(|s| s.stopped_since().is_some()) {
+        wait(cx, steps, WaitReason::ShutdownStopped);
+        return;
+    }
+    let s = match st.shutdown.filter(Shutdown::is_drain) {
+        Some(s) => s,
+        None => {
+            let s = Shutdown::lockout_withdrawing(cx.now());
+            st.shutdown = Some(s);
+            s
+        }
+    };
+    drain_shutdown(cx, st, steps, s, 0);
 }
 
 /// Advances the withdrawal of an exclusive host's requested shutdown (run after the mode

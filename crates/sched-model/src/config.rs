@@ -477,11 +477,12 @@ impl Config {
             .find(|s| s.observe.contains(&Capability::Jobs))
     }
 
-    /// Whether a lockout lease means anything for `id`: only an exclusive resource with a
-    /// power section can be taken back and shut down. Everywhere else a lockout is ignored.
+    /// Whether a lockout lease means anything for `id`: any resource (shared or exclusive)
+    /// with a power section. Without one the host is always on and cannot be shut down, so a
+    /// lockout is ignored (and reported). Whether flowmanager also shuts the host down
+    /// depends on `control: managed` (see [`Config::power_managed`]).
     pub fn supports_lockout(&self, id: &ResourceId) -> bool {
-        self.resource(id)
-            .is_some_and(|r| r.kind == ResourceKind::Exclusive && r.power.is_some())
+        self.resource(id).is_some_and(|r| r.power.is_some())
     }
 
     /// Whether the scheduler controls `id`'s power: it has a power section with

@@ -441,12 +441,12 @@ pub async fn release_host_lease<C: ObjectCtx>(
     req: ReleaseHostLease,
 ) -> Result<Lease, HandlerError> {
     if req.drain.is_some() {
-        // A drain is for shared hosts; read the config inside a journaled step so a replay
+        // A drain is for a host with a power section; read the config inside a journaled step so a replay
         // gets the same answer.
         let (s, resource) = (Arc::clone(shared), req.resource.clone());
         let checked = ctx
             .run_journaled("release_host_lease_check", move || {
-                LeaseBook::check_drain(&s.config.current(), &resource)
+                LeaseBook::check_host(&s.config.current(), &resource)
             })
             .await?;
         checked.map_err(|e| lease_refused(&e))?;
@@ -539,7 +539,7 @@ pub async fn drain_host<C: ObjectCtx>(
             let (mut book, mut core) = (book, core);
             let config = s.config.current();
             let now = s.clock.now();
-            LeaseBook::check_drain(&config, &req.resource)?;
+            LeaseBook::check_host(&config, &req.resource)?;
             let released = book.release_manual_host(&req.resource).is_ok();
             drain::request(&mut core, &config, &req.resource, req.drain, now);
             let drain = core
@@ -1553,7 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_exclusive_host_can_be_leased_and_woken_but_not_drained() {
+    async fn an_exclusive_host_can_be_leased_woken_and_drained() {
         let (s, _) = process_managed();
         let ctx = FakeCtx::default();
         world(&s, 0);
@@ -1582,17 +1582,54 @@ mod tests {
             *ctx.powers.lock().unwrap(),
             [("cuda-central".to_string(), PowerAction::On)]
         );
-        // A drain is refused, with a request to release the lease instead; nothing changes.
-        let e = release_host_lease(&s, &ctx, release("cuda-central", Some(DrainMode::Graceful)))
+        let gpu_leases = |ctx: &FakeCtx| {
+            list_leases(&s, ctx.stored(LEASES_KEY).as_deref())
+                .unwrap()
+                .into_iter()
+                .filter(|l| l.resource.as_str() == "cuda-central")
+                .collect::<Vec<_>>()
+        };
+        let gpu_shutdown = |ctx: &FakeCtx| {
+            stored_state(ctx)
+                .state
+                .resource(&"cuda-central".into())
+                .and_then(|st| st.shutdown)
+        };
+        // A plain release is stored, and records no shutdown.
+        let released = release_host_lease(&s, &ctx, release("cuda-central", None))
             .await
-            .unwrap_err();
-        assert!(
-            refused(&e).contains("not a shared resource")
-                && refused(&e).contains("releasing its host lease"),
-            "{}",
-            refused(&e)
+            .unwrap();
+        ctx.commit();
+        assert_eq!(released, g.lease);
+        assert!(gpu_leases(&ctx).is_empty());
+        assert_eq!(gpu_shutdown(&ctx), None);
+        // The host is seen up now (a drain applies to a host that is up).
+        world(&s, 0);
+        tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        // A drain is accepted on an exclusive host as on a shared one: the lease is released
+        // and a graceful requested shutdown recorded.
+        let g2 = acquire_host_lease(&s, &ctx, req("cuda-central"))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert_eq!(gpu_leases(&ctx), vec![g2.lease.clone()]);
+        let released =
+            release_host_lease(&s, &ctx, release("cuda-central", Some(DrainMode::Graceful)))
+                .await
+                .unwrap();
+        ctx.commit();
+        assert_eq!(released, g2.lease);
+        assert!(gpu_leases(&ctx).is_empty());
+        let s1 = gpu_shutdown(&ctx).expect("a shutdown is recorded");
+        assert_eq!(
+            s1.cause(),
+            sched_model::ShutdownCause::Requested {
+                mode: DrainMode::Graceful
+            }
         );
-        let e = drain_host(
+        // `drain_host` escalates it in place, with no lease held.
+        let a = drain_host(
             &s,
             &ctx,
             DrainHost {
@@ -1601,24 +1638,11 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
-        assert!(refused(&e).contains("not a shared resource"), "{e:?}");
+        .unwrap();
         ctx.commit();
-        let gpu_leases = |ctx: &FakeCtx| {
-            list_leases(&s, ctx.stored(LEASES_KEY).as_deref())
-                .unwrap()
-                .into_iter()
-                .filter(|l| l.resource.as_str() == "cuda-central")
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(gpu_leases(&ctx), vec![g.lease.clone()]);
-        // A plain release is stored.
-        let released = release_host_lease(&s, &ctx, release("cuda-central", None))
-            .await
-            .unwrap();
-        ctx.commit();
-        assert_eq!(released, g.lease);
-        assert!(gpu_leases(&ctx).is_empty());
+        assert!(!a.released);
+        assert_eq!(a.drain.map(|d| d.mode), Some(DrainMode::Immediate));
+        assert_eq!(gpu_shutdown(&ctx).map(|s| s.since()), Some(s1.since()));
     }
 
     #[tokio::test]
@@ -1631,10 +1655,7 @@ mod tests {
                 .unwrap_err();
             assert!(refused(&e).contains(text), "{resource}: {}", refused(&e));
         }
-        for (resource, text) in [
-            ("nowhere", "unknown resource"),
-            ("basestar-nfs", "cannot be locked out"),
-        ] {
+        for (resource, text) in [("nowhere", "unknown resource")] {
             let e = lockout(&s, &ctx, req(resource)).await.unwrap_err();
             assert!(refused(&e).contains(text), "{resource}: {}", refused(&e));
         }
@@ -1769,7 +1790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_host_works_with_or_without_a_lease_changes_the_mode_in_place_and_refuses_what_cannot_drain()
+    async fn drain_host_works_with_or_without_a_lease_changes_the_mode_in_place_and_refuses_an_unknown_host()
      {
         let (s, clock) = process_managed_nfs();
         let ctx = FakeCtx::default();
@@ -1811,8 +1832,8 @@ mod tests {
             .unwrap();
         ctx.commit();
         assert_eq!(a.drain.map(|d| d.mode), Some(DrainMode::Immediate));
-        // The exclusive host and an unknown one are refused, nothing stored.
-        for name in ["cuda-central", "nope"] {
+        // An unknown host is refused, nothing stored.
+        for name in ["nope"] {
             let e = drain_host(
                 &s,
                 &ctx,

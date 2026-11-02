@@ -254,3 +254,32 @@ fn an_exclusive_host_under_manual_control_is_never_adopted() {
     let up = snapshot(Some(true), Some(true), &[]);
     assert_eq!(found(&config, &up, &SchedState::default()), vec![N]);
 }
+
+#[test]
+fn a_locked_out_host_is_never_adopted_on_either_kind_until_the_lockout_is_cleared() {
+    let config = example_config_managed();
+    let locks = [
+        "{ id: l1, resource: basestar-nfs, granted_at: 1, kind: { type: lockout } }",
+        "{ id: l2, resource: cuda-central, granted_at: 1, kind: { type: lockout } }",
+    ];
+    let locked = snapshot(Some(true), Some(true), &locks);
+    let cleared = snapshot(Some(true), Some(true), &[]);
+    let settled_up =
+        state("{ power: { phase: \"on\", since: 5 }, mode: { phase: idle }, locked_down: true }");
+    let settled_off = state("{ power: { phase: off }, mode: { phase: idle }, locked_down: true }");
+    for (name, prev) in [
+        ("no state", SchedState::default()),
+        ("settled, booted", settled_off),
+        ("settled, seen up", settled_up),
+    ] {
+        assert!(
+            found_with(&config, &locked, &prev, &locked.leases).is_empty(),
+            "{name}: locked out"
+        );
+        // Cleared: found running like any other host (the GPU host has no entry in `state`).
+        assert!(
+            found_with(&config, &cleared, &prev, &[]).contains(&N.to_string()),
+            "{name}: cleared"
+        );
+    }
+}

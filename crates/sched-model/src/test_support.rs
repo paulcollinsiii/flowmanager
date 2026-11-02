@@ -377,12 +377,17 @@ mod tests {
         assert!(m.contains("unknown source \"cluster-pod\""), "{m}");
     }
 
-    #[test]
-    fn resource_up_needs_a_power_section() {
-        let yaml = EXAMPLE_CONFIG.replace(
+    /// The example with the NFS host's power section removed (an always-on resource).
+    fn example_without_nfs_power() -> String {
+        EXAMPLE_CONFIG.replace(
             "    power:\n      wake_on_lan: { router_url: \"https://router.example.internal\", interface: lan, mac: \"02:00:00:00:00:02\" }\n      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n      control: manual\n      # Set per resource: the NFS host boots and stops faster than the GPU host.\n      power_on_timeout: 5m\n      shutdown_timeout: 10m\n      # Under managed control, how long a shutdown may wait for pods to stop mounting this\n      # host (see the basestar-mounts source) before the scheduler alerts and stops, without\n      # shutting it down and without retrying (default 30m, at most 1d).\n      veto_timeout: 30m\n",
             "",
-        );
+        )
+    }
+
+    #[test]
+    fn resource_up_needs_a_power_section() {
+        let yaml = example_without_nfs_power();
         let yaml = yaml.replace("    may_change_power: true\n", "");
         assert_ne!(yaml, EXAMPLE_CONFIG);
         let config = Config::from_yaml(&yaml).unwrap();
@@ -399,7 +404,10 @@ mod tests {
 
     #[test]
     fn fixture_state_and_lockout_are_checked() {
-        let cfg = example_config();
+        let cfg = Config::from_yaml(
+            &example_without_nfs_power().replace("    may_change_power: true\n", ""),
+        )
+        .unwrap();
         let bad = "description: x\nsnapshot:\n  config_generation: 4\n  now: 10\n  leases:\n    - { id: r, resource: basestar-nfs, granted_at: 1, kind: { type: lockout } }\nstate:\n  resources:\n    ghost: { power: { phase: \"on\", since: 0 }, mode: { phase: idle } }\n    cuda-central: { power: { phase: \"on\", since: 0 }, mode: { phase: serving, model: immich-ml, since: 0 } }\n    basestar-nfs: { power: { phase: \"on\", since: 0 }, mode: { phase: loading, model: llm, since: 0 } }\n";
         let msg = Fixture::from_yaml_checked(bad, &cfg)
             .unwrap_err()

@@ -20,21 +20,18 @@
 //! - `GET  /v1/resources/{resource}`, `POST /v1/resources/{resource}/on|off` (or a body),
 //!   and `POST /v1/resources/{resource}/resume`: the manual host lease of a host with a power
 //!   section. A host found running reads on (flowmanager holds it for the user, see `adopt`).
-//!   On an **exclusive** host (a GPU) `on` powers it and keeps it up while the queues keep
-//!   choosing the model, `off` is a plain release (the same as `release`: queued work holds the
-//!   host until idle, then `idle_grace` later it shuts down; no lease held is still a success),
-//!   and `off-now` is refused (`400`: an exclusive host is never drained; a lockout is the
-//!   forced "off now"). On a **shared** host `off` releases
-//!   the lease with a **graceful drain** (queued work no longer keeps the host up; in-flight
-//!   work gets `drain_timeout`; also with no lease held, through `drain_host`), and
-//!   `POST /v1/resources/{resource}/off-now` with an
-//!   **immediate** one (the consumers are scaled down at once). Neither overrides a job's hold.
+//!   The vocabulary is the same on every host, shared or exclusive: `on` powers it and keeps
+//!   it up, `off` releases the lease with a **graceful** requested shutdown (queued work no
+//!   longer keeps the host up; in-flight work gets `drain_timeout`; also with no lease held,
+//!   through `drain_host`), and `POST /v1/resources/{resource}/off-now` with an
+//!   **immediate** one (the consumers are withdrawn at once). Neither overrides a job's hold
+//!   or a lease taken afterwards.
 //!   `POST /v1/resources/{resource}/release` is a plain release of the lease (an adopted one
 //!   too) with **no drain**: the host goes down only when nothing holds it, as before; `404`
 //!   if no lease is held, and the reply reads `on` while the host is up.
 //! - `GET  /v1/lockouts/{resource}` and `POST /v1/lockouts/{resource}[/on|/off]`: the
-//!   lockout of an exclusive resource with a power section ("this GPU is mine"): `lockout`
-//!   and `clear_lockout`.
+//!   lockout of a host with a power section, shared or exclusive ("flowmanager, keep away
+//!   from this host until I clear it"): `lockout` and `clear_lockout`.
 //!
 //! Every POST logs one `toggle` line (kind, name, action, outcome, status; never the
 //! token) and is counted in `sched_toggle_requests_total`.
@@ -739,28 +736,8 @@ impl Toggle {
                 Some(self.backend.acquire_host(&id).await?.lease),
                 Some(None),
             ),
-            // An exclusive host is never drained: its switch is a plain release (queued work
-            // holds it until idle, then `idle_grace` later it shuts down). `off-now` on it goes
-            // to the handler, which refuses.
-            Some(false)
-                if drain == DrainMode::Graceful
-                    && config
-                        .resource(&id)
-                        .is_some_and(|r| r.kind == ResourceKind::Exclusive) =>
-            {
-                let leases = self.backend.leases().await?;
-                return match find_host(&leases, &id).cloned() {
-                    Some(lease) => self.release_held(&config, &id, &lease).await,
-                    None => Ok(resource_state(
-                        &config,
-                        &id,
-                        None,
-                        Some(None),
-                        &self.shared.last_report(),
-                        self.shared.clock.now(),
-                    )),
-                };
-            }
+            // Off is a requested shutdown on every host, whatever its kind; the listener
+            // translates and the sequencer decides.
             Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?.drain)),
         };
         Ok(resource_state(
@@ -1031,11 +1008,13 @@ fn find_lockout<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Le
         .find(|l| &l.resource == resource && l.kind == LeaseKind::Lockout)
 }
 
-/// A lockout switch ("this GPU is mine") on an exclusive resource with a power section.
-/// `supported` is false for any other resource, which cannot be locked out. While held and
+/// A lockout switch ("keep away from this host until I clear it") on a resource with a power
+/// section, shared or exclusive.
+/// `supported` is false for a resource without a power section, which cannot be locked out. While held and
 /// seen by the last tick, `status` is `host_failed` (a power transition failed),
 /// `powered_off` (the host is down and is not woken), `left_for_person` (up, with `control:
-/// manual`: flowmanager never shuts it down), `shutting_down`, `draining` (its work
+/// manual`: flowmanager never shuts it down), `left_alone` (up again after the lockout shut it
+/// down: flowmanager leaves it alone until the lockout is cleared), `shutting_down`, `draining` (its work
 /// is awaited for at most the lockout timeout, then cut off) or `pending` (the tick has
 /// not acted on it yet, or the report does not say more); `tick_reason` is that tick's
 /// reason as the sequencer gave it. `needs_attention` is as for a host.
@@ -1120,6 +1099,23 @@ fn lockout_status(
                 "draining",
                 format!(
                     "{model} is winding down on {resource}; its work is cut off after the lockout timeout"
+                ),
+            ),
+            _ if st.shutdown.is_some_and(|s| {
+                s.is_lockout() && s.withdrawal() == sched_model::Withdrawal::Pending
+            }) =>
+            {
+                (
+                    "draining",
+                    format!(
+                        "the consumers of {resource} are given the lockout timeout to finish, then withdrawn and the host shut down"
+                    ),
+                )
+            }
+            _ if st.locked_down => (
+                "left_alone",
+                format!(
+                    "{resource} was shut down by the lockout and is up again (another OS, say); flowmanager leaves it alone until the lockout is cleared"
                 ),
             ),
             _ if !managed => (
@@ -1758,8 +1754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_switch_leases_a_shared_host_and_an_exclusive_one_with_a_plain_release_as_its_off()
-     {
+    async fn a_host_switch_leases_a_shared_host_and_an_exclusive_one_alike() {
         let r = rig(&example_yaml_managed());
         let (s, v) = r.get("/v1/resources/basestar-nfs").await;
         assert_eq!(
@@ -1798,21 +1793,16 @@ mod tests {
             .find(|x| x["id"] == "cuda-central")
             .unwrap_or_else(|| panic!("the listing has the GPU host: {v}"));
         assert_eq!((s, &gpu["held"]), (200, &json!(true)));
-        // off-now is refused for an exclusive host, and does not release the lease.
+        // off-now is accepted for an exclusive host as for a shared one: it releases the
+        // lease (no drain is shown: the host has not been seen up by a tick yet).
         let (s, v) = r.post("/v1/resources/cuda-central/off-now", "").await;
-        assert_eq!(s, 400, "{v}");
-        assert!(
-            v["error"]
-                .as_str()
-                .unwrap()
-                .contains("not a shared resource"),
-            "{v}"
-        );
+        assert_eq!((s, &v["held"]), (200, &json!(false)), "{v}");
+        assert_eq!(r.lease_count(), 0);
+        r.post("/v1/resources/cuda-central/on", "").await;
         assert_eq!(r.lease_count(), 1);
-        // off is a plain release (no drain is ever recorded), and again with nothing held.
+        // off likewise, and again with nothing held.
         let (s, v) = r.post("/v1/resources/cuda-central/off", "").await;
         assert_eq!((s, &v["held"]), (200, &json!(false)), "{v}");
-        assert!(v.get("drain").is_none(), "{v}");
         assert_eq!(r.lease_count(), 0);
         assert_eq!(r.post("/v1/resources/cuda-central/off", "").await.0, 200);
         // release answers 404 when nothing is held, as for a shared host.
@@ -2087,11 +2077,49 @@ mod tests {
         let (s, v) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
         assert_eq!((s, &v["state"]), (200, &json!("off")), "{v}");
         assert!(v.get("drain").is_none(), "{v}");
-        // An exclusive resource cannot be drained; its off is a plain release.
-        let (s, _) = r.post("/v1/resources/cuda-central/off-now", "").await;
-        assert_eq!(s, 400);
+        // The GPU host stays under `control: manual` in this rig: flowmanager never shuts it
+        // down, so a request records nothing (and is not refused for being exclusive).
+        let (s, v) = r.post("/v1/resources/cuda-central/off-now", "").await;
+        assert_eq!((s, v.get("drain").is_none()), (200, true), "{v}");
         let (s, v) = r.post("/v1/resources/cuda-central/off", "").await;
         assert_eq!((s, v.get("drain").is_none()), (200, true), "{v}");
+    }
+
+    #[tokio::test]
+    async fn off_and_off_now_start_a_drain_on_a_managed_exclusive_host_as_on_a_shared_one() {
+        let r = rig(&example_yaml_managed());
+        r.hosts_up(true);
+        r.tick().await;
+        // The adopted lease reads on for both kinds; `off` releases it and records a graceful
+        // requested shutdown.
+        let (s, v) = r.get("/v1/resources/cuda-central").await;
+        assert_eq!(
+            (s, &v["held"], &v["resource_kind"]),
+            (200, &json!(true), &json!("exclusive")),
+            "{v}"
+        );
+        let (s, v) = r.post("/v1/resources/cuda-central/off", "").await;
+        assert_eq!(
+            (s, &v["held"], &v["state"], &v["drain"]["mode"]),
+            (200, &json!(false), &json!("draining"), &json!("graceful")),
+            "{v}"
+        );
+        // `off-now` escalates it in place.
+        let (s, v) = r.post("/v1/resources/cuda-central/off-now", "").await;
+        assert_eq!(
+            (s, &v["state"], &v["drain"]["mode"]),
+            (200, &json!("draining"), &json!("immediate")),
+            "{v}"
+        );
+        // The other host is unaffected.
+        assert_eq!(r.get("/v1/resources/basestar-nfs").await.1["held"], true);
+        // A new manual lease cancels it at the next tick, as on a shared host.
+        let (s, v) = r.post("/v1/resources/cuda-central/on", "").await;
+        assert_eq!(
+            (s, &v["held"], v.get("drain").is_none()),
+            (200, &json!(true), true),
+            "{v}"
+        );
     }
 
     #[tokio::test]
@@ -2334,7 +2362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lockout_switch_is_idempotent_and_refuses_what_cannot_be_locked_out() {
+    async fn a_lockout_switch_is_idempotent_on_either_kind_of_host() {
         let r = rig(&example_yaml_managed_nfs_only());
         let (s, v) = r.get("/v1/lockouts/cuda-central").await;
         assert_eq!(
@@ -2355,30 +2383,33 @@ mod tests {
         let (s, v) = r.post("/v1/lockouts/cuda-central/off", "").await;
         assert_eq!((s, &v["held"]), (200, &json!(false)));
         assert_eq!(r.lease_count(), 0);
-        // A shared host cannot be locked out: the handler's 400 with its message.
-        let (s, v) = r.post("/v1/lockouts/basestar-nfs/on", "").await;
-        assert_eq!(s, 400);
-        assert!(
-            v["error"]
-                .as_str()
-                .unwrap()
-                .contains("cannot be locked out"),
-            "{v}"
-        );
+        // A shared host can be locked out too, and its lockout is its own switch.
         let (s, v) = r.get("/v1/lockouts/basestar-nfs").await;
-        assert_eq!((s, &v["supported"]), (200, &json!(false)));
+        assert_eq!(
+            (s, &v["held"], &v["supported"]),
+            (200, &json!(false), &json!(true))
+        );
+        let (s, v) = r.post("/v1/lockouts/basestar-nfs/on", "").await;
+        assert_eq!(
+            (s, &v["held"], &v["kind"]),
+            (200, &json!(true), &json!("lockout"))
+        );
+        assert_eq!(r.lease_count(), 1);
+        assert_eq!(r.get("/v1/resources/basestar-nfs").await.1["held"], false);
+        let (s, v) = r.post("/v1/lockouts/basestar-nfs/off", "").await;
+        assert_eq!((s, &v["held"]), (200, &json!(false)));
+        assert_eq!(r.lease_count(), 0);
         assert_eq!(r.post("/v1/lockouts/nowhere/on", "").await.0, 404);
         assert_eq!(r.post("/v1/lockouts/nowhere/off", "").await.0, 404);
 
-        // Listed apart from the host leases.
+        // Listed apart from the host leases, one entry per host with a power section.
         r.post("/v1/lockouts/cuda-central/on", "").await;
         let (_, v) = r.get("/v1/leases").await;
         let lockouts = v["lockouts"].as_array().unwrap();
-        assert_eq!(lockouts.len(), 1);
-        assert_eq!(
-            (&lockouts[0]["id"], &lockouts[0]["held"]),
-            (&json!("cuda-central"), &json!(true))
-        );
+        assert_eq!(lockouts.len(), 2);
+        let by_id = |id: &str| lockouts.iter().find(|x| x["id"] == id).unwrap();
+        assert_eq!(by_id("cuda-central")["held"], true);
+        assert_eq!(by_id("basestar-nfs")["held"], false);
         assert_eq!(v["needs_attention"], false);
     }
 

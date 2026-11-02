@@ -1267,39 +1267,6 @@ fn lease_on(id: &str, res: &str, kind: &str) -> String {
 }
 
 #[test]
-fn a_lockout_on_a_shared_resource_is_ignored_and_never_overrides_holds() {
-    let hold = lease_on("h", N, "{ type: shared_hold, holder: x }");
-    let lockout = lease_on("r", N, "{ type: lockout }");
-    let mut c = Case::new()
-        .nfs_state(&managed_idle(99 * MIN))
-        .lease(hold)
-        .lease(lockout);
-    // A planner bug (or a hand-made intent) that names the shared resource changes nothing.
-    c.intent.lockout.insert(rid(N));
-    let d = c.run();
-    assert!(
-        !d.steps.contains(&Step::PowerOff { resource: rid(N) }),
-        "{:?}",
-        d.steps
-    );
-    assert!(d.steps.contains(&wait(N, WaitReason::LockoutUnsupported)));
-    assert!(matches!(power_of(&d, N), PowerPhase::On { .. }));
-    assert!(
-        d.allowed.classes.contains(&cid("paperless-ngx")),
-        "NFS-only classes keep running"
-    );
-
-    // The same lease with an empty intent (the planner filtered it) is still reported.
-    let d = Case::new()
-        .nfs_state(&managed_idle(99 * MIN))
-        .lease(lease_on("h", N, "{ type: shared_hold, holder: x }"))
-        .lease(lease_on("r", N, "{ type: lockout }"))
-        .run();
-    assert!(d.steps.contains(&wait(N, WaitReason::LockoutUnsupported)));
-    assert!(!d.steps.contains(&Step::PowerOff { resource: rid(N) }));
-}
-
-#[test]
 fn an_unforced_switch_is_cut_off_at_the_class_timeout() {
     let yaml = managed_yaml().replace(
         "    preemptibility: kill\n    demand: { source: paperless-ocr-pending }",
@@ -4180,4 +4147,228 @@ fn a_lockout_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
         );
         assert!(matches!(power_of(&d, G), PowerPhase::On { .. }));
     }
+}
+
+// ---- lockout on any host with a power section (power-model.md 2.3, phase 4a) ----
+
+fn lockout_nfs(mut c: Case) -> Case {
+    c.intent.lockout.insert(rid(N));
+    c
+}
+
+/// The example with a `lockout_timeout` (2m) distinct from `drain_timeout` (10m).
+fn with_lockout_timeout(mut c: Case) -> Case {
+    let yaml = managed_yaml().replace(
+        "  drain_timeout: 10m",
+        "  drain_timeout: 10m\n  lockout_timeout: 2m",
+    );
+    assert_ne!(yaml, managed_yaml());
+    c.config = Config::from_yaml(&yaml).unwrap();
+    c
+}
+
+/// The NFS host managed and up, its lockout shutdown started `ago` ms before the tick with
+/// the withdrawal of its consumers still pending.
+fn nfs_lockout_pending(ago: u64) -> String {
+    format!(
+        "{{ power: {}, mode: {}, managed: true, shutdown: {{ cause: {{ kind: lockout }}, since: {}, withdrawal: pending, veto: {{ phase: none }} }} }}",
+        on(),
+        mode_idle(),
+        T - ago
+    )
+}
+
+fn locked_down(d: &Decision, r: &str) -> bool {
+    d.state.resource(&rid(r)).unwrap().locked_down
+}
+
+fn ngx_allowed(d: &Decision) -> bool {
+    d.allowed.classes.contains(&cid("paperless-ngx"))
+}
+
+#[test]
+fn a_lockout_on_a_shared_host_gives_in_flight_work_the_lockout_timeout_then_shuts_it_down() {
+    let busy = || with_lockout_timeout(lockout_nfs(nfs_busy()));
+    // Taken while the host is up and busy: the shutdown starts with its withdrawal pending,
+    // and the consumers keep running for now.
+    let d = busy().nfs_state(&managed_idle(MIN)).run();
+    assert_steps(&d, vec![wait(N, WaitReason::Draining)], "starts");
+    let s = shutdown_of(&d, N).unwrap();
+    assert!(s.is_lockout() && s.withdrawal() == sched_model::Withdrawal::Pending);
+    assert!(ngx_allowed(&d));
+    // lockout_timeout (2m) from the start, not drain_timeout (10m).
+    let d = busy().nfs_state(&nfs_lockout_pending(2 * MIN - 1)).run();
+    assert_steps(&d, vec![wait(N, WaitReason::Draining)], "not yet");
+    assert!(ngx_allowed(&d));
+    let d = busy().nfs_state(&nfs_lockout_pending(2 * MIN)).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "due");
+    assert!(!ngx_allowed(&d), "{:?}", d.allowed);
+    assert!(matches!(power_of(&d, N), PowerPhase::ShuttingDown { .. }));
+    // Without work in flight the withdrawal does not wait for the timeout.
+    let d = lockout_nfs(Case::new())
+        .nfs_state(&nfs_lockout_pending(1))
+        .run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "no work");
+}
+
+#[test]
+fn a_lockout_shuts_a_shared_host_down_despite_a_job_hold_and_a_manual_lease() {
+    let hold = lease_on("h", N, "{ type: shared_hold, holder: x }");
+    let manual = lease_on("m", N, "{ type: manual_host }");
+    let c = || {
+        lockout_nfs(Case::new())
+            .lease(hold.clone())
+            .lease(manual.clone())
+    };
+    // No shutdown recorded yet: the lockout starts one, whatever holds the host.
+    let d = c().nfs_state(&managed_idle(1)).run();
+    assert_steps(&d, vec![wait(N, WaitReason::Draining)], "starts");
+    // Nothing in flight: the next tick withdraws, then the veto passes and the host is shut down.
+    let d = c().nfs_state(&nfs_lockout_pending(1)).run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "powers off");
+    assert!(!ngx_allowed(&d));
+    // The veto applies as for any shutdown: pods still mounting hold the power-off.
+    let d = c()
+        .obs(mounts(2, 0))
+        .nfs_state(&nfs_lockout_pending(1))
+        .run();
+    assert_steps(&d, vec![wait(N, WaitReason::VetoInUse)], "veto");
+}
+
+#[test]
+fn a_lockout_shuts_a_host_down_once_and_leaves_a_later_boot_alone_on_a_shared_host() {
+    // Taken while the host is off (the manual lease and a want do not wake it).
+    let manual = lease_on("m", N, "{ type: manual_host }");
+    let c = lockout_nfs(Case::new())
+        .lease(manual)
+        .want(N, PowerWant::Manual)
+        .obs(up(N, false, 0))
+        .nfs_state(&nfs_off(None));
+    let d = c.run();
+    assert_steps(&d, vec![wait(N, WaitReason::LockedOut)], "keeps it off");
+    assert!(locked_down(&d, N), "seen off under the lockout");
+    assert!(matches!(power_of(&d, N), PowerPhase::Off));
+
+    // Something else boots it: neither powered off, nor given work, nor woken again.
+    let booted = lockout_nfs(Case::new()).want(N, PowerWant::Manual);
+    let mut state = d.state.clone();
+    for _ in 0..2 {
+        let d2 = booted.run_at(&state, T);
+        assert_steps(&d2, vec![wait(N, WaitReason::LockedOut)], "left alone");
+        assert!(matches!(power_of(&d2, N), PowerPhase::On { .. }));
+        assert!(locked_down(&d2, N));
+        assert!(!ngx_allowed(&d2));
+        assert!(shutdown_of(&d2, N).is_none());
+        state = d2.state.clone();
+    }
+    // A lockout taken while the host is up shuts it down and settles once it is seen off.
+    let sd = lockout_nfs(Case::new())
+        .obs(up(N, false, 0))
+        .nfs_state(&format!(
+            "{{ power: {{ phase: shutting_down, since: {} }}, mode: {} }}",
+            T - MIN,
+            mode_idle()
+        ))
+        .run();
+    assert!(matches!(power_of(&sd, N), PowerPhase::Off));
+    assert!(locked_down(&sd, N));
+}
+
+#[test]
+fn clearing_a_lockout_while_the_host_is_up_leaves_it_running_and_adoptable() {
+    let settled = format!(
+        "{{ power: {}, mode: {}, locked_down: true }}",
+        on(),
+        mode_idle()
+    );
+    // Cleared: back to the normal model. It is not powered off (nothing says it is ours),
+    // it is not locked down any more, and its consumers may run again.
+    let d = Case::new().nfs_state(&settled).run();
+    assert!(!locked_down(&d, N));
+    assert!(
+        !d.steps
+            .iter()
+            .any(|s| matches!(s, Step::PowerOff { .. } | Step::PowerOn { .. })),
+        "{:?}",
+        d.steps
+    );
+    assert!(!nfs_state_of(&d).managed);
+    assert!(ngx_allowed(&d));
+    // Still locked out: nothing changes.
+    let d = lockout_nfs(Case::new()).nfs_state(&settled).run();
+    assert!(locked_down(&d, N) && !ngx_allowed(&d));
+}
+
+#[test]
+fn clearing_a_lockout_while_the_host_is_off_wakes_it_only_for_a_want() {
+    let settled = format!(
+        "{{ power: {{ phase: \"off\" }}, mode: {}, locked_down: true }}",
+        mode_idle()
+    );
+    let c = Case::new().obs(up(N, false, 0)).nfs_state(&settled);
+    // Locked out: a want does not wake it.
+    let d = lockout_nfs(c.clone()).want(N, PowerWant::Workload).run();
+    assert!(!d.steps.contains(&Step::PowerOn { resource: rid(N) }));
+    assert!(locked_down(&d, N));
+    // Cleared with nothing wanting it: it stays off.
+    let d = c.run();
+    assert!(!locked_down(&d, N));
+    assert!(!d.steps.contains(&Step::PowerOn { resource: rid(N) }));
+    // Cleared with a want: woken.
+    let d = c.clone().want(N, PowerWant::Workload).run();
+    assert!(
+        d.steps.contains(&Step::PowerOn { resource: rid(N) }),
+        "{:?}",
+        d.steps
+    );
+    assert!(!locked_down(&d, N));
+}
+
+#[test]
+fn clearing_a_lockout_cancels_its_shutdown_in_progress() {
+    let d = Case::new().nfs_state(&nfs_lockout_pending(1)).run();
+    assert!(shutdown_of(&d, N).is_none(), "{:?}", shutdown_of(&d, N));
+    assert!(!d.steps.contains(&Step::PowerOff { resource: rid(N) }));
+    assert!(ngx_allowed(&d));
+}
+
+#[test]
+fn a_lockout_shuts_an_exclusive_host_down_once_and_leaves_a_later_boot_alone() {
+    let c = Case::new()
+        .lockout()
+        .want(G, PowerWant::Manual)
+        .obs(up(G, false, 0))
+        .gpu_state(&gpu_off());
+    let d = c.run();
+    assert_steps(&d, vec![wait(G, WaitReason::LockedOut)], "off stays off");
+    assert!(locked_down(&d, G));
+    // It boots (another OS): not powered off, no model allowed, not woken or given work.
+    let booted = Case::new().lockout().want(G, PowerWant::Manual);
+    let d2 = booted.run_at(&d.state, T);
+    assert_steps(&d2, vec![wait(G, WaitReason::LockedOut)], "left alone");
+    assert!(matches!(power_of(&d2, G), PowerPhase::On { .. }));
+    assert!(d2.allowed.models.is_empty() && !uses_gpu(&d2));
+    assert!(matches!(mode_of(&d2, G), ModePhase::Idle));
+    // Cleared while it is up: not powered off.
+    let d3 = Case::new().run_at(&d2.state, T);
+    assert!(!locked_down(&d3, G));
+    assert!(!d3.steps.contains(&Step::PowerOff { resource: rid(G) }));
+}
+
+#[test]
+fn a_lockout_on_a_manual_host_withdraws_the_consumers_but_never_powers_it_off() {
+    let mut c = Case::new();
+    c.config = example_config();
+    let c = lockout_nfs(c);
+    let d = c.run();
+    assert!(
+        !d.steps.iter().any(|s| matches!(s, Step::PowerOff { .. })),
+        "{:?}",
+        d.steps
+    );
+    assert!(!ngx_allowed(&d));
+    assert!(
+        !locked_down(&d, N),
+        "nothing is ever settled without managed control"
+    );
 }

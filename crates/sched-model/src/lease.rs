@@ -32,8 +32,8 @@ pub enum LeaseKind {
     ManualModel { model: ModelId },
     /// An interactive session's claim on a model. Expires unless renewed.
     Interactive { model: ModelId, expires_at: Millis },
-    /// The user takes an exclusive host back despite pending work. Until released, intake
-    /// stops, the host is shut down and it is not woken.
+    /// The user takes a host (shared or exclusive, with a power section) back despite pending
+    /// work. Until released, intake stops, the host is shut down once and it is not woken.
     Lockout,
 }
 

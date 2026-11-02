@@ -209,11 +209,12 @@ pub enum ShutdownCause {
     /// ignores queued and in-flight work, never a lease, and is cancelled only by a new manual
     /// host lease (or the host no longer being up). `mode` is how in-flight work is treated
     /// before the consumers are withdrawn: scaled down on a shared host, wound down by the
-    /// mode machine on an exclusive one. The sequencer supports it on both kinds; the service
-    /// API still refuses an exclusive host.
+    /// mode machine on an exclusive one. Both kinds take it through the API.
     Requested { mode: DrainMode },
-    /// A lockout lease on an exclusive host forced the shutdown (the model was wound down
-    /// first, see `ModePhase`).
+    /// A lockout lease forced the shutdown. It overrides holds, leases and the grace period.
+    /// On a shared host the consumers are withdrawn first (in-flight work gets
+    /// `lockout_timeout`); on an exclusive host the mode machine winds the model down first
+    /// (see `ModePhase`), so the shutdown starts with nothing to withdraw.
     Lockout,
 }
 
@@ -281,6 +282,8 @@ pub enum Veto {
 /// | idle | not needed | any |
 /// | requested | pending | none |
 /// | requested | done | any |
+/// | lockout | pending | none |
+/// | lockout | done | any |
 /// | lockout | not needed | any |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ShutdownRepr")]
@@ -336,8 +339,8 @@ impl Shutdown {
             (ShutdownCause::Idle, Withdrawal::Pending) => false,
             (ShutdownCause::Idle, Withdrawal::Done) => !matches!(self.veto, Veto::Stopped { .. }),
             (ShutdownCause::Idle, Withdrawal::NotNeeded) => true,
-            (ShutdownCause::Lockout, Withdrawal::NotNeeded) => true,
-            (ShutdownCause::Lockout, Withdrawal::Pending | Withdrawal::Done) => false,
+            (ShutdownCause::Lockout, Withdrawal::Pending) => self.veto == Veto::None,
+            (ShutdownCause::Lockout, Withdrawal::Done | Withdrawal::NotNeeded) => true,
         }
     }
 
@@ -372,14 +375,31 @@ impl Shutdown {
         }
     }
 
-    /// The shutdown a lockout forces (the model was wound down first: nothing to withdraw).
-    pub fn lockout(since: Millis) -> Shutdown {
+    /// The shutdown a lockout forces on an exclusive host (the model was wound down first:
+    /// nothing to withdraw).
+    pub fn lockout_without_consumers(since: Millis) -> Shutdown {
         Shutdown {
             cause: ShutdownCause::Lockout,
             since,
             withdrawal: Withdrawal::NotNeeded,
             veto: Veto::None,
         }
+    }
+
+    /// The shutdown a lockout forces on a shared host, with the withdrawal of its consumers
+    /// still to do (in-flight work gets `lockout_timeout`).
+    pub fn lockout_withdrawing(since: Millis) -> Shutdown {
+        Shutdown {
+            cause: ShutdownCause::Lockout,
+            since,
+            withdrawal: Withdrawal::Pending,
+            veto: Veto::None,
+        }
+    }
+
+    /// Whether a lockout forced this shutdown.
+    pub fn is_lockout(&self) -> bool {
+        self.cause == ShutdownCause::Lockout
     }
 
     pub fn cause(&self) -> ShutdownCause {
@@ -528,6 +548,14 @@ pub struct ResourceState {
     /// wait before the next automatic power-on. Absent for a host found down, one that went down
     /// by itself, once the phase leaves `off`, and for a resource without a `min_off`.
     pub off_since: Option<Millis>,
+    /// Whether the host was seen off while it was locked out: the lockout has done its one
+    /// shutdown. From then on flowmanager leaves the host alone until the lockout is
+    /// cleared: a later boot (another OS, physical work) is not powered off, not adopted and
+    /// not given work. Set when the host is seen off under a lockout (also one taken while it
+    /// was already off); cleared as soon as no lockout applies. Never set under
+    /// `control: manual`.
+    #[serde(default)]
+    pub locked_down: bool,
 }
 
 impl ResourceState {
@@ -540,6 +568,7 @@ impl ResourceState {
             pending_recovery: BTreeSet::new(),
             shutdown: None,
             off_since: None,
+            locked_down: false,
         }
     }
 
@@ -657,7 +686,8 @@ mod tests {
             Shutdown::idle_without_consumers(Millis(1)),
             Shutdown::requested(DrainMode::Graceful, Millis(1)),
             Shutdown::requested(DrainMode::Immediate, Millis(1)),
-            Shutdown::lockout(Millis(1)),
+            Shutdown::lockout_without_consumers(Millis(1)),
+            Shutdown::lockout_withdrawing(Millis(1)),
         ];
         let mut i = 0;
         while i < seen.len() {
@@ -681,8 +711,8 @@ mod tests {
         let all = reachable();
         // 3 causes' worth of states: idle {done: none, vetoing; not needed: none, vetoing,
         // stopped}, requested x2 modes {pending; done: none, vetoing, stopped}, lockout
-        // {none, vetoing, stopped}.
-        assert_eq!(all.len(), 5 + 2 * 4 + 3, "{all:#?}");
+        // {pending; done: none, vetoing, stopped; not needed: none, vetoing, stopped}.
+        assert_eq!(all.len(), 5 + 2 * 4 + 7, "{all:#?}");
         for s in all {
             assert!(s.is_possible(), "{s:?}");
             let mut st = resource_with("null").unwrap();
@@ -711,10 +741,8 @@ mod tests {
         // The combinations the type does not have.
         for (c, w, v) in [
             ("idle", "pending", none),
-            ("lockout", "pending", none),
-            ("lockout", "done", none),
-            ("lockout", "done", vetoing),
-            ("lockout", "done", stopped),
+            ("lockout", "pending", vetoing),
+            ("lockout", "pending", stopped),
             ("idle", "done", stopped),
             ("requested", "not_needed", vetoing),
             ("requested", "not_needed", stopped),
@@ -732,6 +760,9 @@ mod tests {
             ("requested", "pending", none),
             ("requested", "done", stopped),
             ("lockout", "not_needed", vetoing),
+            ("lockout", "pending", none),
+            ("lockout", "done", none),
+            ("lockout", "done", stopped),
         ] {
             assert!(resource_with(&text(c, w, v)).is_ok(), "{c} {w} {v}");
         }
@@ -763,10 +794,14 @@ mod tests {
         // An exclusive host's shutdown never withdrew anything: nothing is left of it.
         for s in [
             Shutdown::idle_without_consumers(Millis(2)),
-            Shutdown::lockout(Millis(2)),
+            Shutdown::lockout_without_consumers(Millis(2)),
         ] {
             assert_eq!(s.vetoing(Millis(5)).without_veto(), None);
         }
+        // A shared host's lockout keeps its consumers out, and stays one even when stopped.
+        let l = Shutdown::lockout_withdrawing(Millis(2)).withdrawn();
+        assert!(l.is_lockout() && l.consumers_withdrawn());
+        assert!(l.stopped(Millis(7)).consumers_withdrawn());
         let stopped = waiting.stopped(Millis(7));
         assert_eq!(stopped.without_veto(), Some(stopped));
         assert!(!stopped.is_drain());

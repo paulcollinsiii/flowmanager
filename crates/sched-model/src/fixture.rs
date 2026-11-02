@@ -308,17 +308,13 @@ impl Fixture {
                         l.resource.as_str()
                     ),
                 ),
-                LeaseKind::Lockout
-                    if res.kind != ResourceKind::Exclusive || res.power.is_none() =>
-                {
-                    add(
-                        &at,
-                        format!(
-                            "lockout on resource {:?}, which is not an exclusive resource with a power section",
-                            l.resource.as_str()
-                        ),
-                    )
-                }
+                LeaseKind::Lockout if res.power.is_none() => add(
+                    &at,
+                    format!(
+                        "lockout on resource {:?}, which has no power section",
+                        l.resource.as_str()
+                    ),
+                ),
                 LeaseKind::ManualHost if res.power.is_none() => add(
                     &at,
                     format!(

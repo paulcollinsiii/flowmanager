@@ -597,18 +597,18 @@ fn snapshot_order_never_changes_the_intent() {
 }
 
 #[test]
-fn a_lockout_lease_on_a_shared_host_is_dropped_by_the_planner() {
+fn a_lockout_lease_on_a_shared_host_is_kept_and_overrides_a_manual_host_lease() {
     let lockout = "{ id: r, resource: basestar-nfs, granted_at: 0, kind: { type: lockout } }";
     let host = "{ id: h, resource: basestar-nfs, granted_at: 0, kind: { type: manual_host } }";
-    let y = fixture_yaml(&[], &[lockout, host], None);
-    // The fixture checker rejects the lockout; the planner must cope with it anyway.
-    let f = Fixture::from_yaml(&y).unwrap();
+    let f = fixture(&[], &[lockout, host], None);
     let i = run(&f);
-    assert!(i.lockout.is_empty());
-    assert_eq!(
-        i.power_up.get(&ResourceId::new("basestar-nfs")),
-        Some(&PowerWant::Manual)
-    );
+    let nfs = ResourceId::new("basestar-nfs");
+    assert!(i.lockout.contains(&nfs));
+    // The manual lease stays in the book but wants nothing while the lockout stands.
+    assert!(!i.power_up.contains_key(&nfs));
+    // Without the lockout the same lease wants the host up.
+    let f = fixture(&[], &[host], None);
+    assert_eq!(run(&f).power_up.get(&nfs), Some(&PowerWant::Manual));
     // A lockout on the exclusive host is kept.
     let lockout = format!("{{ id: r, resource: {G}, granted_at: 0, kind: {{ type: lockout }} }}");
     let f = fixture(&[], &[&lockout], None);

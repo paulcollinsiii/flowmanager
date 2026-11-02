@@ -33,7 +33,9 @@ pub struct Intent {
     /// Hosts that must be powered up, and why.
     #[serde(default)]
     pub power_up: BTreeMap<ResourceId, PowerWant>,
-    /// Lockoutable resources the user has locked out (never a shared resource): intake stops and they are shut down, not woken.
+    /// Resources the user has locked out (any resource with a power section, shared or
+    /// exclusive): intake stops and they are shut down once, then neither woken, adopted nor
+    /// scheduled until the lockout is cleared.
     #[serde(default)]
     pub lockout: BTreeSet<ResourceId>,
 }
@@ -49,9 +51,11 @@ pub enum WaitReason {
     StaleObservation,
     /// A scheduling observation needed to prove no work is in flight is missing or stale.
     StaleDemand,
+    /// A lockout holds the host: it is shut down (or already is, and left alone) and nothing
+    /// wakes or schedules it.
     LockedOut,
-    /// A lockout lease names a resource that cannot be locked out (shared, or without a
-    /// power section). It is ignored.
+    /// A lockout lease names a resource that cannot be locked out (one without a
+    /// power section, say after a config change). It is ignored.
     LockoutUnsupported,
     HostNotUp,
     PoweringOn,

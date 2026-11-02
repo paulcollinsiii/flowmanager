@@ -1,5 +1,5 @@
-//! `release_host_lease` with a drain: a person releases the manual lease of a shared host and
-//! asks for it to go down, even though queued or in-flight work would otherwise keep it up.
+//! `release_host_lease` with a drain and `drain_host`: a person asks a host (shared or
+//! exclusive) to go down, even though queued or in-flight work would otherwise keep it up.
 //!
 //! The request is recorded in the host's sequencer state (`ResourceState::shutdown`, persisted
 //! with it, so it survives a restart); the sequencer does the rest (see `sched_sequencer`:
@@ -45,7 +45,8 @@ pub enum Requested {
     /// The drain is recorded.
     Recorded,
     /// Nothing was recorded: the host's power is under `control: manual` (flowmanager never
-    /// shuts it down), it has no state yet, or it is not up (nothing consumes it).
+    /// shuts it down), it has no state yet, it is not up (nothing consumes it), or it is
+    /// locked out (the lockout shuts it down, or leaves it alone, whatever is asked).
     NotApplicable,
 }
 
@@ -72,6 +73,12 @@ pub fn request(
         return Requested::NotApplicable;
     };
     if !st.is_on() {
+        return Requested::NotApplicable;
+    }
+    // A lockout's shutdown is stricter than a request and is not taken over: the host is
+    // being shut down already, and once it is down (or while it stays up and left alone) a
+    // request changes nothing until the lockout is cleared.
+    if st.shutdown.is_some_and(|s| s.is_lockout()) || st.locked_down {
         return Requested::NotApplicable;
     }
     // A person's request takes over a shutdown that has a withdrawal (a drain, idle or

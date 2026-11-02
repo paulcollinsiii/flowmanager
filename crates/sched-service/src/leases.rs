@@ -1,5 +1,5 @@
-//! Manual leases as the user requests them: on a model, on a shared host, a lockout of an
-//! exclusive resource; released by id (or by resource for a host lease and a lockout),
+//! Manual leases as the user requests them: on a model, on a host, a lockout of a host;
+//! released by id (or by resource for a host lease and a lockout),
 //! listed. The book is plain data that the `Scheduler` object keeps in its Restate state;
 //! the rules here are pure, so they can be tested without Restate.
 //!
@@ -8,9 +8,10 @@
 //! - At most one manual model lease is held per exclusive resource. Asking again for the
 //!   model already leased returns that lease; asking for another model of the same
 //!   resource is refused until the first is released.
-//! - A manual host lease is for a resource (shared or exclusive) with a power section, a lockout for an
-//!   exclusive resource with a power section (`Config::supports_lockout`); each is held at
-//!   most once per resource, and asking again returns the lease held.
+//! - A manual host lease and a lockout are each for a resource (shared or exclusive) with a
+//!   power section (`Config::supports_lockout`); each is held at most once per resource, and
+//!   asking again returns the lease held. A lockout and a manual host lease can both be held:
+//!   neither cancels or removes the other, the lockout wins while it stands.
 //! - Lease ids come from a counter kept in the book, so they are deterministic under
 //!   Restate's replay.
 //!
@@ -63,14 +64,9 @@ pub enum LeaseError {
         resource: ResourceId,
         known: Vec<ResourceId>,
     },
-    /// A drain is for a shared resource; an exclusive host is taken down by releasing its
-    /// host lease.
-    NotShared { resource: ResourceId },
-    /// The resource has no power section: it is always on, so a lease on it would do nothing.
+    /// The resource has no power section: it is always on, so a lease, a lockout or a drain
+    /// on it would do nothing.
     NoPowerSection { resource: ResourceId },
-    /// A lockout names a resource that cannot be locked out: only an exclusive resource with a
-    /// power section can be taken back and shut down.
-    NotLockable { resource: ResourceId },
     /// The resource holds no lease of the kind that was asked to be released.
     NoLeaseOnResource { resource: ResourceId, kind: String },
     /// No lease has this id.
@@ -84,9 +80,7 @@ impl LeaseError {
             LeaseError::UnknownModel { .. }
             | LeaseError::NotExclusive { .. }
             | LeaseError::UnknownResource { .. }
-            | LeaseError::NotShared { .. }
-            | LeaseError::NoPowerSection { .. }
-            | LeaseError::NotLockable { .. } => 400,
+            | LeaseError::NoPowerSection { .. } => 400,
             LeaseError::Conflict { .. } => 409,
             LeaseError::UnknownLease { .. } | LeaseError::NoLeaseOnResource { .. } => 404,
         }
@@ -133,19 +127,9 @@ impl fmt::Display for LeaseError {
                     known.join(", ")
                 )
             }
-            LeaseError::NotShared { resource } => write!(
-                f,
-                "resource {:?} is not a shared resource; a drain is for shared hosts such as an NFS server (an exclusive host is taken down by releasing its host lease, or by a lockout)",
-                resource.as_str()
-            ),
             LeaseError::NoPowerSection { resource } => write!(
                 f,
-                "resource {:?} has no power section: it is always on, so a lease on it would do nothing",
-                resource.as_str()
-            ),
-            LeaseError::NotLockable { resource } => write!(
-                f,
-                "resource {:?} cannot be locked out: only an exclusive resource with a power section can be taken back and shut down",
+                "resource {:?} has no power section: it is always on, so a lease, a lockout or a drain on it would do nothing",
                 resource.as_str()
             ),
             LeaseError::NoLeaseOnResource { resource, kind } => {
@@ -225,19 +209,6 @@ impl LeaseBook {
         Ok(())
     }
 
-    /// Whether `resource` can be drained: a shared resource with a power section. An
-    /// exclusive host is taken down by releasing its host lease (a plain release) or by a
-    /// lockout, never by a drain.
-    pub fn check_drain(config: &Config, resource: &ResourceId) -> Result<(), LeaseError> {
-        Self::check_host(config, resource)?;
-        if known_resource(config, resource)?.kind != ResourceKind::Shared {
-            return Err(LeaseError::NotShared {
-                resource: resource.clone(),
-            });
-        }
-        Ok(())
-    }
-
     /// Acquires a manual lease on a host with a power section (an NFS server, or an exclusive
     /// GPU host): the host is powered on if it is off (when its power is managed) and kept up
     /// until the lease is released. Asking again returns the lease already held.
@@ -251,21 +222,17 @@ impl LeaseBook {
         Ok(self.acquire_unique(resource, LeaseKind::ManualHost, MANUAL_HOST_PREFIX, now))
     }
 
-    /// Lockouts an exclusive resource with a power section: the user takes the host back
-    /// despite pending work (see [`LeaseKind::Lockout`]). Asking again returns the lease
-    /// already held.
+    /// Locks out a resource with a power section, shared or exclusive: the user takes the
+    /// host back despite pending work (see [`LeaseKind::Lockout`]). Asking again returns the
+    /// lease already held. A manual host lease on the resource is neither refused nor
+    /// removed: the lockout simply wins while it stands.
     pub fn acquire_lockout(
         &mut self,
         config: &Config,
         resource: &ResourceId,
         now: Millis,
     ) -> Result<LeaseGrant, LeaseError> {
-        known_resource(config, resource)?;
-        if !config.supports_lockout(resource) {
-            return Err(LeaseError::NotLockable {
-                resource: resource.clone(),
-            });
-        }
+        Self::check_host(config, resource)?;
         Ok(self.acquire_unique(resource, LeaseKind::Lockout, LOCKOUT_PREFIX, now))
     }
 
@@ -533,10 +500,9 @@ mod tests {
             b.release_manual_host(&"cuda-central".into()).unwrap(),
             x.lease
         );
-        let e = LeaseBook::check_drain(&c, &"cuda-central".into()).unwrap_err();
-        assert_eq!(e.status(), 400);
-        assert!(e.to_string().contains("not a shared resource"), "{e}");
-        assert!(LeaseBook::check_drain(&c, &"basestar-nfs".into()).is_ok());
+        // A drain (`off`) is for any host with a power section, whatever its kind.
+        assert!(LeaseBook::check_host(&c, &"cuda-central".into()).is_ok());
+        assert!(LeaseBook::check_host(&c, &"basestar-nfs".into()).is_ok());
         let e = b
             .acquire_manual_host(&c, &"nowhere".into(), Millis(1))
             .unwrap_err();
@@ -574,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lockout_is_for_an_exclusive_powered_resource_and_is_unique_per_resource() {
+    fn a_lockout_is_for_any_powered_resource_and_is_unique_per_resource() {
         let c = example_config();
         let mut b = LeaseBook::default();
         let g = b
@@ -588,11 +554,29 @@ mod tests {
                 .unwrap()
                 .created
         );
+        // A shared host can be locked out too, beside its manual host lease, which stays.
+        let host = b
+            .acquire_manual_host(&c, &"basestar-nfs".into(), Millis(5))
+            .unwrap();
+        let n = b
+            .acquire_lockout(&c, &"basestar-nfs".into(), Millis(6))
+            .unwrap();
+        assert!(n.created);
+        assert!(
+            !b.acquire_lockout(&c, &"basestar-nfs".into(), Millis(7))
+                .unwrap()
+                .created
+        );
+        assert_eq!(b.leases.len(), 3);
+        assert_eq!(b.release_lockout(&"basestar-nfs".into()).unwrap(), n.lease);
+        assert_eq!(
+            b.release_manual_host(&"basestar-nfs".into()).unwrap(),
+            host.lease
+        );
         let e = b
-            .acquire_lockout(&c, &"basestar-nfs".into(), Millis(1))
+            .acquire_lockout(&c, &"nowhere".into(), Millis(1))
             .unwrap_err();
         assert_eq!(e.status(), 400);
-        assert!(e.to_string().contains("cannot be locked out"), "{e}");
         assert_eq!(b.leases.len(), 1);
         // It does not disturb a model lease on the same resource, and each is released alone.
         let m = b

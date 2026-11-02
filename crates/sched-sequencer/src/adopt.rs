@@ -15,7 +15,9 @@
 //! so by a tick that skipped adoption), unless the scheduler left it so on purpose: a stopped
 //! veto, a drain, or a job's hold. A host in `powering_on` that is seen up is
 //! flowmanager's own and an `on` host it manages is not found again (a restart with persisted
-//! state adopts nothing), and under `control: manual` nothing is ever adopted.
+//! state adopts nothing), and under `control: manual` nothing is ever adopted. Nothing is
+//! adopted under a lockout either, on any kind of host: a locked-out host that boots is left
+//! alone, and once the lockout is cleared a host that is up is found running like any other.
 
 use sched_model::{
     ADOPTED_HOST_PREFIX, Config, Lease, LeaseId, LeaseKind, Millis, PowerPhase, ResourceId,
@@ -73,6 +75,13 @@ pub fn found_running(
             !leases
                 .iter()
                 .any(|l| l.resource == r.id && l.kind == LeaseKind::ManualHost)
+        })
+        // Under a lockout nothing is adopted: whatever boots the host (another OS, physical
+        // work) is left alone until the lockout is cleared; then it is found running.
+        .filter(|r| {
+            !leases
+                .iter()
+                .any(|l| l.resource == r.id && l.is_lockout() && l.is_active(snapshot.now))
         })
         .map(|r| r.id.clone())
         .collect()

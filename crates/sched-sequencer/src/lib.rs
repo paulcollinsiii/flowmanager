@@ -100,8 +100,8 @@ impl Cx<'_> {
         self.snapshot.now
     }
 
-    /// Whether this resource is locked out. A lockout only exists for an exclusive resource
-    /// with a power section; the intent cannot make it apply anywhere else.
+    /// Whether this resource is locked out. A lockout exists for any resource with a power
+    /// section (shared or exclusive); the intent cannot make it apply anywhere else.
     pub fn locked_out(&self) -> bool {
         self.intent.lockout.contains(&self.res.id) && self.config.supports_lockout(&self.res.id)
     }
@@ -204,6 +204,23 @@ fn allowed_set(config: &Config, state: &SchedState, intent: &Intent) -> AllowedS
     set
 }
 
+/// Whether a locked-out shared host is still giving its consumers' in-flight work its
+/// `lockout_timeout` (the withdrawal of its lockout shutdown is pending): until then they
+/// stay allowed, as for a graceful drain. Never true for an exclusive host, whose classes
+/// leave at once while the mode machine winds the model down.
+fn lockout_withdrawal_pending(
+    config: &Config,
+    st: &ResourceState,
+    id: &sched_model::ResourceId,
+) -> bool {
+    config
+        .resource(id)
+        .is_some_and(|r| r.kind == sched_model::ResourceKind::Shared)
+        && st
+            .shutdown
+            .is_some_and(|s| s.is_lockout() && s.withdrawal() == sched_model::Withdrawal::Pending)
+}
+
 fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent: &Intent) -> bool {
     class.requires.iter().all(|req| {
         let Some(st) = state.resource(&req.resource) else {
@@ -212,7 +229,9 @@ fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent:
         if !st.is_on()
             // A drain has scaled the consumers of this host down.
             || st.shutdown.is_some_and(|s| s.consumers_withdrawn())
-            || (intent.lockout.contains(&req.resource) && config.supports_lockout(&req.resource))
+            || (intent.lockout.contains(&req.resource)
+                && config.supports_lockout(&req.resource)
+                && !lockout_withdrawal_pending(config, st, &req.resource))
         {
             return false;
         }
