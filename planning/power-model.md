@@ -1,6 +1,6 @@
 # Host power model: plan
 
-Status: **decisions complete; all five phases built on the branch `refactor/power-model`** (based on main @ 689ab82; phase 1 documents, phases 2, 3, 4a, 4b and 5 code). Phase 5 (one derived `HostStatus`, section 2.4) is done and awaits review. The code behaves as sections 2 and 3 describe; section 5 is the one hand-off to the homesvr agent.
+Status: **decisions complete; all six phases built on the branch `refactor/power-model`** (based on main @ 689ab82; phase 1 documents, phases 2, 3, 4a, 4b, 5 and 6 code). Phase 6 (switch status and the remaining duplicates, section 4) is built and awaits review. The code behaves as sections 2 and 3 describe; section 5 is the one hand-off to the homesvr agent.
 All decisions are recorded in section 3 (2026-10-30).
 
 This document is the single description of how flowmanager owns and changes a host's
@@ -217,7 +217,7 @@ is not killed and keeps its hold until it ends.
   (the others are always up and the rest of their status is plain).
 
   The types as built (`crates/sched-sequencer/src/status.rs`; all but `Drain` serialize into
-  `TickReport`):
+  `TickReport`, `Drain` into the `drain_host` reply):
 
   ```rust
   pub struct HostStatus {
@@ -239,13 +239,15 @@ is not killed and keeps its hold until it ends.
       VetoTimeout { resource, readings: Vec<VetoReading>, blocking: Vec<VetoBlocker>, waiting_since: Option<Millis>, at: Millis },
       Adopted { resource }, AdoptionEnded { resource },
   }
-  // Derived view, from HostStatus::drain(); not stored.
+  // Derived view of a Shutdown (Drain::of, HostStatus::drain()); not in the persisted state.
   pub struct Drain { cause: DrainCause /* Requested | Idle */, mode: DrainMode, since: Millis, scaled_down: bool }
   ```
 
   A *drain* is only a host's requested or idle shutdown that has a withdrawal to report; a
   lockout's shutdown is not a drain and is reported as `lockout` (and `locked_out` in the HTTP
-  JSON), so `drain.cause` is `requested` or `idle`, never `lockout`.
+  JSON), so `drain.cause` is `requested` or `idle`, never `lockout`. The status and the reply of
+  a person's request use this one type and one derivation (`Drain::of`; `Drain::requested` for
+  the reply, which only ever holds a requested one).
 - **One-time events** (`HostEvent`: a power timeout, a veto timeout, an adoption, an adoption
   ended) are derived in the same function from the previous and the next state (adoption from
   what `adopt` did before the tick), one list in `TickReport.events`. An event is an edge, a
@@ -257,9 +259,20 @@ is not killed and keeps its hold until it ends.
 - **A failed tick** (the core refused to decide) carries the statuses of the carried previous
   state at the tick's time (no wait, since no step was decided) and no events; the gauges and
   the toggle JSON are computed from them as for any tick.
-- **The toggle listener** routes and translates only: it formats statuses (the status text of a
-  switch, the `drain` and `wait` objects, `needs_attention`) and holds no status logic beyond
-  that. It does not branch on resource kind.
+- **What each switch says** is decided by pure functions in `sched_sequencer::switch` (phase 6):
+  `host_switch`, `model_status` and `lockout_status`, from a `HostStatus` (optional: before the
+  first tick) and what only the listener has: whether the lease is held, the lockout in the
+  fresh lease book, what the request just did (`HostRequest`: a read, a handler's answer, a plain
+  release), whether the last tick saw the lease, whether the model is in the allowed set. They
+  return types (`SwitchState`, `HostWait`, `ModelStatus`, `LockoutSwitchStatus`), and every
+  precedence rule between the report and the fresher lease book is there.
+- **"Is this host locked out"** has one answer, `Config::locked_out` (phase 6): an active lockout
+  lease on a resource with a power section. Adoption, `needs_up`, the status, the planner and the
+  listener read it; the invariant checker keeps its own on purpose, as an independent check.
+- **The toggle listener** routes and translates only: it fetches the inputs, calls the functions
+  above and puts their answers into words (the status text of a switch, the `drain` and `wait`
+  objects, `needs_attention`), and holds no status logic beyond that. It does not branch on
+  resource kind.
 - Request failures (a power call that failed) are not derived from state: they are the service's
   record of what the `Power` object reported, so `TickReport.power_request_failures` stays a
   field of its own.
@@ -384,7 +397,8 @@ this document and checks the phase against it ("does this still fit the model").
        readable. The rules of `drain::request` (`sched_sequencer::drain`) and `needs_up`
        (`sched_sequencer::jobs`) are in the sequencer crate with their tests; the service
        keeps `RecordedDrain` (the report view of a requested shutdown) and the Restate and
-       persistence glue.
+       persistence glue. (Phase 6 removed `RecordedDrain` and the service's `drain` module; see
+       its as-built note.)
 5. **HostStatus and reporting.** One derived status; `tick.rs` report weaving, `reason`,
    metrics and toggle `resource_state` consume it. README power section shrunk to the model
    plus tables, caveats moved to *Known blind spots*.
@@ -407,6 +421,20 @@ this document and checks the phase against it ("does this still fit the model").
    sequencer and the listener; `invariants.rs` keeps its own on purpose, as an independent
    check. Toggle JSON does not change, except that a model switch no longer reads `locked_out`
    for a lockout lease on a host without a power section, which the planner ignores.
+   - *As built.* `sched_sequencer::switch` (2.4) holds the decisions; `resource_state`,
+     `model_state` and `lockout_state` in `toggle.rs` fetch, call and serialize, and the status
+     words and detail text stay there. `release_held`'s patch of `state`, the read-back of the
+     reply's own JSON and the roll-up of `needs_attention` through the entries' JSON are gone.
+     `Drain` replaces `RecordedDrain` (`crates/sched-service/src/drain.rs` is removed), with one
+     derivation (`Drain::of`); `DrainAck.drain` keeps its JSON `{mode, since, scaled_down}`
+     because a `Drain` serializes `cause` only when it is not `requested`, and an entry journaled
+     in that shape reads back as requested. The unused `ShutdownCause::origin` is removed.
+     `Config::locked_out`, `sched_model::lockout_lease` and `sched_model::manual_host_lease` are
+     the one lockout check and the one lookup of each lease, replacing `adopt::lockout_held`, the
+     planner's filter and the listener's `is_locked_out`, `find_lockout` and `find_host`; the
+     sequencer's `LockoutUnsupported` reads `lockout_lease`. `Cx::locked_out` and `class_allowed`
+     read the intent, not the book, and are unchanged. The planner's and the sequencer's decisions
+     are unchanged. The model switch fix asks nothing of homesvr, so section 5 does not list it.
 
 ## 5. Hand-off to homesvr
 

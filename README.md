@@ -887,8 +887,8 @@ supports it, `status` / `detail` (a model: `active`, `waiting_for_host`, `draini
 `host_failed`, `pending`; a lockout also `left_for_person` on a `control: manual` host, and `left_alone` for a host that booted after the lockout shut it down), `power`,
 `wait` and `needs_attention` (the failed power phase or Stopped shutdown also seen in
 `sched_resource_power_failed` and `sched_resource_veto`); a field that cannot be derived is
-left out. They are read off the host's status in the last tick's report and only formatted
-here. A host switch has `drain` while a requested or idle shutdown is withdrawing the host's
+left out. What a switch says is decided in `sched_sequencer::switch` from the host's status in
+the last tick's report and the lease book, and only formatted here. A host switch has `drain` while a requested or idle shutdown is withdrawing the host's
 consumers: `{mode, cause, since_ms, scaled_down}`, with `cause` `requested` (a person asked) or
 `idle` (the scheduler started it). `origin` appears only on a held lease: `requested` (a person)
 or `adopted` (minted for a host found running). A `wait` entry is `shutdown_held_by_veto`
