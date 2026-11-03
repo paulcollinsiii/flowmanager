@@ -35,7 +35,7 @@
 
 use sched_model::{
     Config, Lease, LeaseId, LeaseKind, LeaseOrigin, Millis, PowerPhase, PowerTransition,
-    ResourceId, SchedState, Snapshot,
+    ResourceId, SchedState, Snapshot, manual_host_lease,
 };
 
 /// The result of [`adopt`].
@@ -126,23 +126,10 @@ pub fn found_running(
                 not_ours_and_up_or_off && !st.shutdown.is_some_and(|s| s.stopped_since().is_some())
             }
         })
-        .filter(|r| {
-            !leases
-                .iter()
-                .any(|l| l.resource == r.id && l.kind == LeaseKind::ManualHost)
-        })
-        .filter(|r| !lockout_held(config, leases, &r.id, now))
+        .filter(|r| manual_host_lease(leases, &r.id).is_none())
+        .filter(|r| !config.locked_out(leases, &r.id, now))
         .map(|r| r.id.clone())
         .collect()
-}
-
-/// Whether an active lockout lease holds `resource` locked out (a resource with a power
-/// section; a lockout lease on any other is ignored).
-pub fn lockout_held(config: &Config, leases: &[Lease], resource: &ResourceId, now: Millis) -> bool {
-    config.supports_lockout(resource)
-        && leases
-            .iter()
-            .any(|l| &l.resource == resource && l.is_lockout() && l.is_active(now))
 }
 
 /// The id of the adopted lease of `resource`. Only a name: whether a lease is adopted is its

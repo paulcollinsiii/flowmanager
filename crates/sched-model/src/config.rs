@@ -9,6 +9,7 @@ use serde_yaml_ng::Value;
 
 use crate::ids::{ClassId, JobId, ModelId, ResourceId, SourceId};
 use crate::jobs::JobSpec;
+use crate::lease::{Lease, lockout_lease};
 use crate::power_params::{SshShutdown, WakeOnLan};
 use crate::time::Millis;
 use crate::validate::{self, Problem};
@@ -484,6 +485,14 @@ impl Config {
     /// depends on `control: managed` (see [`Config::power_managed`]).
     pub fn supports_lockout(&self, id: &ResourceId) -> bool {
         self.resource(id).is_some_and(|r| r.power.is_some())
+    }
+
+    /// Whether `id` is locked out: an active lockout lease in `leases`, on a resource where a
+    /// lockout means something ([`Config::supports_lockout`]). The one answer the planner, the
+    /// sequencer and the listener share. A lease left in the book on a resource that lost its
+    /// power section to a config change locks nothing out.
+    pub fn locked_out(&self, leases: &[Lease], id: &ResourceId, now: Millis) -> bool {
+        self.supports_lockout(id) && lockout_lease(leases, id, now).is_some()
     }
 
     /// Whether the scheduler controls `id`'s power: it has a power section with

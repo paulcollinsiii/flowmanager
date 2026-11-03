@@ -51,13 +51,11 @@ impl Strategy for FifoExhaustive {
         let now = snapshot.now;
         let active = |l: &&Lease| l.is_active(now);
 
-        intent.lockout = snapshot
-            .leases
+        intent.lockout = config
+            .resources()
             .iter()
-            .filter(active)
-            .filter(|l| l.is_lockout())
-            .filter(|l| config.supports_lockout(&l.resource))
-            .map(|l| l.resource.clone())
+            .filter(|r| config.locked_out(&snapshot.leases, &r.id, now))
+            .map(|r| r.id.clone())
             .collect();
 
         for l in snapshot.leases.iter().filter(active) {

@@ -19,9 +19,9 @@
 //! it.
 
 use sched_model::{
-    Config, DrainMode, LeaseKind, LeaseOrigin, Millis, ModePhase, ModelId, PowerPhase,
-    PowerTransition, ReadingUse, ResourceId, ResourceKind, SchedState, Shutdown, ShutdownCause,
-    Snapshot, Step, VetoReading, WaitReason, Withdrawal,
+    Config, DrainMode, LeaseOrigin, Millis, ModePhase, ModelId, PowerPhase, PowerTransition,
+    ReadingUse, ResourceId, ResourceKind, SchedState, Shutdown, ShutdownCause, Snapshot, Step,
+    VetoReading, WaitReason, Withdrawal, manual_host_lease,
 };
 use serde::{Deserialize, Serialize};
 
@@ -440,12 +440,9 @@ fn host_status(
             model: model.clone(),
         },
     };
-    let lease = snapshot
-        .leases
-        .iter()
-        .find(|l| &l.resource == id && l.kind == LeaseKind::ManualHost)
-        .map(|l| l.origin);
-    let lockout = (has_power && crate::adopt::lockout_held(config, &snapshot.leases, id, now))
+    let lease = manual_host_lease(&snapshot.leases, id).map(|l| l.origin);
+    let lockout = config
+        .locked_out(&snapshot.leases, id, now)
         .then(|| match st.power {
             PowerPhase::On { .. } => {
                 let withdrawing = matches!(mode, HostMode::WindingDown { .. })

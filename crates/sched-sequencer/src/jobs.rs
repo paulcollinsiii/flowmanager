@@ -648,7 +648,7 @@ pub fn needs_up(
 ) -> bool {
     spec.needs.iter().all(|n| {
         let r = n.resource();
-        !crate::adopt::lockout_held(config, leases, r, snapshot.now)
+        !config.locked_out(leases, r, snapshot.now)
             && host_is_up(config, snapshot, state, r)
             && !state
                 .resource(r)

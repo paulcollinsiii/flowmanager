@@ -116,11 +116,7 @@ fn resource_tick(
 ) -> Option<ResourceState> {
     // A lockout lease on a resource that cannot be locked out is ignored, visibly.
     if !cx.config.supports_lockout(&cx.res.id)
-        && cx
-            .snapshot
-            .leases
-            .iter()
-            .any(|l| l.resource == cx.res.id && l.is_lockout() && l.is_active(cx.now()))
+        && sched_model::lockout_lease(&cx.snapshot.leases, &cx.res.id, cx.now()).is_some()
     {
         steps.push(Step::Wait {
             resource: cx.res.id.clone(),

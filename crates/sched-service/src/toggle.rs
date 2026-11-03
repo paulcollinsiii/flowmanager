@@ -48,7 +48,7 @@ use std::time::Duration;
 use hyper::Method;
 use sched_model::{
     Config, DrainMode, Lease, LeaseId, LeaseKind, Millis, ModelId, PowerPhase, ResourceId,
-    ResourceKind, WaitReason,
+    ResourceKind, WaitReason, lockout_lease, manual_host_lease,
 };
 use sched_sequencer::status::{HostMode, HostStatus, LockoutStatus, VetoStatus};
 use serde::de::DeserializeOwned;
@@ -623,7 +623,7 @@ impl Toggle {
             .models()
             .iter()
             .map(|m| {
-                let locked_out = Some(find_lockout(&leases, &m.resource).is_some());
+                let locked_out = Some(config.locked_out(&leases, &m.resource, now));
                 let held = find_model(&leases, &m.id);
                 model_state(&m.id, &m.resource, held, locked_out, &report, now)
             })
@@ -636,8 +636,8 @@ impl Toggle {
                 resource_state(
                     &config,
                     &r.id,
-                    find_host(&leases, &r.id),
-                    is_locked_out(&config, &leases, &r.id),
+                    manual_host_lease(&leases, &r.id),
+                    config.locked_out(&leases, &r.id, now),
                     None,
                     &report,
                     now,
@@ -648,7 +648,10 @@ impl Toggle {
             .resources()
             .iter()
             .filter(|r| config.supports_lockout(&r.id))
-            .map(|r| lockout_state(&config, &r.id, find_lockout(&leases, &r.id), &report, now))
+            .map(|r| {
+                let held = lockout_lease(&leases, &r.id, now);
+                lockout_state(&config, &r.id, held, &report, now)
+            })
             .collect();
         let attention = resources
             .iter()
@@ -704,16 +707,17 @@ impl Toggle {
                 (None, Some(l))
             }
         };
+        let now = self.shared.clock.now();
         let locked_out = leases
             .as_ref()
-            .map(|l| find_lockout(l, &spec.resource).is_some());
+            .map(|l| config.locked_out(l, &spec.resource, now));
         Ok(model_state(
             &id,
             &spec.resource,
             held.as_ref(),
             locked_out,
             &self.shared.last_report(),
-            self.shared.clock.now(),
+            now,
         ))
     }
 
@@ -732,7 +736,10 @@ impl Toggle {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
         let (held, ack) = match set {
-            None => (find_host(&self.backend.leases().await?, &id).cloned(), None),
+            None => (
+                manual_host_lease(&self.backend.leases().await?, &id).cloned(),
+                None,
+            ),
             // A new lease cancels any drain at the next tick; the reply shows none.
             Some(true) => (
                 Some(self.backend.acquire_host(&id).await?.lease),
@@ -742,15 +749,16 @@ impl Toggle {
             // translates and the sequencer decides.
             Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?.drain)),
         };
-        let locked = is_locked_out(&config, &self.backend.leases().await?, &id);
+        let leases = self.backend.leases().await?;
+        let now = self.shared.clock.now();
         Ok(resource_state(
             &config,
             &id,
             held.as_ref(),
-            locked,
+            config.locked_out(&leases, &id, now),
             ack,
             &self.shared.last_report(),
-            self.shared.clock.now(),
+            now,
         ))
     }
 
@@ -763,7 +771,7 @@ impl Toggle {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
         let leases = self.backend.leases().await?;
-        let Some(lease) = find_host(&leases, &id).cloned() else {
+        let Some(lease) = manual_host_lease(&leases, &id).cloned() else {
             return Err(ApiError::new(
                 404,
                 format!("resource {name:?} holds no manual host lease"),
@@ -784,16 +792,10 @@ impl Toggle {
             self.gone_after(e, &lease.id).await?;
         }
         let report = self.shared.last_report();
-        let locked = is_locked_out(config, &self.backend.leases().await?, id);
-        let mut v = resource_state(
-            config,
-            id,
-            None,
-            locked,
-            Some(None),
-            &report,
-            self.shared.clock.now(),
-        );
+        let leases = self.backend.leases().await?;
+        let now = self.shared.clock.now();
+        let locked = config.locked_out(&leases, id, now);
+        let mut v = resource_state(config, id, None, locked, Some(None), &report, now);
         let up = report
             .as_ref()
             .and_then(|r| r.host(id))
@@ -807,12 +809,13 @@ impl Toggle {
     async fn lockout(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
+        let now = self.shared.clock.now();
         let held = match set {
-            None => find_lockout(&self.backend.leases().await?, &id).cloned(),
+            None => lockout_lease(&self.backend.leases().await?, &id, now).cloned(),
             Some(true) => Some(self.backend.lockout(&id).await?.lease),
             Some(false) => {
                 let l = self.backend.leases().await?;
-                if let Some(lease) = find_lockout(&l, &id).cloned()
+                if let Some(lease) = lockout_lease(&l, &id, now).cloned()
                     && let Err(e) = self.backend.clear_lockout(&id).await
                 {
                     self.gone_after(e, &lease.id).await?;
@@ -825,7 +828,7 @@ impl Toggle {
             &id,
             held.as_ref(),
             &self.shared.last_report(),
-            self.shared.clock.now(),
+            now,
         ))
     }
 
@@ -863,12 +866,6 @@ fn find_model<'a>(leases: &'a [Lease], model: &ModelId) -> Option<&'a Lease> {
     leases
         .iter()
         .find(|l| matches!(&l.kind, LeaseKind::ManualModel { model: m } if m == model))
-}
-
-fn find_host<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Lease> {
-    leases
-        .iter()
-        .find(|l| &l.resource == resource && l.kind == LeaseKind::ManualHost)
 }
 
 /// The fields every switch carries.
@@ -992,17 +989,6 @@ fn model_status(
             format!("{resource} is up and idle; {model} is not allowed yet"),
         ),
     }
-}
-
-/// Whether a lockout is held on `resource` (and means something there: it has a power section).
-fn is_locked_out(config: &Config, leases: &[Lease], resource: &ResourceId) -> bool {
-    config.supports_lockout(resource) && find_lockout(leases, resource).is_some()
-}
-
-fn find_lockout<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Lease> {
-    leases
-        .iter()
-        .find(|l| &l.resource == resource && l.kind == LeaseKind::Lockout)
 }
 
 /// A lockout switch ("keep away from this host until I clear it") on a resource with a power
@@ -3043,6 +3029,52 @@ mod tests {
         assert_eq!(r.post("/v1/lockouts/cuda-central/off", "").await.0, 200);
         let (_, v) = r.get("/v1/models/llm").await;
         assert_ne!(v["status"], "locked_out", "{v}");
+    }
+
+    /// A lockout lease stays in the book when a config change takes its host's power section
+    /// away. The planner then ignores it, so the model switch must not read `locked_out`.
+    #[tokio::test]
+    async fn a_lockout_left_on_a_host_that_lost_its_power_section_locks_no_model_out() {
+        let r = rig(EXAMPLE_CONFIG);
+        r.hosts_up(true);
+        assert_eq!(r.post("/v1/models/llm/on", "").await.0, 200);
+        assert_eq!(r.post("/v1/lockouts/cuda-central/on", "").await.0, 200);
+        r.tick().await;
+        let (_, v) = r.get("/v1/models/llm").await;
+        assert_eq!(v["status"], "locked_out", "{v}");
+
+        let marker = "  - id: cuda-central\n    kind: exclusive\n";
+        let start = EXAMPLE_CONFIG.find(marker).unwrap() + marker.len();
+        let end = EXAMPLE_CONFIG[start..].find("  - id: ").unwrap() + start;
+        let without_power = format!("{}{}", &EXAMPLE_CONFIG[..start], &EXAMPLE_CONFIG[end..]);
+        let applied = r.shared.config.apply_text(&without_power);
+        assert!(
+            matches!(applied, crate::config_source::ReloadOutcome::Applied(_)),
+            "{applied:?}"
+        );
+        assert_eq!(r.lease_count(), 2, "the lockout lease stays in the book");
+        r.tick().await;
+
+        // The planner allows the model, and every switch of the listener agrees.
+        let rep = r.shared.last_report().unwrap();
+        assert!(
+            rep.allowed_models.contains(&"llm".into()),
+            "{:?}",
+            rep.allowed_models
+        );
+        let (_, v) = r.get("/v1/models/llm").await;
+        assert_eq!(v["status"], "active", "{v}");
+        let (_, list) = r.get("/v1/leases").await;
+        assert_eq!(list["models"][1]["id"], "llm", "{list}");
+        assert_eq!(list["models"][1]["status"], "active", "{list}");
+        let (_, v) = r.post("/v1/models/llm/on", "").await;
+        assert_eq!(v["status"], "active", "{v}");
+        let (_, v) = r.get("/v1/resources/cuda-central").await;
+        assert_eq!(v["locked_out"], false, "{v}");
+        assert!(!v["wait"].to_string().contains("locked_out"), "{v}");
+        // The lockout switch still shows the lease, and that it means nothing here.
+        let (_, v) = r.get("/v1/lockouts/cuda-central").await;
+        assert_eq!((&v["held"], &v["supported"]), (&json!(true), &json!(false)));
     }
 
     #[tokio::test]

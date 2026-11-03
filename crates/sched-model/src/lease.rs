@@ -117,6 +117,25 @@ impl Lease {
     }
 }
 
+/// The active lockout lease on `resource`, if any, whether or not a lockout means anything
+/// there. Whether the host is locked out is [`crate::Config::locked_out`].
+pub fn lockout_lease<'a>(
+    leases: &'a [Lease],
+    resource: &ResourceId,
+    now: Millis,
+) -> Option<&'a Lease> {
+    leases
+        .iter()
+        .find(|l| &l.resource == resource && l.is_lockout() && l.is_active(now))
+}
+
+/// The manual host lease on `resource`, if any (a person's or an adopted one).
+pub fn manual_host_lease<'a>(leases: &'a [Lease], resource: &ResourceId) -> Option<&'a Lease> {
+    leases
+        .iter()
+        .find(|l| &l.resource == resource && l.kind == LeaseKind::ManualHost)
+}
+
 /// Number of active leases holding `resource` up.
 pub fn host_hold_count(leases: &[Lease], resource: &ResourceId, now: Millis) -> usize {
     leases
@@ -201,6 +220,41 @@ mod tests {
             lease("d", "gpu", LeaseKind::ManualHost),
         ];
         assert_eq!(host_hold_count(&leases, &nfs, Millis(0)), 3);
+    }
+
+    #[test]
+    fn the_lookups_find_only_the_kind_on_that_resource() {
+        let leases = vec![
+            lease("c", "nfs", LeaseKind::ManualHost),
+            lease("d", "gpu", LeaseKind::Lockout),
+        ];
+        let (nfs, gpu) = (ResourceId::new("nfs"), ResourceId::new("gpu"));
+        assert_eq!(manual_host_lease(&leases, &nfs), Some(&leases[0]));
+        assert_eq!(manual_host_lease(&leases, &gpu), None);
+        assert_eq!(lockout_lease(&leases, &gpu, Millis(0)), Some(&leases[1]));
+        assert_eq!(lockout_lease(&leases, &nfs, Millis(0)), None);
+    }
+
+    #[test]
+    fn a_lockout_lease_means_something_only_on_a_resource_with_a_power_section() {
+        // The example's power sections, one of them taken away by a config change.
+        let yaml = crate::test_support::EXAMPLE_CONFIG;
+        let marker = "  - id: basestar-nfs\n    kind: shared\n";
+        let start = yaml.find(marker).unwrap() + marker.len();
+        let end = yaml.find("\nmodels:").unwrap();
+        let without_power = format!("{}{}", &yaml[..start], &yaml[end..])
+            .replace("    may_change_power: true\n", "");
+        let nfs = ResourceId::new("basestar-nfs");
+        let leases = vec![lease("r", "basestar-nfs", LeaseKind::Lockout)];
+        let with = crate::Config::from_yaml(yaml).unwrap();
+        let without = crate::Config::from_yaml(&without_power).unwrap();
+        assert!(with.locked_out(&leases, &nfs, Millis(0)));
+        assert!(!with.locked_out(&[], &nfs, Millis(0)));
+        assert!(!with.locked_out(&leases, &ResourceId::new("cuda-central"), Millis(0)));
+        assert!(!with.locked_out(&leases, &ResourceId::new("ghost"), Millis(0)));
+        // The lease is still there, and still found; it locks nothing out.
+        assert!(!without.locked_out(&leases, &nfs, Millis(0)));
+        assert!(lockout_lease(&leases, &nfs, Millis(0)).is_some());
     }
 
     #[test]
