@@ -50,7 +50,7 @@ use sched_model::{
     Config, DrainMode, Lease, LeaseId, LeaseKind, Millis, ModelId, PowerPhase, ResourceId,
     ResourceKind, WaitReason, lockout_lease, manual_host_lease,
 };
-use sched_sequencer::status::{HostMode, HostStatus, LockoutStatus, VetoStatus};
+use sched_sequencer::status::{Drain, HostMode, HostStatus, LockoutStatus, VetoStatus};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -1111,7 +1111,7 @@ pub fn resource_state(
     resource: &ResourceId,
     held: Option<&Lease>,
     locked_out: bool,
-    requested: Option<Option<crate::drain::RecordedDrain>>,
+    requested: Option<Option<Drain>>,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
@@ -1129,29 +1129,15 @@ pub fn resource_state(
         json!(config.resource(resource).is_some_and(|r| r.power.is_some())),
     );
     let draining = match requested {
-        Some(d) => d.map(|d| {
-            (
-                d.mode.as_str().to_string(),
-                d.since,
-                d.scaled_down,
-                "requested".to_string(),
-            )
-        }),
-        None => report.as_ref().and_then(|r| {
-            let h = r.host(resource).filter(|h| h.is_up())?;
-            let d = h.drain()?;
-            Some((
-                d.mode.as_str().to_string(),
-                d.since,
-                d.scaled_down,
-                d.cause.as_str().to_string(),
-            ))
-        }),
+        Some(d) => d,
+        None => report
+            .as_ref()
+            .and_then(|r| r.host(resource).filter(|h| h.is_up())?.drain()),
     };
-    if let Some((mode, since, scaled_down, cause)) = draining {
+    if let Some(d) = draining {
         m.insert(
             "drain".into(),
-            json!({ "mode": mode, "cause": cause, "since_ms": since.as_u64(), "scaled_down": scaled_down }),
+            json!({ "mode": d.mode.as_str(), "cause": d.cause.as_str(), "since_ms": d.since.as_u64(), "scaled_down": d.scaled_down }),
         );
         if held.is_none() {
             m.insert("state".into(), json!("draining"));
@@ -1860,7 +1846,8 @@ mod tests {
             .unwrap();
             core.state
                 .resource(&"basestar-nfs".into())
-                .and_then(crate::drain::RecordedDrain::of)
+                .and_then(|st| st.shutdown.as_ref())
+                .and_then(Drain::requested)
         };
         // Off: the lease is released and a graceful drain starts. The host is up, so the
         // answer says draining, not off.

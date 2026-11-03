@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use restate_sdk::errors::{HandlerError, TerminalError};
 use sched_model::{Config, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId};
+use sched_sequencer::status::Drain;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::drain;
 use crate::leases::{LeaseBook, LeaseError, LeaseGrant};
 use crate::persist::{self, CoreState, LEASES_KEY, STATE_KEY, StateError};
 use crate::power::PowerAction;
@@ -430,14 +430,15 @@ async fn release_resource_lease<C: ObjectCtx>(
 pub struct ReleaseHostLease {
     pub resource: ResourceId,
     /// Absent: only the lease is released and the host goes down when nothing holds it (idle
-    /// grace, the mount check). `graceful` or `immediate`: also a drain (see `drain`).
+    /// grace, the mount check). `graceful` or `immediate`: also a drain (see
+    /// `sched_sequencer::drain`).
     #[serde(default)]
     pub drain: Option<DrainMode>,
 }
 
 /// Releases the manual host lease on a resource, and with `drain` records the request to
-/// take the host down (see `drain`). The release and the drain are stored together when the
-/// invocation completes, so one cannot be seen without the other.
+/// take the host down (see `sched_sequencer::drain`). The release and the drain are stored
+/// together when the invocation completes, so one cannot be seen without the other.
 pub async fn release_host_lease<C: ObjectCtx>(
     shared: &Arc<Shared>,
     ctx: &C,
@@ -518,12 +519,14 @@ pub struct DrainAck {
     /// Whether a manual host lease was held and released.
     pub released: bool,
     /// The drain now under way, `None` if none was recorded (the host is not up, or its power
-    /// is under `control: manual`, so there is nothing for flowmanager to take down).
-    pub drain: Option<drain::RecordedDrain>,
+    /// is under `control: manual`, so there is nothing for flowmanager to take down). Only a
+    /// requested one ([`Drain::requested`]), so its JSON is `{mode, since, scaled_down}`.
+    pub drain: Option<Drain>,
 }
 
 /// Takes a shared host down on a person's request, whether or not a manual lease is held:
-/// releases the manual host lease if there is one and records a drain (see `drain`). A drain
+/// releases the manual host lease if there is one and records a drain (see
+/// `sched_sequencer::drain`). A drain
 /// already under way keeps its start: `immediate` escalates a graceful one, `graceful` leaves
 /// an immediate one as it is. Everything is read from the stored state, so it works at any
 /// time, also right after a restart. The lease book and the state are stored together.
@@ -555,7 +558,8 @@ pub async fn drain_host<C: ObjectCtx>(
             let drain = core
                 .state
                 .resource(&req.resource)
-                .and_then(drain::RecordedDrain::of);
+                .and_then(|st| st.shutdown.as_ref())
+                .and_then(Drain::requested);
             let ack = DrainAck {
                 resource: req.resource.clone(),
                 released,
@@ -1723,6 +1727,38 @@ mod tests {
         );
     }
 
+    /// The reply of `drain_host` is journaled and read back by the listener: its shape is the
+    /// one it has always had, and an entry journaled in that shape still reads.
+    #[test]
+    fn the_shape_of_a_drain_ack_has_no_cause_and_a_journaled_one_reads_as_requested() {
+        let shape = serde_json::json!({
+            "resource": "basestar-nfs",
+            "released": true,
+            "drain": { "mode": "graceful", "since": 7, "scaled_down": false },
+        });
+        let ack = DrainAck {
+            resource: "basestar-nfs".into(),
+            released: true,
+            drain: Some(Drain {
+                cause: sched_sequencer::status::DrainCause::Requested,
+                mode: DrainMode::Graceful,
+                since: Millis(7),
+                scaled_down: false,
+            }),
+        };
+        assert_eq!(serde_json::to_value(&ack).unwrap(), shape);
+        assert_eq!(
+            serde_json::from_value::<DrainAck>(shape).unwrap(),
+            ack,
+            "an entry journaled before the types were one"
+        );
+        let none = DrainAck { drain: None, ..ack };
+        assert_eq!(
+            serde_json::to_value(&none).unwrap(),
+            serde_json::json!({ "resource": "basestar-nfs", "released": true, "drain": null })
+        );
+    }
+
     #[tokio::test]
     async fn releasing_a_host_lease_with_a_drain_stores_it_with_the_release_and_a_retry_reuses_the_journal()
      {
@@ -1738,7 +1774,8 @@ mod tests {
                 .unwrap()
                 .state
                 .resource(&"basestar-nfs".into())
-                .and_then(crate::drain::RecordedDrain::of)
+                .and_then(|st| st.shutdown.as_ref())
+                .and_then(Drain::requested)
         };
         assert_eq!(drain_of(&ctx), None);
         clock.set(Millis(T0 + 7_000));
@@ -1757,7 +1794,8 @@ mod tests {
         ctx.commit();
         assert_eq!(
             drain_of(&ctx),
-            Some(crate::drain::RecordedDrain {
+            Some(Drain {
+                cause: sched_sequencer::status::DrainCause::Requested,
                 mode: DrainMode::Graceful,
                 since: Millis(T0 + 7_000),
                 scaled_down: false,

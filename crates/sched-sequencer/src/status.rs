@@ -119,10 +119,11 @@ pub struct ShutdownStatus {
 
 /// Who started a drain: the cause of a shutdown that has a withdrawal to report (not a
 /// lockout's, which the lockout status reports).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DrainCause {
-    /// A person asked.
+    /// A person asked (and what an absent `cause` in a stored [`Drain`] means).
+    #[default]
     Requested,
     /// The scheduler started it when the host went idle.
     Idle,
@@ -135,18 +136,58 @@ impl DrainCause {
             DrainCause::Idle => "idle",
         }
     }
+
+    fn is_requested(&self) -> bool {
+        *self == DrainCause::Requested
+    }
 }
 
-/// A drain under way on a host: a shutdown taking the consumers away (see
-/// [`HostStatus::drain`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A drain under way on a host: a shutdown taking the consumers away (see [`Drain::of`]).
+///
+/// Serialized in the reply of `drain_host`, which is journaled and only ever holds a requested
+/// drain ([`Drain::requested`]): `cause` is left out when it is `requested`, so that reply is
+/// `{mode, since, scaled_down}`, and an entry journaled in that shape reads back as requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drain {
+    #[serde(default, skip_serializing_if = "DrainCause::is_requested")]
     pub cause: DrainCause,
     /// How in-flight work is treated. An idle drain scales the consumers down at once.
     pub mode: DrainMode,
     pub since: Millis,
     /// Whether the host's consumers have been scaled down (left the allowed set).
     pub scaled_down: bool,
+}
+
+impl Drain {
+    /// The drain a shutdown is, if any: one a person asked for, or the scheduler's idle one,
+    /// that has a withdrawal to report. A lockout's shutdown is not a drain.
+    pub fn of(shutdown: &Shutdown) -> Option<Drain> {
+        Drain::from_parts(shutdown.cause(), shutdown.since(), shutdown.withdrawal())
+    }
+
+    /// The drain of a shutdown a person requested. What a request answers with: an idle
+    /// shutdown under way is not what was asked for, and is not recorded as if it were.
+    pub fn requested(shutdown: &Shutdown) -> Option<Drain> {
+        Drain::of(shutdown).filter(|d| d.cause == DrainCause::Requested)
+    }
+
+    /// The one derivation, from a shutdown as stored or as reported.
+    fn from_parts(cause: ShutdownCause, since: Millis, withdrawal: Withdrawal) -> Option<Drain> {
+        if withdrawal == Withdrawal::NotNeeded {
+            return None;
+        }
+        let (cause, mode) = match cause {
+            ShutdownCause::Requested { mode } => (DrainCause::Requested, mode),
+            ShutdownCause::Idle => (DrainCause::Idle, DrainMode::Immediate),
+            ShutdownCause::Lockout => return None,
+        };
+        Some(Drain {
+            cause,
+            mode,
+            since,
+            scaled_down: withdrawal == Withdrawal::Done,
+        })
+    }
 }
 
 /// What a lockout lease on the host is doing (absent from [`HostStatus`] without one).
@@ -251,24 +292,10 @@ impl HostStatus {
         }
     }
 
-    /// The drain under way: a shutdown a person asked for, or the scheduler's idle one, that
-    /// has a withdrawal to report. A lockout's shutdown is not a drain.
+    /// The drain under way, if the shutdown is one (see [`Drain::of`]).
     pub fn drain(&self) -> Option<Drain> {
         let s = self.shutdown.as_ref()?;
-        if s.withdrawal == Withdrawal::NotNeeded {
-            return None;
-        }
-        let (cause, mode) = match s.cause {
-            ShutdownCause::Requested { mode } => (DrainCause::Requested, mode),
-            ShutdownCause::Idle => (DrainCause::Idle, DrainMode::Immediate),
-            ShutdownCause::Lockout => return None,
-        };
-        Some(Drain {
-            cause,
-            mode,
-            since: s.since,
-            scaled_down: s.withdrawal == Withdrawal::Done,
-        })
+        Drain::from_parts(s.cause, s.since, s.withdrawal)
     }
 }
 

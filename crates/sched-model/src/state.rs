@@ -233,18 +233,6 @@ pub enum ShutdownCause {
     Lockout,
 }
 
-impl ShutdownCause {
-    /// The label used in logs and reports for who started a drain: `requested` or `idle`.
-    /// A lockout is not a drain and has no label.
-    pub fn origin(self) -> Option<&'static str> {
-        match self {
-            ShutdownCause::Requested { .. } => Some("requested"),
-            ShutdownCause::Idle => Some("idle"),
-            ShutdownCause::Lockout => None,
-        }
-    }
-}
-
 /// How far the withdrawal has got: taking the host's consumers away. On a shared host the
 /// classes that need it leave the allowed set (their consumers are scaled down); on an
 /// exclusive host the mode machine winds the model down.

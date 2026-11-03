@@ -15,7 +15,6 @@ pub mod cache;
 pub mod clock;
 pub mod config_source;
 pub mod core;
-pub mod drain;
 pub mod invariants;
 pub mod jobs;
 pub mod keda_scaler;

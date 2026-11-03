@@ -8,8 +8,8 @@ use sched_model::{
     SchedState, ShutdownCause, Snapshot, Step, VetoReading, WaitReason, Withdrawal,
 };
 use sched_sequencer::status::{
-    BlockerState, Decided, DrainCause, HostEvent, HostMode, HostStatus, LockoutStatus, VetoBlocker,
-    VetoStatus, blockers_label, derive,
+    BlockerState, Decided, Drain, DrainCause, HostEvent, HostMode, HostStatus, LockoutStatus,
+    VetoBlocker, VetoStatus, blockers_label, derive,
 };
 
 const T: u64 = 100_000_000;
@@ -291,6 +291,62 @@ fn a_drain_is_a_requested_or_idle_shutdown_with_a_withdrawal_and_never_a_lockout
     // Nothing to withdraw, or a lockout's: not a drain.
     assert_eq!(drain_of(&sd("{ kind: idle }", "not_needed")), (None, None));
     assert_eq!(drain_of(&sd("{ kind: lockout }", "pending")), (None, None));
+}
+
+#[test]
+fn one_derivation_of_a_drain_from_a_stored_shutdown_and_from_a_reported_one() {
+    use sched_model::Shutdown;
+    let t = Millis(5);
+    let requested = Shutdown::requested(DrainMode::Graceful, t);
+    let idle = Shutdown::idle_withdrawn(t);
+    let drain = |cause, mode, scaled_down| Drain {
+        cause,
+        mode,
+        since: t,
+        scaled_down,
+    };
+    let want = drain(DrainCause::Requested, DrainMode::Graceful, false);
+    assert_eq!(Drain::of(&requested), Some(want));
+    assert_eq!(Drain::requested(&requested), Some(want));
+    let done = Shutdown::requested(DrainMode::Immediate, t).withdrawn();
+    let want = drain(DrainCause::Requested, DrainMode::Immediate, true);
+    assert_eq!(Drain::of(&done), Some(want));
+    assert_eq!(Drain::requested(&done), Some(want));
+    // An idle drain is a drain, and not what a request answers with.
+    let want = drain(DrainCause::Idle, DrainMode::Immediate, true);
+    assert_eq!(Drain::of(&idle), Some(want));
+    assert_eq!(Drain::requested(&idle), None);
+    // No withdrawal to report, or the lockout's.
+    for s in [
+        Shutdown::idle_without_consumers(t),
+        Shutdown::lockout_withdrawing(t),
+        Shutdown::lockout_without_consumers(t),
+    ] {
+        assert_eq!(Drain::of(&s), None, "{s:?}");
+        assert_eq!(Drain::requested(&s), None, "{s:?}");
+    }
+    // The status of a host reads the same as the shutdown it reports.
+    let snap = snapshot(None, &[]);
+    for s in [requested, done, idle, Shutdown::lockout_withdrawing(t)] {
+        let on = entry("{ phase: \"on\", since: 0 }", "");
+        let mut next = state(&on, &on);
+        next.resources.get_mut(&rid(N)).unwrap().shutdown = Some(s);
+        let r = run(&snap, &next.clone(), &next, &[]);
+        assert_eq!(r.host(N).drain(), Drain::of(&s), "{s:?}");
+    }
+}
+
+#[test]
+fn a_cause_other_than_requested_is_kept_in_a_drains_json() {
+    let idle = Drain {
+        cause: DrainCause::Idle,
+        mode: DrainMode::Immediate,
+        since: Millis(5),
+        scaled_down: true,
+    };
+    let v = serde_json::to_value(idle).unwrap();
+    assert_eq!(v["cause"], "idle", "{v}");
+    assert_eq!(serde_json::from_value::<Drain>(v).unwrap(), idle);
 }
 
 #[test]
