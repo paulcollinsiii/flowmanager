@@ -12,7 +12,7 @@
 //! the book answers before any report, and a lease the last tick has not seen has no status
 //! from it.
 
-use sched_model::{Millis, ModelId, PowerPhase, VetoReading, WaitReason};
+use sched_model::{Config, Millis, ModelId, PowerPhase, VetoReading, WaitReason};
 
 use crate::status::{Drain, HostMode, HostStatus, LockoutStatus, VetoBlocker, VetoStatus};
 
@@ -140,6 +140,19 @@ fn host_waits(h: &HostStatus) -> Vec<HostWait> {
         });
     }
     waits
+}
+
+/// Whether a person has to act on any host with a switch, the roll-up of a listing: among
+/// `hosts`, the statuses of the last report, any whose resource has a power section in `config`
+/// with `attention` set. `config` is the current one and not the status's `has_power`: a switch
+/// exists by the config in force, which a reload may have changed since the tick.
+pub fn any_needs_attention(config: &Config, hosts: &[HostStatus]) -> bool {
+    hosts.iter().any(|h| {
+        h.attention
+            && config
+                .resource(&h.resource)
+                .is_some_and(|r| r.power.is_some())
+    })
 }
 
 /// What the last tick's report knows of a switch's host and lease.

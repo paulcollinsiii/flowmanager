@@ -1,8 +1,9 @@
 //! What each switch says (`sched_sequencer::switch`): every precedence rule, on statuses built
 //! by hand for the host they are about.
 
+use sched_model::test_support::example_config;
 use sched_model::{
-    DrainMode, Millis, ModelId, PowerPhase, PowerTransition, ResourceKind, ShutdownCause,
+    Config, DrainMode, Millis, ModelId, PowerPhase, PowerTransition, ResourceKind, ShutdownCause,
     VetoReading, WaitReason, Withdrawal,
 };
 use sched_sequencer::status::{
@@ -11,7 +12,7 @@ use sched_sequencer::status::{
 };
 use sched_sequencer::switch::{
     HostRequest, HostSwitch, HostWait, LastTick, LockoutSwitchStatus as L, ModelStatus as M,
-    SwitchState as S, host_switch, lockout_status, model_status,
+    SwitchState as S, any_needs_attention, host_switch, lockout_status, model_status,
 };
 
 const ON: PowerPhase = PowerPhase::On {
@@ -419,6 +420,47 @@ fn a_lockout_on_an_up_host_is_the_wind_down_then_the_status_then_manual_then_not
         assert_eq!(say(serving(), lockout, true), L::NotYetShutDown);
         assert_eq!(say(HostMode::Idle, lockout, true), L::NotYetShutDown);
     }
+}
+
+#[test]
+fn the_roll_up_counts_only_a_host_with_a_power_section_and_attention() {
+    let attending = |id: &str, attention: bool| HostStatus {
+        resource: id.into(),
+        attention,
+        ..host(ON)
+    };
+    let config = example_config();
+    let (nfs, gpu) = ("basestar-nfs", "cuda-central");
+    assert!(!any_needs_attention(&config, &[]), "no hosts");
+    assert!(!any_needs_attention(
+        &config,
+        &[attending(nfs, false), attending(gpu, false)]
+    ));
+    assert!(any_needs_attention(
+        &config,
+        &[attending(nfs, false), attending(gpu, true)]
+    ));
+    assert!(any_needs_attention(
+        &config,
+        &[attending(nfs, true), attending(gpu, false)]
+    ));
+    // Not configured: no switch, so it does not count.
+    assert!(!any_needs_attention(&config, &[attending("ghost", true)]));
+
+    // The NFS host's power section taken away by a config change: it no longer counts, whatever
+    // its status (of an older tick) says, and the host that still has one does.
+    let y = sched_model::test_support::EXAMPLE_CONFIG;
+    let marker = "  - id: basestar-nfs\n    kind: shared\n";
+    let start = y.find(marker).unwrap() + marker.len();
+    let end = y.find("\nmodels:").unwrap();
+    let y = format!("{}{}", &y[..start], &y[end..]).replace("    may_change_power: true\n", "");
+    let config = Config::from_yaml(&y).unwrap();
+    assert!(!config.supports_lockout(&nfs.into()));
+    assert!(!any_needs_attention(&config, &[attending(nfs, true)]));
+    assert!(any_needs_attention(
+        &config,
+        &[attending(nfs, true), attending(gpu, true)]
+    ));
 }
 
 #[test]

@@ -52,8 +52,8 @@ use sched_model::{
     lockout_lease, manual_host_lease,
 };
 use sched_sequencer::switch::{
-    HostRequest, HostWait, LastTick, LockoutSwitchStatus, ModelStatus, SwitchState, host_switch,
-    lockout_status, model_status,
+    HostRequest, HostWait, LastTick, LockoutSwitchStatus, ModelStatus, SwitchState,
+    any_needs_attention, host_switch, lockout_status, model_status,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -658,7 +658,9 @@ impl Toggle {
             })
             .collect();
         Ok(json!({
-            "needs_attention": any_needs_attention(&config, &report),
+            "needs_attention": report
+                .as_ref()
+                .is_some_and(|r| any_needs_attention(&config, &r.hosts)),
             "models": models,
             "resources": resources,
             "lockouts": lockouts,
@@ -903,17 +905,6 @@ fn switch(
         );
     }
     m
-}
-
-/// The listing's `needs_attention`: any listed host's, that is any with a power section.
-fn any_needs_attention(config: &Config, report: &Option<TickReport>) -> bool {
-    report.as_ref().is_some_and(|rep| {
-        config
-            .resources()
-            .iter()
-            .filter(|r| r.power.is_some())
-            .any(|r| rep.host(&r.id).is_some_and(|h| h.attention))
-    })
 }
 
 /// What the last tick's report knows of a switch on `resource` with the lease `held`.
@@ -1384,6 +1375,7 @@ mod tests {
 
     struct Rig {
         toggle: Toggle,
+        clock: Arc<ManualClock>,
         shared: Arc<Shared>,
         backend: Arc<Fake>,
         token_file: PathBuf,
@@ -1393,7 +1385,11 @@ mod tests {
     fn rig(yaml: &str) -> Rig {
         let clock = Arc::new(ManualClock::new(Millis(T0)));
         let holder = Arc::new(ConfigHolder::new(yaml).unwrap());
-        let shared = Arc::new(Shared::new(holder, Arc::new(Metrics::new()), clock));
+        let shared = Arc::new(Shared::new(
+            holder,
+            Arc::new(Metrics::new()),
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        ));
         let backend = Arc::new(Fake {
             shared: Arc::clone(&shared),
             ctx: FakeCtx::default(),
@@ -1413,6 +1409,7 @@ mod tests {
         );
         Rig {
             toggle,
+            clock,
             shared,
             backend,
             token_file,
@@ -2641,12 +2638,6 @@ mod tests {
         });
         st.attention = true;
         put_host(&mut rep, st);
-        // The listing rolls it up, from the hosts it lists; a report with none says nothing.
-        assert!(any_needs_attention(&config, &Some(rep.clone())));
-        assert!(!any_needs_attention(&config, &None));
-        let mut quiet = rep.clone();
-        quiet.hosts.clear();
-        assert!(!any_needs_attention(&config, &Some(quiet)));
         let v = resource_state(
             &config,
             &nfs,
@@ -2658,6 +2649,37 @@ mod tests {
         );
         assert_eq!(v["needs_attention"], true);
         assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_veto");
+    }
+
+    /// The listing's `needs_attention` says true exactly when one of its entries does.
+    #[tokio::test]
+    async fn the_listing_rolls_up_needs_attention_as_its_entries_say_it() {
+        let r = rig(&example_yaml_managed());
+        let rolled_up = |list: &Value| {
+            let entries = ["resources", "lockouts"]
+                .iter()
+                .flat_map(|k| list[*k].as_array().unwrap());
+            entries.into_iter().any(|e| e["needs_attention"] == true)
+        };
+        let (_, list) = r.get("/v1/leases").await;
+        assert_eq!(list["needs_attention"], false, "no tick yet: {list}");
+        assert!(!rolled_up(&list), "{list}");
+        // The GPU host is asked for, and does not come up within its timeout.
+        r.hosts_up(false);
+        r.tick().await;
+        assert_eq!(r.post("/v1/resources/cuda-central/on", "").await.0, 200);
+        r.tick().await;
+        let (_, list) = r.get("/v1/leases").await;
+        assert_eq!(list["needs_attention"], false, "powering on: {list}");
+        assert!(!rolled_up(&list), "{list}");
+        r.clock.set(Millis(T0 + 11 * 60_000));
+        r.hosts_up(false);
+        r.tick().await;
+        let (_, v) = r.get("/v1/resources/cuda-central").await;
+        assert_eq!(v["power"]["phase"], "failed", "{v}");
+        let (_, list) = r.get("/v1/leases").await;
+        assert_eq!(list["needs_attention"], true, "{list}");
+        assert!(rolled_up(&list), "{list}");
     }
 
     #[test]
