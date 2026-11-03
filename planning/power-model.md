@@ -1,6 +1,6 @@
 # Host power model: plan
 
-Status: **decisions complete; all six phases built on the branch `refactor/power-model`** (based on main @ 689ab82; phase 1 documents, phases 2, 3, 4a, 4b, 5 and 6 code). Phase 6 (switch status and the remaining duplicates, section 4) is built and awaits review. The code behaves as sections 2 and 3 describe; section 5 is the one hand-off to the homesvr agent.
+Status: **decisions complete; all six phases built on the branch `refactor/power-model`** (based on main @ 689ab82; phase 1 documents, phases 2, 3, 4a, 4b, 5 and 6 code). All six accepted in review, nothing run against a real cluster yet. The code behaves as sections 2 and 3 describe; section 5 is the one hand-off to the homesvr agent.
 All decisions are recorded in section 3 (2026-10-30).
 
 This document is the single description of how flowmanager owns and changes a host's
@@ -460,6 +460,8 @@ describe the behaviour.
    read fails, every tick publishes nothing (the scaler keeps what it had) and the lease
    handlers answer `503`. If the upgrade was done first: roll back, `unreclaim`, roll forward;
    or discard `lease_book` (`discard_state`, which drops every lease, job holds are re-derived).
+   Let in-flight invocations finish on the old deployment too: a journaled step of type
+   `drain_model` does not decode in the new build, where it is `withdraw_model`.
 2. **Config renames and additions** (5.2): `policy.reclaim_timeout` is `lockout_timeout` (the old
    key is refused at load); `resources[].power.mounts_timeout` is `veto_timeout`.
 3. **Persisted state: nothing to migrate, nothing to do.** `scheduler_state` is version 4. An
