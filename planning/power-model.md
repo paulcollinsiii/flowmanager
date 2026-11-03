@@ -265,10 +265,14 @@ is not killed and keeps its hold until it ends.
   fresh lease book, what the request just did (`HostRequest`: a read, a handler's answer, a plain
   release), whether the last tick saw the lease, whether the model is in the allowed set. They
   return types (`SwitchState`, `HostWait`, `ModelStatus`, `LockoutSwitchStatus`), and every
-  precedence rule between the report and the fresher lease book is there.
+  precedence rule between the report and the fresher lease book is there. `any_needs_attention`
+  is the listing's roll-up: any status with `attention` whose resource has a power section in the
+  current config.
 - **"Is this host locked out"** has one answer, `Config::locked_out` (phase 6): an active lockout
   lease on a resource with a power section. Adoption, `needs_up`, the status, the planner and the
-  listener read it; the invariant checker keeps its own on purpose, as an independent check.
+  listener read it; the invariant checker keeps its own on purpose, as an independent check. The
+  sequencer also ignores a lockout in the intent on a resource without a power section
+  (`Cx::locked_out`, `class_allowed`), since it enforces its rules whatever intent it is given.
 - **The toggle listener** routes and translates only: it fetches the inputs, calls the functions
   above and puts their answers into words (the status text of a switch, the `drain` and `wait`
   objects, `needs_attention`), and holds no status logic beyond that. It does not branch on
@@ -423,8 +427,9 @@ this document and checks the phase against it ("does this still fit the model").
    for a lockout lease on a host without a power section, which the planner ignores.
    - *As built.* `sched_sequencer::switch` (2.4) holds the decisions; `resource_state`,
      `model_state` and `lockout_state` in `toggle.rs` fetch, call and serialize, and the status
-     words and detail text stay there. `release_held`'s patch of `state`, the read-back of the
-     reply's own JSON and the roll-up of `needs_attention` through the entries' JSON are gone.
+     words and detail text stay there. `release_held`'s patch of `state` and the read-back of the
+     reply's own JSON are gone, and the listing's `needs_attention`, which read the entries' JSON,
+     is `switch::any_needs_attention` over the report's statuses, with the same result.
      `Drain` replaces `RecordedDrain` (`crates/sched-service/src/drain.rs` is removed), with one
      derivation (`Drain::of`); `DrainAck.drain` keeps its JSON `{mode, since, scaled_down}`
      because a `Drain` serializes `cause` only when it is not `requested`, and an entry journaled
@@ -433,7 +438,10 @@ this document and checks the phase against it ("does this still fit the model").
      the one lockout check and the one lookup of each lease, replacing `adopt::lockout_held`, the
      planner's filter and the listener's `is_locked_out`, `find_lockout` and `find_host`; the
      sequencer's `LockoutUnsupported` reads `lockout_lease`. `Cx::locked_out` and `class_allowed`
-     read the intent, not the book, and are unchanged. The planner's and the sequencer's decisions
+     read the intent, not the book, and keep their `supports_lockout`: the planner has already
+     filtered with the one check, so production never needs it, but the sequencer holds to its
+     rules for any intent, and `a_lockout_on_a_resource_without_a_power_section_is_ignored_and_reported`
+     gives it a hand-built one. The planner's and the sequencer's decisions
      are unchanged. The model switch fix asks nothing of homesvr, so section 5 does not list it.
 
 ## 5. Hand-off to homesvr
