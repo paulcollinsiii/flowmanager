@@ -7,8 +7,9 @@
 //! call (`acquire_model_lease`, `release_lease`, `acquire_host_lease`, `release_host_lease`,
 //! `resume`, `leases`) and sent through the Restate ingress, so the object's lock, its
 //! journal and its persisted state are used exactly as for any other caller; this module
-//! keeps no lease state of its own. A switch's richer status is read from what the scheduler
-//! already published (the last tick's report, in this process).
+//! keeps no lease state of its own. What a switch says is decided by `sched_sequencer::switch`
+//! from what the scheduler already published (the last tick's report, in this process) and the
+//! lease book; this module fetches those, calls it and puts the answer into words.
 //!
 //! Endpoints (every one needs `Authorization: Bearer <token>`; names are config ids):
 //!
@@ -47,10 +48,13 @@ use std::time::Duration;
 
 use hyper::Method;
 use sched_model::{
-    Config, DrainMode, Lease, LeaseId, LeaseKind, Millis, ModelId, PowerPhase, ResourceId,
-    ResourceKind, WaitReason, lockout_lease, manual_host_lease,
+    Config, DrainMode, Lease, LeaseId, LeaseKind, Millis, ModelId, ResourceId, ResourceKind,
+    lockout_lease, manual_host_lease,
 };
-use sched_sequencer::status::{Drain, HostMode, HostStatus, LockoutStatus, VetoStatus};
+use sched_sequencer::switch::{
+    HostRequest, HostWait, LastTick, LockoutSwitchStatus, ModelStatus, SwitchState, host_switch,
+    lockout_status, model_status,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -638,7 +642,7 @@ impl Toggle {
                     &r.id,
                     manual_host_lease(&leases, &r.id),
                     config.locked_out(&leases, &r.id, now),
-                    None,
+                    HostRequest::Read,
                     &report,
                     now,
                 )
@@ -653,12 +657,8 @@ impl Toggle {
                 lockout_state(&config, &r.id, held, &report, now)
             })
             .collect();
-        let attention = resources
-            .iter()
-            .chain(&lockouts)
-            .any(|r| r["needs_attention"] == true);
         Ok(json!({
-            "needs_attention": attention,
+            "needs_attention": any_needs_attention(&config, &report),
             "models": models,
             "resources": resources,
             "lockouts": lockouts,
@@ -735,19 +735,24 @@ impl Toggle {
     ) -> Result<Value, ApiError> {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
-        let (held, ack) = match set {
+        let (held, request) = match set {
             None => (
                 manual_host_lease(&self.backend.leases().await?, &id).cloned(),
-                None,
+                HostRequest::Read,
             ),
             // A new lease cancels any drain at the next tick; the reply shows none.
             Some(true) => (
                 Some(self.backend.acquire_host(&id).await?.lease),
-                Some(None),
+                HostRequest::Answered { drain: None },
             ),
             // Off is a requested shutdown on every host, whatever its kind; the listener
             // translates and the sequencer decides.
-            Some(false) => (None, Some(self.backend.drain_host(&id, drain).await?.drain)),
+            Some(false) => (
+                None,
+                HostRequest::Answered {
+                    drain: self.backend.drain_host(&id, drain).await?.drain,
+                },
+            ),
         };
         let leases = self.backend.leases().await?;
         let now = self.shared.clock.now();
@@ -756,7 +761,7 @@ impl Toggle {
             &id,
             held.as_ref(),
             config.locked_out(&leases, &id, now),
-            ack,
+            request,
             &self.shared.last_report(),
             now,
         ))
@@ -791,19 +796,17 @@ impl Toggle {
         if let Err(e) = self.backend.release_host(id).await {
             self.gone_after(e, &lease.id).await?;
         }
-        let report = self.shared.last_report();
         let leases = self.backend.leases().await?;
         let now = self.shared.clock.now();
-        let locked = config.locked_out(&leases, id, now);
-        let mut v = resource_state(config, id, None, locked, Some(None), &report, now);
-        let up = report
-            .as_ref()
-            .and_then(|r| r.host(id))
-            .is_some_and(HostStatus::is_up);
-        if up {
-            v["state"] = json!("on");
-        }
-        Ok(v)
+        Ok(resource_state(
+            config,
+            id,
+            None,
+            config.locked_out(&leases, id, now),
+            HostRequest::Released,
+            &self.shared.last_report(),
+            now,
+        ))
     }
 
     async fn lockout(&self, name: &str, set: Option<bool>) -> Result<Value, ApiError> {
@@ -873,6 +876,7 @@ fn switch(
     kind: &str,
     id: &str,
     held: Option<&Lease>,
+    state: SwitchState,
     now: Millis,
 ) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
@@ -881,7 +885,12 @@ fn switch(
     m.insert("held".into(), json!(held.is_some()));
     m.insert(
         "state".into(),
-        json!(if held.is_some() { "on" } else { "off" }),
+        json!(match state {
+            SwitchState::On => "on",
+            SwitchState::Off => "off",
+            SwitchState::Draining => "draining",
+            SwitchState::LockedOut => "locked_out",
+        }),
     );
     if let Some(l) = held {
         // Who made the lease: a host lease flowmanager minted for a host it found running is
@@ -896,16 +905,37 @@ fn switch(
     m
 }
 
-/// A model switch. `status`, when present, is derived from the last tick's report of this
-/// process: `active` (the model is in the allowed set), `waiting_for_host` (its host is not
-/// up), `host_failed` (its host's power transition failed), `draining` (another model of
-/// the resource is being wound down, its in-flight work awaited), or `pending` (the
-/// scheduler has not yet acted on the lease, or is serving another model for a reason the
-/// report does not give). Absent while the process has not ticked. While a lockout is held
-/// on the model's resource the status is `locked out` whatever the report says: the planner
-/// gives a locked out resource no model, so the lease cannot become active until the lockout
-/// is released. `locked out` is whether the lease book holds one; `None` (the book could not
-/// be read just now) leaves the status out.
+/// The listing's `needs_attention`: any listed host's, that is any with a power section.
+fn any_needs_attention(config: &Config, report: &Option<TickReport>) -> bool {
+    report.as_ref().is_some_and(|rep| {
+        config
+            .resources()
+            .iter()
+            .filter(|r| r.power.is_some())
+            .any(|r| rep.host(&r.id).is_some_and(|h| h.attention))
+    })
+}
+
+/// What the last tick's report knows of a switch on `resource` with the lease `held`.
+fn last_tick<'a>(
+    report: &'a Option<TickReport>,
+    resource: &ResourceId,
+    held: Option<&Lease>,
+) -> Option<LastTick<'a>> {
+    report.as_ref().map(|r| LastTick {
+        host: r.host(resource),
+        saw_lease: held.is_some_and(|lease| r.leases.iter().any(|l| l.id == lease.id)),
+    })
+}
+
+/// A model switch. `status` and `detail` say what `sched_sequencer::switch::model_status`
+/// decides, from the last tick's report of this process and the lease book (`locked_out`;
+/// `None`: it could not be read just now): `active` (the model is in the allowed set),
+/// `waiting_for_host` (its host is not up), `host_failed` (its host's power transition failed),
+/// `draining` (another model of the resource is being wound down, its in-flight work awaited),
+/// `locked_out` (the planner gives a locked out resource no model), or `pending` (the scheduler
+/// has not yet acted on the lease, or is serving another model for a reason the report does not
+/// give). Absent when that decides nothing.
 pub fn model_state(
     model: &ModelId,
     resource: &ResourceId,
@@ -914,77 +944,60 @@ pub fn model_state(
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
-    let mut m = switch("model", model.as_str(), held, now);
+    let state = SwitchState::of_lease(held.is_some());
+    let mut m = switch("model", model.as_str(), held, state, now);
     m.insert("resource".into(), json!(resource));
-    if let (Some(lease), Some(locked_out)) = (held, locked_out) {
-        let status = if locked_out {
-            let power = report
-                .as_ref()
-                .and_then(|r| r.host(resource))
-                .map(|h| format!(" (power: {})", h.phase()))
-                .unwrap_or_default();
-            Some((
-                "locked_out",
-                format!(
-                    "{resource} is locked out{power}: no model is allowed on it until the lockout is released"
-                ),
-            ))
-        } else {
-            report
-                .as_ref()
-                .map(|r| model_status(r, lease, model, resource))
-        };
-        if let Some((status, detail)) = status {
-            m.insert("status".into(), json!(status));
-            m.insert("detail".into(), json!(detail));
-        }
+    let allowed = report
+        .as_ref()
+        .is_some_and(|r| r.allowed_models.contains(model));
+    let tick = last_tick(report, resource, held);
+    if let Some(status) = model_status(held.is_some(), locked_out, tick, allowed) {
+        let (status, detail) = model_words(&status, model, resource);
+        m.insert("status".into(), json!(status));
+        m.insert("detail".into(), json!(detail));
     }
     Value::Object(m)
 }
 
-fn model_status(
-    r: &TickReport,
-    lease: &Lease,
+/// The words of a model switch's status.
+fn model_words(
+    status: &ModelStatus,
     model: &ModelId,
     resource: &ResourceId,
 ) -> (&'static str, String) {
-    if !r.leases.iter().any(|l| l.id == lease.id) {
-        return (
+    match status {
+        ModelStatus::LockedOut { phase } => {
+            let power = phase.map(|p| format!(" (power: {p})")).unwrap_or_default();
+            (
+                "locked_out",
+                format!(
+                    "{resource} is locked out{power}: no model is allowed on it until the lockout is released"
+                ),
+            )
+        }
+        ModelStatus::LeaseNotSeen => (
             "pending",
             "the last tick was decided before this lease was taken; the next tick acts on it"
                 .into(),
-        );
-    }
-    if r.allowed_models.contains(model) {
-        return ("active", format!("{model} is allowed on {resource}"));
-    }
-    let Some(h) = r.host(resource) else {
-        return ("pending", format!("no state for {resource} yet"));
-    };
-    match &h.power {
-        PowerPhase::On { .. } => {}
-        PowerPhase::Failed { .. } => {
-            return (
-                "host_failed",
-                format!(
-                    "a power transition of {resource} failed; resume it once the host is fixed"
-                ),
-            );
+        ),
+        ModelStatus::Active => ("active", format!("{model} is allowed on {resource}")),
+        ModelStatus::NoHostState => ("pending", format!("no state for {resource} yet")),
+        ModelStatus::HostFailed => (
+            "host_failed",
+            format!("a power transition of {resource} failed; resume it once the host is fixed"),
+        ),
+        ModelStatus::WaitingForHost { phase } => {
+            ("waiting_for_host", format!("{resource} is {phase}"))
         }
-        _ => {
-            return ("waiting_for_host", format!("{resource} is {}", h.phase()));
-        }
-    }
-    match &h.mode {
-        HostMode::WindingDown { model: other } => (
+        ModelStatus::OtherWindingDown { model: other } => (
             "draining",
             format!("{other} is winding down on {resource}; its in-flight work is awaited"),
         ),
-        HostMode::Serving { model: other } => (
+        ModelStatus::OtherServing { model: other } => (
             "pending",
             format!("{other} is still allowed on {resource}; the switch has not been decided"),
         ),
-        HostMode::Idle => (
+        ModelStatus::HostIdle => (
             "pending",
             format!("{resource} is up and idle; {model} is not allowed yet"),
         ),
@@ -992,15 +1005,16 @@ fn model_status(
 }
 
 /// A lockout switch ("keep away from this host until I clear it") on a resource with a power
-/// section, shared or exclusive.
-/// `supported` is false for a resource without a power section, which cannot be locked out. While held and
-/// seen by the last tick, `status` is `host_failed` (a power transition failed),
-/// `powered_off` (the host is down and is not woken), `left_for_person` (up, with `control:
-/// manual`: flowmanager never shuts it down), `left_alone` (up again after the lockout shut it
-/// down: flowmanager leaves it alone until the lockout is cleared), `shutting_down`, `draining` (its work
-/// is awaited for at most the lockout timeout, then cut off) or `pending` (the tick has
-/// not acted on it yet, or the report does not say more); `tick_reason` is that tick's
-/// reason as the sequencer gave it. `needs_attention` is as for a host.
+/// section, shared or exclusive. `supported` is false for a resource without a power section,
+/// which cannot be locked out. `status` and `detail` say what
+/// `sched_sequencer::switch::lockout_status` decides, while held and once a tick has been
+/// reported: `host_failed` (a power transition failed), `powered_off` (the host is down and is
+/// not woken), `left_for_person` (up, with `control: manual`: flowmanager never shuts it down),
+/// `left_alone` (up again after the lockout shut it down: flowmanager leaves it alone until the
+/// lockout is cleared), `shutting_down`, `draining` (its work is awaited for at most the lockout
+/// timeout, then cut off) or `pending` (the tick has not acted on it yet, or the report does not
+/// say more); `tick_reason` is that tick's reason as the sequencer gave it. `needs_attention` is
+/// as for a host.
 pub fn lockout_state(
     config: &Config,
     resource: &ResourceId,
@@ -1008,19 +1022,20 @@ pub fn lockout_state(
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
-    let mut m = switch("lockout", resource.as_str(), held, now);
+    let state = SwitchState::of_lease(held.is_some());
+    let mut m = switch("lockout", resource.as_str(), held, state, now);
     m.insert("supported".into(), json!(config.supports_lockout(resource)));
     if let Some(r) = report {
-        let host = r.host(resource);
-        if let Some(h) = host {
+        if let Some(h) = r.host(resource) {
             m.insert(
                 "power".into(),
                 serde_json::to_value(h.power).unwrap_or(Value::Null),
             );
             m.insert("needs_attention".into(), json!(h.attention));
         }
-        if let Some(lease) = held {
-            let (status, detail) = lockout_status(r, lease, resource, host);
+        let tick = last_tick(report, resource, held);
+        if let Some(status) = lockout_status(held.is_some(), tick) {
+            let (status, detail) = lockout_words(&status, resource);
             m.insert("status".into(), json!(status));
             m.insert("detail".into(), json!(detail));
             m.insert("tick_reason".into(), json!(r.reason));
@@ -1029,93 +1044,83 @@ pub fn lockout_state(
     Value::Object(m)
 }
 
-/// Words for a lockout switch from the host's status: the status decides, this only formats.
-fn lockout_status(
-    r: &TickReport,
-    lease: &Lease,
-    resource: &ResourceId,
-    host: Option<&HostStatus>,
-) -> (&'static str, String) {
-    if !r.leases.iter().any(|l| l.id == lease.id) {
-        return (
+/// The words of a lockout switch's status.
+fn lockout_words(status: &LockoutSwitchStatus, resource: &ResourceId) -> (&'static str, String) {
+    match status {
+        LockoutSwitchStatus::LeaseNotSeen => (
             "pending",
             "the last tick was decided before this lockout was taken; the next tick acts on it"
                 .into(),
-        );
-    }
-    let Some(h) = host else {
-        return ("pending", format!("no state for {resource} yet"));
-    };
-    match &h.power {
-        PowerPhase::Failed { .. } => (
+        ),
+        LockoutSwitchStatus::NoHostState => ("pending", format!("no state for {resource} yet")),
+        LockoutSwitchStatus::HostFailed => (
             "host_failed",
             format!("a power transition of {resource} failed; resume it once the host is fixed"),
         ),
-        PowerPhase::Off { .. } => (
+        LockoutSwitchStatus::PoweredOff => (
             "powered_off",
             format!("{resource} is off and is not woken while locked out"),
         ),
-        PowerPhase::ShuttingDown { .. } => {
+        LockoutSwitchStatus::ShuttingDown => {
             ("shutting_down", format!("{resource} is shutting down"))
         }
-        PowerPhase::PoweringOn { .. } => (
+        LockoutSwitchStatus::PoweringOn => (
             "pending",
             format!("{resource} is powering on; it is shut down once the tick decides it"),
         ),
-        PowerPhase::On { .. } => match (h.lockout, &h.mode) {
-            (_, HostMode::WindingDown { model }) => (
-                "draining",
-                format!(
-                    "{model} is winding down on {resource}; its work is cut off after the lockout timeout"
-                ),
+        LockoutSwitchStatus::ModelWindingDown { model } => (
+            "draining",
+            format!(
+                "{model} is winding down on {resource}; its work is cut off after the lockout timeout"
             ),
-            (Some(LockoutStatus::Withdrawing), _) => (
-                "draining",
-                format!(
-                    "the consumers of {resource} are given the lockout timeout to finish, then withdrawn and the host shut down"
-                ),
+        ),
+        LockoutSwitchStatus::Withdrawing => (
+            "draining",
+            format!(
+                "the consumers of {resource} are given the lockout timeout to finish, then withdrawn and the host shut down"
             ),
-            (Some(LockoutStatus::LeftAlone), _) => (
-                "left_alone",
-                format!(
-                    "{resource} was shut down by the lockout and is up again (another OS, say); flowmanager leaves it alone until the lockout is cleared"
-                ),
+        ),
+        LockoutSwitchStatus::LeftAlone => (
+            "left_alone",
+            format!(
+                "{resource} was shut down by the lockout and is up again (another OS, say); flowmanager leaves it alone until the lockout is cleared"
             ),
-            _ if !h.managed => (
-                "left_for_person",
-                format!(
-                    "{resource} is up; its power is control: manual, so flowmanager does not shut it down: power it off yourself"
-                ),
+        ),
+        LockoutSwitchStatus::LeftForPerson => (
+            "left_for_person",
+            format!(
+                "{resource} is up; its power is control: manual, so flowmanager does not shut it down: power it off yourself"
             ),
-            _ => (
-                "pending",
-                format!("{resource} is up; the lockout has not yet shut it down"),
-            ),
-        },
+        ),
+        LockoutSwitchStatus::NotYetShutDown => (
+            "pending",
+            format!("{resource} is up; the lockout has not yet shut it down"),
+        ),
     }
 }
 
-/// A resource (host) switch. `power`, `wait` and `needs_attention` come from the last tick's
-/// report of this process and are absent before the first tick; `wait` names why the
-/// scheduler holds something back (`min_off`, `shutdown_held_by_veto`). `drain` is present while
-/// a drain is under way (a switch-off asked for the host to go down): its mode and whether
-/// the consumers are already scaled down. `requested` is the drain a request has just recorded
-/// (the last tick has not seen it yet); while one is under way the switch is not off: `held` is
-/// false and `state` is `draining`. `locked_out` (from the lease book) says a lockout is held
-/// on the host: the reply then has `locked_out: true` and a `wait` entry `locked_out`, whatever
-/// was just asked (a request is still recorded or refused as before: the lockout decides what
-/// happens to the host), and `state` reads `locked_out` instead of `off` while the last report
-/// does not show the host off.
+/// A resource (host) switch: `state`, `drain` and `wait` say what
+/// `sched_sequencer::switch::host_switch` decides. `power` and `needs_attention` come from the
+/// last tick's report of this process and are absent before the first tick, as is `wait` unless
+/// a lockout is held; `wait` names why the scheduler holds something back
+/// (`shutdown_held_by_veto`, `min_off`, `locked_out`). `drain` is present while a drain is under
+/// way (a switch-off asked for the host to go down): its mode, who started it and whether the
+/// consumers are already scaled down. `request` is what the request has just done, which the
+/// last tick has not seen yet. `locked_out` (from the lease book) says a lockout is held on the
+/// host, whatever was just asked (a request is still recorded or refused as before: the lockout
+/// decides what happens to the host).
 pub fn resource_state(
     config: &Config,
     resource: &ResourceId,
     held: Option<&Lease>,
     locked_out: bool,
-    requested: Option<Option<Drain>>,
+    request: HostRequest,
     report: &Option<TickReport>,
     now: Millis,
 ) -> Value {
-    let mut m = switch("resource", resource.as_str(), held, now);
+    let host = report.as_ref().and_then(|r| r.host(resource));
+    let says = host_switch(host, held.is_some(), locked_out, request);
+    let mut m = switch("resource", resource.as_str(), held, says.state, now);
     let kind = config.resource(resource).map(|r| r.kind);
     m.insert(
         "resource_kind".into(),
@@ -1128,61 +1133,46 @@ pub fn resource_state(
         "lease_supported".into(),
         json!(config.resource(resource).is_some_and(|r| r.power.is_some())),
     );
-    let draining = match requested {
-        Some(d) => d,
-        None => report
-            .as_ref()
-            .and_then(|r| r.host(resource).filter(|h| h.is_up())?.drain()),
-    };
-    if let Some(d) = draining {
+    if let Some(d) = says.drain {
         m.insert(
             "drain".into(),
             json!({ "mode": d.mode.as_str(), "cause": d.cause.as_str(), "since_ms": d.since.as_u64(), "scaled_down": d.scaled_down }),
         );
-        if held.is_none() {
-            m.insert("state".into(), json!("draining"));
-        }
     }
-    let host = report.as_ref().and_then(|r| r.host(resource));
     if let Some(h) = host {
         m.insert(
             "power".into(),
             serde_json::to_value(h.power).unwrap_or(Value::Null),
         );
-        let mut waits = Vec::new();
-        if let Some(v) = h.veto() {
-            waits.push(json!({
-                "reason": "shutdown_held_by_veto",
-                "readings": h.veto_readings,
-                "blocking": h.blocking(),
-                "stopped": matches!(v, VetoStatus::Stopped { .. }),
-            }));
-        }
-        if let (Some(WaitReason::MinOff), Some(w)) = (h.wait, h.min_off) {
-            waits.push(json!({
-                "reason": "min_off",
-                "remaining_seconds": w.remaining.as_u64() / 1000,
-            }));
-        }
-        m.insert("wait".into(), Value::Array(waits));
         m.insert("needs_attention".into(), json!(h.attention));
     }
-    m.insert("locked_out".into(), json!(locked_out));
-    if locked_out {
-        let mut waits = match m.remove("wait") {
-            Some(Value::Array(w)) => w,
-            _ => Vec::new(),
-        };
-        waits.push(json!({ "reason": "locked_out" }));
+    if let Some(waits) = says.waits {
+        let waits = waits.iter().map(host_wait_json).collect();
         m.insert("wait".into(), Value::Array(waits));
-        // Not `off` while the host is not seen off: the lockout is shutting it down, or
-        // leaving it alone after another boot.
-        let off = host.is_some_and(HostStatus::is_off);
-        if held.is_none() && !off && m.get("state") != Some(&json!("draining")) {
-            m.insert("state".into(), json!("locked_out"));
-        }
     }
+    m.insert("locked_out".into(), json!(locked_out));
     Value::Object(m)
+}
+
+/// A `wait` entry of a host switch.
+fn host_wait_json(wait: &HostWait) -> Value {
+    match wait {
+        HostWait::Veto {
+            readings,
+            blocking,
+            stopped,
+        } => json!({
+            "reason": "shutdown_held_by_veto",
+            "readings": readings,
+            "blocking": blocking,
+            "stopped": stopped,
+        }),
+        HostWait::MinOff { remaining } => json!({
+            "reason": "min_off",
+            "remaining_seconds": remaining.as_u64() / 1000,
+        }),
+        HostWait::LockedOut => json!({ "reason": "locked_out" }),
+    }
 }
 
 fn error_reply(e: ApiError) -> Reply {
@@ -1242,8 +1232,8 @@ mod tests {
     use sched_observe::Report;
     use sched_observe::testserver::{Reply as TestReply, TestServer};
 
-    use sched_model::{ShutdownCause, Withdrawal};
-    use sched_sequencer::status::ShutdownStatus;
+    use sched_model::{PowerPhase, ShutdownCause, Withdrawal};
+    use sched_sequencer::status::{Drain, HostMode, HostStatus, ShutdownStatus, VetoStatus};
 
     const T0: u64 = 10_000_000;
     const TOKEN: &str = "s3cret-token";
@@ -1946,7 +1936,7 @@ mod tests {
             &nfs,
             None,
             false,
-            None,
+            HostRequest::Read,
             &Some(rep.clone()),
             Millis(9),
         );
@@ -1962,7 +1952,7 @@ mod tests {
             &nfs,
             None,
             false,
-            None,
+            HostRequest::Read,
             &Some(rep.clone()),
             Millis(9),
         );
@@ -1979,7 +1969,7 @@ mod tests {
             &nfs,
             None,
             false,
-            Some(None),
+            HostRequest::Answered { drain: None },
             &Some(rep),
             Millis(9),
         );
@@ -2144,7 +2134,7 @@ mod tests {
                 &nfs,
                 held,
                 locked,
-                None,
+                HostRequest::Read,
                 &Some(rep.clone()),
                 Millis(5_000),
             );
@@ -2317,9 +2307,19 @@ mod tests {
         let mut rep = r.shared.last_report().unwrap();
         rep.leases.push(lease.clone());
         rep.allowed_models.clear();
-        let status =
-            |rep: &TickReport| model_status(rep, &lease, &"llm".into(), &"cuda-central".into());
         let gpu: ResourceId = "cuda-central".into();
+        let status = |rep: &TickReport| {
+            let v = model_state(
+                &"llm".into(),
+                &gpu,
+                Some(&lease),
+                Some(false),
+                &Some(rep.clone()),
+                Millis(T0),
+            );
+            let word = |k: &str| v[k].as_str().unwrap().to_string();
+            (word("status"), word("detail"))
+        };
 
         let mut st = status_of_host(
             &gpu,
@@ -2624,7 +2624,7 @@ mod tests {
             &nfs,
             None,
             false,
-            None,
+            HostRequest::Read,
             &Some(rep.clone()),
             Millis(5_000),
         );
@@ -2641,7 +2641,21 @@ mod tests {
         });
         st.attention = true;
         put_host(&mut rep, st);
-        let v = resource_state(&config, &nfs, None, false, None, &Some(rep), Millis(5_000));
+        // The listing rolls it up, from the hosts it lists; a report with none says nothing.
+        assert!(any_needs_attention(&config, &Some(rep.clone())));
+        assert!(!any_needs_attention(&config, &None));
+        let mut quiet = rep.clone();
+        quiet.hosts.clear();
+        assert!(!any_needs_attention(&config, &Some(quiet)));
+        let v = resource_state(
+            &config,
+            &nfs,
+            None,
+            false,
+            HostRequest::Read,
+            &Some(rep),
+            Millis(5_000),
+        );
         assert_eq!(v["needs_attention"], true);
         assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_veto");
     }

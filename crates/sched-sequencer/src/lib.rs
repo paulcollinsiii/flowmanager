@@ -18,6 +18,7 @@ mod exclusive;
 pub mod jobs;
 mod power;
 pub mod status;
+pub mod switch;
 
 use sched_model::{
     AllowedSet, ClassSpec, Config, Intent, ModePhase, ResourceSpec, ResourceState, SchedState,

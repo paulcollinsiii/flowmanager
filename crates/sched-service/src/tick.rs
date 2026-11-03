@@ -2492,6 +2492,7 @@ mod tests {
     #[test]
     fn a_failed_tick_still_says_what_a_person_must_attend_to() {
         use crate::toggle::{lockout_state, model_state, resource_state};
+        use sched_sequencer::switch::HostRequest;
         let mut nfs = sched_model::ResourceState::new(PowerPhase::On {
             since: Millis(1),
             ours: true,
@@ -2517,12 +2518,28 @@ mod tests {
         let (nfs, gpu): (ResourceId, ResourceId) = ("basestar-nfs".into(), "cuda-central".into());
         let config = s.config.current();
         let now = Millis(T0 + 1_000);
-        let v = resource_state(&config, &nfs, None, false, None, &Some(r.clone()), now);
+        let v = resource_state(
+            &config,
+            &nfs,
+            None,
+            false,
+            HostRequest::Read,
+            &Some(r.clone()),
+            now,
+        );
         assert_eq!(v["needs_attention"], true, "{v}");
         assert_eq!(v["power"]["phase"], "on", "{v}");
         assert_eq!(v["wait"][0]["reason"], "shutdown_held_by_veto", "{v}");
         assert_eq!(v["wait"][0]["stopped"], true, "{v}");
-        let v = resource_state(&config, &gpu, None, false, None, &Some(r.clone()), now);
+        let v = resource_state(
+            &config,
+            &gpu,
+            None,
+            false,
+            HostRequest::Read,
+            &Some(r.clone()),
+            now,
+        );
         assert_eq!(v["needs_attention"], true, "{v}");
         assert_eq!(v["power"]["phase"], "failed", "{v}");
         // The status words of a switch read the carried state, not "no state yet".
