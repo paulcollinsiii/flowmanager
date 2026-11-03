@@ -398,6 +398,15 @@ this document and checks the phase against it ("does this still fit the model").
      the one that sets the per-host gauges and `log_host_event` the one that logs an event.
      No decision changed: the planner, the sequencer's decisions and the jobs machine are
      untouched apart from the new pure module. The output changes are in section 5.
+6. **Switch status and the remaining duplicates.** Phase 5 left status decisions in the toggle
+   listener, against 2.4 ("routes and translates only"), and some questions answered in more
+   than one place. A pure function in the sequencer crate decides what each switch says, from
+   a `HostStatus` plus the inputs only the listener has (the fresh lease book, a drain just
+   recorded, whether the last tick saw the lease); the listener fetches, calls and serializes.
+   One drain type replaces `RecordedDrain`. One lockout check serves the planner, the
+   sequencer and the listener; `invariants.rs` keeps its own on purpose, as an independent
+   check. Toggle JSON does not change, except that a model switch no longer reads `locked_out`
+   for a lockout lease on a host without a power section, which the planner ignores.
 
 ## 5. Hand-off to homesvr
 
