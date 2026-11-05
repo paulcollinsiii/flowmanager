@@ -466,6 +466,33 @@ fn check_with(snap: &Snapshot, prev_state: &SchedState, d: &Decision) -> Vec<Str
 }
 
 #[test]
+fn withdrawing_past_unknown_demand_needs_another_required_host_seen_down() {
+    let world = |nfs_up: bool| {
+        let mut obs = idle_demand();
+        obs.retain(|o| !matches!(&o.value, sched_model::ObservedValue::Demand { class, .. } if class.as_str() == "paperless-ocr"));
+        obs.extend(zero_pods_and_up(&["cuda-central"]));
+        obs.push(sched_model::Observation {
+            source: "cluster-pods".into(),
+            observed_at: Millis(NOW),
+            fidelity: sched_model::Fidelity::Event,
+            value: sched_model::ObservedValue::ResourceUp {
+                resource: ResourceId::new("basestar-nfs"),
+                up: nfs_up,
+            },
+        });
+        snap(obs, vec![])
+    };
+    let d = decided(vec![withdraw("mineru")], &[], &[], GPU_ON_IDLE);
+    let flagged = |nfs_up: bool| {
+        check_with(&world(nfs_up), &prev(GPU_SERVING_OCR), &d)
+            .iter()
+            .any(|m| m.contains("possible in-flight work of paperless-ocr"))
+    };
+    assert!(flagged(true), "the host is up: unknown may be running");
+    assert!(!flagged(false), "the work cannot run without the host");
+}
+
+#[test]
 fn a_switch_must_withdraw_the_old_model_in_the_same_decision() {
     let mut obs = zero_pods_and_up(&["cuda-central", "basestar-nfs"]);
     obs.extend(idle_demand());

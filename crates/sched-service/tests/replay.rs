@@ -65,11 +65,12 @@ scenarios! {
     min_off_wait => "min-off-wait.yaml",
     min_off_manual_lease => "min-off-manual-lease.yaml",
     exclusive_host_lease => "exclusive-host-lease.yaml",
+    llm_only_basestar_off => "llm-only-basestar-off.yaml",
 }
 
 #[test]
 fn every_scenario_file_has_a_test() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
     let count = std::fs::read_dir(dir).unwrap().count();
-    assert_eq!(count, 24, "add new scenario files to the scenarios! list");
+    assert_eq!(count, 25, "add new scenario files to the scenarios! list");
 }

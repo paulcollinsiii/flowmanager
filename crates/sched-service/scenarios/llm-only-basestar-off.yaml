@@ -1,0 +1,68 @@
+description: "The GPU host powered for the LLM alone with basestar off: the classes that need basestar are offline, not unknown, so a plain release lets the model go at once and the host go down after one idle_grace."
+# The power machine as under managed control (M4).
+power_control: managed
+frames:
+  # Both hosts off. The sources of the classes that need basestar have nothing to answer them:
+  # no reading of their demand ever appears here.
+  - at: 100000000
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: mineru, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: whisperx, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: model_pods, model: immich-ml, pods: 0, ready_pods: 0 } }
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: false } }
+      - { source: cluster-pods, value: { type: resource_up, resource: basestar-nfs, up: false } }
+      - { source: llm-sessions, value: { type: demand, class: interactive-llm, ready: 0, in_flight: 0 } }
+    expect:
+      steps: []
+  # A person takes the host and the LLM.
+  - at: 100010000
+    refresh: true
+    leases:
+      - { id: user-gpu, resource: cuda-central, granted_at: 100010000, kind: { type: manual_host } }
+      - { id: user-llm, resource: cuda-central, granted_at: 100010000, kind: { type: manual_model, model: llm } }
+    expect:
+      steps: [{ type: power_on, resource: cuda-central }]
+  - at: 100040000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: resource_up, resource: cuda-central, up: true } }
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 1, ready_pods: 1 } }
+    expect:
+      steps: [{ type: allow_model, resource: cuda-central, model: llm }]
+  # The next tick starts the model's idle clock: the lease pins it, but nothing keeps it busy.
+  - at: 100050000
+    refresh: true
+    expect:
+      steps: []
+  # An hour with the LLM.
+  - at: 103640000
+    refresh: true
+    expect:
+      steps: []
+  # Both leases released, no shutdown asked for. Nothing has been busy, so the model has
+  # already had its idle_grace and goes at once.
+  - at: 103650000
+    refresh: true
+    leases: []
+    expect:
+      steps:
+        - { type: pause_intake, class: paperless-tagging }
+        - { type: pause_intake, class: speakr-summarization }
+        - { type: pause_intake, class: interactive-llm }
+        - { type: withdraw_model, resource: cuda-central, model: llm }
+  # The pods exit; the host's idle clock started when the model left.
+  - at: 103660000
+    refresh: true
+    observe:
+      - { source: cluster-pods, value: { type: model_pods, model: llm, pods: 0, ready_pods: 0 } }
+    expect:
+      steps: []
+  - at: 104259000
+    refresh: true
+    expect:
+      steps: []
+  - at: 104260000
+    refresh: true
+    expect:
+      steps: [{ type: power_off, resource: cuda-central }]

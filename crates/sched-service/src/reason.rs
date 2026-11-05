@@ -37,9 +37,13 @@ pub const KIND_PINNED: &str = "pinned";
 
 /// Metric label for demand that is not known although something should be reporting it:
 /// an observer runs for the source (or the source has reported before) and it is silent or
-/// stale. A tick with no step but unknown demand is this, never [`KIND_IDLE`]: unknown is
-/// not zero.
+/// stale, with no host the class requires seen down ([`KIND_DEMAND_OFFLINE`]). A tick with no
+/// step but unknown demand is this, never [`KIND_IDLE`]: unknown is not zero.
 pub const KIND_DEMAND_UNKNOWN: &str = "demand_unknown";
+
+/// Metric label for demand with no usable reading while a host the class requires is seen
+/// down. It counts as no demand; kept apart from [`KIND_DEMAND_UNKNOWN`].
+pub const KIND_DEMAND_OFFLINE: &str = "demand_offline";
 
 /// Metric label for demand of a source whose kind has no observer in this build and that
 /// has never reported. It counts as no demand; kept apart from [`KIND_DEMAND_UNKNOWN`].
@@ -163,17 +167,21 @@ pub fn with_hosts(
     (kinds, reason)
 }
 
-/// Classes whose demand is unknown, by why. None of them is "zero demand".
+/// Classes with no measured demand, by why. Only `unknown` holds anything up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DemandGaps {
     pub unknown: Vec<sched_model::ClassId>,
+    pub offline: Vec<sched_model::ClassId>,
     pub unsupported: Vec<sched_model::ClassId>,
     pub unpolled: Vec<sched_model::ClassId>,
 }
 
 impl DemandGaps {
     pub fn is_empty(&self) -> bool {
-        self.unknown.is_empty() && self.unsupported.is_empty() && self.unpolled.is_empty()
+        self.unknown.is_empty()
+            && self.offline.is_empty()
+            && self.unsupported.is_empty()
+            && self.unpolled.is_empty()
     }
 }
 
@@ -193,12 +201,15 @@ pub fn pinned(intent: &Intent) -> Vec<(ResourceId, ModelId)> {
 
 /// The distinct kinds in a decision, sorted; [`KIND_PINNED`] when a manual model lease pins
 /// a model; [`KIND_IDLE`] when there are no steps, no class's demand is unknown and nothing
-/// is pinned (unobservable demand counts as none, so it does not prevent `idle`, but its
-/// kind is still listed).
+/// is pinned (unobservable and offline demand count as none, so they do not prevent `idle`,
+/// but their kinds are still listed).
 pub fn kinds(steps: &[Step], gaps: &DemandGaps, pinned: bool) -> Vec<&'static str> {
     let mut set: BTreeSet<&'static str> = steps.iter().map(step_kind).collect();
     if !gaps.unknown.is_empty() {
         set.insert(KIND_DEMAND_UNKNOWN);
+    }
+    if !gaps.offline.is_empty() {
+        set.insert(KIND_DEMAND_OFFLINE);
     }
     if !gaps.unsupported.is_empty() {
         set.insert(KIND_DEMAND_UNSUPPORTED);
@@ -451,6 +462,12 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
             ids(&gaps.unknown)
         ));
     }
+    if !gaps.offline.is_empty() {
+        out.push_str(&format!(
+            "; demand offline for [{}] (a host it requires is down): counted as no demand",
+            ids(&gaps.offline)
+        ));
+    }
     if !gaps.unpolled.is_empty() {
         out.push_str(&format!(
             "; demand not polled for [{}] (the source is configured without params and has never reported): counted as no demand",
@@ -509,11 +526,20 @@ mod tests {
         let c = |n: &str| vec![sched_model::ClassId::from(n)];
         let gap = |u: &[&str], s: &[&str], p: &[&str]| DemandGaps {
             unknown: u.iter().map(|n| (*n).into()).collect(),
+            offline: vec![],
             unsupported: s.iter().map(|n| (*n).into()).collect(),
             unpolled: p.iter().map(|n| (*n).into()).collect(),
         };
         let _ = c;
         assert_eq!(kinds(&[], &DemandGaps::default(), false), vec![KIND_IDLE]);
+        let offline = DemandGaps {
+            offline: vec!["a".into()],
+            ..DemandGaps::default()
+        };
+        assert_eq!(
+            kinds(&[], &offline, false),
+            vec![KIND_DEMAND_OFFLINE, KIND_IDLE]
+        );
         assert_eq!(
             kinds(&[], &gap(&["a"], &[], &[]), false),
             vec![KIND_DEMAND_UNKNOWN]

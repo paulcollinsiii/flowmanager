@@ -20,8 +20,13 @@ pub struct ClassWork {
     pub failed: u64,
     pub oldest_ready_at: Option<Millis>,
     /// False when the class has demand but its observation is missing or older than
-    /// `queue_reading_stale_after`. Unknown work must be assumed possibly in flight.
+    /// `queue_reading_stale_after`, while every host it requires may be up. Unknown work must
+    /// be assumed possibly in flight.
     pub known: bool,
+    /// The observation is missing or stale but a host the class requires is freshly seen down:
+    /// known to have no work. Derived on every read, never stored; only reports tell it apart
+    /// from an empty queue.
+    pub offline: bool,
 }
 
 impl ClassWork {
@@ -31,6 +36,7 @@ impl ClassWork {
         failed: 0,
         oldest_ready_at: None,
         known: true,
+        offline: false,
     };
 
     /// Ready or in-flight work is known to exist.
@@ -53,7 +59,8 @@ impl ClassWork {
 }
 
 /// The current work of `class`. Classes without a demand source never have work, nor do
-/// classes whose source is listed in `Snapshot::unobservable` and has not reported.
+/// classes whose source is listed in `Snapshot::unobservable` and has not reported, nor
+/// offline ones (see [`ClassWork::offline`]).
 pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> ClassWork {
     let Some(demand) = &class.demand else {
         return ClassWork::NONE;
@@ -65,9 +72,24 @@ pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> Cl
     // item), so snapshot order never matters. A newest observation that is stale or
     // future-dated makes the class's demand unknown.
     let group = snapshot.demand_group(&demand.source, &class.id);
-    let unknown = ClassWork {
-        known: false,
-        ..ClassWork::NONE
+    // No usable reading. With a host the class requires freshly seen down its work cannot run
+    // and its source has good reason to be silent, so it is offline; otherwise it is unknown.
+    // A fresh reading always wins, offline or not: in-flight work it reports is still waited for.
+    let max_age = config.policy().host_reading_stale_after;
+    let unknown = if class
+        .requires
+        .iter()
+        .any(|r| snapshot.fresh_resource_up(config, &r.resource, max_age) == Some(false))
+    {
+        ClassWork {
+            offline: true,
+            ..ClassWork::NONE
+        }
+    } else {
+        ClassWork {
+            known: false,
+            ..ClassWork::NONE
+        }
     };
     let Some(first) = group.first() else {
         // A source that can never report and never has: no demand can ever arrive, so
@@ -168,6 +190,57 @@ mod tests {
         assert_eq!(w.oldest_age(Millis(1_000_000)), Millis::ZERO);
         let w = class_work(&config, &snap(0), class);
         assert!(!w.wanted());
+    }
+
+    #[test]
+    fn no_reading_is_offline_only_while_a_required_host_is_freshly_seen_down() {
+        let config = example_config();
+        let class = config.class(&"paperless-ocr".into()).unwrap();
+        let now = 1_000_000;
+        let nfs = |up: bool, at: u64| Observation {
+            source: "cluster-pods".into(),
+            observed_at: Millis(at),
+            fidelity: Fidelity::Event,
+            value: ObservedValue::ResourceUp {
+                resource: "basestar-nfs".into(),
+                up,
+            },
+        };
+        let work = |observations: Vec<Observation>| {
+            let snap = Snapshot {
+                now: Millis(now),
+                observations,
+                ..Snapshot::default()
+            };
+            class_work(&config, &snap, class)
+        };
+        let w = work(vec![nfs(false, now)]);
+        assert!(w.offline && w.known && !w.busy(), "fresh down: {w:?}");
+        for (name, obs) in [
+            ("no host reading", vec![]),
+            ("host up", vec![nfs(true, now)]),
+            ("stale down", vec![nfs(false, 1)]),
+        ] {
+            let w = work(obs);
+            assert!(!w.offline && !w.known, "{name}: {w:?}");
+        }
+        // A fresh demand reading wins: reported work counts with the host down.
+        let w = work(vec![
+            nfs(false, now),
+            Observation {
+                source: "paperless-ocr-pending".into(),
+                observed_at: Millis(now),
+                fidelity: Fidelity::Polled,
+                value: ObservedValue::Demand {
+                    class: "paperless-ocr".into(),
+                    ready: 0,
+                    in_flight: 2,
+                    failed: 0,
+                    oldest_ready_at: None,
+                },
+            },
+        ]);
+        assert!(!w.offline && w.known && w.in_flight == 2, "{w:?}");
     }
 
     #[test]

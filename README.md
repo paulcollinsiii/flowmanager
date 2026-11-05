@@ -88,7 +88,8 @@ How a model is chosen and kept:
   one starts its clock again. The one unbounded wait is a class with preemptibility `none`
   that has work (an interactive session): the switch is not even started, with no timeout,
   and the wait reason is `not_preemptible`. (A demand source that has gone silent also
-  holds a switch, as `stale_demand`, until it reports or is removed.)
+  holds a switch, as `stale_demand`, until it reports or is removed, unless a host its class
+  requires is seen down: the class is then offline and holds nothing.)
 - **When the bound does not hold.** The bound above assumes the planner's intent stays
   away from the serving model for the whole wind-down. If the intent flickers back to it,
   the wind-down is dropped (the serving mode returns to "no wind-down") and a later one
@@ -199,7 +200,8 @@ What is carried out and what is not:
   by the `llm-sessions` session source, kept the LLM loaded forever). Such classes are
   still listed apart in the tick (`unsupported_demand`, `unpolled_demand`) and its kinds
   (`demand_unsupported`, `demand_unpolled`). A source that has reported before (in any
-  process; the set is persisted) and then goes silent stays unknown: busy, not idle.
+  process; the set is persisted) and then goes silent stays unknown: busy, not idle, unless
+  a host its class requires is seen down (offline: no demand).
 - Every observer is read-only.
 
 Run it locally against a Restate server:
@@ -605,6 +607,7 @@ journaled makes Restate run the step once more, and both calls are harmless to r
   `lockout_timeout` under a lockout), or nothing when the shutdown is `immediate`. A graceful
   one ends its wait when none of the classes that need the host has work in flight, or at
   `drain_timeout` from the request, whichever is first; until then the step is `wait ... draining`.
+  An offline class (below) has no work to wait for.
 - **Vetoing.** Before any power-off a fresh reading must show nothing still uses the host
   (below). Bounded by `veto_timeout`.
 - **ShuttingDown.** The power-off was requested; the host is followed from its reachability
@@ -1135,13 +1138,16 @@ Notes:
   resource is in the failed power phase), `pinned` (a
   manual model lease pins a model; such a tick is never `idle`, even with no step), and
   `demand_unknown` (something should be reporting the demand, an observer runs or the source
-  has reported before, and it is silent or stale), `demand_unsupported` (the source kind has
+  has reported before, and it is silent or stale with no host of its class seen down),
+  `demand_offline` (the same silence with such a host seen down), `demand_unsupported` (the source kind has
   no observer in this build, e.g. session sources, and nothing has ever pushed
   to it) and `demand_unpolled` (an observable kind configured without `params`: nothing polls
   it and nothing has pushed to it). `sched_source_has_observer{source}` is 0 for the last two.
   `demand_unknown` means "not idle"; `demand_unsupported` and `demand_unpolled` count as no
-  demand (see above) and can appear together with `idle`. A source that has reported once
-  and then goes quiet is always `demand_unknown`, also after a restart. The counter was called
+  demand (see above) and can appear together with `idle`, as can `demand_offline` (no usable
+  reading while a host the class requires is seen down). A source that has reported once and
+  then goes quiet with its hosts not seen down is always `demand_unknown`, also after a restart.
+  The counter was called
   `sched_decisions_total` in the first cut; dashboards on the old name need updating.
 - **Bounding `http_json` by age**: a request may carry `since: { param, ago }`; each poll
   appends `param=<now - ago>` (ISO 8601 UTC, from the scheduler's clock). The example config
@@ -1176,6 +1182,11 @@ Notes:
 - **Unknown is not idle**: if a class's demand source should be reporting (an observer runs
   for it, or it has reported before) and is silent or stale, the tick is `demand_unknown`
   (listed in `unknown_demand`), never `idle`.
+- **Offline is not unknown**: the same silence while a fresh reading shows a host the class
+  requires is down is `demand_offline` (listed in `offline_demand`, and `offline` in the queue
+  report). The work cannot run, so the class has no demand: with basestar off, the classes that
+  need basestar hold neither a model nor cuda-central. A stale host reading is unknown, and a
+  fresh demand reading always counts.
 
 ## Known blind spots
 

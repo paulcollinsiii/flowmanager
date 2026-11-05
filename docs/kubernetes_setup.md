@@ -932,7 +932,8 @@ and the code reads no other secret:
 A missing or empty variable is not a start-up error: the affected source reports an error
 at each poll (`environment variable X is not set`), counted in
 `sched_source_errors_total`, and its demand reads as unknown (busy, never idle) until it
-is fixed. Check the three after deploying. The scheduler's own settings are the `SCHED_*`
+is fixed, or as offline (no demand) while a host its class requires is down. Check the three
+after deploying. The scheduler's own settings are the `SCHED_*`
 variables of section 1. In the manifests, take each token from a `Secret` (SOPS-encrypted
 in git, decrypted by Flux) with `secretKeyRef`, or mount it as a file and use `file:`.
 
@@ -1169,7 +1170,7 @@ event):
 
 - `sched_tick_decisions_total{kind}`: ticks by decision kind (`allow_model`, `withdraw_model`,
   `pause_intake`, `power_on`, `power_off`, `kill_in_flight`, `run_recovery`, `wait`, `idle`,
-  `error`, `pinned`, `shutdown_stopped`, `power_failed`, `demand_unknown`, `demand_unsupported`, `demand_unpolled`).
+  `error`, `pinned`, `shutdown_stopped`, `power_failed`, `demand_unknown`, `demand_offline`, `demand_unsupported`, `demand_unpolled`).
 - `sched_persisted_state_errors_total{key}`: a tick or lease request could not read a
   persisted document (`scheduler_state`, `lease_book`).
 - `sched_resource_phase_age_seconds{resource,axis,phase}`: age of the current power phase

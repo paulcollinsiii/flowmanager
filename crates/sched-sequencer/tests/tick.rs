@@ -865,6 +865,118 @@ fn forced_switches_give_in_flight_work_its_timeout() {
     );
 }
 
+/// Mineru serving past `min_dwell` with the OCR class's demand unknown and the NFS host, which
+/// that class also requires, read as `nfs_up`, `nfs_age` ms ago.
+fn ocr_unknown_with_nfs(nfs_up: bool, nfs_age: u64) -> Case {
+    Case::new()
+        .gpu(&serving("mineru", 10 * MIN))
+        .obs(pods("mineru", 1, 1, 0))
+        .drop_obs("class: paperless-ocr,")
+        .obs(up(N, nfs_up, nfs_age))
+}
+
+#[test]
+fn an_offline_class_does_not_hold_a_forced_wind_down() {
+    let d = ocr_unknown_with_nfs(false, 0).target(None).forced().run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), withdraw("mineru")],
+        "nothing to wait for, and nothing stopped",
+    );
+    let d = ocr_unknown_with_nfs(false, 0).lockout().run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), withdraw("mineru")],
+        "under a lockout",
+    );
+}
+
+#[test]
+fn a_wind_down_still_waits_for_what_a_down_host_does_not_explain() {
+    // The other host is up: unknown may be running.
+    let d = ocr_unknown_with_nfs(true, 0).target(None).forced().run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), wait(G, WaitReason::StaleDemand)],
+        "host up",
+    );
+    // A stale "down" (host_reading_stale_after is 30s in the example) is not a reading.
+    let d = ocr_unknown_with_nfs(false, 10 * MIN)
+        .target(None)
+        .forced()
+        .run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), wait(G, WaitReason::StaleDemand)],
+        "stale reading",
+    );
+    // A fresh reading of in-flight work counts whatever the other host reads.
+    let d = ocr_unknown_with_nfs(false, 0)
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 0, 1, 0))
+        .target(None)
+        .forced()
+        .run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), wait(G, WaitReason::InFlightWork)],
+        "known in flight",
+    );
+    // A down host the class does not require explains nothing: interactive-llm needs only
+    // the GPU host.
+    let d = Case::new()
+        .gpu(&serving("llm", 10 * MIN))
+        .obs(pods("llm", 1, 1, 0))
+        .drop_obs("class: interactive-llm,")
+        .obs(up(N, false, 0))
+        .target(None)
+        .forced()
+        .run();
+    assert!(
+        d.steps.iter().any(|s| matches!(
+            s,
+            Step::Wait {
+                reason: WaitReason::StaleDemand,
+                ..
+            }
+        )),
+        "{:?}",
+        d.steps
+    );
+}
+
+#[test]
+fn an_offline_class_holds_neither_an_unforced_switch_nor_an_idle_shutdown() {
+    let d = ocr_unknown_with_nfs(false, 0).target(None).run();
+    assert_steps(
+        &d,
+        vec![pause("paperless-ocr"), withdraw("mineru")],
+        "unforced",
+    );
+    let idle_gpu = |nfs_up: bool| {
+        Case::new()
+            .drop_obs("class: paperless-ocr,")
+            .obs(up(N, nfs_up, 0))
+            .gpu_state(&format!(
+                "{{ power: {}, mode: {}, idle_since: {} }}",
+                on_ours(),
+                mode_idle(),
+                T - 60 * MIN
+            ))
+            .run()
+    };
+    assert_steps(
+        &idle_gpu(false),
+        vec![Step::PowerOff { resource: rid(G) }],
+        "offline",
+    );
+    // With the other host up the same silence is a real unknown: it still holds.
+    assert_steps(
+        &idle_gpu(true),
+        vec![wait(G, WaitReason::StaleDemand)],
+        "unknown",
+    );
+}
+
 #[test]
 fn lockout_uses_lockout_timeout_and_class_kill_timeout() {
     // A class-level kill_timeout shortens the wait for that class.
@@ -3147,6 +3259,18 @@ fn a_graceful_drain_scales_down_as_soon_as_nothing_is_in_flight() {
         .run();
     assert_steps(&unknown, vec![wait(N, WaitReason::Draining)], "unknown");
     assert!(gate_allowed(&unknown));
+    // Unless the GPU host, which that class also requires, reads down: as on an exclusive host.
+    let gpu_down = Case::new()
+        .drop_obs("class: paperless-ocr,")
+        .obs(up(G, false, 0))
+        .nfs_state(&nfs_draining("graceful", MIN))
+        .run();
+    assert_steps(
+        &gpu_down,
+        vec![Step::PowerOff { resource: rid(N) }],
+        "unknown, other host down",
+    );
+    assert!(!gate_allowed(&gpu_down));
 }
 
 #[test]

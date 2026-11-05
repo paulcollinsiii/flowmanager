@@ -95,7 +95,8 @@ fn wake_body(interface: &str, mac: MacAddr) -> Value {
 }
 
 /// Any non-2xx is a failure. The body is also checked when it carries a `status` that is
-/// not "ok", since a rejected wake may still come back as HTTP 200.
+/// not "ok" in any case (the router answers `{"status":"OK"}`), since a rejected wake may
+/// still come back as HTTP 200.
 fn check_response(status: u16, body: &str) -> Result<(), String> {
     let shown: String = body.chars().take(200).collect();
     if !(200..300).contains(&status) {
@@ -103,7 +104,7 @@ fn check_response(status: u16, body: &str) -> Result<(), String> {
     }
     if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(body)
         && let Some(Value::String(s)) = fields.get("status")
-        && s != "ok"
+        && !s.eq_ignore_ascii_case("ok")
     {
         return Err(format!("opnsense reported status {s:?}: {shown}"));
     }
@@ -175,10 +176,13 @@ mod tests {
     #[test]
     fn response_checks() {
         assert!(check_response(200, r#"{"status":"ok"}"#).is_ok());
+        assert!(check_response(200, r#"{"status":"OK"}"#).is_ok());
         assert!(check_response(200, "").is_ok());
         assert!(check_response(200, "<html>").is_ok());
         assert!(check_response(200, r#"{"status":"failed"}"#).is_err());
+        assert!(check_response(200, r#"{"status":"FAILED"}"#).is_err());
         assert!(check_response(401, r#"{"status":401}"#).is_err());
+        assert!(check_response(500, r#"{"status":"OK"}"#).is_err());
         assert!(check_response(500, "").is_err());
     }
 
@@ -197,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn wake_posts_with_basic_auth_read_from_the_file_on_every_call() {
         let server = TestServer::start().await;
-        server.set("/api/wol/wol/set", Reply::json(r#"{"status":"ok"}"#));
+        server.set("/api/wol/wol/set", Reply::json(r#"{"status":"OK"}"#));
         let url = server.url("/api/wol/wol/set");
         let creds = scratch("creds-ok", "the-key:the-secret\n");
         let http = client(None).unwrap();

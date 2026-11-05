@@ -121,6 +121,10 @@ pub struct QueueReport {
     pub oldest_ready_age_ms: Option<u64>,
     /// False when the reading is missing or stale (the counts are then zero, not measured).
     pub known: bool,
+    /// The reading is missing or stale but a host the class requires is down: no work is
+    /// possible, so `known` stays true.
+    #[serde(default)]
+    pub offline: bool,
 }
 
 /// What a tick decided, for logs and for the `last_decision` handler.
@@ -130,9 +134,14 @@ pub struct TickReport {
     pub at: Millis,
     /// Classes whose demand is unknown although something should be reporting it: an
     /// observer runs for the source, or the source has reported before (in this process or
-    /// an earlier one), and it is silent or stale. A real problem. Unknown is not zero:
-    /// such a tick is never `idle`.
+    /// an earlier one), and it is silent or stale with no host the class requires seen down
+    /// (that is `offline_demand`). A real problem. Unknown is not zero: such a tick is never
+    /// `idle`.
     pub unknown_demand: Vec<ClassId>,
+    /// Classes with no usable reading while a host they require is seen down: their work
+    /// cannot run and their source is expected to be silent. Counted as no demand.
+    #[serde(default)]
+    pub offline_demand: Vec<ClassId>,
     /// Classes whose demand cannot be observed because this build has no observer for their
     /// source kind (schedule, session, ...) and the source has never reported. Nothing can
     /// push to it either (`observe` is ingress-private), so such a class counts as having
@@ -424,6 +433,7 @@ impl Shared {
             config_generation: self.config.current().generation(),
             at: now,
             unknown_demand: vec![],
+            offline_demand: vec![],
             unsupported_demand: vec![],
             unpolled_demand: vec![],
             forced: vec![],
@@ -639,12 +649,15 @@ impl Shared {
                     .oldest_ready_at
                     .map(|at| now.saturating_sub(at).as_u64()),
                 known: work.known,
+                offline: work.offline,
             });
             if snapshot.unobservable.contains(&d.source) {
                 match config.source(&d.source).map(observer_state) {
                     Some(ObserverState::NoParams) => gaps.unpolled.push(c.id.clone()),
                     _ => gaps.unsupported.push(c.id.clone()),
                 }
+            } else if work.offline {
+                gaps.offline.push(c.id.clone());
             } else if !work.known {
                 gaps.unknown.push(c.id.clone());
             }
@@ -734,6 +747,7 @@ impl Shared {
             config_generation: config.generation(),
             at: now,
             unknown_demand: gaps.unknown,
+            offline_demand: gaps.offline,
             unsupported_demand: gaps.unsupported,
             unpolled_demand: gaps.unpolled,
             forced,
@@ -988,6 +1002,7 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
         replayed,
         input_changed = r.input_changed,
         unknown_demand = ?ids(&r.unknown_demand),
+        offline_demand = ?ids(&r.offline_demand),
         unsupported_demand = ?ids(&r.unsupported_demand),
         unpolled_demand = ?ids(&r.unpolled_demand),
         drains = ?r
@@ -1029,6 +1044,7 @@ fn log_tick(r: &TickReport, inputs: &str, replayed: bool) {
                 failed = q.failed,
                 oldest_ready_age_ms = ?q.oldest_ready_age_ms,
                 known = q.known,
+                offline = q.offline,
                 at_ms = r.at.as_u64(),
                 "queue {}: {} ready, {} in flight, {} failed",
                 q.class,

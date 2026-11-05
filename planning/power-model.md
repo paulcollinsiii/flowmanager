@@ -50,6 +50,7 @@ What wants a host up has not changed (`intent.power_up`, planner `fifo.rs`): a `
 - **Withdrawing**: the host's consumers leave the allowed set. On an exclusive host this
   *is* the mode wind-down; on a shared host it is scaling the classes that need it down.
   It has one bound: graceful = wait for in-flight work up to the timeout, immediate = at once.
+  Unknown demand counts as in flight. *Offline* demand is not unknown: see 2.1c.
 - **Vetoing**: a fresh reading must show nothing still uses the host: mounting pods for an
   NFS host, the models' pods for a GPU host. Unknown counts as "in use". Bounded; on expiry
   flowmanager stops and alerts (today's `mounts_timeout` behaviour, generalised).
@@ -76,6 +77,22 @@ lease; the same host with a manual lease taken mid-job stays up; a host found ru
 a job holds it is adopted and stays up after the job (D6). They exist since 4b, end to end
 through the `Scheduler` tick with the real job machine
 (`crates/sched-service/src/jobs/scenarios/ownership.rs`).
+
+### 2.1c Offline demand
+
+A class with a demand source but no usable reading is one of two things, decided afresh by
+`class_work` on every read and never stored:
+
+- **Offline**: a fresh reading shows a host the class requires is down. Its work cannot run and
+  its source has good reason to be silent, so it has no work: it holds no model and no host,
+  on any path, forced or not, and nothing is stopped for it. It is listed apart
+  (`offline_demand`, `demand_offline`) and does not prevent `idle`.
+- **Unknown**: otherwise, including when the host reading itself is missing or stale. Unknown
+  is not zero: it holds a model and a host, as before.
+
+A fresh demand reading always wins over both, so in-flight or queued work a source reports is
+counted with the host down. Queued work a source reports while the class's host is down
+therefore still holds a model and a host.
 
 ### 2.2 State as types, not flags
 
