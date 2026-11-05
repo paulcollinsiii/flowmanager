@@ -30,6 +30,36 @@ This is not ceremony: it repeatedly caught work reported as complete and passing
 that was in fact broken — hooks reported green while failing, and a check
 reported as "no issues" that could not execute at all in the image it runs in.
 
+**Reviewers also check fit to the model, not only the phase's criteria.** Some
+areas have an agreed model document (host power: `planning/power-model.md`
+sections 2–3; overall design and the invariant list: `planning/architecture.md`).
+The Orchestrator includes the relevant one in every Reviewer dispatch. The
+Reviewer reports a model-fit section with a verdict for each item below (found /
+none found), so an empty section cannot be mistaken for a skipped one:
+
+- state, a flag, a concept or a special case that the model document does not
+  describe;
+- shared and exclusive resources handled differently where the model says they
+  behave the same;
+- decision logic outside the pure crates (planner, sequencer), or HTTP or
+  Restate glue that decides policy;
+- every "current" / "target" / "enforced" marker in changed docs, checked
+  against the code;
+- the model document, the invariant list or its mapping out of step with the
+  code (enumerate every `out.push` in `crates/sched-service/src/invariants.rs`
+  rather than trusting a count).
+
+Known deviations the model already records as current behaviour, still to be
+fixed by a later phase, are not findings. New code or text must not add to them.
+A phase that passes its criteria but does not fit the model is not accepted
+until the code or the model document changes, and changing the model is the
+user's decision.
+
+**Why:** five power features were each accepted against their own criteria and
+together drifted from any single design: six coupled state flags, two records of
+host ownership, and different shutdown verbs for shared and exclusive hosts
+(architecture review, Oct 30, 2026).
+
 ## Verify before asserting
 
 Prefer running a command over reasoning about what a file probably says. Claims
