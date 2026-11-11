@@ -3,7 +3,8 @@
 Status: **proposal, nothing built; decisions agreed with the user 2026-11-11.** It replaces
 the first draft of this file, which treated a person's request as demand. Facts marked
 *(read)* were checked by reading the code, not by running it. The model-document changes in
-section 8 still need the user's approval in the form they are finally written.
+section 8 were approved by the user on 2026-11-11 and are written into `architecture.md`
+(switched class, invariants 3, 10, 21) and `power-model.md` 2.1c, marked *target* until built.
 
 ## 1. Problem
 

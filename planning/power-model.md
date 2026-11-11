@@ -83,7 +83,9 @@ through the `Scheduler` tick with the real job machine
 A class with a demand source but no usable reading is one of two things, decided afresh by
 `class_work` on every read and never stored:
 
-- **Offline**: a fresh reading shows a host the class requires is down. Its work cannot run and
+- **Offline**: a fresh reading shows a host the class requires is down, or (*target, switched
+  apps phase 3*) the class's demand source `reads_from` a switched class that is off, with
+  any graceful wait over (`architecture.md` invariant 21). Its work cannot run and
   its source has good reason to be silent, so it has no work: it holds no model and no host,
   on any path, forced or not, and nothing is stopped for it. It is listed apart
   (`offline_demand`, `demand_offline`) and does not prevent `idle`.
@@ -93,6 +95,11 @@ A class with a demand source but no usable reading is one of two things, decided
 A fresh demand reading always wins over both, so in-flight or queued work a source reports is
 counted with the host down. Queued work a source reports while the class's host is down
 therefore still holds a model and a host.
+
+A switch-off is the exception: a fresh demand reading does **not** win over it. A person
+turned the app off, and the graceful wait (invariant 21) is how its in-flight work is
+honoured. Which switched classes are off is decided by one pure function in `sched-model`,
+next to `class_work`, so the planner and the sequencer cannot disagree.
 
 ### 2.2 State as types, not flags
 
