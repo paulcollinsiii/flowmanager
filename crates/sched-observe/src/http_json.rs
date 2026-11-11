@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sched_model::{
-    AuthSpec, ClassId, CountsAs, ElementFilter, Fidelity, FilterValue, HttpJsonParams, Millis,
-    ObservedValue, RequestSpec, ResponseCondition, SinceSpec, SourceSpec,
+    AuthSpec, Capability, ClassId, CountsAs, ElementFilter, Fidelity, FilterValue, HttpJsonParams,
+    MapValue, Millis, ObservedValue, RequestSpec, ResponseCondition, SinceSpec, SourceSpec,
+    SwitchState, ValueMap,
 };
 use serde_json::Value;
 
@@ -80,6 +81,15 @@ pub enum ExtractError {
     Missing(String),
     NotANumber(String),
     NotAnArray(String),
+    /// With a `map`: the value is not a string or a boolean, so the map cannot match it.
+    NotMappable(String),
+    /// With a `map`: the value's text is not in it.
+    Unmapped {
+        path: String,
+        value: String,
+    },
+    /// A switch request's map yields a number, not a switch state.
+    NotASwitchState(String),
     /// The array is as long as the page can be, so items may be missing.
     AtLimit(u64),
     /// The `where` field is in none of the (non-empty) array's items, so the filter would
@@ -103,6 +113,19 @@ impl std::fmt::Display for ExtractError {
                 write!(f, "value at {p:?} is not a non-negative whole number")
             }
             ExtractError::NotAnArray(p) => write!(f, "value at {p:?} is not an array"),
+            ExtractError::NotMappable(p) => write!(
+                f,
+                "value at {p:?} is not a string or a boolean, so the map cannot match it"
+            ),
+            ExtractError::Unmapped { path, value } => {
+                write!(f, "value {value:?} at {path:?} is not in the map")
+            }
+            ExtractError::NotASwitchState(p) => {
+                write!(
+                    f,
+                    "the map entry for the value at {p:?} is not a switch state"
+                )
+            }
             ExtractError::FilterFieldMissing(field) => write!(
                 f,
                 "the where field {field:?} is missing from every item, so the filter would count nothing; check the field name against the API"
@@ -199,16 +222,77 @@ pub fn request_numbers(
     }
     let mut out = vec![(req.counts_as, extract(doc, req)?)];
     for e in &req.also {
-        out.push((e.counts_as, extract_number(doc, &e.count)?));
+        out.push((e.counts_as, extract_count(doc, &e.count, e.map.as_ref())?));
     }
     Ok(out)
+}
+
+/// The text a [`ValueMap`] looks a value up by: a JSON string's content, or `true` /
+/// `false` for a boolean. Any other JSON type (a number, `null`, an array, an object) has
+/// none, so a map cannot match it.
+fn map_key(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// The entry of `map` for the value at `ptr`. A missing value, one of a type a map cannot
+/// match, or one not in the map is an error, never a default.
+fn mapped<'a>(doc: &Value, ptr: &str, map: &'a ValueMap) -> Result<&'a MapValue, ExtractError> {
+    let v = doc
+        .pointer(ptr)
+        .ok_or_else(|| ExtractError::Missing(ptr.to_string()))?;
+    let key = map_key(v).ok_or_else(|| ExtractError::NotMappable(ptr.to_string()))?;
+    map.get(&key).ok_or_else(|| ExtractError::Unmapped {
+        path: ptr.to_string(),
+        value: key.chars().take(MAX_ECHOED_VALUE).collect(),
+    })
+}
+
+/// Longest part of an unmapped response value that is put into an error.
+const MAX_ECHOED_VALUE: usize = 64;
+
+/// The number at `ptr`: with a `map`, the mapped value of the text found there; without,
+/// a non-negative whole number as [`extract_number`] reads it.
+pub fn extract_count(doc: &Value, ptr: &str, map: Option<&ValueMap>) -> Result<u64, ExtractError> {
+    match map {
+        None => extract_number(doc, ptr),
+        Some(m) => match mapped(doc, ptr, m)? {
+            MapValue::Number(n) => Ok(*n),
+            MapValue::Switch(_) => Err(ExtractError::NotANumber(ptr.to_string())),
+        },
+    }
+}
+
+/// The switch state a switch request's `value` and `map` read from the response.
+pub fn extract_switch(doc: &Value, req: &RequestSpec) -> Result<SwitchState, ExtractError> {
+    let (Some(ptr), Some(map)) = (&req.value, &req.map) else {
+        return Err(ExtractError::Missing("value".to_string()));
+    };
+    match mapped(doc, ptr, map)? {
+        MapValue::Switch(s) => Ok(*s),
+        MapValue::Number(_) => Err(ExtractError::NotASwitchState(ptr.to_string())),
+    }
+}
+
+/// One switch observation per class that takes its switch from this source.
+pub fn switch_values(classes: &[ClassId], state: SwitchState) -> Vec<ObservedValue> {
+    classes
+        .iter()
+        .map(|class| ObservedValue::Switch {
+            class: class.clone(),
+            state,
+        })
+        .collect()
 }
 
 /// The number one request contributes: the value at `count`, or the number of elements of
 /// the array at `length` that pass `where`.
 pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
     if let Some(ptr) = &req.count {
-        return extract_number(doc, ptr);
+        return extract_count(doc, ptr, req.map.as_ref());
     }
     let ptr = req.length.as_deref().unwrap_or("");
     let items = doc
@@ -495,6 +579,24 @@ pub async fn poll_at(
         },
         None => None,
     };
+    if spec.observe.contains(&Capability::Switch) {
+        // A switch source has exactly one request (validated); anything else is a failure.
+        let [req] = params.requests.as_slice() else {
+            return fail("a switch source needs exactly one request".to_string());
+        };
+        let doc = match fetch(client, req, auth.as_ref(), max_body, now).await {
+            Ok(d) => d,
+            Err(e) => return fail(format!("request 0 ({}): {e}", redact_url(&req.url))),
+        };
+        return match extract_switch(&doc, req) {
+            Ok(state) => Report::Observed {
+                source: spec.id.clone(),
+                fidelity: Fidelity::Polled,
+                values: switch_values(classes, state),
+            },
+            Err(e) => fail(format!("request 0 ({}): {e}", redact_url(&req.url))),
+        };
+    }
     let mut parts = Vec::with_capacity(params.requests.len());
     for (i, req) in params.requests.iter().enumerate() {
         let doc = match fetch(client, req, auth.as_ref(), max_body, now).await {
@@ -573,6 +675,8 @@ mod tests {
         RequestSpec {
             url: "http://x".into(),
             count: count.map(Into::into),
+            value: None,
+            map: None,
             length: length.map(Into::into),
             filter,
             counts_as: CountsAs::Ready,
@@ -1396,6 +1500,7 @@ mod tests {
         let mut r = req(Some("/a"), None, None);
         r.also = vec![sched_model::ExtraCount {
             count: "/b".into(),
+            map: None,
             counts_as: CountsAs::InFlight,
         }];
         r.when = Some(sched_model::ResponseCondition {
@@ -1571,5 +1676,213 @@ mod tests {
             demand(&poll_now(&client, &spec, &params, &classes, &env).await),
             (6, 5)
         );
+    }
+
+    fn map_of(yaml: &str) -> ValueMap {
+        serde_json::from_str(yaml).unwrap()
+    }
+
+    /// A switch request reading `/state` through the example's map.
+    fn switch_req() -> RequestSpec {
+        let mut r = req(None, None, None);
+        r.value = Some("/state".into());
+        r.map = Some(map_of(
+            r#"{ "on": "on", "off": "off", "off-now": "off_now", "true": "on" }"#,
+        ));
+        r
+    }
+
+    #[test]
+    fn a_switch_value_is_looked_up_by_its_text() {
+        let r = switch_req();
+        let state = |text: &str| extract_switch(&doc(text), &r);
+        assert_eq!(state(r#"{"state": "on"}"#), Ok(SwitchState::On));
+        assert_eq!(state(r#"{"state": "off"}"#), Ok(SwitchState::Off));
+        assert_eq!(state(r#"{"state": "off-now"}"#), Ok(SwitchState::OffNow));
+        // A boolean is looked up as `true` / `false`.
+        assert_eq!(state(r#"{"state": true}"#), Ok(SwitchState::On));
+        // `false` is not in this map: failing, never defaulting.
+        assert_eq!(
+            state(r#"{"state": false}"#),
+            Err(ExtractError::Unmapped {
+                path: "/state".into(),
+                value: "false".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_unmapped_missing_or_unmappable_switch_value_is_an_error() {
+        let r = switch_req();
+        let state = |text: &str| extract_switch(&doc(text), &r);
+        assert_eq!(
+            state(r#"{"state": "ON"}"#),
+            Err(ExtractError::Unmapped {
+                path: "/state".into(),
+                value: "ON".into()
+            })
+        );
+        assert_eq!(
+            state(r#"{"other": "on"}"#),
+            Err(ExtractError::Missing("/state".into()))
+        );
+        // The text of a number is not looked up, however it is spelt.
+        for body in [
+            r#"{"state": 1}"#,
+            r#"{"state": null}"#,
+            r#"{"state": ["on"]}"#,
+            r#"{"state": {"v": "on"}}"#,
+        ] {
+            assert_eq!(
+                state(body),
+                Err(ExtractError::NotMappable("/state".into())),
+                "{body}"
+            );
+        }
+        // A long unmapped value is cut in the error.
+        let long = "x".repeat(500);
+        match state(&format!(r#"{{"state": "{long}"}}"#)) {
+            Err(ExtractError::Unmapped { value, .. }) => assert_eq!(value.len(), MAX_ECHOED_VALUE),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_demand_count_may_be_mapped_from_text() {
+        let map = map_of(r#"{ "true": 1, "false": 0, "busy": 7 }"#);
+        let d = doc(r#"{"a": true, "b": false, "c": "busy", "d": "idle", "e": 3, "f": null}"#);
+        assert_eq!(extract_count(&d, "/a", Some(&map)), Ok(1));
+        assert_eq!(extract_count(&d, "/b", Some(&map)), Ok(0));
+        assert_eq!(extract_count(&d, "/c", Some(&map)), Ok(7));
+        assert_eq!(
+            extract_count(&d, "/d", Some(&map)),
+            Err(ExtractError::Unmapped {
+                path: "/d".into(),
+                value: "idle".into()
+            })
+        );
+        assert_eq!(
+            extract_count(&d, "/e", Some(&map)),
+            Err(ExtractError::NotMappable("/e".into()))
+        );
+        assert_eq!(
+            extract_count(&d, "/f", Some(&map)),
+            Err(ExtractError::NotMappable("/f".into()))
+        );
+        assert_eq!(
+            extract_count(&d, "/zz", Some(&map)),
+            Err(ExtractError::Missing("/zz".into()))
+        );
+        // Without a map the number is read as before, and text is not a number.
+        assert_eq!(extract_count(&d, "/e", None), Ok(3));
+        assert_eq!(
+            extract_count(&d, "/c", None),
+            Err(ExtractError::NotANumber("/c".into()))
+        );
+    }
+
+    #[test]
+    fn a_mapped_count_and_a_mapped_also_count_feed_the_totals() {
+        let mut r = req(Some("/running"), None, None);
+        r.map = Some(map_of(r#"{ "true": 1, "false": 0 }"#));
+        r.also = vec![sched_model::ExtraCount {
+            count: "/queue".into(),
+            map: Some(map_of(r#"{ "none": 0, "some": 4 }"#)),
+            counts_as: CountsAs::Ready,
+        }];
+        let d = doc(r#"{"running": true, "queue": "some"}"#);
+        assert_eq!(
+            request_numbers(&d, &r),
+            Ok(vec![(CountsAs::Ready, 1), (CountsAs::Ready, 4)])
+        );
+        let d = doc(r#"{"running": true, "queue": "lots"}"#);
+        assert!(matches!(
+            request_numbers(&d, &r),
+            Err(ExtractError::Unmapped { .. })
+        ));
+    }
+
+    fn ha_env(name: &str) -> Option<String> {
+        (name == "HA_TOKEN").then(|| "ha-token".to_string())
+    }
+
+    const HA_STATE: &str = "/api/states/input_select.app_wikijs";
+
+    fn ha_state(state: &str) -> Reply {
+        Reply::json(&format!(
+            r#"{{"entity_id": "input_select.app_wikijs", "state": "{state}"}}"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_switch_poll_yields_one_switch_value_per_class() {
+        let server = TestServer::start().await;
+        let (spec, params, _) = example_source("ha-wikijs", &server);
+        let classes = [ClassId::from("wikijs"), ClassId::from("other")];
+        let client = reqwest::Client::new();
+        for (text, state) in [
+            ("on", SwitchState::On),
+            ("off", SwitchState::Off),
+            ("off-now", SwitchState::OffNow),
+        ] {
+            server.set(HA_STATE, ha_state(text));
+            match poll_now(&client, &spec, &params, &classes, &ha_env).await {
+                Report::Observed { source, values, .. } => {
+                    assert_eq!(source, spec.id);
+                    assert_eq!(
+                        values,
+                        classes
+                            .iter()
+                            .map(|class| ObservedValue::Switch {
+                                class: class.clone(),
+                                state
+                            })
+                            .collect::<Vec<_>>(),
+                        "{text}"
+                    );
+                }
+                Report::Failed { error, .. } => panic!("{text}: {error}"),
+            }
+        }
+        // One request per poll, with the token.
+        assert_eq!(server.requests().len(), 3);
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|(path, auth)| path == HA_STATE && auth.as_deref() == Some("Bearer ha-token"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_poll_fails_on_an_unmapped_or_unmappable_value() {
+        let server = TestServer::start().await;
+        let (spec, params, _) = example_source("ha-wikijs", &server);
+        let classes = [ClassId::from("wikijs")];
+        let client = reqwest::Client::new();
+        let error = |body: Reply| {
+            server.set(HA_STATE, body);
+            let (client, spec, params, classes) = (&client, &spec, &params, &classes);
+            async move {
+                match poll_now(client, spec, params, classes, &ha_env).await {
+                    Report::Failed { source, error } => {
+                        assert_eq!(&source, &spec.id);
+                        error
+                    }
+                    other => panic!("expected a failure, got {other:?}"),
+                }
+            }
+        };
+        let e = error(ha_state("unavailable")).await;
+        assert!(
+            e.contains("not in the map") && e.contains("request 0"),
+            "{e}"
+        );
+        let e = error(Reply::json(r#"{"state": 1}"#)).await;
+        assert!(e.contains("cannot match"), "{e}");
+        let e = error(Reply::json(r#"{"other": "on"}"#)).await;
+        assert!(e.contains("no value at"), "{e}");
+        let e = error(Reply::status(500)).await;
+        assert!(e.contains("HTTP 500"), "{e}");
     }
 }

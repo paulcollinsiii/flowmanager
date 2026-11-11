@@ -87,6 +87,7 @@ impl InputReport {
                 Some("pods") => Some(Capability::Pods),
                 Some("reachability") => Some(Capability::Reachability),
                 Some("demand") => Some(Capability::Demand),
+                Some("switch") => Some(Capability::Switch),
                 _ => None,
             },
             observer: match self.observer.as_str() {

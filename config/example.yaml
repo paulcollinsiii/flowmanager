@@ -21,6 +21,11 @@ policy:
   # lockout_timeout: 10m
 
 resources:
+  # A shared resource with no `power:` section is always up, with nothing to wake or stop. It
+  # is what a switched class that needs no host of its own requires (see the commented-out
+  # wikijs class below):
+  # - id: blade-runner
+  #   kind: shared
   - id: cuda-central
     kind: exclusive
     power:
@@ -215,6 +220,24 @@ classes:
       - { resource: basestar-nfs }
     priority: 0
     preemptibility: none
+
+  # A switched class: an app a person switches on and off from Home Assistant. It names no
+  # model and has no demand; `switch.source` is a source that observes `switch`. The reading
+  # is `on`, `off` or `off_now` (see the ha-wikijs source). A class that requires only a
+  # resource without a `power:` section (blade-runner, the node the app runs on) has nothing
+  # to wake, so may_change_power stays false. A class has `demand` or `switch`, never both.
+  #
+  # NOT ENFORCED YET: the switch is read and kept, but it does not gate the class (phase 2 of
+  # planning/pending/demand.md). A switched class is allowed while its hosts are up, whatever
+  # the switch says, so enabling this one would put it in the allowed set. It is shown
+  # commented out (with the blade-runner resource) so the shipped example decides as before;
+  # the ha-wikijs source below is live and is read, but no class takes its reading yet.
+  # - id: wikijs
+  #   requires:
+  #     - { resource: blade-runner }
+  #   priority: 0
+  #   preemptibility: kill
+  #   switch: { source: ha-wikijs }
 
 sources:
   - id: cluster-pods
@@ -461,6 +484,27 @@ sources:
     kind: session
     observe: [demand]
     resync: 30s
+
+  # A switch source (http_json only): one request, and it reads one value. `value` is a JSON
+  # pointer to a string or a boolean in the response; `map` turns its text into on, off or
+  # off_now (a boolean's text is `true` / `false`). Anything not in the map, a number, null or
+  # a missing field fails the poll: the reading is then missing, and stale after
+  # policy.queue_reading_stale_after. It must observe `switch` and nothing else. The same
+  # `map` (strings to numbers, e.g. { "true": 1, "false": 0 }) also works on a demand
+  # request's `count` and an `also` entry's `count`.
+  - id: ha-wikijs
+    kind: http_json
+    observe: [switch]
+    resync: 30s
+    params:
+      timeout: 10s
+      auth: { header: Authorization, prefix: "Bearer ", env: HA_TOKEN }
+      requests:
+        - url: http://homeassistant.example.internal:8123/api/states/input_select.app_wikijs
+          value: /state
+          map: { "on": on, "off": off, "off-now": off_now }
+      # `webhook: { path: ... }` works as on any http_json source: a Home Assistant automation
+      # can then ask for a poll on each change instead of waiting for `resync`.
 
 # Scheduled jobs: flowmanager starts a Kubernetes Job from a CronJob on a cron schedule, after
 # taking what the job needs. The CronJob is only the template: keep it `suspend: true` (its

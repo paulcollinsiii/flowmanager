@@ -1167,6 +1167,28 @@ Notes:
   (a path of letters, digits and `-._~/`, starting with `/`, no trailing `/`; unknown keys under
   `webhook` are refused). Without `--webhook-listen` it has no effect and the source is polled at
   its `resync` only.
+- **`http_json` value maps, and the switch reading** (phase 1 of `planning/pending/demand.md`).
+  A request may carry `map: { "<text>": <meaning>, ... }` to turn the text of a response value
+  into something. The value is looked up by its text: a JSON string by its content, a JSON
+  boolean as `true` / `false` (quote the keys in YAML). A value that is missing, not in the map,
+  or of another JSON type (a number, `null`, an array, an object) **fails the poll**: it is
+  never defaulted. Two uses:
+  - **Demand:** `count: /running` with `map: { "true": 1, "false": 0 }` (also on an `also`
+    entry's `count`) reads a text or boolean as a number. The map values must be non-negative
+    whole numbers; without a `map`, `count` is read as before.
+  - **Switch:** a source that declares `observe: [switch]` (http_json only) has exactly one
+    request, with `value: <JSON pointer>` and `map: { "<text>": on | off | off_now }` instead of
+    `count` / `length`, and no other capability. Each poll yields one `switch` reading for every
+    class with `switch: { source: <id> }`. `on`, `off` (graceful) and `off_now` (immediate) are
+    the three states. A class has `demand:` or `switch:`, never both; a switched class names no
+    model on any requirement and requires at least one resource (for an app that needs no host
+    of its own, a shared resource without a `power:` section). The reading is a scheduling input
+    (stale after `policy.queue_reading_stale_after`).
+  **The switch does not gate anything yet.** In this phase the reading is validated, polled,
+  routed to its class and kept (and counted in the input ages as capability `switch`); no
+  planner, sequencer, allowed-set, hold or wake decision reads it, so a switched class behaves
+  as a class with no demand does today: allowed while its hosts are up. Gating on it is phase
+  2. `config/example.yaml` has the `ha-wikijs` switch source and, commented out, the class.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - **Reachability sources for hosts outside the cluster**: `tcp_probe` (params `host`,

@@ -169,6 +169,14 @@ pub struct DemandRef {
     pub source: SourceId,
 }
 
+/// Where a class's switch reading (on, off, off now) is observed. Phase 1: parsed, validated
+/// and routed, but it gates nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchRef {
+    pub source: SourceId,
+}
+
 /// An action to run after in-flight work is killed. The kind lives in code.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,6 +207,10 @@ pub struct ClassSpec {
     /// resource without a model (a gate class).
     #[serde(default)]
     pub demand: Option<DemandRef>,
+    /// A switched class names no model and has this instead of `demand`. The reading is
+    /// observed and kept, and does not yet gate the class.
+    #[serde(default)]
+    pub switch: Option<SwitchRef>,
     #[serde(default)]
     pub recovery: Option<RecoverySpec>,
     /// How long this class's in-flight work may run once a wind-down starts (forced or not).
@@ -231,9 +243,8 @@ impl SourceKind {
             SourceKind::KubernetesWatch => {
                 matches!(capability, Pods | Reachability | Mounts | Jobs)
             }
-            SourceKind::HttpJson | SourceKind::Prometheus => {
-                matches!(capability, Reachability | Demand)
-            }
+            SourceKind::HttpJson => matches!(capability, Reachability | Demand | Switch),
+            SourceKind::Prometheus => matches!(capability, Reachability | Demand),
             SourceKind::TcpProbe => matches!(capability, Reachability),
             SourceKind::Sql | SourceKind::Session => {
                 matches!(capability, Demand)
@@ -267,6 +278,9 @@ pub enum Capability {
     /// from the Kubernetes API. Whether a job is complete, failed or gone; a reading that is
     /// stale or unavailable is never read as "finished".
     Jobs,
+    /// The state of a switched class, set by a person (`switch`): `on`, `off` or `off_now`.
+    /// A scheduling input (held to `queue_reading_stale_after`). Nothing acts on it yet.
+    Switch,
 }
 
 /// A reading the veto before a power-off consults (see `Config::veto_readings`).
@@ -297,6 +311,7 @@ impl std::fmt::Display for Capability {
             Capability::Demand => "demand",
             Capability::Mounts => "mounts",
             Capability::Jobs => "jobs",
+            Capability::Switch => "switch",
         })
     }
 }

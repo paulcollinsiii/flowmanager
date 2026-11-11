@@ -19,7 +19,7 @@ use crate::{ReportTx, http_json, prometheus, tcp_probe};
 #[derive(Debug, Clone, PartialEq)]
 struct Fingerprint {
     spec: SourceSpec,
-    /// Classes taking demand from the source (used by HTTP/JSON only).
+    /// Classes taking demand or a switch reading from the source (used by HTTP/JSON only).
     classes: Vec<ClassId>,
     /// Which workloads make up each model (Kubernetes): the only thing about a model the
     /// pod observer uses, so other model changes (load time and the like) do not restart it.
@@ -164,7 +164,10 @@ fn fingerprint(config: &Config, spec: &SourceSpec) -> Fingerprint {
             config
                 .classes()
                 .iter()
-                .filter(|c| c.demand.as_ref().is_some_and(|d| d.source == spec.id))
+                .filter(|c| {
+                    c.demand.as_ref().is_some_and(|d| d.source == spec.id)
+                        || c.switch.as_ref().is_some_and(|s| s.source == spec.id)
+                })
                 .map(|c| c.id.clone())
                 .collect()
         },
@@ -488,6 +491,28 @@ pub fn spawn_observers(config: &Arc<Config>, tx: &ReportTx) -> Observers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sched_model::test_support::{EXAMPLE_CONFIG, with_switched_class};
+
+    #[test]
+    fn a_source_is_routed_the_classes_that_name_it_by_demand_or_by_switch() {
+        let config = Config::from_yaml(&with_switched_class(EXAMPLE_CONFIG)).unwrap();
+        let fp = |id: &str| fingerprint(&config, config.source(&id.into()).unwrap());
+        assert_eq!(fp("ha-wikijs").classes, [ClassId::from("wikijs")]);
+        assert_eq!(
+            fp("speakr-pending").classes,
+            [ClassId::from("speakr-transcription")]
+        );
+        assert!(
+            fp("immich-queues")
+                .classes
+                .iter()
+                .all(|c| c.as_str() != "wikijs")
+        );
+        // The shipped example has no switched class, so its switch source routes to none.
+        let shipped = Config::from_yaml(EXAMPLE_CONFIG).unwrap();
+        let source = shipped.source(&"ha-wikijs".into()).unwrap();
+        assert!(fingerprint(&shipped, source).classes.is_empty());
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)

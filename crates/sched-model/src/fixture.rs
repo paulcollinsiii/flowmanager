@@ -138,6 +138,7 @@ impl Fixture {
                     format!("resource_mounts:{resource}")
                 }
                 ObservedValue::JobRuns { job, .. } => format!("job_runs:{job}"),
+                ObservedValue::Switch { class, .. } => format!("switch:{class}"),
             };
             if !seen.insert((&o.source, subject.clone())) {
                 add(
@@ -278,6 +279,39 @@ impl Fixture {
                     }
                     if config.job(job).is_none() {
                         add(&at, format!("unknown job {:?}", job.as_str()));
+                    }
+                }
+                ObservedValue::Switch { class, .. } => {
+                    match config.class(class) {
+                        None => add(&at, format!("unknown class {:?}", class.as_str())),
+                        Some(spec) => match &spec.switch {
+                            None => add(
+                                &at,
+                                format!(
+                                    "class {:?} has no switch source, so it cannot have switch observations",
+                                    class.as_str()
+                                ),
+                            ),
+                            Some(s) if s.source != o.source => add(
+                                &at,
+                                format!(
+                                    "class {:?} takes its switch from source {:?}, not {:?}",
+                                    class.as_str(),
+                                    s.source.as_str(),
+                                    o.source.as_str()
+                                ),
+                            ),
+                            Some(_) => {}
+                        },
+                    }
+                    if source.is_some() && !config.source_observes(&o.source, Capability::Switch) {
+                        add(
+                            &at,
+                            format!(
+                                "source {:?} does not declare the switch capability",
+                                o.source.as_str()
+                            ),
+                        );
                     }
                 }
             }

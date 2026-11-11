@@ -514,6 +514,34 @@ fn classes(c: &Config, p: &mut Problems) {
                 Some(_) => {}
             }
         }
+        if let Some(sw) = &k.switch {
+            if k.demand.is_some() {
+                p.add(
+                    format!("{at}.switch"),
+                    "a class has demand or a switch, not both",
+                );
+            }
+            if k.requires.iter().any(|r| r.model.is_some()) {
+                p.add(
+                    format!("{at}.switch"),
+                    "a switched class names no model on any requirement",
+                );
+            }
+            match c.source(&sw.source) {
+                None => p.add(
+                    format!("{at}.switch"),
+                    format!("references unknown source {:?}", sw.source.as_str()),
+                ),
+                Some(s) if !s.observe.contains(&Capability::Switch) => p.add(
+                    format!("{at}.switch"),
+                    format!(
+                        "source {:?} does not declare the switch capability (observe: [switch])",
+                        sw.source.as_str()
+                    ),
+                ),
+                Some(_) => {}
+            }
+        }
         if let Some(t) = k.kill_timeout
             && (t == Millis::ZERO || t > MAX_LEASE_DURATION)
         {
@@ -1103,6 +1131,8 @@ sources:
                 "{kind:?} reachability"
             );
             assert_eq!(kind.can_supply(Demand), demand, "{kind:?} demand");
+            // Only an http_json source can read a switch (it maps a string to a state).
+            assert_eq!(kind.can_supply(Switch), kind == HttpJson, "{kind:?} switch");
         }
     }
 
@@ -1878,5 +1908,228 @@ sources:
         );
         let none = none.split("\n# Scheduled jobs").next().unwrap().to_string();
         assert!(Config::from_yaml(&none).unwrap().jobs().is_empty());
+    }
+
+    // ---- switched classes -------------------------------------------------------------
+
+    const SWITCH_CLASS: &str = "  - id: app\n    requires: [ { resource: nfs } ]\n    priority: 0\n    preemptibility: kill\n    switch: { source: sw }\n";
+    const SWITCH_MAP: &str = "map: { \"on\": on, \"off\": off, \"off-now\": off_now }";
+    const SWITCH_SOURCE: &str = "  - { id: sw, kind: http_json, resync: 30s, observe: [switch], params: { requests: [ { url: 'http://x/s', value: /state, map: { \"on\": on, \"off\": off, \"off-now\": off_now } } ] } }\n";
+
+    /// [`VALID`] with the switched class `app` and its source `sw` added.
+    fn with_switch() -> String {
+        VALID.replace(
+            "\nsources:\n",
+            &format!("\n{SWITCH_CLASS}sources:\n{SWITCH_SOURCE}"),
+        )
+    }
+
+    /// [`with_switch`] with one piece of text replaced.
+    fn switch_with(from: &str, to: &str) -> String {
+        let y = with_switch();
+        assert!(y.contains(from), "{from}");
+        y.replace(from, to)
+    }
+
+    #[test]
+    fn a_switched_class_with_a_switch_source_loads() {
+        let c = Config::from_yaml(&with_switch()).unwrap_or_else(|e| panic!("{e}"));
+        let k = c.class(&"app".into()).unwrap();
+        assert_eq!(k.switch.as_ref().unwrap().source.as_str(), "sw");
+        assert!(k.demand.is_none());
+        assert!(c.source_observes(&"sw".into(), crate::Capability::Switch));
+        // It needs no resource with a power section: a shared resource without one will do.
+        let y = switch_with("resource: nfs } ]", "resource: blade } ]").replace(
+            "resources:\n",
+            "resources:\n  - { id: blade, kind: shared }\n",
+        );
+        assert!(Config::from_yaml(&y).is_ok(), "{:?}", problems(&y));
+    }
+
+    #[test]
+    fn rejects_a_class_with_both_demand_and_switch() {
+        let ps = problems(&switch_with(
+            "    switch: { source: sw }\n",
+            "    switch: { source: sw }\n    demand: { source: s1 }\n",
+        ));
+        assert!(
+            has(
+                &ps,
+                "classes[app].switch: a class has demand or a switch, not both"
+            ),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_switched_class_that_names_a_model_or_requires_nothing() {
+        let ps = problems(&switch_with(
+            "requires: [ { resource: nfs } ]",
+            "requires: [ { resource: gpu, model: m1 } ]",
+        ));
+        assert!(
+            has(&ps, "a switched class names no model on any requirement"),
+            "{ps:?}"
+        );
+        let ps = problems(&switch_with(
+            "requires: [ { resource: nfs } ]",
+            "requires: []",
+        ));
+        assert!(
+            has(&ps, "classes[app]: must require at least one resource"),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_switch_source_that_is_unknown_or_does_not_declare_switch() {
+        let ps = problems(&switch_with(
+            "switch: { source: sw }",
+            "switch: { source: ghost }",
+        ));
+        assert!(
+            has(
+                &ps,
+                "classes[app].switch: references unknown source \"ghost\""
+            ),
+            "{ps:?}"
+        );
+        // A demand source is not a switch source.
+        let ps = problems(&switch_with(
+            "switch: { source: sw }",
+            "switch: { source: s1 }",
+        ));
+        assert!(
+            has(&ps, "source \"s1\" does not declare the switch capability"),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn only_http_json_can_supply_switch() {
+        for kind in [
+            "prometheus",
+            "tcp_probe",
+            "sql",
+            "session",
+            "kubernetes_watch",
+        ] {
+            let ps = problems(&switch_with(
+                "{ id: sw, kind: http_json,",
+                &format!("{{ id: sw, kind: {kind},"),
+            ));
+            assert!(
+                has(&ps, "cannot supply the switch capability"),
+                "{kind}: {ps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_switch_source_that_is_not_one_value_read_through_a_map() {
+        // Another capability beside switch.
+        let ps = problems(&switch_with(
+            "observe: [switch]",
+            "observe: [switch, demand]",
+        ));
+        assert!(
+            has(&ps, "must observe nothing else (it also declares demand)"),
+            "{ps:?}"
+        );
+        // Two requests.
+        let one = format!("{{ url: 'http://x/s', value: /state, {SWITCH_MAP} }}");
+        let two = format!("{{ url: 'http://x/t', value: /state, {SWITCH_MAP} }}");
+        let ps = problems(&switch_with(&one, &format!("{one}, {two}")));
+        assert!(has(&ps, "exactly one request (it has 2)"), "{ps:?}");
+        // No request at all.
+        let ps = problems(&switch_with(&format!("[ {one} ]"), "[]"));
+        assert!(has(&ps, "exactly one request (it has 0)"), "{ps:?}");
+        // A count instead of value and map, and a value without a map.
+        let ps = problems(&switch_with(
+            &format!("value: /state, {SWITCH_MAP}"),
+            "count: /n",
+        ));
+        assert!(has(&ps, "needs value and map"), "{ps:?}");
+        let ps = problems(&switch_with(&format!(", {SWITCH_MAP}"), ""));
+        assert!(has(&ps, "needs value and map"), "{ps:?}");
+        assert!(has(&ps, "value needs a map"), "{ps:?}");
+        // No params at all.
+        let ps = problems(&switch_with(
+            &format!(", params: {{ requests: [ {one} ] }}"),
+            "",
+        ));
+        assert!(has(&ps, "needs params with exactly one request"), "{ps:?}");
+        // Other request options do not combine with value.
+        let ps = problems(&switch_with(
+            "value: /state,",
+            "value: /state, count: /n, when: { field: /a, equals: true },",
+        ));
+        assert!(has(&ps, "takes only url, value and map"), "{ps:?}");
+        // A bad pointer.
+        let ps = problems(&switch_with("value: /state", "value: state"));
+        assert!(has(&ps, "must be empty or start with '/'"), "{ps:?}");
+    }
+
+    #[test]
+    fn value_is_only_for_a_source_that_observes_switch() {
+        let ps = problems(&VALID.replace(
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand], params: { requests: [ { url: 'http://x/s', count: /n, value: /state, map: { \"on\": on } } ] } }",
+        ));
+        assert!(
+            has(&ps, "value is only valid on a source that observes switch"),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn map_values_must_be_switch_states_or_numbers_as_the_request_needs() {
+        // Switch source: a number, an unknown word.
+        let ps = problems(&switch_with("\"on\": on,", "\"on\": 1,"));
+        assert!(
+            has(
+                &ps,
+                "map[\"on\"] must be a switch state (on, off or off_now), not a number"
+            ),
+            "{ps:?}"
+        );
+        for bad in ["maybe", "off-now", "true"] {
+            let ps = problems(&switch_with("\"on\": on,", &format!("\"on\": {bad},")));
+            assert!(has(&ps, "invalid params"), "{bad}: {ps:?}");
+        }
+        let ps = problems(&switch_with(SWITCH_MAP, "map: {}"));
+        assert!(has(&ps, "map must not be empty"), "{ps:?}");
+
+        // Demand source: numbers are fine; a switch state, a negative, a fraction are not.
+        let demand = |map: &str| {
+            VALID.replace(
+                "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+                &format!("{{ id: s1, kind: http_json, resync: 30s, observe: [demand], params: {{ requests: [ {{ url: 'http://x/s', count: /on, map: {map}, also: [ {{ count: /q, map: {map} }} ] }} ] }} }}"),
+            )
+        };
+        let ok = demand("{ \"true\": 1, \"false\": 0 }");
+        assert!(Config::from_yaml(&ok).is_ok(), "{:?}", problems(&ok));
+        let ps = problems(&demand("{ \"true\": on }"));
+        assert!(
+            has(
+                &ps,
+                "requests[0].map[\"true\"] must be a non-negative number, not a switch state"
+            ),
+            "{ps:?}"
+        );
+        assert!(
+            has(&ps, "also[0].map[\"true\"] must be a non-negative number"),
+            "{ps:?}"
+        );
+        let ps = problems(&demand("{ \"true\": -1 }"));
+        assert!(has(&ps, "-1 is negative"), "{ps:?}");
+        let ps = problems(&demand("{ \"true\": 1.5 }"));
+        assert!(has(&ps, "invalid type"), "{ps:?}");
+        // A map needs a count (or value) to apply to.
+        let ps = problems(&VALID.replace(
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand], params: { requests: [ { url: 'http://x/s', length: /l, map: { \"a\": 1 } } ] } }",
+        ));
+        assert!(has(&ps, "map is only valid with count or value"), "{ps:?}");
     }
 }

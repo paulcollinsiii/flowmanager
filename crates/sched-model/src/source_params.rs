@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{SourceKind, SourceSpec};
 use crate::ids::ResourceId;
+use crate::observation::SwitchState;
 use crate::time::Millis;
 
 /// Longest accepted `timeout` of an HTTP request.
@@ -204,13 +205,64 @@ pub struct SinceSpec {
 /// Longest accepted `since.ago`.
 pub const MAX_SINCE_AGO: Millis = Millis(365 * 86_400_000);
 
+/// What a `map` entry turns a response string into: a switch state (a switch source) or a
+/// number (a demand count). Anything else is refused when the config is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum MapValue {
+    Switch(SwitchState),
+    Number(u64),
+}
+
+impl<'de> Deserialize<'de> for MapValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = MapValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a switch state (on, off or off_now) or a non-negative whole number")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<MapValue, E> {
+                Ok(MapValue::Number(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<MapValue, E> {
+                u64::try_from(v)
+                    .map(MapValue::Number)
+                    .map_err(|_| E::custom(format!("{v} is negative; use a non-negative number")))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<MapValue, E> {
+                match v {
+                    "on" => Ok(MapValue::Switch(SwitchState::On)),
+                    "off" => Ok(MapValue::Switch(SwitchState::Off)),
+                    "off_now" => Ok(MapValue::Switch(SwitchState::OffNow)),
+                    other => Err(E::custom(format!(
+                        "{other:?} is not a switch state; use on, off or off_now"
+                    ))),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A map from the text of a response value (a JSON string's content, or `true` / `false`
+/// for a boolean) to what it means. A value not in it fails the poll.
+pub type ValueMap = BTreeMap<String, MapValue>;
+
 /// A further number read from the same response as the request's own, so a service that
 /// reports several counts in one document needs one request, not several.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtraCount {
-    /// JSON pointer to a number in the response.
+    /// JSON pointer to a number in the response (or, with `map`, to a string or boolean).
     pub count: String,
+    /// Turns the value at `count` from text into a number (values must be numbers).
+    #[serde(default)]
+    pub map: Option<ValueMap>,
     #[serde(default)]
     pub counts_as: CountsAs,
 }
@@ -220,9 +272,18 @@ pub struct ExtraCount {
 #[serde(deny_unknown_fields)]
 pub struct RequestSpec {
     pub url: String,
-    /// JSON pointer to a number in the response.
+    /// JSON pointer to a number in the response (or, with `map`, to a string or boolean).
     #[serde(default)]
     pub count: Option<String>,
+    /// JSON pointer to a string or boolean in the response that a switch source reads (a
+    /// request of a switch source has `value` and `map` instead of `count` or `length`).
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Turns the text at `value` into a switch state (the values must be `on`, `off` or
+    /// `off_now`), or the text at `count` into a number (the values must be numbers). A
+    /// value not in it, or of another JSON type than string or boolean, fails the poll.
+    #[serde(default)]
+    pub map: Option<ValueMap>,
     /// JSON pointer to an array in the response; its (filtered) length is the number.
     #[serde(default)]
     pub length: Option<String>,
@@ -413,12 +474,61 @@ pub(crate) fn pointer_problem(p: &str) -> Option<String> {
         .then(|| format!("JSON pointer {p:?} must be empty or start with '/'"))
 }
 
-fn http_problems(p: &HttpJsonParams) -> Vec<String> {
+/// Problems with a `map`: every value must be a switch state (`switch`) or a number.
+fn map_problems(map: &ValueMap, switch: bool, at: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if map.is_empty() {
+        out.push(format!("{at}.map must not be empty"));
+    }
+    for (k, v) in map {
+        match (switch, v) {
+            (true, MapValue::Switch(_)) | (false, MapValue::Number(_)) => {}
+            (true, MapValue::Number(_)) => out.push(format!(
+                "{at}.map[{k:?}] must be a switch state (on, off or off_now), not a number"
+            )),
+            (false, MapValue::Switch(_)) => out.push(format!(
+                "{at}.map[{k:?}] must be a non-negative number, not a switch state"
+            )),
+        }
+    }
+    out
+}
+
+/// The rules for a source that observes `switch`: it reads one value and nothing else.
+fn switch_source_problems(p: &HttpJsonParams, spec: &SourceSpec) -> Vec<String> {
+    use crate::config::Capability;
+    let mut out = Vec::new();
+    if let Some(other) = spec.observe.iter().find(|c| **c != Capability::Switch) {
+        out.push(format!(
+            "a source that observes switch must observe nothing else (it also declares {other})"
+        ));
+    }
+    if p.requests.len() != 1 {
+        out.push(format!(
+            "a source that observes switch must have exactly one request (it has {})",
+            p.requests.len()
+        ));
+    }
+    for (i, r) in p.requests.iter().enumerate() {
+        if r.value.is_none() || r.map.is_none() {
+            out.push(format!(
+                "requests[{i}]: a switch source's request needs value and map"
+            ));
+        }
+    }
+    out
+}
+
+fn http_problems(p: &HttpJsonParams, spec: &SourceSpec) -> Vec<String> {
+    use crate::config::Capability;
+    let switch_source = spec.observe.contains(&Capability::Switch);
     let mut out = Vec::new();
     if p.requests.is_empty() {
         out.push("requests must not be empty".to_string());
     }
-    if !p.requests.iter().any(|r| r.counts_as == CountsAs::Ready) {
+    if switch_source {
+        out.extend(switch_source_problems(p, spec));
+    } else if !p.requests.iter().any(|r| r.counts_as == CountsAs::Ready) {
         out.push("at least one request must count as ready".to_string());
     }
     out.extend(timeout_problem(p.timeout));
@@ -432,15 +542,47 @@ fn http_problems(p: &HttpJsonParams) -> Vec<String> {
         if !(r.url.starts_with("http://") || r.url.starts_with("https://")) {
             out.push(format!("{at}.url must start with http:// or https://"));
         }
-        match (&r.count, &r.length) {
-            (Some(_), None) | (None, Some(_)) => {}
-            _ => out.push(format!("{at}: set exactly one of count and length")),
+        if let Some(v) = &r.value {
+            if !switch_source {
+                out.push(format!(
+                    "{at}: value is only valid on a source that observes switch"
+                ));
+            }
+            out.extend(pointer_problem(v).map(|m| format!("{at}: {m}")));
+            if r.count.is_some()
+                || r.length.is_some()
+                || r.filter.is_some()
+                || !r.also.is_empty()
+                || r.max_items.is_some()
+                || r.when.is_some()
+            {
+                out.push(format!(
+                    "{at}: a request with value takes only url, value and map (not count, length, where, max_items, also or when)"
+                ));
+            }
+            match &r.map {
+                None => out.push(format!("{at}: value needs a map")),
+                Some(m) => out.extend(map_problems(m, true, &at)),
+            }
+        } else {
+            match (&r.count, &r.length) {
+                (Some(_), None) | (None, Some(_)) => {}
+                _ => out.push(format!("{at}: set exactly one of count and length")),
+            }
+            match (&r.map, &r.count) {
+                (Some(m), Some(_)) => out.extend(map_problems(m, false, &at)),
+                (Some(_), None) => out.push(format!("{at}: map is only valid with count or value")),
+                (None, _) => {}
+            }
         }
         for ptr in [&r.count, &r.length].into_iter().flatten() {
             out.extend(pointer_problem(ptr).map(|m| format!("{at}: {m}")));
         }
         for (k, e) in r.also.iter().enumerate() {
             out.extend(pointer_problem(&e.count).map(|m| format!("{at}.also[{k}]: {m}")));
+            if let Some(m) = &e.map {
+                out.extend(map_problems(m, false, &format!("{at}.also[{k}]")));
+            }
             // The same number counted twice would silently double it.
             let primary =
                 r.count.as_deref() == Some(e.count.as_str()) && r.counts_as == e.counts_as;
@@ -701,7 +843,10 @@ fn kube_problems(p: &KubeWatchParams, spec: &SourceSpec) -> Vec<String> {
 pub(crate) fn problems(spec: &SourceSpec) -> Vec<String> {
     match spec.kind {
         SourceKind::HttpJson => match spec.http_json_params() {
-            Ok(Some(p)) => http_problems(&p),
+            Ok(Some(p)) => http_problems(&p, spec),
+            Ok(None) if spec.observe.contains(&crate::config::Capability::Switch) => {
+                vec!["a source that observes switch needs params with exactly one request".into()]
+            }
             Ok(None) => Vec::new(),
             Err(e) => vec![e],
         },

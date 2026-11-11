@@ -102,6 +102,7 @@ fn subject(v: &ObservedValue) -> String {
         ObservedValue::ResourceUp { resource, .. } => format!("resource_up:{resource}"),
         ObservedValue::ResourceMounts { resource, .. } => format!("resource_mounts:{resource}"),
         ObservedValue::JobRuns { job, .. } => format!("job_runs:{job}"),
+        ObservedValue::Switch { class, .. } => format!("switch:{class}"),
     }
 }
 

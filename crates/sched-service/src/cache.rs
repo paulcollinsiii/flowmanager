@@ -21,6 +21,7 @@ enum Subject {
     Up(ResourceId),
     Mounts(ResourceId),
     Jobs(JobId),
+    Switch(ClassId),
 }
 
 fn subject(v: &ObservedValue) -> Subject {
@@ -30,6 +31,7 @@ fn subject(v: &ObservedValue) -> Subject {
         ObservedValue::ResourceUp { resource, .. } => Subject::Up(resource.clone()),
         ObservedValue::ResourceMounts { resource, .. } => Subject::Mounts(resource.clone()),
         ObservedValue::JobRuns { job, .. } => Subject::Jobs(job.clone()),
+        ObservedValue::Switch { class, .. } => Subject::Switch(class.clone()),
     }
 }
 
@@ -41,6 +43,7 @@ fn capability(v: &ObservedValue) -> Capability {
         ObservedValue::ResourceUp { .. } => Capability::Reachability,
         ObservedValue::ResourceMounts { .. } => Capability::Mounts,
         ObservedValue::JobRuns { .. } => Capability::Jobs,
+        ObservedValue::Switch { .. } => Capability::Switch,
     }
 }
 
@@ -61,6 +64,10 @@ fn accepts(config: &Config, source: &SourceId, value: &ObservedValue) -> bool {
         ObservedValue::ResourceUp { resource, .. } => config.resource(resource).is_some(),
         ObservedValue::ResourceMounts { resource, .. } => config.resource(resource).is_some(),
         ObservedValue::JobRuns { job, .. } => config.job(job).is_some(),
+        ObservedValue::Switch { class, .. } => config
+            .class(class)
+            .and_then(|c| c.switch.as_ref())
+            .is_some_and(|s| &s.source == source),
     }
 }
 
@@ -614,6 +621,47 @@ mod tests {
         };
         assert_eq!(of(Capability::Reachability), Some(Millis(500)));
         assert_eq!(of(Capability::Pods), None);
+    }
+
+    #[test]
+    fn a_switch_reading_is_kept_for_the_class_that_names_its_source_only() {
+        use sched_model::SwitchState;
+        use sched_model::test_support::{EXAMPLE_CONFIG, with_switched_class};
+        let cfg = Config::from_yaml(&with_switched_class(EXAMPLE_CONFIG)).unwrap();
+        let switch = |class: &str, state| ObservedValue::Switch {
+            class: class.into(),
+            state,
+        };
+        let mut c = ObservationCache::new();
+        c.ingest(
+            &cfg,
+            report(
+                "ha-wikijs",
+                vec![
+                    switch("wikijs", SwitchState::OffNow),
+                    // Not a switched class, and an unknown class: dropped.
+                    switch("paperless-ngx", SwitchState::On),
+                    switch("ghost", SwitchState::On),
+                ],
+            ),
+            Millis(1_000),
+        );
+        // A source that does not declare switch is not believed.
+        c.ingest(
+            &cfg,
+            report("immich-queues", vec![switch("wikijs", SwitchState::On)]),
+            Millis(1_000),
+        );
+        let held = held(&c, &cfg, 1_500);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].source.as_str(), "ha-wikijs");
+        assert_eq!(held[0].value, switch("wikijs", SwitchState::OffNow));
+        // A scheduling input, so held to queue_reading_stale_after, not the host bound.
+        assert!(!held[0].value.is_safety_critical());
+        assert_eq!(
+            cfg.policy().max_age_for(&held[0].value),
+            cfg.policy().queue_reading_stale_after
+        );
     }
 
     #[test]

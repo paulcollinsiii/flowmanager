@@ -84,6 +84,17 @@ pub enum ObservedValue {
         job: JobId,
         runs: Vec<JobRunReading>,
     },
+    /// The switch reading of a switched class, as a person set it. Nothing acts on it yet.
+    Switch { class: ClassId, state: SwitchState },
+}
+
+/// What a switch reads: `on`, `off` (graceful) or `off_now` (immediate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchState {
+    On,
+    Off,
+    OffNow,
 }
 
 /// What a Job's status says.

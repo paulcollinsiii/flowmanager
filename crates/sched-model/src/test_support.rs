@@ -51,6 +51,29 @@ pub fn example_config() -> Config {
     Config::from_yaml(EXAMPLE_CONFIG).expect("bundled example config is valid")
 }
 
+/// A shared resource without a `power:` section, for [`with_switched_class`].
+pub const BLADE_RUNNER_RESOURCE: &str = "  - id: blade-runner\n    kind: shared\n";
+
+/// A switched class on [`BLADE_RUNNER_RESOURCE`], taking its switch from the example's
+/// `ha-wikijs` source. The shipped example has it commented out (the switch gates nothing yet).
+pub const SWITCHED_CLASS: &str = "  - id: wikijs\n    requires:\n      - { resource: blade-runner }\n    priority: 0\n    preemptibility: kill\n    switch: { source: ha-wikijs }\n\n";
+
+/// `yaml` (the example, possibly edited) with [`BLADE_RUNNER_RESOURCE`] and
+/// [`SWITCHED_CLASS`] added.
+pub fn with_switched_class(yaml: &str) -> String {
+    let (resource_anchor, class_anchor) = ("  - id: cuda-central\n", "  - id: interactive-llm\n");
+    assert!(
+        yaml.contains(resource_anchor) && yaml.contains(class_anchor),
+        "the example's cuda-central resource or interactive-llm class changed; update with_switched_class"
+    );
+    yaml.replacen(
+        resource_anchor,
+        &format!("{BLADE_RUNNER_RESOURCE}{resource_anchor}"),
+        1,
+    )
+    .replacen(class_anchor, &format!("{SWITCHED_CLASS}{class_anchor}"), 1)
+}
+
 /// A class on the NFS share that may change power and the source that feeds its demand, for
 /// tests of workload-driven power. The shipped example has no such class (its scheduled jobs
 /// hold the share instead), but the planner and the sequencer still honour `may_change_power`.
@@ -226,6 +249,45 @@ mod tests {
         format!(
             "    - {{ source: {source}, observed_at: 900, fidelity: polled, value: {{ type: demand, class: {class}, {rest} }} }}\n"
         )
+    }
+
+    #[test]
+    fn a_switch_observation_is_checked_against_the_switched_class() {
+        let config = Config::from_yaml(&with_switched_class(EXAMPLE_CONFIG)).unwrap();
+        let check = |class: &str, source: &str, state: &str| {
+            let yaml = format!(
+                "description: x\nsnapshot:\n  now: 1000\n  observations:\n    - {{ source: {source}, observed_at: 900, fidelity: polled, value: {{ type: switch, class: {class}, state: {state} }} }}\n  leases: []\n"
+            );
+            match Fixture::from_yaml_checked(&yaml, &config) {
+                Ok(f) => Ok(f.snapshot.observations[0].value.clone()),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        for (text, state) in [
+            ("on", crate::SwitchState::On),
+            ("off", crate::SwitchState::Off),
+            ("off_now", crate::SwitchState::OffNow),
+        ] {
+            assert_eq!(
+                check("wikijs", "ha-wikijs", text),
+                Ok(crate::ObservedValue::Switch {
+                    class: "wikijs".into(),
+                    state
+                })
+            );
+        }
+        let m = check("wikijs", "ha-wikijs", "off-now").unwrap_err();
+        assert!(m.contains("off-now"), "{m}");
+        let m = check("paperless-ngx", "ha-wikijs", "on").unwrap_err();
+        assert!(m.contains("has no switch source"), "{m}");
+        let m = check("wikijs", "immich-queues", "on").unwrap_err();
+        assert!(
+            m.contains("takes its switch from source \"ha-wikijs\""),
+            "{m}"
+        );
+        assert!(m.contains("does not declare the switch capability"), "{m}");
+        let m = check("ghost", "ha-wikijs", "on").unwrap_err();
+        assert!(m.contains("unknown class \"ghost\""), "{m}");
     }
 
     #[test]
