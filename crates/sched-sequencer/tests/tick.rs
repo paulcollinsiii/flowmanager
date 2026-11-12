@@ -211,6 +211,10 @@ impl Case {
     }
 
     fn run_at(&self, state: &SchedState, now: u64) -> Decision {
+        tick(&self.config, &self.snapshot_at(now), state, &self.intent).unwrap()
+    }
+
+    fn snapshot_at(&self, now: u64) -> sched_model::Snapshot {
         let mut y = format!("description: t\nsnapshot:\n  now: {now}\n  observations:\n");
         for o in &self.obs {
             y.push_str(o);
@@ -222,8 +226,9 @@ impl Case {
         for l in &self.leases {
             y.push_str(&format!("    - {l}\n"));
         }
-        let f = Fixture::from_yaml(&y).unwrap_or_else(|e| panic!("{e}\n{y}"));
-        tick(&self.config, &f.snapshot, state, &self.intent).unwrap()
+        Fixture::from_yaml(&y)
+            .unwrap_or_else(|e| panic!("{e}\n{y}"))
+            .snapshot
     }
 
     /// Like `run_at`, but every observation is moved forward with the clock, as if the
@@ -5010,4 +5015,222 @@ fn offline_dependents_neither_wake_nor_stop_nor_prevent_idle_on_the_gpu() {
         ModePhase::Serving { idle_since, .. } => assert!(idle_since.is_none(), "busy"),
         other => panic!("{other:?}"),
     }
+}
+
+// ---- switched classes: failed work of an offline dependent ----
+
+/// The graceful-off example with `speakr-pending` also reading from `nfs-app`, so that
+/// `speakr-transcription`, the example's class with a recovery action, is a dependent. The
+/// switch reads `state`; whisperx serves and two transcriptions have failed.
+fn recovering_dependent(state: &str) -> Case {
+    let read = "  - id: speakr-pending\n    kind: http_json\n";
+    let yaml = sched_model::test_support::example_yaml_switched_dependents().replacen(
+        read,
+        &format!("{read}    reads_from: nfs-app\n"),
+        1,
+    );
+    assert!(yaml.contains(&format!("{read}    reads_from: nfs-app\n")));
+    let mut c = Case::new()
+        .obs(sw("nfs-app", state))
+        .obs(failed_transcriptions(2))
+        .obs(pods("whisperx", 1, 1, 0))
+        .gpu(&serving("whisperx", 20 * MIN))
+        .target(Some("whisperx"));
+    c.config = Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"));
+    c
+}
+
+fn work_of(c: &Case, st: &SchedState, class: &str) -> sched_model::ClassWork {
+    sched_model::class_work(
+        &c.config,
+        &c.snapshot_at(T),
+        st,
+        c.config.class(&cid(class)).unwrap(),
+    )
+}
+
+#[test]
+fn failed_work_of_an_offline_dependent_runs_no_recovery_and_wants_nothing() {
+    use sched_model::Withdrawal::{Done, Pending};
+    // The control: with the switch on the same reading runs the recovery and is not idle.
+    let c = recovering_dependent("on");
+    let d = c.run();
+    assert!(allowed(&d, "speakr-transcription"), "{:?}", d.allowed);
+    assert_steps(&d, vec![recovery()], "switch on");
+    let w = work_of(&c, &c.state(), "speakr-transcription");
+    assert!(w.failed == 2 && w.wanted(), "{w:?}");
+    // Switched off with the wait over (stored done, timed out, off-now): no recovery, and the
+    // failed items are gone from the class's work, so they make nothing wanted.
+    for (name, switch, stored) in [
+        ("done", "off", Some((MIN, Done))),
+        ("timed out", "off", Some((10 * MIN, Pending))),
+        ("off-now", "off_now", None),
+    ] {
+        let c = recovering_dependent(switch);
+        let st = match stored {
+            Some((ago, withdrawal)) => wait_state_of(&c, ago, withdrawal),
+            None => c.state(),
+        };
+        let w = work_of(&c, &st, "speakr-transcription");
+        assert!(w.offline && w.failed == 0 && !w.wanted(), "{name}: {w:?}");
+        let d = c.run_at(&st, T);
+        assert_eq!(recoveries(&d), 0, "{name}: {:?}", d.steps);
+    }
+}
+
+// ---- switched classes: two sharing one powered host ----
+
+/// The graceful-off example plus a second switched class, `nfs-app2`, on the same host, read by
+/// `paperless-post-ocr` (`reads_from`): `paperless-tagging` is its dependent, as
+/// `paperless-ocr` is `nfs-app`'s. Both switches are read from the `ha-wikijs` source.
+fn two_switched_config() -> Config {
+    let class = "  - id: nfs-app2\n    requires:\n      - { resource: basestar-nfs }\n    priority: 0\n    preemptibility: kill\n    may_change_power: true\n    switch: { source: ha-wikijs }\n\nsources:\n";
+    let read = "  - id: paperless-post-ocr\n    kind: http_json\n";
+    let yaml = sched_model::test_support::example_yaml_switched_dependents()
+        .replacen("\nsources:\n", &format!("\n{class}"), 1)
+        .replacen(read, &format!("{read}    reads_from: nfs-app2\n"), 1);
+    assert!(yaml.contains("reads_from: nfs-app2") && yaml.contains("id: nfs-app2"));
+    Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// The NFS host idle, ours, for 10 minutes; `nfs-app` reads `first` and `nfs-app2` `second`;
+/// each dependent has `in_flight` items in flight.
+fn two_switched(first: &str, second: &str, in_flight: u64) -> Case {
+    let mut c = Case::new()
+        .nfs_state(&idle_nfs())
+        .obs(sw("nfs-app", first))
+        .obs(sw("nfs-app2", second))
+        .obs(demand(
+            "paperless-ocr",
+            "paperless-ocr-pending",
+            0,
+            in_flight,
+            0,
+        ))
+        .obs(demand(
+            "paperless-tagging",
+            "paperless-post-ocr",
+            0,
+            in_flight,
+            0,
+        ));
+    c.config = two_switched_config();
+    c
+}
+
+/// The case's state with stored switch-offs: `(class, ago, withdrawal)`.
+fn stored_offs(c: &Case, offs: &[(&str, u64, sched_model::Withdrawal)]) -> SchedState {
+    let mut st = c.state();
+    for (class, ago, withdrawal) in offs {
+        st.classes.insert(
+            cid(class),
+            sched_model::SwitchOff {
+                since: sched_model::Millis(T - ago),
+                withdrawal: *withdrawal,
+            },
+        );
+    }
+    st
+}
+
+#[test]
+fn an_on_class_keeps_holding_the_shared_host_while_the_off_one_waits_and_leaves() {
+    use sched_model::Withdrawal::{Done, Pending};
+    let off = Step::PowerOff { resource: rid(N) };
+    // The dependent of the `on` class has nothing to do, so only its switch holds the host.
+    let c = two_switched("off", "on", 2).obs(demand(
+        "paperless-tagging",
+        "paperless-post-ocr",
+        0,
+        0,
+        0,
+    ));
+    // While `nfs-app` waits: both classes allowed, its dependent as reported, host held.
+    let st = stored_offs(&c, &[("nfs-app", MIN, Pending)]);
+    let d = c.run_at(&st, T);
+    assert!(
+        allowed(&d, "nfs-app") && allowed(&d, "nfs-app2"),
+        "{:?}",
+        d.allowed
+    );
+    assert!(!d.steps.contains(&off), "{:?}", d.steps);
+    let w = work_of(&c, &st, "paperless-ocr");
+    assert!(!w.offline && w.in_flight == 2, "{w:?}");
+    // The wait is bounded: at the timeout `nfs-app` leaves, stored done, and its dependent
+    // goes offline; `nfs-app2` stays allowed and still holds the host.
+    let st = stored_offs(&c, &[("nfs-app", 10 * MIN - 1, Pending)]);
+    assert!(allowed(&c.run_at(&st, T), "nfs-app"));
+    let st = stored_offs(&c, &[("nfs-app", 10 * MIN, Pending)]);
+    let d = c.run_at(&st, T);
+    assert!(!allowed(&d, "nfs-app"), "{:?}", d.allowed);
+    assert!(allowed(&d, "nfs-app2"), "{:?}", d.allowed);
+    assert_eq!(stored(&d).unwrap().withdrawal, Done);
+    assert_eq!(d.state.classes.get(&cid("nfs-app2")), None);
+    assert!(!d.steps.contains(&off), "the on class holds: {:?}", d.steps);
+    let w = work_of(&c, &st, "paperless-ocr");
+    assert!(w.offline && w.switched_off && !w.busy(), "{w:?}");
+    // The other dependent is unaffected, also when it has work in flight.
+    let w = work_of(&c, &st, "paperless-tagging");
+    assert!(!w.offline && !w.switched_off, "{w:?}");
+    let busy = two_switched("off", "on", 2);
+    let st = stored_offs(&busy, &[("nfs-app", 10 * MIN, Done)]);
+    let w = work_of(&busy, &st, "paperless-tagging");
+    assert!(!w.offline && !w.switched_off && w.in_flight == 2, "{w:?}");
+    let d = busy.run_at(&st, T);
+    assert!(!d.steps.contains(&off), "{:?}", d.steps);
+}
+
+#[test]
+fn the_shared_host_goes_idle_once_both_switched_classes_are_off_and_their_waits_are_over() {
+    use sched_model::Withdrawal::{Done, Pending};
+    let off = Step::PowerOff { resource: rid(N) };
+    let c = two_switched("off", "off", 2);
+    // Both waiting: held.
+    let st = stored_offs(&c, &[("nfs-app", MIN, Pending), ("nfs-app2", MIN, Pending)]);
+    let d = c.run_at(&st, T);
+    assert!(allowed(&d, "nfs-app") && allowed(&d, "nfs-app2"));
+    assert!(!d.steps.contains(&off), "{:?}", d.steps);
+    // One over, the other still waiting: still held.
+    let st = stored_offs(&c, &[("nfs-app", MIN, Done), ("nfs-app2", MIN, Pending)]);
+    let d = c.run_at(&st, T);
+    assert!(
+        !allowed(&d, "nfs-app") && allowed(&d, "nfs-app2"),
+        "{:?}",
+        d.allowed
+    );
+    assert!(!d.steps.contains(&off), "{:?}", d.steps);
+    // Both over (stored done, or both timed out in this tick): no hold from either, and the
+    // dependents' in-flight work holds nothing, so the idle host goes down.
+    for (name, st) in [
+        (
+            "done",
+            stored_offs(&c, &[("nfs-app", MIN, Done), ("nfs-app2", MIN, Done)]),
+        ),
+        (
+            "timed out",
+            stored_offs(
+                &c,
+                &[
+                    ("nfs-app", 10 * MIN, Pending),
+                    ("nfs-app2", 10 * MIN, Pending),
+                ],
+            ),
+        ),
+    ] {
+        let d = c.run_at(&st, T);
+        assert!(
+            !allowed(&d, "nfs-app") && !allowed(&d, "nfs-app2"),
+            "{name}"
+        );
+        assert!(d.steps.contains(&off), "{name}: {:?}", d.steps);
+        for dependent in ["paperless-ocr", "paperless-tagging"] {
+            let w = work_of(&c, &st, dependent);
+            assert!(w.offline && w.switched_off && !w.busy(), "{name}: {w:?}");
+        }
+    }
+    // The control: one of them back on holds the host again.
+    let c = two_switched("off", "on", 2);
+    let st = stored_offs(&c, &[("nfs-app", MIN, Done), ("nfs-app2", MIN, Done)]);
+    let d = c.run_at(&st, T);
+    assert!(allowed(&d, "nfs-app2") && !d.steps.contains(&off), "{d:?}");
 }

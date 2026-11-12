@@ -36,6 +36,10 @@ fn sw(state: SwitchState) -> Observation {
 }
 
 fn ocr(ready: u64, in_flight: u64) -> Observation {
+    ocr_failed(ready, in_flight, 0)
+}
+
+fn ocr_failed(ready: u64, in_flight: u64, failed: u64) -> Observation {
     obs(
         "paperless-ocr-pending",
         NOW,
@@ -43,7 +47,7 @@ fn ocr(ready: u64, in_flight: u64) -> Observation {
             class: "paperless-ocr".into(),
             ready,
             in_flight,
-            failed: 0,
+            failed,
             oldest_ready_at: (ready > 0).then_some(Millis(NOW - 1000)),
         },
     )
@@ -303,6 +307,38 @@ fn a_dependent_is_offline_once_the_wait_is_over_even_with_a_fresh_reading_of_wor
     // An unreadable switch too (fail closed).
     let w = work(&snap(vec![ocr(7, 3)]), &SchedState::default());
     assert!(w.offline && w.switched_off && !w.busy(), "{w:?}");
+}
+
+#[test]
+fn a_dependent_with_failed_work_has_none_of_it_once_the_wait_is_over() {
+    // Failed items, with ready and in-flight work, in a fresh reading.
+    let reading = |s: SwitchState| snap(vec![sw(s), ocr_failed(4, 2, 5)]);
+    // Wait over (stored done, timed out, off-now): no failed work, not wanted.
+    for (name, s, st) in [
+        ("done", reading(SwitchState::Off), done(MIN)),
+        ("timed out", reading(SwitchState::Off), pending(DRAIN)),
+        (
+            "off-now",
+            reading(SwitchState::OffNow),
+            SchedState::default(),
+        ),
+    ] {
+        let w = work(&s, &st);
+        assert!(w.offline && w.switched_off, "{name}: {w:?}");
+        assert_eq!(w.failed, 0, "{name}: {w:?}");
+        assert!(!w.busy() && !w.wanted(), "{name}: {w:?}");
+    }
+    // The control: while the wait runs and while the switch is on, failed items are reported.
+    assert_eq!(
+        work(&reading(SwitchState::Off), &pending(MIN)).failed,
+        5,
+        "during the wait"
+    );
+    assert_eq!(
+        work(&reading(SwitchState::On), &SchedState::default()).failed,
+        5,
+        "switch on"
+    );
 }
 
 #[test]
