@@ -83,8 +83,7 @@ through the `Scheduler` tick with the real job machine
 A class with a demand source but no usable reading is one of two things, decided afresh by
 `class_work` on every read and never stored:
 
-- **Offline**: a fresh reading shows a host the class requires is down, or (*enforced, switched
-  apps phase 3: `class_work` reads `sched_model::switch_phase`*) the class's demand source `reads_from` a switched class that is off, with
+- **Offline**: a fresh reading shows a host the class requires is down, or (*enforced: `class_work` reads `sched_model::switch_phase`*) the class's demand source `reads_from` a switched class that is off, with
   any graceful wait over (`architecture.md` invariant 21). Its work cannot run and
   its source has good reason to be silent, so it has no work: it holds no model and no host,
   on any path, forced or not, and nothing is stopped for it. It is listed apart
