@@ -366,6 +366,21 @@ pub fn check(
                 }
             }
         }
+        // 21. A switched class is allowed only while its switch reads `on` (a missing or
+        // stale reading is off-now). Phase 3 adds the graceful wait for dependents.
+        if let Some(switch) = sched_model::class_switch(config, snapshot, spec)
+            && !switch.on()
+        {
+            out.push(format!(
+                "invariant 21: switched class {class} allowed while its switch is {:?}{}",
+                switch.state,
+                if switch.read {
+                    ""
+                } else {
+                    " (no usable reading)"
+                }
+            ));
+        }
         if decision
             .steps
             .iter()
@@ -630,6 +645,17 @@ pub fn check(
                                 class.id
                             ));
                         }
+                    }
+                    for class in config.classes().iter().filter(|c| {
+                        !draining
+                            && needs(c, resource)
+                            && sched_model::class_switch(config, snapshot, c)
+                                .is_some_and(|s| s.on())
+                    }) {
+                        out.push(format!(
+                            "invariant 10: powered off {resource} while the switch of {} reads on",
+                            class.id
+                        ));
                     }
                     let grace_ok = policy.idle_grace == Millis::ZERO
                         || draining

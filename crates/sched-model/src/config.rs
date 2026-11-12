@@ -169,8 +169,7 @@ pub struct DemandRef {
     pub source: SourceId,
 }
 
-/// Where a class's switch reading (on, off, off now) is observed. Phase 1: parsed, validated
-/// and routed, but it gates nothing.
+/// Where a class's switch reading (on, off, off now) is observed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwitchRef {
@@ -208,7 +207,8 @@ pub struct ClassSpec {
     #[serde(default)]
     pub demand: Option<DemandRef>,
     /// A switched class names no model and has this instead of `demand`. The reading is
-    /// observed and kept, and does not yet gate the class.
+    /// observed and gates the class: it is allowed only while the switch reads `on` (see
+    /// `work::class_switch`).
     #[serde(default)]
     pub switch: Option<SwitchRef>,
     #[serde(default)]

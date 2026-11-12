@@ -81,7 +81,7 @@ pub fn tick(
             next.resources.insert(res.id.clone(), st);
         }
     }
-    let allowed = allowed_set(config, &next, intent);
+    let allowed = allowed_set(config, snapshot, &next, intent);
     recovery_steps(config, snapshot, &allowed, &mut steps);
     Ok(Decision {
         steps,
@@ -185,7 +185,12 @@ fn model_known_not_ready(config: &Config, snapshot: &Snapshot, class: &ClassSpec
 }
 
 /// What KEDA may run, derived from the new state alone.
-fn allowed_set(config: &Config, state: &SchedState, intent: &Intent) -> AllowedSet {
+fn allowed_set(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+    intent: &Intent,
+) -> AllowedSet {
     let mut set = AllowedSet::default();
     for (id, st) in &state.resources {
         if st.is_on()
@@ -196,7 +201,7 @@ fn allowed_set(config: &Config, state: &SchedState, intent: &Intent) -> AllowedS
         }
     }
     for class in config.classes() {
-        if class_allowed(config, class, state, intent) {
+        if class_allowed(config, snapshot, class, state, intent) {
             set.classes.insert(class.id.clone());
         }
     }
@@ -220,7 +225,26 @@ fn lockout_withdrawal_pending(
             .is_some_and(|s| s.is_lockout() && s.withdrawal() == sched_model::Withdrawal::Pending)
 }
 
-fn class_allowed(config: &Config, class: &ClassSpec, state: &SchedState, intent: &Intent) -> bool {
+/// A class is allowed when every requirement holds (the host's lockout and requested
+/// shutdown first) and, for a switched class, its switch is `on` (`sched_model::class_switch`,
+/// the one rule the planner's wakes and the holds read too).
+fn class_allowed(
+    config: &Config,
+    snapshot: &Snapshot,
+    class: &ClassSpec,
+    state: &SchedState,
+    intent: &Intent,
+) -> bool {
+    requirements_hold(config, class, state, intent)
+        && sched_model::class_switch(config, snapshot, class).is_none_or(|s| s.on())
+}
+
+fn requirements_hold(
+    config: &Config,
+    class: &ClassSpec,
+    state: &SchedState,
+    intent: &Intent,
+) -> bool {
     class.requires.iter().all(|req| {
         let Some(st) = state.resource(&req.resource) else {
             return false;

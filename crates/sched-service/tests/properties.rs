@@ -33,6 +33,8 @@ struct Raw {
     demand: Vec<Option<(u64, u64, u64, u64)>>,
     leases: Option<Vec<usize>>,
     refresh: bool,
+    /// The `wikijs` switch reading this frame: 0 on, 1 off, 2 off_now (`None`: no reading).
+    switch: Option<u8>,
 }
 
 fn raw() -> impl Strategy<Value = Raw> {
@@ -50,16 +52,20 @@ fn raw() -> impl Strategy<Value = Raw> {
         ),
         prop::option::weighted(0.3, prop::collection::vec(0usize..9, 0..4)),
         prop::bool::weighted(0.6),
+        prop::option::weighted(0.7, 0u8..3),
     )
-        .prop_map(|(dt, pods, up, mounts, demand, leases, refresh)| Raw {
-            dt,
-            pods,
-            up,
-            mounts,
-            demand,
-            leases,
-            refresh,
-        })
+        .prop_map(
+            |(dt, pods, up, mounts, demand, leases, refresh, switch)| Raw {
+                dt,
+                pods,
+                up,
+                mounts,
+                demand,
+                leases,
+                refresh,
+                switch,
+            },
+        )
 }
 
 fn lease(kind: usize, now: u64, n: usize) -> Lease {
@@ -164,6 +170,21 @@ fn scenario(frames: &[Raw]) -> Scenario {
                     },
                 });
             }
+        }
+        if let Some(s) = r.switch {
+            observe.push(Observe {
+                source: SourceId::new("ha-wikijs"),
+                observed_at: None,
+                fidelity: Fidelity::Polled,
+                value: ObservedValue::Switch {
+                    class: ClassId::new("wikijs"),
+                    state: match s {
+                        0 => sched_model::SwitchState::On,
+                        1 => sched_model::SwitchState::Off,
+                        _ => sched_model::SwitchState::OffNow,
+                    },
+                },
+            });
         }
         let leases = r.leases.as_ref().map(|ks| {
             ks.iter()

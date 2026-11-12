@@ -491,11 +491,11 @@ pub fn spawn_observers(config: &Arc<Config>, tx: &ReportTx) -> Observers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sched_model::test_support::{EXAMPLE_CONFIG, with_switched_class};
+    use sched_model::test_support::EXAMPLE_CONFIG;
 
     #[test]
     fn a_source_is_routed_the_classes_that_name_it_by_demand_or_by_switch() {
-        let config = Config::from_yaml(&with_switched_class(EXAMPLE_CONFIG)).unwrap();
+        let config = Config::from_yaml(EXAMPLE_CONFIG).unwrap();
         let fp = |id: &str| fingerprint(&config, config.source(&id.into()).unwrap());
         assert_eq!(fp("ha-wikijs").classes, [ClassId::from("wikijs")]);
         assert_eq!(
@@ -508,10 +508,6 @@ mod tests {
                 .iter()
                 .all(|c| c.as_str() != "wikijs")
         );
-        // The shipped example has no switched class, so its switch source routes to none.
-        let shipped = Config::from_yaml(EXAMPLE_CONFIG).unwrap();
-        let source = shipped.source(&"ha-wikijs".into()).unwrap();
-        assert!(fingerprint(&shipped, source).classes.is_empty());
     }
 
     fn ms(n: u64) -> Duration {

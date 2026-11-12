@@ -213,6 +213,13 @@ pub(crate) fn holds(cx: &Cx, ignore_work: bool) -> Holds {
         return h;
     }
     for class in cx.config.classes().iter().filter(|c| needs(c, cx)) {
+        // A switched class that reads `on` holds the host like a class with work.
+        if let Some(switch) = sched_model::class_switch(cx.config, cx.snapshot, class) {
+            if switch.on() {
+                h.count += 1;
+            }
+            continue;
+        }
         if class.demand.is_none() {
             continue;
         }

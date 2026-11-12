@@ -58,4 +58,4 @@ pub use state::{
 pub use store::ConfigStore;
 pub use time::Millis;
 pub use validate::Problem;
-pub use work::{ClassWork, class_work, classes_of_model, host_is_up};
+pub use work::{ClassSwitch, ClassWork, class_switch, class_work, classes_of_model, host_is_up};

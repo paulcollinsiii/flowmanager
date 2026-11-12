@@ -84,7 +84,12 @@ impl Strategy for FifoExhaustive {
             }
         }
         for class in config.classes().iter().filter(|c| c.may_change_power) {
-            if !class_work(config, snapshot, class).busy() {
+            // A switched class has no demand: it wants its hosts up while its switch is on.
+            let wants_hosts = match sched_model::class_switch(config, snapshot, class) {
+                Some(switch) => switch.on(),
+                None => class_work(config, snapshot, class).busy(),
+            };
+            if !wants_hosts {
                 continue;
             }
             for req in &class.requires {

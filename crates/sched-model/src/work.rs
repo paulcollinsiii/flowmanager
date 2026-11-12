@@ -3,7 +3,7 @@
 
 use crate::config::{ClassSpec, Config};
 use crate::ids::ModelId;
-use crate::observation::{ObservedValue, Snapshot};
+use crate::observation::{ObservedValue, Snapshot, SwitchState};
 use crate::time::Millis;
 
 /// The demand for one class as the scheduler may rely on it.
@@ -122,6 +122,58 @@ pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> Cl
         }
     }
     work
+}
+
+/// What a switched class's switch allows. The one place the rule lives: the planner (wakes),
+/// the sequencer (allowed set, holds), the status text and the invariant check all read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassSwitch {
+    /// The newest reading's state, or `OffNow` when there is no usable reading (fail closed).
+    pub state: SwitchState,
+    /// False when `state` is `OffNow` only because the reading is missing, stale or
+    /// future-dated, not because a person pressed it.
+    pub read: bool,
+}
+
+impl ClassSwitch {
+    /// The class may run on the switch's say-so. In this release only `on` does: `off`
+    /// behaves as `off-now` (the graceful wait for dependents comes later), but the three
+    /// values stay distinct here so that wait can be added in one place.
+    pub fn on(&self) -> bool {
+        self.state == SwitchState::On
+    }
+}
+
+/// The switch of `class`, or `None` for a class that is not switched. Fail closed: a missing,
+/// stale or future-dated reading is `off-now`. Observations are filtered by class AND the
+/// class's configured switch source before the newest timestamp is chosen; ties at it
+/// resolve to the most restrictive state, so snapshot order never matters.
+pub fn class_switch(
+    config: &Config,
+    snapshot: &Snapshot,
+    class: &ClassSpec,
+) -> Option<ClassSwitch> {
+    let switch = class.switch.as_ref()?;
+    let closed = ClassSwitch {
+        state: SwitchState::OffNow,
+        read: false,
+    };
+    let group = snapshot.switch_group(&switch.source, &class.id);
+    let Some(first) = group.first() else {
+        return Some(closed);
+    };
+    if !first.is_fresh(snapshot.now, config.policy().max_age_for(&first.value)) {
+        return Some(closed);
+    }
+    let state = group
+        .iter()
+        .filter_map(|o| match o.value {
+            ObservedValue::Switch { state, .. } => Some(state),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(SwitchState::OffNow);
+    Some(ClassSwitch { state, read: true })
 }
 
 /// Classes that require `model`, in configuration order.
@@ -274,5 +326,87 @@ mod tests {
         snap.observations[0].observed_at = Millis(999_000);
         let w = class_work(&config, &snap, class);
         assert!(w.known && w.busy());
+    }
+
+    fn switch_obs(source: &str, state: SwitchState, at: u64) -> Observation {
+        Observation {
+            source: source.into(),
+            observed_at: Millis(at),
+            fidelity: Fidelity::Polled,
+            value: ObservedValue::Switch {
+                class: "wikijs".into(),
+                state,
+            },
+        }
+    }
+
+    #[test]
+    fn a_switch_reads_its_newest_fresh_reading_and_fails_closed() {
+        let config = example_config();
+        let class = config.class(&"wikijs".into()).unwrap();
+        let now = 1_000_000;
+        let read = |observations: Vec<Observation>| {
+            let snap = Snapshot {
+                now: Millis(now),
+                observations,
+                ..Snapshot::default()
+            };
+            class_switch(&config, &snap, class).unwrap()
+        };
+        let closed = ClassSwitch {
+            state: SwitchState::OffNow,
+            read: false,
+        };
+        for (state, on) in [
+            (SwitchState::On, true),
+            (SwitchState::Off, false),
+            (SwitchState::OffNow, false),
+        ] {
+            let s = read(vec![switch_obs("ha-wikijs", state, now)]);
+            assert_eq!((s.state, s.read, s.on()), (state, true, on));
+        }
+        assert_eq!(read(vec![]), closed, "missing");
+        let stale = now - 10 * 60_000 - 1;
+        assert_eq!(
+            read(vec![switch_obs("ha-wikijs", SwitchState::On, stale)]),
+            closed,
+            "stale"
+        );
+        assert_eq!(
+            read(vec![switch_obs("ha-wikijs", SwitchState::On, now + 1)]),
+            closed,
+            "future-dated"
+        );
+        assert_eq!(
+            read(vec![switch_obs("speakr-pending", SwitchState::On, now)]),
+            closed,
+            "wrong source"
+        );
+        // The newest reading wins; a wrong-source one never hides it, and neither does a
+        // reading of another class.
+        let mut other = switch_obs("ha-wikijs", SwitchState::On, now);
+        other.value = ObservedValue::Switch {
+            class: "other".into(),
+            state: SwitchState::On,
+        };
+        let s = read(vec![
+            switch_obs("ha-wikijs", SwitchState::On, now - 5),
+            switch_obs("ha-wikijs", SwitchState::Off, now),
+            switch_obs("speakr-pending", SwitchState::On, now),
+        ]);
+        assert_eq!((s.state, s.read), (SwitchState::Off, true));
+        assert_eq!(read(vec![other]), closed, "another class");
+        // Tied readings resolve to the most restrictive, in any order.
+        let tied = vec![
+            switch_obs("ha-wikijs", SwitchState::On, now),
+            switch_obs("ha-wikijs", SwitchState::OffNow, now),
+        ];
+        let rev: Vec<_> = tied.iter().cloned().rev().collect();
+        assert_eq!(read(tied).state, SwitchState::OffNow);
+        assert_eq!(read(rev).state, SwitchState::OffNow);
+        // A class that is not switched has no switch.
+        let snap = Snapshot::default();
+        let plain = config.class(&"paperless-ngx".into()).unwrap();
+        assert_eq!(class_switch(&config, &snap, plain), None);
     }
 }

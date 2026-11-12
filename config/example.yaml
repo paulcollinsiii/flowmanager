@@ -24,8 +24,8 @@ resources:
   # A shared resource with no `power:` section is always up, with nothing to wake or stop. It
   # is what a switched class that needs no host of its own requires (see the commented-out
   # wikijs class below):
-  # - id: blade-runner
-  #   kind: shared
+  - id: blade-runner
+    kind: shared
   - id: cuda-central
     kind: exclusive
     power:
@@ -223,21 +223,18 @@ classes:
 
   # A switched class: an app a person switches on and off from Home Assistant. It names no
   # model and has no demand; `switch.source` is a source that observes `switch`. The reading
-  # is `on`, `off` or `off_now` (see the ha-wikijs source). A class that requires only a
-  # resource without a `power:` section (blade-runner, the node the app runs on) has nothing
-  # to wake, so may_change_power stays false. A class has `demand` or `switch`, never both.
-  #
-  # NOT ENFORCED YET: the switch is read and kept, but it does not gate the class (phase 2 of
-  # planning/pending/demand.md). A switched class is allowed while its hosts are up, whatever
-  # the switch says, so enabling this one would put it in the allowed set. It is shown
-  # commented out (with the blade-runner resource) so the shipped example decides as before;
-  # the ha-wikijs source below is live and is read, but no class takes its reading yet.
-  # - id: wikijs
-  #   requires:
-  #     - { resource: blade-runner }
-  #   priority: 0
-  #   preemptibility: kill
-  #   switch: { source: ha-wikijs }
+  # is `on`, `off` or `off_now` (see the ha-wikijs source) and it gates the class: the class
+  # is allowed only while its hosts are up and the reading is `on`. In this release `off` is
+  # immediate, like `off_now`; the graceful wait for dependents comes later. A missing or
+  # stale reading counts as `off_now` (fail closed). A class that requires only a resource
+  # without a `power:` section (blade-runner, the node the app runs on) has nothing to wake,
+  # so may_change_power stays false. A class has `demand` or `switch`, never both.
+  - id: wikijs
+    requires:
+      - { resource: blade-runner }
+    priority: 0
+    preemptibility: kill
+    switch: { source: ha-wikijs }
 
 sources:
   - id: cluster-pods

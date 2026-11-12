@@ -703,6 +703,12 @@ impl Shared {
                     &events,
                     &power_request_failures,
                 );
+                let reason = reason
+                    + &reason::switch_text(&reason::switch_gaps(
+                        &config,
+                        &snapshot,
+                        &decision.allowed,
+                    ));
                 (
                     kinds,
                     reason,
@@ -2472,6 +2478,8 @@ mod tests {
             kinds,
             vec![
                 ("basestar-nfs", sched_model::ResourceKind::Shared),
+                // The example's blade-runner has no `power:` section but still has a status.
+                ("blade-runner", sched_model::ResourceKind::Shared),
                 ("cuda-central", sched_model::ResourceKind::Exclusive)
             ]
         );

@@ -919,3 +919,52 @@ fn a_host_lease_on_an_exclusive_host_does_not_pin_the_model() {
     );
     assert_eq!(run(&f).models[&gpu], Some(ModelId::new("whisperx")));
 }
+
+/// The example plus `nfs-app`, a switched class on the NFS host (which has a `power:` section).
+fn switched_config(may_change_power: bool) -> Config {
+    let class = format!(
+        "  - id: nfs-app\n    requires:\n      - {{ resource: basestar-nfs }}\n    priority: 0\n    preemptibility: kill\n    may_change_power: {may_change_power}\n    switch: {{ source: ha-wikijs }}\n\nsources:\n"
+    );
+    let yaml = EXAMPLE_CONFIG.replacen("\nsources:\n", &format!("\n{class}"), 1);
+    Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn switch_obs(source: &str, state: &str, at: u64) -> String {
+    format!(
+        "    - {{ source: {source}, observed_at: {at}, fidelity: polled, value: {{ type: switch, class: nfs-app, state: {state} }} }}\n"
+    )
+}
+
+#[test]
+fn a_switched_class_wakes_its_hosts_only_while_on_and_only_if_it_may_change_power() {
+    let nfs = ResourceId::new("basestar-nfs");
+    let wants = |may: bool, obs: &[String]| {
+        let config = switched_config(may);
+        let y = fixture_yaml(obs, &[], None);
+        // Unchecked: a future-dated reading is a case here, and the checker refuses it.
+        let f = Fixture::from_yaml(&y).unwrap_or_else(|e| panic!("{e}\n{y}"));
+        plan(&config, &f.snapshot, &f.state)
+            .unwrap()
+            .power_up
+            .get(&nfs)
+            .copied()
+    };
+    assert_eq!(
+        wants(true, &[switch_obs("ha-wikijs", "on", T)]),
+        Some(PowerWant::Workload)
+    );
+    assert_eq!(wants(false, &[switch_obs("ha-wikijs", "on", T)]), None);
+    for (name, obs) in [
+        ("off", vec![switch_obs("ha-wikijs", "off", T)]),
+        ("off_now", vec![switch_obs("ha-wikijs", "off_now", T)]),
+        ("missing", vec![]),
+        (
+            "stale",
+            vec![switch_obs("ha-wikijs", "on", T - 10 * MIN - 1)],
+        ),
+        ("future", vec![switch_obs("ha-wikijs", "on", T + 1)]),
+        ("wrong source", vec![switch_obs("speakr-pending", "on", T)]),
+    ] {
+        assert_eq!(wants(true, &obs), None, "{name}");
+    }
+}

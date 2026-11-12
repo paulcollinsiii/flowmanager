@@ -51,29 +51,6 @@ pub fn example_config() -> Config {
     Config::from_yaml(EXAMPLE_CONFIG).expect("bundled example config is valid")
 }
 
-/// A shared resource without a `power:` section, for [`with_switched_class`].
-pub const BLADE_RUNNER_RESOURCE: &str = "  - id: blade-runner\n    kind: shared\n";
-
-/// A switched class on [`BLADE_RUNNER_RESOURCE`], taking its switch from the example's
-/// `ha-wikijs` source. The shipped example has it commented out (the switch gates nothing yet).
-pub const SWITCHED_CLASS: &str = "  - id: wikijs\n    requires:\n      - { resource: blade-runner }\n    priority: 0\n    preemptibility: kill\n    switch: { source: ha-wikijs }\n\n";
-
-/// `yaml` (the example, possibly edited) with [`BLADE_RUNNER_RESOURCE`] and
-/// [`SWITCHED_CLASS`] added.
-pub fn with_switched_class(yaml: &str) -> String {
-    let (resource_anchor, class_anchor) = ("  - id: cuda-central\n", "  - id: interactive-llm\n");
-    assert!(
-        yaml.contains(resource_anchor) && yaml.contains(class_anchor),
-        "the example's cuda-central resource or interactive-llm class changed; update with_switched_class"
-    );
-    yaml.replacen(
-        resource_anchor,
-        &format!("{BLADE_RUNNER_RESOURCE}{resource_anchor}"),
-        1,
-    )
-    .replacen(class_anchor, &format!("{SWITCHED_CLASS}{class_anchor}"), 1)
-}
-
 /// A class on the NFS share that may change power and the source that feeds its demand, for
 /// tests of workload-driven power. The shipped example has no such class (its scheduled jobs
 /// hold the share instead), but the planner and the sequencer still honour `may_change_power`.
@@ -181,10 +158,11 @@ mod tests {
             "interactive-llm",
             "paperless-ngx",
             "immich-server",
+            "wikijs",
         ] {
             assert!(c.class(&id.into()).is_some(), "missing class {id}");
         }
-        assert_eq!(c.resources().len(), 2);
+        assert_eq!(c.resources().len(), 3);
         assert_eq!(c.models().len(), 4);
         assert!(c.class(&"paperless-ngx".into()).unwrap().demand.is_none());
     }
@@ -253,7 +231,7 @@ mod tests {
 
     #[test]
     fn a_switch_observation_is_checked_against_the_switched_class() {
-        let config = Config::from_yaml(&with_switched_class(EXAMPLE_CONFIG)).unwrap();
+        let config = Config::from_yaml(EXAMPLE_CONFIG).unwrap();
         let check = |class: &str, source: &str, state: &str| {
             let yaml = format!(
                 "description: x\nsnapshot:\n  now: 1000\n  observations:\n    - {{ source: {source}, observed_at: 900, fidelity: polled, value: {{ type: switch, class: {class}, state: {state} }} }}\n  leases: []\n"

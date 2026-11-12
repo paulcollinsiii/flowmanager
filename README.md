@@ -1184,11 +1184,18 @@ Notes:
     model on any requirement and requires at least one resource (for an app that needs no host
     of its own, a shared resource without a `power:` section). The reading is a scheduling input
     (stale after `policy.queue_reading_stale_after`).
-  **The switch does not gate anything yet.** In this phase the reading is validated, polled,
-  routed to its class and kept (and counted in the input ages as capability `switch`); no
-  planner, sequencer, allowed-set, hold or wake decision reads it, so a switched class behaves
-  as a class with no demand does today: allowed while its hosts are up. Gating on it is phase
-  2. `config/example.yaml` has the `ha-wikijs` switch source and, commented out, the class.
+  **The switch gates its class** (phase 2; `sched_model::class_switch` is the one rule the
+  planner, the sequencer, the status text and the invariant check all read). A switched class
+  is allowed only while its requirements hold (hosts up, no lockout or requested shutdown) **and**
+  the switch reads `on`. Fail closed: a missing, stale or future-dated reading, or one from a
+  source other than the class's own, is `off_now`. In this release `off` is immediate, like
+  `off_now`; the graceful wait for dependents comes later. While it reads `on` the class holds
+  the hosts it requires against an idle shutdown (a requested shutdown or a lockout still wins),
+  and with `may_change_power: true` it wants its powered hosts up. Off, or no usable reading,
+  wakes nothing and holds nothing. The decision's `reason` names the class as switched off,
+  as having no usable switch reading, or as switched on but kept out by a host. The reading is
+  counted in the input ages as capability `switch`. `config/example.yaml` has the `blade-runner`
+  resource, the `wikijs` class and the `ha-wikijs` source.
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - **Reachability sources for hosts outside the cluster**: `tcp_probe` (params `host`,

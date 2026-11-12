@@ -4673,3 +4673,131 @@ fn a_lockout_takes_over_a_requested_shutdown_of_an_exclusive_host_and_clearing_i
         shutdown_of(&d, G)
     );
 }
+
+// ---- switched classes: the switch gates the class, holds its hosts and (optionally) wakes them ----
+
+/// The managed example plus `nfs-app`, a switched class on the NFS host that may change power,
+/// reading its switch from the example's `ha-wikijs` source like `wikijs` does.
+fn switched_config(may_change_power: bool) -> Config {
+    let class = format!(
+        "  - id: nfs-app\n    requires:\n      - {{ resource: basestar-nfs }}\n    priority: 0\n    preemptibility: kill\n    may_change_power: {may_change_power}\n    switch: {{ source: ha-wikijs }}\n\nsources:\n"
+    );
+    let yaml = managed_yaml().replacen("\nsources:\n", &format!("\n{class}"), 1);
+    Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// A switch reading of `class` from `source`, observed at `at` (absolute, so it can be stale
+/// or in the future).
+fn sw_at(class: &str, source: &str, state: &str, at: u64) -> String {
+    format!(
+        "    - {{ source: {source}, observed_at: {at}, fidelity: polled, value: {{ type: switch, class: {class}, state: {state} }} }}\n"
+    )
+}
+
+fn sw(class: &str, state: &str) -> String {
+    sw_at(class, "ha-wikijs", state, T)
+}
+
+fn allowed(d: &Decision, c: &str) -> bool {
+    d.allowed.classes.contains(&cid(c))
+}
+
+#[test]
+fn a_switched_class_is_allowed_only_while_its_switch_reads_on() {
+    let on = Case::new().obs(sw("wikijs", "on")).run();
+    assert!(allowed(&on, "wikijs"));
+    for (name, case) in [
+        ("off", Case::new().obs(sw("wikijs", "off"))),
+        ("off_now", Case::new().obs(sw("wikijs", "off_now"))),
+        ("missing", Case::new()),
+        (
+            "stale",
+            Case::new().obs(sw_at("wikijs", "ha-wikijs", "on", T - 10 * MIN - 1)),
+        ),
+        (
+            "future",
+            Case::new().obs(sw_at("wikijs", "ha-wikijs", "on", T + 1)),
+        ),
+        (
+            "wrong source",
+            Case::new().obs(sw_at("wikijs", "speakr-pending", "on", T)),
+        ),
+    ] {
+        assert!(!allowed(&case.run(), "wikijs"), "{name}");
+    }
+}
+
+#[test]
+fn a_switched_class_on_a_locked_out_host_is_withdrawn_whatever_the_switch_says() {
+    let locked = |state: &str| {
+        let mut case = nfs_busy().nfs_state(state).obs(sw("nfs-app", "on"));
+        case.config = switched_config(false);
+        case.intent.lockout.insert(rid(N));
+        case.run()
+    };
+    // Like a gate class, it keeps its lockout timeout while the withdrawal is pending...
+    let d = locked(&nfs_lockout_pending(1));
+    assert_eq!(
+        allowed(&d, "nfs-app"),
+        allowed(&d, "paperless-ngx"),
+        "{:?}",
+        d.allowed
+    );
+    assert!(allowed(&d, "nfs-app"), "{:?}", d);
+    // ...and is withdrawn when the lockout's timeout is over, switch on or not.
+    let d = locked(&nfs_lockout_pending(10 * MIN));
+    assert!(!allowed(&d, "nfs-app") && !allowed(&d, "paperless-ngx"));
+    // Without a lockout it is allowed.
+    let mut c = Case::new().obs(sw("nfs-app", "on"));
+    c.config = switched_config(false);
+    assert!(allowed(&c.run(), "nfs-app"));
+}
+
+#[test]
+fn a_requested_shutdown_withdraws_a_switched_class_as_it_does_a_gate_class() {
+    let mut case = Case::new().nfs_state(&nfs_draining("immediate", 1_000));
+    case.config = switched_config(false);
+    case = case.obs(sw("nfs-app", "on"));
+    let d = case.run();
+    assert!(!allowed(&d, "paperless-ngx"), "gate class: {:?}", d.allowed);
+    assert!(!allowed(&d, "nfs-app"), "{:?}", d.allowed);
+}
+
+#[test]
+fn an_idle_shutdown_is_held_while_a_switch_reads_on_and_proceeds_once_off() {
+    let idle = format!(
+        "{{ power: {}, mode: {}, idle_since: {} }}",
+        on_ours(),
+        mode_idle(),
+        T - 10 * MIN
+    );
+    let case = |state: &str| {
+        let mut c = Case::new().nfs_state(&idle).obs(sw("nfs-app", state));
+        c.config = switched_config(false);
+        c
+    };
+    let d = case("on").run();
+    assert_steps(&d, vec![], "held while on");
+    for off in ["off", "off_now"] {
+        let d = case(off).run();
+        assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], off);
+    }
+    // A reading that went stale no longer holds the host.
+    let mut stale = Case::new().nfs_state(&idle);
+    stale.config = switched_config(false);
+    let d = stale.run();
+    assert_steps(&d, vec![Step::PowerOff { resource: rid(N) }], "missing");
+}
+
+#[test]
+fn a_requested_shutdown_overrides_the_hold_of_a_switched_class() {
+    let mut case = Case::new().nfs_state(&nfs_draining("immediate", 1_000));
+    case.config = switched_config(false);
+    case = case.obs(sw("nfs-app", "on"));
+    let d = case.run();
+    assert!(
+        d.steps.contains(&Step::PowerOff { resource: rid(N) }),
+        "{:?}",
+        d.steps
+    );
+}

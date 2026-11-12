@@ -626,8 +626,8 @@ mod tests {
     #[test]
     fn a_switch_reading_is_kept_for_the_class_that_names_its_source_only() {
         use sched_model::SwitchState;
-        use sched_model::test_support::{EXAMPLE_CONFIG, with_switched_class};
-        let cfg = Config::from_yaml(&with_switched_class(EXAMPLE_CONFIG)).unwrap();
+        use sched_model::test_support::EXAMPLE_CONFIG;
+        let cfg = Config::from_yaml(EXAMPLE_CONFIG).unwrap();
         let switch = |class: &str, state| ObservedValue::Switch {
             class: class.into(),
             state,

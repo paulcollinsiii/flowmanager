@@ -185,6 +185,70 @@ impl DemandGaps {
     }
 }
 
+/// Switched classes that are not in the allowed set, by why. Text only: the sequencer decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SwitchGaps {
+    /// The switch reads `off` or `off-now`.
+    pub off: Vec<sched_model::ClassId>,
+    /// No usable switch reading (missing, stale or future-dated): treated as `off-now`.
+    pub unreadable: Vec<sched_model::ClassId>,
+    /// The switch reads `on`, so a host the class requires is the reason (down, locked out
+    /// or being shut down).
+    pub blocked: Vec<sched_model::ClassId>,
+}
+
+/// Which switched classes are out of the allowed set and why.
+pub fn switch_gaps(
+    config: &sched_model::Config,
+    snapshot: &sched_model::Snapshot,
+    allowed: &sched_model::AllowedSet,
+) -> SwitchGaps {
+    let mut gaps = SwitchGaps::default();
+    for class in config.classes() {
+        let Some(switch) = sched_model::class_switch(config, snapshot, class) else {
+            continue;
+        };
+        if !switch.read {
+            gaps.unreadable.push(class.id.clone());
+        } else if !switch.on() {
+            gaps.off.push(class.id.clone());
+        } else if !allowed.classes.contains(&class.id) {
+            gaps.blocked.push(class.id.clone());
+        }
+    }
+    gaps
+}
+
+/// The text for [`SwitchGaps`], each sentence empty when its list is.
+pub fn switch_text(gaps: &SwitchGaps) -> String {
+    let ids = |v: &[sched_model::ClassId]| {
+        v.iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = String::new();
+    if !gaps.off.is_empty() {
+        out.push_str(&format!(
+            "; switched off, not allowed: [{}] (a person switched the app off; nothing holds or wakes its hosts for it)",
+            ids(&gaps.off)
+        ));
+    }
+    if !gaps.unreadable.is_empty() {
+        out.push_str(&format!(
+            "; switch reading missing, stale or unusable, not allowed: [{}] (treated as off-now, so the app stays down until a fresh reading says on)",
+            ids(&gaps.unreadable)
+        ));
+    }
+    if !gaps.blocked.is_empty() {
+        out.push_str(&format!(
+            "; switched on but not allowed: [{}] (a host it requires is down, locked out or being shut down)",
+            ids(&gaps.blocked)
+        ));
+    }
+    out
+}
+
 /// The resources a manual model lease pins, with their model: forced to a model (a lockout
 /// is forced to none).
 pub fn pinned(intent: &Intent) -> Vec<(ResourceId, ModelId)> {
@@ -796,5 +860,60 @@ mod tests {
             format_inputs(&ages),
             "a/pods=1200ms, b=none (error: HTTP 500)"
         );
+    }
+
+    #[test]
+    fn a_switched_class_out_of_the_allowed_set_says_whether_it_is_off_unreadable_or_blocked() {
+        use sched_model::{Fidelity, Observation, ObservedValue, SwitchState};
+        let config = sched_model::test_support::example_config();
+        let now = 1_000_000;
+        let reading = |state, at| Observation {
+            source: "ha-wikijs".into(),
+            observed_at: sched_model::Millis(at),
+            fidelity: Fidelity::Polled,
+            value: ObservedValue::Switch {
+                class: "wikijs".into(),
+                state,
+            },
+        };
+        let text = |observations: Vec<Observation>, allowed: bool| {
+            let snapshot = sched_model::Snapshot {
+                now: sched_model::Millis(now),
+                observations,
+                ..sched_model::Snapshot::default()
+            };
+            let mut set = sched_model::AllowedSet::default();
+            if allowed {
+                set.classes.insert("wikijs".into());
+            }
+            switch_text(&switch_gaps(&config, &snapshot, &set))
+        };
+        // (a) switched off, however it was said.
+        for state in [SwitchState::Off, SwitchState::OffNow] {
+            let t = text(vec![reading(state, now)], false);
+            assert!(t.contains("switched off, not allowed: [wikijs]"), "{t}");
+            assert!(!t.contains("unusable") && !t.contains("requires"), "{t}");
+        }
+        // (b) missing, stale or future-dated.
+        for obs in [
+            vec![],
+            vec![reading(SwitchState::On, 1)],
+            vec![reading(SwitchState::On, now + 1)],
+        ] {
+            let t = text(obs, false);
+            assert!(
+                t.contains("switch reading missing, stale or unusable"),
+                "{t}"
+            );
+            assert!(!t.contains("switched off"), "{t}");
+        }
+        // (c) on, but a host it requires keeps it out.
+        let t = text(vec![reading(SwitchState::On, now)], false);
+        assert!(
+            t.contains("switched on but not allowed: [wikijs]") && t.contains("host it requires"),
+            "{t}"
+        );
+        // Allowed: nothing to say.
+        assert_eq!(text(vec![reading(SwitchState::On, now)], true), "");
     }
 }

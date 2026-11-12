@@ -1143,3 +1143,46 @@ fn kill_llm() -> Step {
         class: ClassId::new("interactive-llm"),
     }
 }
+
+#[test]
+fn a_switched_class_allowed_while_its_switch_is_not_on_is_a_violation() {
+    use sched_model::{Fidelity, Observation, ObservedValue, SwitchState};
+    let switch = |state, at| Observation {
+        source: "ha-wikijs".into(),
+        observed_at: Millis(at),
+        fidelity: Fidelity::Polled,
+        value: ObservedValue::Switch {
+            class: ClassId::new("wikijs"),
+            state,
+        },
+    };
+    let violations = |observations: Vec<Observation>| {
+        let mut d = decision(vec![]);
+        d.allowed.classes.insert(ClassId::new("wikijs"));
+        check(
+            &example_config(),
+            &snap(observations, vec![]),
+            &SchedState::default(),
+            &Intent::default(),
+            &d,
+        )
+        .into_iter()
+        .filter(|m| m.contains("invariant 21"))
+        .collect::<Vec<_>>()
+    };
+    assert!(violations(vec![switch(SwitchState::On, NOW)]).is_empty());
+    for (name, obs) in [
+        ("off", vec![switch(SwitchState::Off, NOW)]),
+        ("off_now", vec![switch(SwitchState::OffNow, NOW)]),
+        ("missing", vec![]),
+        ("stale", vec![switch(SwitchState::On, NOW - 11 * MIN)]),
+        ("future", vec![switch(SwitchState::On, NOW + 1)]),
+    ] {
+        let v = violations(obs);
+        assert!(
+            v.iter()
+                .any(|m| m.contains("wikijs") && m.contains("switch")),
+            "{name}: {v:?}"
+        );
+    }
+}

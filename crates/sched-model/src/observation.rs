@@ -84,7 +84,8 @@ pub enum ObservedValue {
         job: JobId,
         runs: Vec<JobRunReading>,
     },
-    /// The switch reading of a switched class, as a person set it. Nothing acts on it yet.
+    /// The switch reading of a switched class, as a person set it. `work::class_switch` turns it into
+    /// what the class may do.
     Switch { class: ClassId, state: SwitchState },
 }
 
@@ -370,6 +371,15 @@ impl Snapshot {
         self.newest_group(|o| {
             &o.source == source
                 && matches!(&o.value, ObservedValue::Demand { class: c, .. } if c == class)
+        })
+    }
+
+    /// Newest-timestamp switch observations for `class` from `source`, the source its
+    /// config says supplies it; everything else is filtered out first.
+    pub(crate) fn switch_group(&self, source: &SourceId, class: &ClassId) -> Vec<&Observation> {
+        self.newest_group(|o| {
+            &o.source == source
+                && matches!(&o.value, ObservedValue::Switch { class: c, .. } if c == class)
         })
     }
 
