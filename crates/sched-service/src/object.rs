@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use restate_sdk::errors::{HandlerError, TerminalError};
-use sched_model::{Config, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId};
+use sched_model::{Config, DrainMode, Lease, LeaseId, Millis, ModelId, ResourceId, Waker};
 use sched_sequencer::status::Drain;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -466,16 +466,36 @@ pub async fn release_host_lease<C: ObjectCtx>(
         let core = persist::decode_state(ctx.get_raw(STATE_KEY).await?.as_deref())
             .map_err(|e| unreadable(shared, &e))?;
         let (s, resource) = (Arc::clone(shared), req.resource.clone());
-        let (core, recorded) = ctx
+        let (core, recorded, refused_by) = ctx
             .run_journaled("release_host_lease", move || {
                 let mut core = core;
                 let config = s.config.current();
                 let now = s.clock.now();
-                let r =
-                    sched_sequencer::drain::request(&mut core.state, &config, &resource, mode, now);
-                (core, r == sched_sequencer::drain::Requested::Recorded)
+                let wakers = last_wakers(&s, &resource);
+                let r = sched_sequencer::drain::request(
+                    &mut core.state,
+                    &config,
+                    &resource,
+                    mode,
+                    now,
+                    &wakers,
+                );
+                let refused = r == sched_sequencer::drain::Requested::Refused;
+                (
+                    core,
+                    r == sched_sequencer::drain::Requested::Recorded,
+                    if refused { wakers } else { Vec::new() },
+                )
             })
             .await?;
+        // A refusal changes nothing: neither the state nor the lease book is stored, so the
+        // manual lease stays held.
+        if !refused_by.is_empty() {
+            return Err(lease_refused(&LeaseError::HostHasWakers {
+                resource: req.resource.clone(),
+                wakers: refused_by,
+            }));
+        }
         if recorded {
             ctx.set_raw(STATE_KEY, persist::encode_state(&core));
             drain_mode = Some(mode);
@@ -522,6 +542,23 @@ pub struct DrainAck {
     /// is under `control: manual`, so there is nothing for flowmanager to take down). Only a
     /// requested one ([`Drain::requested`]), so its JSON is `{mode, since, scaled_down}`.
     pub drain: Option<Drain>,
+    /// The host's wakers as of the last tick (power-model 2.1d). Empty when there were none or
+    /// no tick has been reported yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wakers: Vec<Waker>,
+    /// A graceful request was refused because of `wakers`: nothing was changed, the manual
+    /// lease (if any) is still held and `drain` is `None`. Never set for an immediate request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
+}
+
+/// The wakers the last tick reported for `resource`: none before the first tick of this
+/// process (the sequencer then cancels a graceful shutdown a waker contradicts).
+fn last_wakers(shared: &Shared, resource: &ResourceId) -> Vec<Waker> {
+    shared
+        .last_report()
+        .and_then(|r| r.host(resource).map(|h| h.wakers.clone()))
+        .unwrap_or_default()
 }
 
 /// Takes a shared host down on a person's request, whether or not a manual lease is held:
@@ -547,23 +584,34 @@ pub async fn drain_host<C: ObjectCtx>(
             let config = s.config.current();
             let now = s.clock.now();
             LeaseBook::check_host(&config, &req.resource)?;
+            let wakers = last_wakers(&s, &req.resource);
             let released = book.release_manual_host(&req.resource).is_ok();
-            sched_sequencer::drain::request(
+            let outcome = sched_sequencer::drain::request(
                 &mut core.state,
                 &config,
                 &req.resource,
                 req.drain,
                 now,
+                &wakers,
             );
-            let drain = core
-                .state
-                .resource(&req.resource)
-                .and_then(|st| st.shutdown.as_ref())
-                .and_then(Drain::requested);
+            let refused = outcome == sched_sequencer::drain::Requested::Refused;
+            // A refusal changes nothing: the lease book is not stored, so the manual lease
+            // stays held.
+            let released = released && !refused;
+            let drain = if refused {
+                None
+            } else {
+                core.state
+                    .resource(&req.resource)
+                    .and_then(|st| st.shutdown.as_ref())
+                    .and_then(Drain::requested)
+            };
             let ack = DrainAck {
                 resource: req.resource.clone(),
                 released,
                 drain,
+                wakers,
+                refused,
             };
             Ok::<_, LeaseError>((ack, book, core))
         })
@@ -1745,6 +1793,8 @@ mod tests {
                 since: Millis(7),
                 scaled_down: false,
             }),
+            wakers: vec![],
+            refused: false,
         };
         assert_eq!(serde_json::to_value(&ack).unwrap(), shape);
         assert_eq!(
@@ -1894,6 +1944,210 @@ mod tests {
             .unwrap_err();
             assert!(format!("{e:?}").contains("code: 400"), "{e:?}");
         }
+    }
+
+    /// The managed NFS-only example plus `nfs-batch`, a class on the NFS host that may change
+    /// power (demand pushed to `nfs-batch-queue`), and `nfs-app`, a switched one (read from the
+    /// example's `ha-wikijs` source).
+    fn process_with_wakers() -> (Arc<Shared>, Arc<ManualClock>) {
+        let app = "  - id: nfs-app\n    requires:\n      - { resource: basestar-nfs }\n    priority: 0\n    preemptibility: kill\n    may_change_power: true\n    switch: { source: ha-wikijs }\n\nsources:\n";
+        let yaml = sched_model::test_support::with_nfs_batch(
+            &sched_model::test_support::example_yaml_managed_nfs_only(),
+        )
+        .replacen("\nsources:\n", &format!("\n{app}"), 1);
+        let clock = Arc::new(ManualClock::new(Millis(T0)));
+        let holder = Arc::new(ConfigHolder::new(&yaml).unwrap());
+        let s = Arc::new(Shared::new(holder, Arc::new(Metrics::new()), clock.clone()));
+        (s, clock)
+    }
+
+    fn batch_work(s: &Shared, ready: u64) {
+        push(
+            s,
+            "nfs-batch-queue",
+            vec![ObservedValue::Demand {
+                failed: 0,
+                class: "nfs-batch".into(),
+                ready,
+                in_flight: 0,
+                oldest_ready_at: None,
+            }],
+        );
+    }
+
+    fn switch_of_app(s: &Shared, state: sched_model::SwitchState) {
+        push(
+            s,
+            "ha-wikijs",
+            vec![ObservedValue::Switch {
+                class: "nfs-app".into(),
+                state,
+            }],
+        );
+    }
+
+    fn leases_held(s: &Shared, ctx: &FakeCtx) -> usize {
+        list_leases(s, ctx.stored(LEASES_KEY).as_deref())
+            .unwrap()
+            .len()
+    }
+
+    fn nfs_shutdown(ctx: &FakeCtx) -> Option<sched_model::Shutdown> {
+        stored_state(ctx)
+            .state
+            .resource(&"basestar-nfs".into())
+            .and_then(|st| st.shutdown)
+    }
+
+    #[tokio::test]
+    async fn a_graceful_drain_is_refused_while_the_host_has_wakers_at_every_entry_point() {
+        let (s, clock) = process_with_wakers();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        batch_work(&s, 2);
+        // The host is found running and adopted (an adopted lease is held); the queued work of
+        // `nfs-batch` is a waker.
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(r.adopted().len(), 1, "{r:?}");
+        let host = r.host(&"basestar-nfs".into()).unwrap();
+        assert_eq!(host.wakers.len(), 1, "{host:?}");
+        assert_eq!(leases_held(&s, &ctx), 1);
+        clock.set(Millis(T0 + 1_000));
+
+        // release_host_lease with a graceful drain: 409, nothing changed.
+        let e = release_host_lease(&s, &ctx, release("basestar-nfs", Some(DrainMode::Graceful)))
+            .await
+            .unwrap_err();
+        let msg = refused(&e);
+        assert!(
+            msg.contains("code: 409") && msg.contains("nfs-batch"),
+            "{msg}"
+        );
+        ctx.commit();
+        assert_eq!(leases_held(&s, &ctx), 1, "the lease is still held");
+        assert_eq!(nfs_shutdown(&ctx), None, "no shutdown recorded");
+
+        // drain_host graceful: refused, naming the wakers, nothing changed.
+        let ask = |mode| DrainHost {
+            resource: "basestar-nfs".into(),
+            drain: mode,
+        };
+        let a = drain_host(&s, &ctx, ask(DrainMode::Graceful))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert!(a.refused && !a.released && a.drain.is_none(), "{a:?}");
+        assert_eq!(a.wakers.len(), 1);
+        assert_eq!(a.wakers[0].class.as_str(), "nfs-batch");
+        assert_eq!(leases_held(&s, &ctx), 1, "the lease is still held");
+        assert_eq!(nfs_shutdown(&ctx), None, "no shutdown recorded");
+
+        // An immediate drain is never refused: it goes ahead and carries the wakers.
+        let a = drain_host(&s, &ctx, ask(DrainMode::Immediate))
+            .await
+            .unwrap();
+        ctx.commit();
+        assert!(!a.refused && a.released, "{a:?}");
+        assert_eq!(a.drain.map(|d| d.mode), Some(DrainMode::Immediate));
+        assert_eq!(a.wakers.len(), 1, "the wakers are reported with it");
+        assert_eq!(leases_held(&s, &ctx), 0);
+    }
+
+    #[tokio::test]
+    async fn a_switched_class_reading_on_refuses_a_graceful_drain_and_work_ending_lifts_the_refusal()
+     {
+        let (s, clock) = process_with_wakers();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        batch_work(&s, 0);
+        switch_of_app(&s, sched_model::SwitchState::On);
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        let wakers = &r.host(&"basestar-nfs".into()).unwrap().wakers;
+        assert_eq!(wakers.len(), 1, "{wakers:?}");
+        assert_eq!(wakers[0].why, sched_model::WakeReason::SwitchedOn);
+        clock.set(Millis(T0 + 1_000));
+        let ask = DrainHost {
+            resource: "basestar-nfs".into(),
+            drain: DrainMode::Graceful,
+        };
+        assert!(
+            drain_host(&s, &ctx, ask.clone()).await.unwrap().refused,
+            "switched on"
+        );
+        ctx.commit();
+        // The switch goes off: the next tick sees no waker and the request is accepted.
+        switch_of_app(&s, sched_model::SwitchState::OffNow);
+        tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        let a = drain_host(&s, &ctx, ask).await.unwrap();
+        ctx.commit();
+        assert!(!a.refused && a.wakers.is_empty(), "{a:?}");
+        assert_eq!(a.drain.map(|d| d.mode), Some(DrainMode::Graceful));
+    }
+
+    #[tokio::test]
+    async fn a_waker_appearing_cancels_a_stored_graceful_shutdown_at_the_next_tick() {
+        let (s, clock) = process_with_wakers();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        batch_work(&s, 0);
+        tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        clock.set(Millis(T0 + 1_000));
+        let a = drain_host(
+            &s,
+            &ctx,
+            DrainHost {
+                resource: "basestar-nfs".into(),
+                drain: DrainMode::Graceful,
+            },
+        )
+        .await
+        .unwrap();
+        ctx.commit();
+        assert!(!a.refused && a.drain.is_some(), "{a:?}");
+        assert!(nfs_shutdown(&ctx).is_some());
+        // Work arrives for a class that may wake the host: the person's off is cancelled.
+        batch_work(&s, 3);
+        clock.set(Millis(T0 + 2_000));
+        let r = tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        assert_eq!(nfs_shutdown(&ctx), None, "{r:?}");
+        assert!(
+            !r.steps
+                .iter()
+                .any(|st| matches!(st, sched_model::Step::PowerOff { .. })),
+            "{:?}",
+            r.steps
+        );
+        assert_eq!(r.host(&"basestar-nfs".into()).unwrap().wakers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_report_yet_accepts_a_graceful_drain() {
+        // No tick has been reported by this process: there are no wakers to judge on.
+        let (s, _) = process_with_wakers();
+        let ctx = FakeCtx::default();
+        world(&s, 0);
+        batch_work(&s, 2);
+        tick(&s, &ctx).await.unwrap();
+        ctx.commit();
+        let (fresh, _) = process_with_wakers();
+        world(&fresh, 0);
+        assert_eq!(fresh.last_report(), None);
+        let a = drain_host(
+            &fresh,
+            &ctx,
+            DrainHost {
+                resource: "basestar-nfs".into(),
+                drain: DrainMode::Graceful,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!a.refused && a.wakers.is_empty(), "{a:?}");
     }
 
     #[tokio::test]

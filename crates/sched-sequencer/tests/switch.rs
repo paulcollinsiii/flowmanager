@@ -42,6 +42,7 @@ fn host(power: PowerPhase) -> HostStatus {
         lockout: None,
         min_off: None,
         wait: None,
+        wakers: Vec::new(),
         attention: false,
     }
 }

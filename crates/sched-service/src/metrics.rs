@@ -759,6 +759,7 @@ mod tests {
             lockout: None,
             min_off: None,
             wait: None,
+            wakers: vec![],
             attention: false,
         }
     }

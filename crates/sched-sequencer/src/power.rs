@@ -529,6 +529,19 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
         st.shutdown = None;
         return;
     }
+    // A waker (a class that may change power and is busy, or switched on) cancels a graceful
+    // requested shutdown before the host goes down: the person's off would otherwise end in a
+    // bounce (power-model 2.1d). An immediate one is not cancelled, nor is an idle or lockout
+    // one; a class that may not wake the host is no waker and is withdrawn as before.
+    if s.cause()
+        == (ShutdownCause::Requested {
+            mode: DrainMode::Graceful,
+        })
+        && !sched_model::wakers(cx.config, cx.snapshot, cx.state, &cx.res.id).is_empty()
+    {
+        st.shutdown = None;
+        return;
+    }
     // A lockout taking over a shutdown in progress makes it the lockout's own, on either kind
     // of host (see `Shutdown::under_lockout`): a pending withdrawal gives in-flight work
     // `lockout_timeout` from now, whichever cause the shutdown had; a done one stays done;

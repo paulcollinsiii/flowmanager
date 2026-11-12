@@ -48,8 +48,8 @@ use std::time::Duration;
 
 use hyper::Method;
 use sched_model::{
-    Config, DrainMode, Lease, LeaseId, LeaseKind, Millis, ModelId, ResourceId, ResourceKind,
-    lockout_lease, manual_host_lease,
+    Config, DrainMode, Lease, LeaseId, LeaseKind, Millis, ModelId, ResourceId, ResourceKind, Waker,
+    lockout_lease, manual_host_lease, wakers_label,
 };
 use sched_sequencer::switch::{
     HostRequest, HostWait, LastTick, LockoutSwitchStatus, ModelStatus, SwitchState,
@@ -76,6 +76,8 @@ const MAX_BODY: usize = 1024;
 pub struct ApiError {
     pub status: u16,
     pub message: String,
+    /// The JSON body to answer with, when it is more than `{"error": message}`.
+    pub body: Option<Value>,
 }
 
 impl ApiError {
@@ -83,6 +85,7 @@ impl ApiError {
         ApiError {
             status,
             message: message.into(),
+            body: None,
         }
     }
 }
@@ -737,6 +740,7 @@ impl Toggle {
     ) -> Result<Value, ApiError> {
         let config = self.shared.config.current();
         let id = known_resource(&config, name)?;
+        let mut warning = None;
         let (held, request) = match set {
             None => (
                 manual_host_lease(&self.backend.leases().await?, &id).cloned(),
@@ -749,16 +753,22 @@ impl Toggle {
             ),
             // Off is a requested shutdown on every host, whatever its kind; the listener
             // translates and the sequencer decides.
-            Some(false) => (
-                None,
-                HostRequest::Answered {
-                    drain: self.backend.drain_host(&id, drain).await?.drain,
-                },
-            ),
+            Some(false) => {
+                let ack = self.backend.drain_host(&id, drain).await?;
+                // The sequencer refused a graceful off: the host has wakers. The reply is a
+                // 409 naming them; nothing was changed, so the lease is still held.
+                if ack.refused {
+                    return Err(refused_by_wakers(name, &ack.wakers));
+                }
+                if drain == DrainMode::Immediate && !ack.wakers.is_empty() {
+                    warning = Some(waker_warning(name, &ack.wakers));
+                }
+                (None, HostRequest::Answered { drain: ack.drain })
+            }
         };
         let leases = self.backend.leases().await?;
         let now = self.shared.clock.now();
-        Ok(resource_state(
+        let mut state = resource_state(
             &config,
             &id,
             held.as_ref(),
@@ -766,7 +776,11 @@ impl Toggle {
             request,
             &self.shared.last_report(),
             now,
-        ))
+        );
+        if let (Some(w), Value::Object(m)) = (warning, &mut state) {
+            m.insert("warning".into(), json!(w));
+        }
+        Ok(state)
     }
 
     /// A plain release of the manual host lease (an adopted one included), with no drain: the
@@ -842,6 +856,33 @@ impl Toggle {
         let ack = self.backend.resume(&id).await?;
         Ok(json!({ "resource": ack.resource, "cleared": ack.cleared }))
     }
+}
+
+/// The wakers as JSON: `[{"class": ..., "why": "switched_on" | "work"}]`.
+fn wakers_json(wakers: &[Waker]) -> Value {
+    serde_json::to_value(wakers).unwrap_or(Value::Null)
+}
+
+/// The 409 of a graceful off the sequencer refused: the host has wakers. The body names each
+/// waker and why it wants the host.
+fn refused_by_wakers(resource: &str, wakers: &[Waker]) -> ApiError {
+    let message = format!(
+        "{resource} was not turned off: it has wakers that would power it straight back on: {}. Nothing was changed. Turn them off or wait for their work, or use off-now to reboot it",
+        wakers_label(wakers)
+    );
+    ApiError {
+        status: 409,
+        body: Some(json!({ "error": message, "wakers": wakers_json(wakers) })),
+        message,
+    }
+}
+
+/// The warning of an `off-now` on a host that has wakers.
+fn waker_warning(resource: &str, wakers: &[Waker]) -> String {
+    format!(
+        "{resource} has wakers and will be powered back on after min_off: {}",
+        wakers_label(wakers)
+    )
 }
 
 fn bad_wish() -> ApiError {
@@ -1092,7 +1133,9 @@ fn lockout_words(status: &LockoutSwitchStatus, resource: &ResourceId) -> (&'stat
 
 /// A resource (host) switch: `state`, `drain` and `wait` say what
 /// `sched_sequencer::switch::host_switch` decides. `power` and `needs_attention` come from the
-/// last tick's report of this process and are absent before the first tick, as is `wait` unless
+/// last tick's report of this process and are absent before the first tick (`wakers` is always
+/// there, empty before it: the classes that would power the host back on, each with `why`), as
+/// is `wait` unless
 /// a lockout is held; `wait` names why the scheduler holds something back
 /// (`shutdown_held_by_veto`, `min_off`, `locked_out`). `drain` is present while a drain is under
 /// way (a switch-off asked for the host to go down): its mode, who started it and whether the
@@ -1141,6 +1184,12 @@ pub fn resource_state(
         let waits = waits.iter().map(host_wait_json).collect();
         m.insert("wait".into(), Value::Array(waits));
     }
+    // Always present, empty without wakers (and before the first tick): what a person needs to
+    // see before pressing off.
+    m.insert(
+        "wakers".into(),
+        wakers_json(host.map_or(&[][..], |h| &h.wakers)),
+    );
     m.insert("locked_out".into(), json!(locked_out));
     Value::Object(m)
 }
@@ -1167,7 +1216,10 @@ fn host_wait_json(wait: &HostWait) -> Value {
 }
 
 fn error_reply(e: ApiError) -> Reply {
-    Reply::failure(e.status, &e.message)
+    match e.body {
+        Some(body) => Reply::json(e.status, body),
+        None => Reply::failure(e.status, &e.message),
+    }
 }
 
 /// Serves until the task is dropped or aborted.
@@ -1246,6 +1298,7 @@ mod tests {
             lockout: None,
             min_off: None,
             wait: None,
+            wakers: vec![],
             attention: matches!(power, PowerPhase::Failed { .. }),
         }
     }
@@ -2239,6 +2292,172 @@ mod tests {
             (200, &json!(true), true),
             "{v}"
         );
+    }
+
+    /// The managed example plus `nfs-batch` (demand, on the shared NFS host) and the switched
+    /// classes `nfs-app` (NFS host) and `gpu-app` (exclusive GPU host), all of which may change
+    /// power, and `quiet-app` (switched, NFS host) which may not.
+    fn waker_yaml() -> String {
+        let classes = "  - id: nfs-app\n    requires:\n      - { resource: basestar-nfs }\n    priority: 0\n    preemptibility: kill\n    may_change_power: true\n    switch: { source: ha-wikijs }\n\n  - id: gpu-app\n    requires:\n      - { resource: cuda-central }\n    priority: 0\n    preemptibility: kill\n    may_change_power: true\n    switch: { source: ha-wikijs }\n\n  - id: quiet-app\n    requires:\n      - { resource: basestar-nfs }\n    priority: 0\n    preemptibility: kill\n    switch: { source: ha-wikijs }\n\nsources:\n";
+        sched_model::test_support::with_nfs_batch(&example_yaml_managed()).replacen(
+            "\nsources:\n",
+            &format!("\n{classes}"),
+            1,
+        )
+    }
+
+    impl Rig {
+        fn batch_work(&self, ready: u64) {
+            self.push(
+                "nfs-batch-queue",
+                vec![ObservedValue::Demand {
+                    failed: 0,
+                    class: "nfs-batch".into(),
+                    ready,
+                    in_flight: 0,
+                    oldest_ready_at: None,
+                }],
+            );
+        }
+
+        fn app(&self, class: &str, state: sched_model::SwitchState) {
+            self.push(
+                "ha-wikijs",
+                vec![ObservedValue::Switch {
+                    class: class.into(),
+                    state,
+                }],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_wakers_of_each_powered_host_are_reported_always_present_with_why() {
+        let r = rig(&waker_yaml());
+        // Before any tick: present and empty.
+        let (s, v) = r.get("/v1/resources/basestar-nfs").await;
+        assert_eq!((s, &v["wakers"]), (200, &json!([])), "{v}");
+        r.hosts_up(true);
+        r.tick().await;
+        let (_, v) = r.get("/v1/leases").await;
+        for res in v["resources"].as_array().unwrap() {
+            assert_eq!(res["wakers"], json!([]), "{res}");
+        }
+        // Work for a class that may change power, a switched one reading on, and (not wakers)
+        // a switched one that may not change power and a busy one that may not.
+        r.batch_work(2);
+        r.app("gpu-app", sched_model::SwitchState::On);
+        r.app("quiet-app", sched_model::SwitchState::On);
+        r.tick().await;
+        let (_, v) = r.get("/v1/leases").await;
+        let by_id = |id: &str| {
+            v["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            by_id("basestar-nfs")["wakers"],
+            json!([{ "class": "nfs-batch", "why": "work" }])
+        );
+        assert_eq!(
+            by_id("cuda-central")["wakers"],
+            json!([{ "class": "gpu-app", "why": "switched_on" }])
+        );
+        // The same on the single-host read.
+        let (_, v) = r.get("/v1/resources/cuda-central").await;
+        assert_eq!(
+            v["wakers"],
+            json!([{ "class": "gpu-app", "why": "switched_on" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn off_is_refused_with_a_409_naming_the_wakers_and_changes_nothing_on_both_host_kinds() {
+        let r = rig(&waker_yaml());
+        r.hosts_up(true);
+        r.tick().await;
+        r.batch_work(2);
+        r.app("gpu-app", sched_model::SwitchState::On);
+        r.tick().await;
+        let leases = r.lease_count();
+        assert_eq!(leases, 2, "both hosts adopted");
+        for (host, class, why) in [
+            ("basestar-nfs", "nfs-batch", "work"),
+            ("cuda-central", "gpu-app", "switched_on"),
+        ] {
+            // Every graceful form of off: the `off` route and a body of `off`.
+            for (path, body) in [
+                (format!("/v1/resources/{host}/off"), ""),
+                (format!("/v1/resources/{host}"), "off"),
+            ] {
+                let (s, v) = r.post(&path, body).await;
+                assert_eq!(s, 409, "{host} {path}: {v}");
+                assert_eq!(v["wakers"], json!([{ "class": class, "why": why }]), "{v}");
+                let msg = v["error"].as_str().unwrap();
+                assert!(
+                    msg.contains(class) && msg.contains("Nothing was changed"),
+                    "{msg}"
+                );
+                // Nothing changed: the lease is still held, no drain is shown.
+                assert_eq!(r.lease_count(), leases, "{host}");
+                let (_, v) = r.get(&format!("/v1/resources/{host}")).await;
+                assert_eq!(v["held"], true, "{v}");
+                assert!(v.get("drain").is_none(), "{v}");
+            }
+        }
+        // The wakers end: the next tick lifts the refusal.
+        r.batch_work(0);
+        r.tick().await;
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off", "").await;
+        assert_eq!(
+            (s, &v["state"], &v["drain"]["mode"], &v["wakers"]),
+            (200, &json!("draining"), &json!("graceful"), &json!([])),
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_non_wakers_do_not_refuse_an_off() {
+        let r = rig(&waker_yaml());
+        r.hosts_up(false);
+        r.tick().await;
+        // A switched class that may not change power, switched classes not reading on, and
+        // unknown demand for the class that may change power.
+        r.app("quiet-app", sched_model::SwitchState::On);
+        r.app("nfs-app", sched_model::SwitchState::Off);
+        r.tick().await;
+        let (_, v) = r.get("/v1/resources/basestar-nfs").await;
+        assert_eq!(v["wakers"], json!([]), "{v}");
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off", "").await;
+        assert_eq!((s, &v["state"]), (200, &json!("draining")), "{v}");
+    }
+
+    #[tokio::test]
+    async fn off_now_is_never_refused_and_warns_naming_the_wakers() {
+        let r = rig(&waker_yaml());
+        r.hosts_up(true);
+        r.tick().await;
+        r.batch_work(2);
+        r.tick().await;
+        let (s, v) = r.post("/v1/resources/basestar-nfs/off-now", "").await;
+        assert_eq!(
+            (s, &v["state"], &v["drain"]["mode"]),
+            (200, &json!("draining"), &json!("immediate")),
+            "{v}"
+        );
+        let w = v["warning"].as_str().unwrap();
+        assert!(
+            w.contains("nfs-batch") && w.contains("powered back on after min_off"),
+            "{w}"
+        );
+        // A host without wakers: no warning.
+        let (s, v) = r.post("/v1/resources/cuda-central/off-now", "").await;
+        assert_eq!(s, 200, "{v}");
+        assert!(v.get("warning").is_none(), "{v}");
     }
 
     #[tokio::test]

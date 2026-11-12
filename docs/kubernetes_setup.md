@@ -240,8 +240,8 @@ only control). Request and response shapes were exercised live:
 | `Scheduler/main/acquire_model_lease` | `{"model": "<id>"}` | **Pins a model on its GPU**: batch work is cut short (its classes leave the allowed set at once, in-flight work gets `drain_timeout`, or a class's `kill_timeout`, then is stopped) and the model stays allowed however much other work waits, until the lease is released. Asking again for the leased model returns the existing lease; another model of the same resource is `409`; an unknown model is `400`. | an operator (a person); later Open WebUI's service account. |
 | `Scheduler/main/release_lease` | `{"id": "manual-model-<n>"}` | Releases a lease and returns it; unknown id `404`. Whoever can release can end somebody's pin. | an operator; the same identity that acquired it. |
 | `Scheduler/main/acquire_host_lease` | `{"resource": "<id>"}` | **Holds a host with a power section up**, shared (the NFS server) or exclusive (a GPU): a `managed` host that is off is powered on, and while the lease is held everything gated on the host is allowed even with no work queued. On an exclusive host it pins no model (the queues keep choosing); with no host or model lease, and no `may_change_power` class, nothing powers an exclusive managed host on. Asking again returns the lease; a resource without a power section or an unknown one is `400`. Ids `manual-host-<n>`. | an operator. |
-| `Scheduler/main/release_host_lease` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` (`drain` optional) | Releases the manual host lease of a resource (also the one flowmanager minted for a host it found running); none held is `404`. Without `drain` the host is shut down once nothing else holds it (queued or in-flight work of its consumers included), `idle_grace` has passed and no pod mounts it. A plain release of an exclusive host leaves queued or in-flight work holding it until it is idle, then `idle_grace` after the model is withdrawn it is shut down. With `drain` (any host with a power section, shared or exclusive) the request is recorded in the host's state: queued and in-flight work stops holding the host, its consumers are withdrawn (a shared host: scaled down; an exclusive host: the model is wound down) (`immediate`: at once; `graceful`: when nothing is in flight or after `policy.drain_timeout`), and the host is shut down once no lease holds it (a job's hold is waited for, never overridden) and no pod mounts it (`veto_timeout` still applies). A new `acquire_host_lease` cancels the drain. The drain is in the tick report (`drains`) and the logs (`drain_requested`, `drain`). | an operator. |
-| `Scheduler/main/drain_host` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` | Takes a host (shared or exclusive) down whether or not a manual lease is held (the Home Assistant switch-off): releases the lease if there is one and records the drain as `release_host_lease` does. Asked again it changes the drain under way in place (`immediate` escalates, `graceful` leaves an immediate one), from the stored state. Answers `{resource, released, drain}`; `drain` is absent when the host is not up under managed control. A resource without a power section or an unknown one is `400`. A resource that is locked out records nothing (the lockout shuts it down or leaves it alone). **Rollback:** an older build cannot decode a stored state that holds a drain, so let it finish (or discard the state) before rolling back. | an operator. |
+| `Scheduler/main/release_host_lease` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` (`drain` optional) | Releases the manual host lease of a resource (also the one flowmanager minted for a host it found running); none held is `404`. Without `drain` the host is shut down once nothing else holds it (queued or in-flight work of its consumers included), `idle_grace` has passed and no pod mounts it. A plain release of an exclusive host leaves queued or in-flight work holding it until it is idle, then `idle_grace` after the model is withdrawn it is shut down. With `drain` (any host with a power section, shared or exclusive) the request is recorded in the host's state: queued and in-flight work stops holding the host, its consumers are withdrawn (a shared host: scaled down; an exclusive host: the model is wound down) (`immediate`: at once; `graceful`: when nothing is in flight or after `policy.drain_timeout`), and the host is shut down once no lease holds it (a job's hold is waited for, never overridden) and no pod mounts it (`veto_timeout` still applies). A new `acquire_host_lease` cancels the drain. A **graceful** drain of a host that has *wakers* (see the toggle listener below) is refused, judged on the last tick: the call fails with `409` naming them, and nothing changes (the manual lease stays held, no shutdown is recorded). An `immediate` drain is never refused. The drain is in the tick report (`drains`) and the logs (`drain_requested`, `drain`). | an operator. |
+| `Scheduler/main/drain_host` | `{"resource": "<id>", "drain": "graceful" \| "immediate"}` | Takes a host (shared or exclusive) down whether or not a manual lease is held (the Home Assistant switch-off): releases the lease if there is one and records the drain as `release_host_lease` does. Asked again it changes the drain under way in place (`immediate` escalates, `graceful` leaves an immediate one), from the stored state. Answers `{resource, released, drain}`; `drain` is absent when the host is not up under managed control. When the host has wakers (as of the last tick) the answer also carries `wakers` (`[{"class", "why"}]`), and a `graceful` request is refused with nothing changed: the answer is `{resource, released: false, wakers, refused: true}` and no `drain` (the toggle listener turns it into a `409`). An `immediate` request is never refused. A resource without a power section or an unknown one is `400`. A resource that is locked out records nothing (the lockout shuts it down or leaves it alone). **Rollback:** an older build cannot decode a stored state that holds a drain, so let it finish (or discard the state) before rolling back. | an operator. |
 | `Scheduler/main/lockout` | `{"resource": "<id>"}` | **Locks a host out despite pending work** ("flowmanager, keep away from this host until I clear it"): intake stops, in-flight work gets `lockout_timeout` and is then cut off, a `managed` host is shut down once, and nothing wakes, adopts or schedules it (no workload, job hold or manual lease) until `clear_lockout`; if something else boots it later it is left alone. Valid on any resource with a power section, shared or exclusive (`400` otherwise). A manual lease is neither cancelled nor deleted by a lockout. Replaces `reclaim`. Ids `lockout-<n>`. | an operator. |
 | `Scheduler/main/clear_lockout` | `{"resource": "<id>"}` | Releases the lockout; none held is `404`. | an operator. |
 | `Scheduler/main/resume` | `{"resource": "<id>"}` | After a host was fixed by hand: clears a failed power transition, or a shutdown stopped by mounting pods, for that one resource, which then follows observation (found running means up and not ours; a `managed` host, shared or exclusive, is then adopted at the next tick). Powers nothing; other resources and the leases are untouched. Not stopped: `409`. | an operator. |
@@ -364,7 +364,7 @@ tick's report in the process (so a status is absent until this process has ticke
 | `GET /v1/leases` | Every model, powered resource and (under `lockouts`) every resource with a power section with its state, and a top-level `needs_attention`. |
 | `GET /v1/models/{model}` | A manual model lease (on = the lease is held, **not** that the model is loaded). |
 | `POST /v1/models/{model}/on`, `/off` | Take or release it. Idempotent: on when held returns the same state; off when not held is a success. |
-| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release` | The manual host lease of a host with a power section (the NFS server, or an exclusive GPU host): powers a managed host on and keeps it up. On an **exclusive** host the queues keep choosing the model; the vocabulary is the same as for a shared host. A host found running (power button, Wake-on-LAN, first start) reads **on**: flowmanager holds it for you with an adopted lease, and switching it off releases it. on any host `off` releases with a **graceful** requested shutdown (queued work no longer keeps the host up; in-flight work gets `drain_timeout`, then the consumers are withdrawn and the host is shut down once nothing else holds it), `off-now` with an **immediate** one (consumers withdrawn at once). Neither overrides a job's hold: the host stays up until it ends. `release` is a plain release with no drain (what `off` did before drains): the host is shut down only once nothing holds it, `404` if no lease is held, and the reply keeps `state: "on"` while the host is up. A later `on` cancels a drain. This works with no lease held too (a host held up only by queued work), and the answer is `state: "draining"` with a `drain` object while the host is up, never `off`; an idle drain (no lease, `held:false`) is shown the same way, with `drain.origin` `idle`. |
+| `GET /v1/resources/{resource}`, `POST .../on`, `.../off`, `.../off-now`, `.../release` | The manual host lease of a host with a power section (the NFS server, or an exclusive GPU host): powers a managed host on and keeps it up. On an **exclusive** host the queues keep choosing the model; the vocabulary is the same as for a shared host. A host found running (power button, Wake-on-LAN, first start) reads **on**: flowmanager holds it for you with an adopted lease, and switching it off releases it. on any host `off` releases with a **graceful** requested shutdown (queued work no longer keeps the host up; in-flight work gets `drain_timeout`, then the consumers are withdrawn and the host is shut down once nothing else holds it), `off-now` with an **immediate** one (consumers withdrawn at once). Neither overrides a job's hold: the host stays up until it ends. **A graceful `off` is refused while the host has wakers**: `409` with `{"error": ..., "wakers": [{"class": "nfs-app", "why": "switched_on"}, ...]}`, judged on the last tick, and nothing changes (the lease stays held, no drain is recorded). A waker is a class that may change power, requires the host and is busy (`why: "work"`: queued or in-flight work) or is a switched class reading `on` (`why: "switched_on"`): it would power the host straight back on. A job's hold, unknown demand, a class that may not change power, a switch that is not a usable `on` and a locked-out host are not wakers. A waker appearing while a graceful off is under way cancels it, before the host is powered off. `off-now` is never refused: when the host has wakers the answer carries a `warning` naming them ("will be powered back on after `min_off`": in effect a reboot). `release` is a plain release with no drain (what `off` did before drains): the host is shut down only once nothing holds it, `404` if no lease is held, and the reply keeps `state: "on"` while the host is up. A later `on` cancels a drain. This works with no lease held too (a host held up only by queued work), and the answer is `state: "draining"` with a `drain` object while the host is up, never `off`; an idle drain (no lease, `held:false`) is shown the same way, with `drain.origin` `idle`. |
 | `POST /v1/resources/{resource}/resume` | Clears a failed power phase (or a shutdown stopped by mounting pods) after a person fixed the host. `409` if the resource is not stopped. |
 | `GET /v1/lockouts/{resource}`, `POST .../on`, `.../off` | `lockout` / `clear_lockout` of a resource with a power section, shared or exclusive (replaces `/v1/reclaims/{resource}`): intake stops, work is cut off after the lockout timeout, the host is shut down once if its power is managed, and nothing wakes or adopts it until the lockout is cleared. |
 
@@ -396,7 +396,10 @@ derived from the last tick's report and are **left out when they cannot be said*
   `shutdown_held_by_veto` with `readings`, `blocking` and `stopped`, or `locked_out`), `drain`
   (present while a requested or idle shutdown is withdrawing the consumers: `mode`, `cause`
   (`requested` or `idle`; `origin` now means only a lease's), `since_ms`, `scaled_down`),
-  `needs_attention`;
+  `needs_attention`, and `wakers` (always present, `[]` when there are none or before the first
+  tick: the classes that would power the host back on, each `{"class", "why"}` with `why` `work`
+  or `switched_on`; read it before pressing off), plus `warning` on an `off-now` answer when
+  the host has wakers;
 - lockout: `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_alone` (the host booted after the lockout shut it down: flowmanager leaves it alone until the lockout is cleared), `left_for_person` (the host
   is up and its power is `control: manual`, so flowmanager never shuts it down: power it off
   yourself), `pending`, the `power`
@@ -411,7 +414,8 @@ there is no separate metric for it (alert on those two, see the alert list).
 Errors are JSON `{"error": "<message>"}`. The handler's own message and status are relayed for
 `400` (a resource that cannot be leased, drained or locked out: one without a power section, for a host lease, a drain or
 a lockout) and `409` (another model already leased on the
-resource; `resume` of a resource that is not stopped). `404` is the listener's own answer for a
+resource; `resume` of a resource that is not stopped). The `409` of a refused graceful `off`
+(the host has wakers) has the body `{"error": "<message>", "wakers": [{"class": ..., "why": ...}]}`. `404` is the listener's own answer for a
 name the config does not have (the message lists what is configured) or a path it does not
 serve. A `404` from Restate is never relayed: Restate gives it for a service it does not know
 (the `Scheduler` deployment is not registered), so it is a `502`, like any other unexpected
@@ -514,7 +518,9 @@ switch:
       Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"   # the value is "Bearer <token>"
     timeout: 20
   - platform: rest                  # one host: the NFS server. On = held (also for a host found running);
-                                    # off = a graceful drain: the host is taken down even with work queued
+                                    # off = a graceful drain: the host is taken down even with work queued,
+                                    # but refused (409, the switch stays on) while it has wakers: see the
+                                    # script below, which also tells you why
     name: Flowmanager NFS host lease
     unique_id: flowmanager_lease_basestar
     resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/basestar-nfs
@@ -572,6 +578,94 @@ rest_command:
     method: post
     headers:
       Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+  flowmanager_set:                  # one command for any switch: kind (models|resources|lockouts), name, state
+    url: "http://flowmanager.flowmanager.svc.cluster.local:9096/v1/{{ kind }}/{{ name }}/{{ state }}"
+    method: post
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+    timeout: 20
+```
+
+**Wakers: seeing why an off would be refused, and being told when it is.** A graceful `off` of a
+host that has wakers (classes that would power it straight back on, see the table above) is
+answered `409` and changes nothing, and an `off-now` of such a host is accepted with a
+`warning`. A REST switch cannot show either, so call the `off` from a script that keeps the
+answer: `rest_command` returns `status` and `content` (the parsed JSON) to a
+`response_variable`, also for a `409`. The template sensor reads the wakers of the host from
+the same `/v1/leases` read as the rest of the state, so the dashboard can show them before the
+switch is pressed:
+
+```yaml
+# configuration.yaml: the one read of everything, polled
+sensor:
+  - platform: rest
+    name: Flowmanager leases
+    unique_id: flowmanager_leases
+    resource: http://flowmanager.flowmanager.svc.cluster.local:9096/v1/leases
+    value_template: "{{ value_json.resources | length }}"
+    json_attributes: [resources]
+    scan_interval: 30
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH "Bearer unset"
+
+# templates.yaml: the wakers of the NFS host. The state is how many there are, the
+# attribute names them ("nfs-app (switched on), paperless-batch (queued or in-flight work)").
+template:
+  - sensor:
+      - name: Flowmanager NFS host wakers
+        unique_id: flowmanager_wakers_basestar
+        availability: "{{ state_attr('sensor.flowmanager_leases', 'resources') is not none }}"
+        state: >-
+          {% set r = state_attr('sensor.flowmanager_leases', 'resources') | selectattr('id', 'eq', 'basestar-nfs') | list %}
+          {{ (r | first).wakers | length if r else 0 }}
+        attributes:
+          wakers: >-
+            {% set r = state_attr('sensor.flowmanager_leases', 'resources') | selectattr('id', 'eq', 'basestar-nfs') | list %}
+            {% set out = namespace(items=[]) %}
+            {% for w in ((r | first).wakers if r else []) %}
+              {% set why = 'switched on' if w.why == 'switched_on' else 'queued or in-flight work' %}
+              {% set out.items = out.items + [w.class ~ ' (' ~ why ~ ')'] %}
+            {% endfor %}
+            {{ out.items | join(', ') }}
+
+# scripts.yaml: the turn_off of the host switch (`turn_off: [ action: script.flowmanager_nfs_off ]`)
+script:
+  flowmanager_nfs_off:
+    alias: Flowmanager NFS host off
+    fields:
+      state:
+        description: off (graceful: refused while it has wakers) or off-now (never refused)
+        default: "off"
+    sequence:
+      - action: rest_command.flowmanager_set
+        data: { kind: resources, name: basestar-nfs, state: "{{ state }}" }
+        response_variable: fm
+      - choose:
+          # Refused: nothing changed, the lease is still held, the switch stays on.
+          - conditions: "{{ fm.status == 409 }}"
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  notification_id: flowmanager_basestar_off
+                  title: basestar was not turned off
+                  message: "{{ fm.content.error }}"
+          # Accepted, but it will be powered back on after min_off: in effect a reboot.
+          - conditions: "{{ fm.status == 200 and fm.content.warning is defined }}"
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  notification_id: flowmanager_basestar_off
+                  title: basestar is going down and coming back
+                  message: "{{ fm.content.warning }}"
+          - conditions: "{{ fm.status >= 400 }}"
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  title: flowmanager refused the request
+                  message: "HTTP {{ fm.status }}: {{ fm.content.error | default(fm.content) }}"
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.flowmanager_leases
 ```
 
 (The names `flowmanager` / `flowmanager` are the Service and namespace of section 1; the

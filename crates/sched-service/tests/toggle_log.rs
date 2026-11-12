@@ -28,6 +28,7 @@ fn refused<T: Send + 'static>() -> BoxFut<'static, Result<T, ApiError>> {
         Err(ApiError {
             status: 409,
             message: "refused by the stub".into(),
+            body: None,
         })
     })
 }

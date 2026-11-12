@@ -21,6 +21,7 @@ pub mod state;
 pub mod store;
 pub mod time;
 pub mod validate;
+pub mod wakers;
 pub mod work;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -58,6 +59,7 @@ pub use state::{
 pub use store::ConfigStore;
 pub use time::Millis;
 pub use validate::Problem;
+pub use wakers::{WakeReason, Waker, wakers, wakers_label};
 pub use work::{
     ClassSwitch, ClassWork, SwitchPhase, class_switch, class_work, classes_of_model, dependents,
     host_is_up, reads_from_class, switch_offs_next, switch_phase,

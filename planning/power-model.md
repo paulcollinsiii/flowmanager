@@ -56,9 +56,9 @@ What wants a host up has not changed (`intent.power_up`, planner `fifo.rs`): a `
   flowmanager stops and alerts (today's `mounts_timeout` behaviour, generalised).
 - **Any hold arriving** during Withdrawing or Vetoing cancels an *idle* shutdown. A
   *requested* shutdown is cancelled by a new manual lease, and a *graceful* one also by a
-  waker (2.1d) (*target*).
+  waker (2.1d) (*enforced*: `drain_step` in `crates/sched-sequencer/src/power.rs`).
 
-### 2.1d Wakers: a graceful off never ends in a bounce (*target*)
+### 2.1d Wakers: a graceful off never ends in a bounce (*enforced*)
 
 A host's **wakers** are the classes that would power it back on if it went down now: each
 class with `may_change_power` that requires the host and is busy (queued or in-flight work),
@@ -67,7 +67,9 @@ a busy class and an app switched on want the host alike. A job's hold is not a w
 lease, which a graceful drain already waits for. Unknown demand is not a waker (it wakes
 nothing, 2.1c). A locked-out host has none, since nothing wakes it. One pure function in
 `sched-model` lists them; the planner's wake for a class and everything below read it, so
-they cannot disagree.
+they cannot disagree (*enforced*: `sched_model::wakers` in `crates/sched-model/src/wakers.rs`,
+read by the planner's wake loop, `drain_step` and `HostStatus::wakers`; the invariant checker
+restates the rule on purpose).
 
 - **`off` (graceful) is refused** while the host has wakers, judged on the last tick. Nothing
   changes: a manual host lease stays held and no shutdown is recorded. The refusal names the
@@ -208,8 +210,8 @@ manual host lease yet, no active lockout lease.
 | --- | --- |
 | `on` | take a manual host lease (power on if off) |
 | `release` | drop the lease; the host goes down when idle like any other |
-| `off` | requested shutdown, graceful; refused while the host has wakers, and nothing changes (2.1d, *target*) |
-| `off-now` | requested shutdown, immediate; never refused, warns when the host has wakers (2.1d, *target*) |
+| `off` | requested shutdown, graceful; refused while the host has wakers, and nothing changes (2.1d, *enforced*: `drain::request` returns `Refused`; the toggle answers `409`) |
+| `off-now` | requested shutdown, immediate; never refused, warns when the host has wakers (2.1d, *enforced*: the toggle's answer carries `warning`) |
 | `resume` | clear a `Stopped` shutdown or a failed power transition |
 | `lockout` on / off | see below (replaces reclaim) |
 

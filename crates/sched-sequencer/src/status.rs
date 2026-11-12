@@ -21,7 +21,7 @@
 use sched_model::{
     Config, DrainMode, LeaseOrigin, Millis, ModePhase, ModelId, PowerPhase, PowerTransition,
     ReadingUse, ResourceId, ResourceKind, SchedState, Shutdown, ShutdownCause, Snapshot, Step,
-    VetoReading, WaitReason, Withdrawal, manual_host_lease,
+    VetoReading, WaitReason, Waker, Withdrawal, manual_host_lease,
 };
 use serde::{Deserialize, Serialize};
 
@@ -243,6 +243,11 @@ pub struct HostStatus {
     pub min_off: Option<MinOff>,
     /// Why the host holds something back this tick (the decision's wait step for it).
     pub wait: Option<WaitReason>,
+    /// The classes that would power the host back on if it went down now (power-model 2.1d),
+    /// judged on the state and readings of this tick. Empty for a host without wakers, a
+    /// locked-out one, and one without a power section.
+    #[serde(default)]
+    pub wakers: Vec<Waker>,
     /// A person has to act: a power transition failed, or the veto stopped the shutdown.
     pub attention: bool,
 }
@@ -365,7 +370,11 @@ pub fn derive(d: &Decided<'_>) -> (Vec<HostStatus>, Vec<HostEvent>) {
         .iter()
         .filter_map(|(id, st)| {
             let spec = config.resource(id)?;
-            Some(host_status(config, snapshot, steps, now, spec.kind, id, st))
+            // The wakers are read from the state as the tick began, as the planner reads them.
+            Some(HostStatus {
+                wakers: sched_model::wakers(config, snapshot, prev, id),
+                ..host_status(config, snapshot, steps, now, spec.kind, id, st)
+            })
         })
         .collect();
     let mut events: Vec<HostEvent> = adopted
@@ -521,5 +530,6 @@ fn host_status(
         lockout,
         min_off,
         wait,
+        wakers: Vec::new(),
     }
 }

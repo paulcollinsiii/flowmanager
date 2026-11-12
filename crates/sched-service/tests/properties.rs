@@ -11,13 +11,16 @@ use sched_model::{
 use sched_service::replay::{Frame, Observe, Scenario, run};
 
 const MODELS: [&str; 4] = ["mineru", "llm", "whisperx", "immich-ml"];
-const CLASSES: [(&str, &str); 6] = [
+const CLASSES: [(&str, &str); 7] = [
     ("paperless-ocr", "paperless-ocr-pending"),
     ("paperless-tagging", "paperless-post-ocr"),
     ("speakr-transcription", "speakr-pending"),
     ("speakr-summarization", "speakr-summaries"),
     ("immich-ml", "immich-queues"),
     ("interactive-llm", "llm-sessions"),
+    // The class on the NFS host that may change power (a waker while it has work): see
+    // `config_for`.
+    ("nfs-batch", "nfs-batch-queue"),
 ];
 const HOSTS: [&str; 2] = ["cuda-central", "basestar-nfs"];
 
@@ -51,7 +54,7 @@ fn raw() -> impl Strategy<Value = Raw> {
         prop::option::weighted(0.6, 0u32..3),
         prop::collection::vec(
             prop::option::weighted(0.7, (0u64..4, 0u64..3, 0u64..4_000_000, 0u64..3)),
-            6,
+            CLASSES.len(),
         ),
         prop::option::weighted(0.3, prop::collection::vec(0usize..9, 0..4)),
         prop::bool::weighted(0.6),
@@ -231,9 +234,13 @@ fn scenario(frames: &[Raw]) -> Scenario {
 
 /// The example (managed power or not) plus `nfs-app`, a switched class on the powered NFS host
 /// that `paperless-ocr` reads from (`reads_from`): the graceful off, its stored wait and the
-/// dependents' offline demand are all in the generated worlds.
+/// dependents' offline demand are all in the generated worlds. `nfs-batch`, a class on the same
+/// host that may change power and has a demand source, is there too: with `nfs-app` switched on
+/// it is a waker of the NFS host (power-model 2.1d), so a graceful drain meets wakers appearing.
 fn config_for(managed: bool) -> sched_model::Config {
-    let yaml = sched_model::test_support::example_yaml_switched_dependents();
+    let yaml = sched_model::test_support::with_nfs_batch(
+        &sched_model::test_support::example_yaml_switched_dependents(),
+    );
     let yaml = if managed {
         yaml
     } else {
@@ -271,7 +278,7 @@ fn quiet(dt: u64, up: [bool; 2]) -> Raw {
         pods: vec![None; 4],
         up: up.iter().map(|u| Some(*u)).collect(),
         mounts: None,
-        demand: vec![None; 6],
+        demand: vec![None; CLASSES.len()],
         leases: None,
         refresh: false,
         switch: None,
@@ -302,7 +309,7 @@ fn an_idle_drain_with_its_idle_clock_may_power_off() {
     let config = config_for(true);
     let mut f = quiet(1, [false, true]);
     f.mounts = Some(0);
-    f.demand = vec![Some((0, 0, 0, 0)); 6];
+    f.demand = vec![Some((0, 0, 0, 0)); CLASSES.len()];
     f.switch = Some(1);
     f.nfs_app = Some(1);
     let mut sc = scenario(&[f]);
@@ -336,7 +343,7 @@ fn an_idle_drain_keeps_its_idle_clock_while_it_stands() {
         let mut f = quiet(dt, [true, true]);
         f.mounts = mounts;
         f.leases = leases;
-        f.demand = vec![Some((0, 0, 0, 0)); 6];
+        f.demand = vec![Some((0, 0, 0, 0)); CLASSES.len()];
         f.switch = Some(1);
         f.nfs_app = Some(1);
         frames.push(f);
@@ -458,6 +465,53 @@ proptest! {
         for (x, y) in a.iter().zip(&b) {
             prop_assert_eq!(&x.intent, &y.intent);
             prop_assert_eq!(&x.decision, &y.decision);
+        }
+    }
+
+    /// A graceful requested shutdown under way on the NFS host meets a may-wake class becoming
+    /// busy or a switched class reading on (the generated frames have both): whenever the host
+    /// has a waker the shutdown is cancelled, it is never powered off, and no invariant is
+    /// violated (including the one that a graceful shutdown never powers off over a waker).
+    #[test]
+    fn a_graceful_drain_never_outlives_a_waker(
+        frames in prop::collection::vec(raw(), 1..40),
+        scaled_down in any::<bool>(),
+        ago in 0u64..1_500_000,
+    ) {
+        let config = config_for(true);
+        let nfs = sched_model::ResourceId::new("basestar-nfs");
+        let mut sc = scenario(&frames);
+        let mut st = nfs_with_idle_drain(&config, Millis(50_000_000 - ago));
+        st.idle_since = None;
+        let requested = sched_model::Shutdown::requested(
+            sched_model::DrainMode::Graceful,
+            Millis(50_000_000 - ago),
+        );
+        st.shutdown = Some(if scaled_down { requested.withdrawn() } else { requested });
+        sc.initial_state.resources.insert(nfs.clone(), st);
+        let mut before = sc.initial_state.clone();
+        let results = run(&config, &sc).unwrap();
+        for (i, r) in results.iter().enumerate() {
+            prop_assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
+            let graceful = |s: &sched_model::SchedState| {
+                s.resource(&nfs).and_then(|x| x.shutdown).is_some_and(|x| {
+                    x.cause() == sched_model::ShutdownCause::Requested {
+                        mode: sched_model::DrainMode::Graceful,
+                    }
+                })
+            };
+            let wakers = sched_model::wakers(&config, &r.snapshot, &before, &nfs);
+            if graceful(&before) && !wakers.is_empty() {
+                prop_assert!(
+                    !graceful(&r.decision.state),
+                    "frame {}: a graceful shutdown stands with wakers {:?}", i, wakers
+                );
+                prop_assert!(
+                    !r.decision.steps.contains(&Step::PowerOff { resource: nfs.clone() }),
+                    "frame {}: powered off with wakers {:?}", i, wakers
+                );
+            }
+            before = r.decision.state.clone();
         }
     }
 

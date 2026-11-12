@@ -690,6 +690,34 @@ pub fn check(
                             ));
                         }
                     }
+                    // A graceful requested shutdown never powers the host down while a waker
+                    // exists (a class that may change power, needs the host, and is busy or
+                    // switched on): it would end in a bounce. The sequencer cancels it first.
+                    // Read independently of `sched_model::wakers`: busy is the demand reading
+                    // above, switched on is `class_switch` (the one switch rule).
+                    if drain.is_some_and(|d| {
+                        d.cause()
+                            == sched_model::ShutdownCause::Requested {
+                                mode: sched_model::DrainMode::Graceful,
+                            }
+                    }) {
+                        for class in config
+                            .classes()
+                            .iter()
+                            .filter(|c| c.may_change_power && needs(c, resource))
+                        {
+                            let wakes = match sched_model::class_switch(config, snapshot, class) {
+                                Some(s) => s.on(),
+                                None => demand(config, snapshot, prev, class).is_some_and(|d| d.0),
+                            };
+                            if wakes {
+                                out.push(format!(
+                                    "invariant 10: powered off {resource} from a graceful requested shutdown while {} is a waker",
+                                    class.id
+                                ));
+                            }
+                        }
+                    }
                     for class in config
                         .classes()
                         .iter()

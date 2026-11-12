@@ -20,7 +20,10 @@
 
 use std::fmt;
 
-use sched_model::{Config, Lease, LeaseId, LeaseKind, Millis, ModelId, ResourceId, ResourceKind};
+use sched_model::{
+    Config, Lease, LeaseId, LeaseKind, Millis, ModelId, ResourceId, ResourceKind, Waker,
+    wakers_label,
+};
 use serde::{Deserialize, Serialize};
 
 /// Prefix of the ids of manual model leases.
@@ -71,6 +74,12 @@ pub enum LeaseError {
     NoLeaseOnResource { resource: ResourceId, kind: String },
     /// No lease has this id.
     UnknownLease { id: LeaseId },
+    /// A graceful take-down of a host that has wakers (power-model 2.1d): it would be powered
+    /// back on. Nothing was changed.
+    HostHasWakers {
+        resource: ResourceId,
+        wakers: Vec<Waker>,
+    },
 }
 
 impl LeaseError {
@@ -81,7 +90,7 @@ impl LeaseError {
             | LeaseError::NotExclusive { .. }
             | LeaseError::UnknownResource { .. }
             | LeaseError::NoPowerSection { .. } => 400,
-            LeaseError::Conflict { .. } => 409,
+            LeaseError::Conflict { .. } | LeaseError::HostHasWakers { .. } => 409,
             LeaseError::UnknownLease { .. } | LeaseError::NoLeaseOnResource { .. } => 404,
         }
     }
@@ -138,6 +147,12 @@ impl fmt::Display for LeaseError {
             LeaseError::UnknownLease { id } => {
                 write!(f, "no lease with id {:?}", id.as_str())
             }
+            LeaseError::HostHasWakers { resource, wakers } => write!(
+                f,
+                "cannot take {:?} down gracefully: it has wakers that would power it back on: {}; nothing was changed (an immediate off is not refused)",
+                resource.as_str(),
+                wakers_label(wakers)
+            ),
         }
     }
 }

@@ -5234,3 +5234,6 @@ fn the_shared_host_goes_idle_once_both_switched_classes_are_off_and_their_waits_
     let d = c.run_at(&st, T);
     assert!(allowed(&d, "nfs-app2") && !d.steps.contains(&off), "{d:?}");
 }
+
+#[path = "tick/wakers.rs"]
+mod wakers;

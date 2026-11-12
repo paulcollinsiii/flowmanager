@@ -1295,3 +1295,98 @@ fn a_switched_class_allowed_while_its_switch_is_not_on_is_a_violation() {
         );
     }
 }
+
+/// Invariant 10, the waker rule: a graceful requested shutdown is never powered off while the
+/// host has a waker, the checker's own reading of it. The managed example with `nfs-batch` (a
+/// class on the NFS host that may change power) and `nfs-app` (switched, may change power).
+#[test]
+fn powering_off_from_a_graceful_shutdown_while_a_waker_exists_is_a_violation() {
+    use sched_model::{Fidelity, Observation, ObservedValue, SwitchState};
+    let app = "  - id: nfs-app\n    requires:\n      - { resource: basestar-nfs }\n    priority: 0\n    preemptibility: kill\n    may_change_power: true\n    switch: { source: ha-wikijs }\n\nsources:\n";
+    let yaml = sched_model::test_support::with_nfs_batch(
+        &sched_model::test_support::example_yaml_managed(),
+    )
+    .replacen("\nsources:\n", &format!("\n{app}"), 1);
+    let config = sched_model::Config::from_yaml(&yaml).unwrap();
+    let shutdown = |mode: &str| {
+        prev(&format!(
+            "    basestar-nfs: {{ power: {{ phase: \"on\", since: 0, ours: true }}, mode: {{ phase: idle }}, shutdown: {{ cause: {{ kind: requested, mode: {mode} }}, since: {}, withdrawal: done, veto: {{ phase: none }} }} }}\n",
+            NOW - MIN
+        ))
+    };
+    let obs = |source: &str, at: u64, value| Observation {
+        source: source.into(),
+        observed_at: Millis(at),
+        fidelity: Fidelity::Polled,
+        value,
+    };
+    let batch = |ready| {
+        obs(
+            "nfs-batch-queue",
+            NOW,
+            ObservedValue::Demand {
+                failed: 0,
+                class: ClassId::new("nfs-batch"),
+                ready,
+                in_flight: 0,
+                oldest_ready_at: None,
+            },
+        )
+    };
+    let switch = |state, at| {
+        obs(
+            "ha-wikijs",
+            at,
+            ObservedValue::Switch {
+                class: ClassId::new("nfs-app"),
+                state,
+            },
+        )
+    };
+    let violations = |mode: &str, extra: Vec<Observation>, leases: Vec<Lease>| {
+        let mut o = zero_pods_and_up(&["basestar-nfs"]);
+        o.extend(idle_demand());
+        o.push(nfs_mounts_zero());
+        o.extend(extra);
+        let prev_state = shutdown(mode);
+        let mut d = decision(vec![power_off("basestar-nfs")]);
+        d.state = prev_state.clone();
+        check(
+            &config,
+            &snap(o, leases),
+            &prev_state,
+            &Intent::default(),
+            &d,
+        )
+        .into_iter()
+        .filter(|m| m.contains("waker"))
+        .collect::<Vec<_>>()
+    };
+    // Busy class and a switched one reading on: each is a waker.
+    for (name, extra) in [
+        ("queued work", vec![batch(2)]),
+        ("switched on", vec![switch(SwitchState::On, NOW)]),
+    ] {
+        let v = violations("graceful", extra, vec![]);
+        assert!(v.len() == 1, "{name}: {v:?}");
+        assert!(v[0].contains("invariant 10"), "{v:?}");
+    }
+    // Not wakers: nothing busy, a switch that is not a usable `on`, and unknown demand.
+    for (name, extra) in [
+        ("idle", vec![batch(0)]),
+        ("off", vec![batch(0), switch(SwitchState::Off, NOW)]),
+        ("off_now", vec![batch(0), switch(SwitchState::OffNow, NOW)]),
+        (
+            "stale",
+            vec![batch(0), switch(SwitchState::On, NOW - 11 * MIN)],
+        ),
+        ("unknown demand", vec![]),
+    ] {
+        let v = violations("graceful", extra, vec![]);
+        assert!(v.is_empty(), "{name}: {v:?}");
+    }
+    // An immediate shutdown is not judged by wakers, and a lockout overrides them.
+    assert!(violations("immediate", vec![batch(2)], vec![]).is_empty());
+    let locked = vec![lease("r", "basestar-nfs", LeaseKind::Lockout)];
+    assert!(violations("graceful", vec![batch(2)], locked).is_empty());
+}

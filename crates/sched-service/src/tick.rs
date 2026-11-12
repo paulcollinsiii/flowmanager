@@ -3186,6 +3186,7 @@ mod tests {
             &nfs(),
             sched_model::DrainMode::Immediate,
             clock.now(),
+            &[],
         );
         assert_eq!(rec, sched_sequencer::drain::Requested::Recorded);
         let r = s.tick(clock.now(), &mut d);
@@ -3233,6 +3234,7 @@ mod tests {
             &nfs(),
             sched_model::DrainMode::Graceful,
             clock.now(),
+            &[],
         );
         // Work is queued, nothing in flight: the graceful drain would scale down at once,
         // but a manual lease arrives first.

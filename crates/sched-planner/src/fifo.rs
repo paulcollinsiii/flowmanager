@@ -83,25 +83,14 @@ impl Strategy for FifoExhaustive {
                     .or_insert(PowerWant::Workload);
             }
         }
-        for class in config.classes().iter().filter(|c| c.may_change_power) {
-            // A switched class has no demand: it wants its hosts up while its switch is on.
-            let wants_hosts = match sched_model::class_switch(config, snapshot, class) {
-                Some(switch) => switch.on(),
-                None => class_work(config, snapshot, state, class).busy(),
-            };
-            if !wants_hosts {
-                continue;
-            }
-            for req in &class.requires {
-                let powered = config
-                    .resource(&req.resource)
-                    .is_some_and(|r| r.power.is_some());
-                if powered {
-                    intent
-                        .power_up
-                        .entry(req.resource.clone())
-                        .or_insert(PowerWant::Workload);
-                }
+        // A host with a waker (`sched_model::wakers`, the one rule: a class that may change
+        // power and is busy, or switched on) is wanted up by the workload.
+        for res in config.resources().iter().filter(|r| r.power.is_some()) {
+            if !sched_model::wakers(config, snapshot, state, &res.id).is_empty() {
+                intent
+                    .power_up
+                    .entry(res.id.clone())
+                    .or_insert(PowerWant::Workload);
             }
         }
         intent.power_up.retain(|r, _| !intent.lockout.contains(r));

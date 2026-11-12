@@ -7,13 +7,18 @@
 //! consumers, wait for the leases that hold the host, apply the veto, shut the host down). A
 //! new manual host lease cancels it; the host being seen down ends it.
 
-use sched_model::{Config, DrainMode, Millis, ResourceId, SchedState, Shutdown, ShutdownCause};
+use sched_model::{
+    Config, DrainMode, Millis, ResourceId, SchedState, Shutdown, ShutdownCause, Waker,
+};
 
 /// What a drain request did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requested {
     /// The drain is recorded.
     Recorded,
+    /// A graceful request was refused because the host has wakers (power-model 2.1d): nothing
+    /// was recorded or changed.
+    Refused,
     /// Nothing was recorded: the host's power is under `control: manual` (flowmanager never
     /// shuts it down), it has no state yet, it is not up (nothing consumes it), or it is
     /// locked out (the lockout shuts it down, or leaves it alone, whatever is asked).
@@ -29,12 +34,18 @@ pub enum Requested {
 /// ends the wait, and `graceful` after `immediate` leaves it immediate. A person's request
 /// takes over an idle drain: it is a requested drain from now on (immediate, as the idle
 /// one was), with the start and the scale-down kept.
+///
+/// `wakers` are the host's wakers as of the last tick (`HostStatus::wakers`). A `graceful`
+/// request is refused while there are any (a graceful off must never end in a bounce, 2.1d):
+/// [`Requested::Refused`], with nothing changed. An `immediate` one is never refused. A request
+/// that is not applicable is reported as such, whatever the wakers.
 pub fn request(
     state: &mut SchedState,
     config: &Config,
     resource: &ResourceId,
     mode: DrainMode,
     now: Millis,
+    wakers: &[Waker],
 ) -> Requested {
     if !config.power_managed(resource) {
         return Requested::NotApplicable;
@@ -50,6 +61,9 @@ pub fn request(
     // request changes nothing until the lockout is cleared.
     if st.shutdown.is_some_and(|s| s.is_lockout()) || st.locked_down {
         return Requested::NotApplicable;
+    }
+    if mode == DrainMode::Graceful && !wakers.is_empty() {
+        return Requested::Refused;
     }
     // A person's request takes over a shutdown that has a withdrawal (a drain, idle or
     // requested), keeping its start and withdrawal; anything else starts a requested one.
@@ -83,7 +97,58 @@ mod tests {
     use super::*;
     use sched_model::ResourceState;
     use sched_model::test_support::{example_config, example_config_managed};
-    use sched_model::{PowerPhase, Veto, Withdrawal};
+    use sched_model::{PowerPhase, Veto, WakeReason, Withdrawal};
+
+    /// A request with no wakers.
+    fn ask(
+        c: &mut SchedState,
+        config: &Config,
+        resource: &ResourceId,
+        mode: DrainMode,
+        now: Millis,
+    ) -> Requested {
+        request(c, config, resource, mode, now, &[])
+    }
+
+    fn waker() -> Vec<Waker> {
+        vec![Waker {
+            class: "gpu-batch".into(),
+            why: WakeReason::Work,
+        }]
+    }
+
+    #[test]
+    fn a_graceful_request_is_refused_while_the_host_has_wakers_and_changes_nothing() {
+        let (config, now) = (example_config_managed(), Millis(9));
+        for before in [
+            None,
+            Some(Shutdown::requested(DrainMode::Immediate, Millis(2))),
+        ] {
+            let mut c = core(up());
+            c.resources.get_mut(&nfs()).unwrap().shutdown = before;
+            let was = c.clone();
+            let r = request(&mut c, &config, &nfs(), DrainMode::Graceful, now, &waker());
+            assert_eq!(r, Requested::Refused);
+            assert_eq!(c, was, "nothing changes");
+        }
+    }
+
+    #[test]
+    fn an_immediate_request_is_never_refused_by_wakers() {
+        let (config, now) = (example_config_managed(), Millis(9));
+        let mut c = core(up());
+        let r = request(&mut c, &config, &nfs(), DrainMode::Immediate, now, &waker());
+        assert_eq!(r, Requested::Recorded);
+        assert_eq!(mode_of(state(&c)), Some(DrainMode::Immediate));
+    }
+
+    #[test]
+    fn a_request_that_does_not_apply_is_not_a_refusal() {
+        let (config, now) = (example_config_managed(), Millis(9));
+        let mut c = core(PowerPhase::Off { ours: false });
+        let r = request(&mut c, &config, &nfs(), DrainMode::Graceful, now, &waker());
+        assert_eq!(r, Requested::NotApplicable);
+    }
 
     fn up() -> PowerPhase {
         PowerPhase::On {
@@ -122,19 +187,19 @@ mod tests {
         let lockout = Shutdown::lockout_withdrawing(Millis(2));
         c.resources.get_mut(&nfs()).unwrap().shutdown = Some(lockout);
         for mode in [DrainMode::Graceful, DrainMode::Immediate] {
-            let r = request(&mut c, &config, &nfs(), mode, now);
+            let r = ask(&mut c, &config, &nfs(), mode, now);
             assert_eq!(r, Requested::NotApplicable);
             assert_eq!(state(&c).shutdown, Some(lockout), "not taken over");
         }
         // The lockout's one shutdown done and the host booted again: left alone.
         let mut c = core(up());
         c.resources.get_mut(&nfs()).unwrap().locked_down = true;
-        let r = request(&mut c, &config, &nfs(), DrainMode::Immediate, now);
+        let r = ask(&mut c, &config, &nfs(), DrainMode::Immediate, now);
         assert_eq!(r, Requested::NotApplicable);
         assert_eq!(state(&c).shutdown, None);
         // Without a lockout the same host takes the request.
         let mut c = core(up());
-        let r = request(&mut c, &config, &nfs(), DrainMode::Immediate, now);
+        let r = ask(&mut c, &config, &nfs(), DrainMode::Immediate, now);
         assert_eq!(r, Requested::Recorded);
     }
 
@@ -147,7 +212,7 @@ mod tests {
                 .vetoing(Millis(1))
                 .stopped(Millis(2)),
         );
-        let r = request(
+        let r = ask(
             &mut c,
             &example_config_managed(),
             &nfs(),
@@ -169,15 +234,15 @@ mod tests {
     fn a_second_request_keeps_the_start_and_the_scale_down_and_changes_the_mode() {
         let mut c = core(up());
         let config = example_config_managed();
-        request(&mut c, &config, &nfs(), DrainMode::Graceful, Millis(9));
+        ask(&mut c, &config, &nfs(), DrainMode::Graceful, Millis(9));
         let withdrawn = state(&c).shutdown.unwrap().withdrawn();
         c.resources.get_mut(&nfs()).unwrap().shutdown = Some(withdrawn);
-        request(&mut c, &config, &nfs(), DrainMode::Immediate, Millis(50));
+        ask(&mut c, &config, &nfs(), DrainMode::Immediate, Millis(50));
         let s = state(&c).shutdown.unwrap();
         assert_eq!(mode_of(state(&c)), Some(DrainMode::Immediate));
         assert_eq!((s.since(), s.consumers_withdrawn()), (Millis(9), true));
         // Graceful asked of an immediate drain leaves it immediate.
-        request(&mut c, &config, &nfs(), DrainMode::Graceful, Millis(60));
+        ask(&mut c, &config, &nfs(), DrainMode::Graceful, Millis(60));
         assert_eq!(mode_of(state(&c)), Some(DrainMode::Immediate));
     }
 
@@ -185,7 +250,7 @@ mod tests {
     fn a_request_takes_over_an_idle_drain_keeping_its_start_and_scale_down() {
         let mut c = core(up());
         c.resources.get_mut(&nfs()).unwrap().shutdown = Some(Shutdown::idle_withdrawn(Millis(4)));
-        request(
+        ask(
             &mut c,
             &example_config_managed(),
             &nfs(),
@@ -206,7 +271,7 @@ mod tests {
                 .vetoing(Millis(5))
                 .stopped(Millis(8)),
         );
-        request(
+        ask(
             &mut c,
             &example_config_managed(),
             &nfs(),
@@ -225,7 +290,7 @@ mod tests {
     fn nothing_is_recorded_for_manual_control_an_unseen_host_or_one_that_is_not_up() {
         let mut manual = core(up());
         assert_eq!(
-            request(
+            ask(
                 &mut manual,
                 &example_config(),
                 &nfs(),
@@ -237,7 +302,7 @@ mod tests {
         assert_eq!(state(&manual).shutdown, None);
         let mut none = SchedState::default();
         assert_eq!(
-            request(
+            ask(
                 &mut none,
                 &example_config_managed(),
                 &nfs(),
@@ -248,7 +313,7 @@ mod tests {
         );
         let mut off = core(PowerPhase::Off { ours: false });
         assert_eq!(
-            request(
+            ask(
                 &mut off,
                 &example_config_managed(),
                 &nfs(),
