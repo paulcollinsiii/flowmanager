@@ -4801,3 +4801,213 @@ fn a_requested_shutdown_overrides_the_hold_of_a_switched_class() {
         d.steps
     );
 }
+
+// ---- switched classes: the graceful off, its stored wait and the offline dependents ----
+
+/// The example with `nfs-app` (switched, on the powered NFS host) read by
+/// `paperless-ocr-pending` (`reads_from`): `paperless-ocr` is its dependent. The switch reads
+/// `state` and the dependent has two items in flight.
+fn graceful(state: &str) -> Case {
+    let mut c = Case::new().obs(sw("nfs-app", state)).obs(demand(
+        "paperless-ocr",
+        "paperless-ocr-pending",
+        0,
+        2,
+        0,
+    ));
+    c.config = sched_model::test_support::example_config_switched_dependents();
+    c
+}
+
+fn wait_state(ago: u64, withdrawal: sched_model::Withdrawal) -> SchedState {
+    wait_state_of(&Case::new(), ago, withdrawal)
+}
+
+/// The state of `case` with a stored switch-off of `nfs-app` that began `ago` ms ago.
+fn wait_state_of(case: &Case, ago: u64, withdrawal: sched_model::Withdrawal) -> SchedState {
+    let mut st = case.state();
+    st.classes.insert(
+        cid("nfs-app"),
+        sched_model::SwitchOff {
+            since: sched_model::Millis(T - ago),
+            withdrawal,
+        },
+    );
+    st
+}
+
+fn stored(d: &Decision) -> Option<sched_model::SwitchOff> {
+    d.state.classes.get(&cid("nfs-app")).copied()
+}
+
+#[test]
+fn a_graceful_off_keeps_the_class_allowed_while_a_dependent_has_work_in_flight() {
+    use sched_model::Withdrawal::{Done, Pending};
+    let d = graceful("off").run();
+    assert!(allowed(&d, "nfs-app"), "{:?}", d.allowed);
+    assert_eq!(
+        stored(&d),
+        Some(sched_model::SwitchOff {
+            since: sched_model::Millis(T),
+            withdrawal: Pending
+        })
+    );
+    // The next tick keeps the original start: no new wait.
+    let d = graceful("off").run_at(&wait_state(3 * MIN, Pending), T);
+    assert!(allowed(&d, "nfs-app"));
+    assert_eq!(stored(&d).unwrap().since, sched_model::Millis(T - 3 * MIN));
+    // The timeout ends it, from the stored start, and it stays out.
+    let d = graceful("off").run_at(&wait_state(10 * MIN - 1, Pending), T);
+    assert!(allowed(&d, "nfs-app"));
+    let d = graceful("off").run_at(&wait_state(10 * MIN, Pending), T);
+    assert!(!allowed(&d, "nfs-app"));
+    assert_eq!(stored(&d).unwrap().withdrawal, Done);
+    assert_eq!(stored(&d).unwrap().since, sched_model::Millis(T - 10 * MIN));
+    // Done is not revived by the dependent's work still being in flight.
+    let d = graceful("off").run_at(&wait_state(MIN, Done), T);
+    assert!(!allowed(&d, "nfs-app"));
+    assert_eq!(stored(&d).unwrap().withdrawal, Done);
+}
+
+#[test]
+fn a_graceful_off_leaves_at_once_with_no_dependent_work_in_flight() {
+    // Ready work alone does not count; nothing in flight.
+    let c = graceful("off").obs(demand("paperless-ocr", "paperless-ocr-pending", 5, 0, 0));
+    let d = c.run();
+    assert!(!allowed(&d, "nfs-app"), "{:?}", d.allowed);
+    assert_eq!(
+        stored(&d).unwrap().withdrawal,
+        sched_model::Withdrawal::Done
+    );
+    // A switched class without dependents: `wikijs` leaves at once too.
+    let d = Case::new().obs(sw("wikijs", "off")).run();
+    assert!(!allowed(&d, "wikijs"));
+}
+
+#[test]
+fn off_now_and_an_unreadable_switch_end_a_running_wait_and_on_cancels_it() {
+    use sched_model::Withdrawal::{Done, Pending};
+    let during = wait_state(MIN, Pending);
+    let d = graceful("off_now").run_at(&during, T);
+    assert!(!allowed(&d, "nfs-app"));
+    assert_eq!(stored(&d).unwrap().withdrawal, Done);
+    let d = graceful("off")
+        .drop_obs("class: nfs-app")
+        .run_at(&during, T);
+    assert!(!allowed(&d, "nfs-app"), "no reading: off-now");
+    assert_eq!(stored(&d).unwrap().withdrawal, Done);
+    for before in [during.clone(), wait_state(MIN, Done)] {
+        let d = graceful("on").run_at(&before, T);
+        assert!(allowed(&d, "nfs-app"));
+        assert_eq!(stored(&d), None, "removed when the reading is on");
+    }
+}
+
+#[test]
+fn unknown_dependent_demand_holds_the_wait_but_only_within_the_timeout() {
+    use sched_model::Withdrawal::Pending;
+    let c = graceful("off").drop_obs("source: paperless-ocr-pending");
+    let d = c.run();
+    assert!(allowed(&d, "nfs-app"), "{:?}", d.allowed);
+    let d = c.run_at(&wait_state(10 * MIN, Pending), T);
+    assert!(!allowed(&d, "nfs-app"));
+}
+
+#[test]
+fn a_lockout_or_requested_shutdown_withdraws_a_waiting_class_whatever_the_switch_says() {
+    let d = graceful("off")
+        .nfs_state(&nfs_draining("immediate", 1_000))
+        .run();
+    assert!(!allowed(&d, "nfs-app"), "{:?}", d.allowed);
+    let mut c = graceful("off").nfs_state(&nfs_lockout_pending(10 * MIN));
+    c.intent.lockout.insert(rid(N));
+    let d = c.run();
+    assert!(!allowed(&d, "nfs-app"), "{:?}", d.allowed);
+}
+
+#[test]
+fn state_for_a_class_no_longer_configured_is_dropped() {
+    let mut st = wait_state(MIN, sched_model::Withdrawal::Pending);
+    st.classes.insert(
+        cid("ghost"),
+        sched_model::SwitchOff {
+            since: sched_model::Millis(1),
+            withdrawal: sched_model::Withdrawal::Done,
+        },
+    );
+    let d = graceful("off").run_at(&st, T);
+    assert!(!d.state.classes.contains_key(&cid("ghost")));
+    assert!(d.state.classes.contains_key(&cid("nfs-app")));
+}
+
+/// The NFS host up, ours and idle for 10 minutes: it goes down unless something holds it.
+fn idle_nfs() -> String {
+    format!(
+        "{{ power: {}, mode: {}, idle_since: {} }}",
+        on_ours(),
+        mode_idle(),
+        T - 10 * MIN
+    )
+}
+
+#[test]
+fn a_dependents_work_holds_the_host_during_the_wait_and_nothing_holds_it_after() {
+    use sched_model::Withdrawal::{Done, Pending};
+    let off = Step::PowerOff { resource: rid(N) };
+    // During the wait the dependent's own in-flight work holds the host.
+    let c = graceful("off").nfs_state(&idle_nfs());
+    let d = c.run_at(&wait_state_of(&c, MIN, Pending), T);
+    assert!(!d.steps.contains(&off), "{:?}", d.steps);
+    // Once the class has left, the dependent's demand is offline: a fresh reading of ready
+    // and in-flight work holds nothing, so the idle host goes down.
+    let c = graceful("off").nfs_state(&idle_nfs()).obs(demand(
+        "paperless-ocr",
+        "paperless-ocr-pending",
+        5,
+        3,
+        0,
+    ));
+    let d = c.run_at(&wait_state_of(&c, MIN, Done), T);
+    assert!(d.steps.contains(&off), "{:?}", d.steps);
+    // The same reading with no `reads_from` holds it (the control).
+    let mut control = Case::new()
+        .nfs_state(&idle_nfs())
+        .obs(sw("nfs-app", "off"))
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 5, 0, 0));
+    control.config = switched_config(true);
+    let d = control.run();
+    assert!(!d.steps.contains(&off), "{:?}", d.steps);
+}
+
+#[test]
+fn offline_dependents_neither_wake_nor_stop_nor_prevent_idle_on_the_gpu() {
+    use sched_model::Withdrawal::Done;
+    // mineru serving, idle, with ready work reported for paperless-ocr: with the switch off and
+    // its wait over that work is offline, so it holds nothing and the model is idle.
+    let c = graceful("off_now")
+        .obs(demand("paperless-ocr", "paperless-ocr-pending", 5, 3, 0))
+        .obs(pods("mineru", 1, 1, 0))
+        .gpu(&serving("mineru", 20 * MIN))
+        .target(Some("mineru"));
+    let d = c.run_at(&wait_state_of(&c, MIN, Done), T);
+    assert!(
+        !d.steps.iter().any(|s| matches!(
+            s,
+            Step::KillInFlight { .. } | Step::WithdrawModel { .. } | Step::PauseIntake { .. }
+        )),
+        "{:?}",
+        d.steps
+    );
+    match mode_of(&d, G) {
+        ModePhase::Serving { idle_since, .. } => {
+            assert!(idle_since.is_some(), "offline demand is not busy")
+        }
+        other => panic!("{other:?}"),
+    }
+    // The control: the same readings with the switch on are busy.
+    let c = c.obs(sw("nfs-app", "on"));
+    match mode_of(&c.run(), G) {
+        ModePhase::Serving { idle_since, .. } => assert!(idle_since.is_none(), "busy"),
+        other => panic!("{other:?}"),
+    }
+}

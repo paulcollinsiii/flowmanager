@@ -68,12 +68,19 @@ pub fn tick(
             snapshot: snapshot.config_generation,
         });
     }
-    let mut next = SchedState::default();
+    // The switched classes' switch-offs are a pure function of the snapshot and the state as
+    // the tick began (`switch_offs_next`), the same state the planner and the machines below
+    // read; the allowed set reads the result.
+    let mut next = SchedState {
+        classes: sched_model::switch_offs_next(config, snapshot, state),
+        ..SchedState::default()
+    };
     let mut steps = Vec::new();
     for res in config.resources() {
         let cx = Cx {
             config,
             snapshot,
+            state,
             intent,
             res,
         };
@@ -82,7 +89,7 @@ pub fn tick(
         }
     }
     let allowed = allowed_set(config, snapshot, &next, intent);
-    recovery_steps(config, snapshot, &allowed, &mut steps);
+    recovery_steps(config, snapshot, state, &allowed, &mut steps);
     Ok(Decision {
         steps,
         allowed,
@@ -94,6 +101,8 @@ pub fn tick(
 pub(crate) struct Cx<'a> {
     pub config: &'a Config,
     pub snapshot: &'a Snapshot,
+    /// The state as the tick began, the one the planner read.
+    pub state: &'a SchedState,
     pub intent: &'a Intent,
     pub res: &'a ResourceSpec,
 }
@@ -150,6 +159,7 @@ fn resource_tick(
 fn recovery_steps(
     config: &Config,
     snapshot: &Snapshot,
+    state: &SchedState,
     allowed: &sched_model::AllowedSet,
     steps: &mut Vec<Step>,
 ) {
@@ -160,7 +170,7 @@ fn recovery_steps(
             .is_some_and(|r| r.needs_serving_model());
         if needs_model
             && allowed.classes.contains(&class.id)
-            && sched_model::class_work(config, snapshot, class).failed > 0
+            && sched_model::class_work(config, snapshot, state, class).failed > 0
             && !model_known_not_ready(config, snapshot, class)
         {
             steps.push(Step::RunRecovery {
@@ -226,8 +236,10 @@ fn lockout_withdrawal_pending(
 }
 
 /// A class is allowed when every requirement holds (the host's lockout and requested
-/// shutdown first) and, for a switched class, its switch is `on` (`sched_model::class_switch`,
-/// the one rule the planner's wakes and the holds read too).
+/// shutdown first) and, for a switched class, its switch is `on` or a graceful off still
+/// waits (`sched_model::switch_phase`, the one rule the planner's wakes, the holds and the
+/// dependents' offline demand read too; `state` is the new one, whose switch-offs agree with
+/// it).
 fn class_allowed(
     config: &Config,
     snapshot: &Snapshot,
@@ -236,7 +248,8 @@ fn class_allowed(
     intent: &Intent,
 ) -> bool {
     requirements_hold(config, class, state, intent)
-        && sched_model::class_switch(config, snapshot, class).is_none_or(|s| s.on())
+        && sched_model::switch_phase(config, snapshot, state, class)
+            .is_none_or(|phase| phase.allows())
 }
 
 fn requirements_hold(

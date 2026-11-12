@@ -640,10 +640,10 @@ impl Shared {
         let mut queues = Vec::new();
         for c in config.classes() {
             let Some(d) = &c.demand else { continue };
-            let work = class_work(&config, &snapshot, c);
+            let work = class_work(&config, &snapshot, &prev_state, c);
             queues.push(QueueReport {
                 class: c.id.clone(),
-                ready: work.ready,
+                ready: work.ready + work.withheld,
                 in_flight: work.in_flight,
                 failed: work.failed,
                 oldest_ready_age_ms: work
@@ -657,6 +657,8 @@ impl Shared {
                     Some(ObserverState::NoParams) => gaps.unpolled.push(c.id.clone()),
                     _ => gaps.unsupported.push(c.id.clone()),
                 }
+            } else if work.switched_off {
+                gaps.switched_off.push(c.id.clone());
             } else if work.offline {
                 gaps.offline.push(c.id.clone());
             } else if !work.known {
@@ -707,6 +709,7 @@ impl Shared {
                     + &reason::switch_text(&reason::switch_gaps(
                         &config,
                         &snapshot,
+                        &prev_state,
                         &decision.allowed,
                     ));
                 (
@@ -754,7 +757,8 @@ impl Shared {
             config_generation: config.generation(),
             at: now,
             unknown_demand: gaps.unknown,
-            offline_demand: gaps.offline,
+            // Offline for either cause; the reason text tells them apart.
+            offline_demand: gaps.offline.into_iter().chain(gaps.switched_off).collect(),
             unsupported_demand: gaps.unsupported,
             unpolled_demand: gaps.unpolled,
             forced,

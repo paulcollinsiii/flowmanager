@@ -329,6 +329,11 @@ pub struct SourceSpec {
     pub observe: std::collections::BTreeSet<Capability>,
     #[serde(default)]
     pub params: Value,
+    /// Only on a source that observes `demand`: the switched class whose app this source polls.
+    /// While that class is switched off (and its graceful wait is over) the demand of the
+    /// classes reading this source is offline (see `work::class_work`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads_from: Option<ClassId>,
 }
 
 /// Longest accepted `interactive_ttl` and `drain_timeout`.

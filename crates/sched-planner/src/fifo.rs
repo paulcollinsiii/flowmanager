@@ -87,7 +87,7 @@ impl Strategy for FifoExhaustive {
             // A switched class has no demand: it wants its hosts up while its switch is on.
             let wants_hosts = match sched_model::class_switch(config, snapshot, class) {
                 Some(switch) => switch.on(),
-                None => class_work(config, snapshot, class).busy(),
+                None => class_work(config, snapshot, state, class).busy(),
             };
             if !wants_hosts {
                 continue;
@@ -173,7 +173,7 @@ fn target_for(
             ..
         }) if configured(model) => {
             let served = now.saturating_sub(*since);
-            let (busy, preemptible) = cur_status(config, snap, model);
+            let (busy, preemptible) = cur_status(config, snap, state, model);
             if busy {
                 let others: Vec<&Candidate> =
                     candidates.iter().filter(|c| &c.model != model).collect();
@@ -204,11 +204,16 @@ fn target_for(
 
 /// Whether the loaded model has work (or unknown demand, assumed busy), and whether all
 /// of that work may be interrupted by yielding.
-fn cur_status(config: &Config, snap: &Snapshot, model: &ModelId) -> (bool, bool) {
+fn cur_status(
+    config: &Config,
+    snap: &Snapshot,
+    state: &SchedState,
+    model: &ModelId,
+) -> (bool, bool) {
     let mut busy = false;
     let mut preemptible = true;
     for class in classes_of_model(config, model) {
-        let w = class_work(config, snap, class);
+        let w = class_work(config, snap, state, class);
         let active = w.busy() || (class.demand.is_some() && !w.known);
         busy |= active;
         if active && class.preemptibility == Preemptibility::None {
@@ -255,7 +260,7 @@ fn candidate(
     let mut oldest: Option<Millis> = None;
     let mut starved = false;
     for class in classes_of_model(config, &m.id) {
-        let w = class_work(config, snap, class);
+        let w = class_work(config, snap, state, class);
         let wanted = w.ready > 0 || (count_failed && w.failed > 0);
         if !wanted || !runnable(config, snap, state, class) {
             continue;

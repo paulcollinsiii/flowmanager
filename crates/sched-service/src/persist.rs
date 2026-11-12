@@ -234,6 +234,37 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_off_survives_a_restart_and_the_state_version_is_unchanged() {
+        use sched_model::{Millis, SwitchOff, Withdrawal};
+        let mut s = CoreState::default();
+        s.state.classes.insert(
+            "paperless-ngx".into(),
+            SwitchOff {
+                since: Millis(4_000),
+                withdrawal: Withdrawal::Pending,
+            },
+        );
+        let bytes = encode_state(&s);
+        assert_eq!(decode_state(Some(&bytes)).unwrap(), s);
+        let text = String::from_utf8(bytes).unwrap();
+        // `classes` is an additive field with a serde default: no version bump, and a document
+        // written before it reads with none (a restart that lost it starts a new bounded wait).
+        assert!(text.starts_with("{\"version\":4,\"data\":"), "{text}");
+        let old = text.replace(
+            ",\"classes\":{\"paperless-ngx\":{\"since\":4000,\"withdrawal\":\"pending\"}}",
+            "",
+        );
+        assert_ne!(old, text, "{text}");
+        assert!(
+            decode_state(Some(old.as_bytes()))
+                .unwrap()
+                .state
+                .classes
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn the_off_stamp_and_a_shutdown_survive_a_restart() {
         use sched_model::{Millis, PowerPhase, ResourceState};
         let mut s = CoreState::default();

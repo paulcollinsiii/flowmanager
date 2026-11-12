@@ -195,6 +195,22 @@ classes:
     demand: { source: llm-sessions }
 
   # NFS-only services: no demand of their own; they run whenever NFS is up.
+  #
+  # Paperless-ngx as a switched app with dependents (kept as a comment: enabling it here
+  # would make every test that expects paperless-ngx to be a plain gate class a different
+  # test). The switched class wakes basestar when it is on (may_change_power), and the demand
+  # sources that poll Paperless say so with `reads_from` (see paperless-ocr-pending below).
+  # When it is switched off and its graceful wait is over, paperless-ocr and
+  # paperless-tagging are offline: no demand, whatever the source reports, so the OCR queues
+  # hold neither cuda-central nor basestar.
+  #
+  #   - id: paperless-ngx
+  #     requires:
+  #       - { resource: basestar-nfs }
+  #     priority: 0
+  #     preemptibility: none
+  #     may_change_power: true
+  #     switch: { source: ha-paperless }     # a switch source like ha-wikijs below
   - id: paperless-ngx
     requires:
       - { resource: basestar-nfs }
@@ -224,8 +240,12 @@ classes:
   # A switched class: an app a person switches on and off from Home Assistant. It names no
   # model and has no demand; `switch.source` is a source that observes `switch`. The reading
   # is `on`, `off` or `off_now` (see the ha-wikijs source) and it gates the class: the class
-  # is allowed only while its hosts are up and the reading is `on`. In this release `off` is
-  # immediate, like `off_now`; the graceful wait for dependents comes later. A missing or
+  # is allowed only while its hosts are up and the reading is `on`, or while a graceful `off`
+  # still waits: `off` keeps the class allowed while a *dependent* (a class whose demand
+  # source declares `reads_from: <this class>`, see the commented example at paperless-ngx
+  # below) has work in flight, or unknown, for at most policy.drain_timeout from when `off`
+  # was first read. `off_now` ends the class at once and ends a wait that is running, and
+  # `on` cancels it. wikijs has no dependents, so `off` is immediate for it too. A missing or
   # stale reading counts as `off_now` (fail closed). A class that requires only a resource
   # without a `power:` section (blade-runner, the node the app runs on) has nothing to wake,
   # so may_change_power stays false. A class has `demand` or `switch`, never both.
@@ -321,6 +341,12 @@ sources:
 
   # Secrets are never in this file: `auth` names an environment variable (or a mounted
   # file) that holds the token.
+  #
+  # `reads_from: <switched class>` (a source-level field, only on a source that observes
+  # `demand`) says this source polls that app. While the app is switched off and its graceful
+  # wait is over, the classes reading the source are offline, even if the source still
+  # answers. Add `reads_from: paperless-ngx` to the two paperless sources below together with
+  # the switched paperless-ngx class above.
   - id: paperless-ocr-pending
     kind: http_json
     observe: [demand]

@@ -163,7 +163,7 @@ fn serving(
     let classes: Vec<&ClassSpec> = classes_of_model(cx.config, &model).collect();
     let works: Vec<_> = classes
         .iter()
-        .map(|c| class_work(cx.config, cx.snapshot, c))
+        .map(|c| class_work(cx.config, cx.snapshot, cx.state, c))
         .collect();
     let busy = classes
         .iter()

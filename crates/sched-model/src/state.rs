@@ -639,12 +639,31 @@ impl ResourceState {
 pub struct SchedState {
     #[serde(default)]
     pub resources: BTreeMap<ResourceId, ResourceState>,
+    /// The switch-off of every switched class whose switch does not read `on` (and has been
+    /// seen so): absent while it is on. See [`SwitchOff`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub classes: BTreeMap<ClassId, SwitchOff>,
 }
 
 impl SchedState {
     pub fn resource(&self, id: &ResourceId) -> Option<&ResourceState> {
         self.resources.get(id)
     }
+}
+
+/// A switched class whose switch reads `off`, `off-now` or is unusable: the one stored fact
+/// about it, the start of the graceful wait, so the next tick does not start a new one.
+/// Created when the switch first reads other than `on`, kept while it stays so, removed when it
+/// reads `on` (all by `sched_sequencer::tick`; whether the class is off is decided by
+/// `sched_model::switch_phase`, not by this value alone). The withdrawal reuses the host
+/// shutdown's: `Pending` while the wait runs, `Done` once the class has left (it stays out for
+/// as long as the switch does not read `on`). `NotNeeded` is never written and reads as `Done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchOff {
+    /// When the switch was first read as not `on`; the wait lasts `drain_timeout` from here.
+    pub since: Millis,
+    pub withdrawal: Withdrawal,
 }
 
 #[cfg(test)]
@@ -949,5 +968,46 @@ mod tests {
         let mut st = ResourceState::new(PowerPhase::PoweringOn { since: Millis(1) });
         st.set_ours(true);
         assert!(!st.ours() && st.power == PowerPhase::PoweringOn { since: Millis(1) });
+    }
+
+    #[test]
+    fn switch_offs_round_trip_and_a_state_without_them_reads_as_none() {
+        let mut st = SchedState::default();
+        st.classes.insert(
+            "wikijs".into(),
+            SwitchOff {
+                since: Millis(7),
+                withdrawal: Withdrawal::Pending,
+            },
+        );
+        st.classes.insert(
+            "paperless-ngx".into(),
+            SwitchOff {
+                since: Millis(9),
+                withdrawal: Withdrawal::Done,
+            },
+        );
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(json.contains(r#""withdrawal":"pending""#), "{json}");
+        assert_eq!(serde_json::from_str::<SchedState>(&json).unwrap(), st);
+        // A state as stored before switched classes (or after a restart that lost them) has no
+        // `classes`: none, so a graceful off found afterwards starts a new, bounded wait.
+        let old = r#"{"resources":{}}"#;
+        assert!(
+            serde_json::from_str::<SchedState>(old)
+                .unwrap()
+                .classes
+                .is_empty()
+        );
+        // And none is not written.
+        assert!(
+            !serde_json::to_string(&SchedState::default())
+                .unwrap()
+                .contains("classes")
+        );
+        // Strict, as the rest of the state: an unknown field is refused.
+        assert!(
+            serde_json::from_str::<SwitchOff>(r#"{"since":1,"withdrawal":"done","x":1}"#).is_err()
+        );
     }
 }

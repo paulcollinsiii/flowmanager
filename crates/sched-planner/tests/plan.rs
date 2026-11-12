@@ -968,3 +968,145 @@ fn a_switched_class_wakes_its_hosts_only_while_on_and_only_if_it_may_change_powe
         assert_eq!(wants(true, &obs), None, "{name}");
     }
 }
+
+/// The switched example (`nfs-app` on the powered NFS host, `paperless-ocr` reading from it)
+/// plus the NFS batch class (`may_change_power`), whose source also reads from `nfs-app`.
+fn dependents_config() -> Config {
+    let yaml = sched_model::test_support::with_nfs_batch(
+        &sched_model::test_support::example_yaml_switched_dependents(),
+    )
+    .replacen(
+        "  - id: nfs-batch-queue\n    kind: http_json\n",
+        "  - id: nfs-batch-queue\n    kind: http_json\n    reads_from: nfs-app\n",
+        1,
+    );
+    Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Plans `obs` against [`dependents_config`] with the stored switch-off (if any) `state`.
+fn dependents_plan(
+    obs: &[String],
+    serving: Option<(&str, u64, Option<u64>)>,
+    stored: Option<sched_model::Withdrawal>,
+) -> Intent {
+    let y = fixture_yaml(obs, &[], serving);
+    let mut f = Fixture::from_yaml(&y).unwrap_or_else(|e| panic!("{e}\n{y}"));
+    if let Some(withdrawal) = stored {
+        f.state.classes.insert(
+            "nfs-app".into(),
+            sched_model::SwitchOff {
+                since: sched_model::Millis(T - MIN),
+                withdrawal,
+            },
+        );
+    }
+    plan(&dependents_config(), &f.snapshot, &f.state).unwrap()
+}
+
+#[test]
+fn during_a_graceful_off_the_dependents_ready_work_wants_no_model_and_wakes_no_host() {
+    let (gpu, nfs) = (ResourceId::new(G), ResourceId::new("basestar-nfs"));
+    // paperless-ocr has work in flight (the wait), and ready work behind it; nfs-batch (which
+    // may change power) has only ready work.
+    let obs = |switch: &str| {
+        vec![
+            switch_obs("ha-wikijs", switch, T),
+            demand(
+                "paperless-ocr",
+                "paperless-ocr-pending",
+                5,
+                2,
+                Some(T - MIN),
+            ),
+            demand("nfs-batch", "nfs-batch-queue", 5, 0, Some(T - MIN)),
+        ]
+    };
+    // The control: with the switch on both queues count.
+    let i = dependents_plan(&obs("on"), None, None);
+    assert_eq!(i.models[&gpu], Some(ModelId::new("mineru")));
+    assert_eq!(i.power_up.get(&nfs), Some(&PowerWant::Workload));
+    // During the wait, whether or not a wait is stored yet: no model, no wake.
+    for stored in [None, Some(sched_model::Withdrawal::Pending)] {
+        let i = dependents_plan(&obs("off"), None, stored);
+        assert_eq!(i.models[&gpu], None, "{stored:?}");
+        assert!(!i.power_up.contains_key(&nfs), "{stored:?}");
+    }
+    // Their in-flight work still keeps a serving model: mineru stays for paperless-ocr's
+    // two items although nothing else asks for it.
+    let i = dependents_plan(
+        &obs("off"),
+        Some(("mineru", T - 20 * MIN, None)),
+        Some(sched_model::Withdrawal::Pending),
+    );
+    assert_eq!(i.models[&gpu], Some(ModelId::new("mineru")));
+}
+
+#[test]
+fn once_the_wait_is_over_dependents_are_offline_and_want_nothing_whatever_they_report() {
+    let (gpu, nfs) = (ResourceId::new(G), ResourceId::new("basestar-nfs"));
+    let obs = vec![
+        switch_obs("ha-wikijs", "off", T),
+        demand(
+            "paperless-ocr",
+            "paperless-ocr-pending",
+            5,
+            2,
+            Some(T - MIN),
+        ),
+        demand("nfs-batch", "nfs-batch-queue", 5, 3, Some(T - MIN)),
+    ];
+    for stored in [
+        Some(sched_model::Withdrawal::Done),
+        // The timeout over counts too, with the entry still pending.
+        None,
+    ] {
+        let mut obs = obs.clone();
+        if stored.is_none() {
+            // No dependent in flight: nothing to wait for from the first read.
+            obs[1] = demand(
+                "paperless-ocr",
+                "paperless-ocr-pending",
+                5,
+                0,
+                Some(T - MIN),
+            );
+            obs[2] = demand("nfs-batch", "nfs-batch-queue", 5, 0, Some(T - MIN));
+        }
+        let i = dependents_plan(&obs, None, stored);
+        assert_eq!(i.models[&gpu], None, "{stored:?}");
+        assert!(!i.power_up.contains_key(&nfs), "{stored:?}");
+    }
+    // A serving model loses its in-flight work's claim: offline demand is not busy.
+    let i = dependents_plan(
+        &obs,
+        Some(("mineru", T - 20 * MIN, Some(T - 15 * MIN))),
+        Some(sched_model::Withdrawal::Done),
+    );
+    assert_eq!(i.models[&gpu], None);
+}
+
+#[test]
+fn a_switched_class_on_a_powered_host_wakes_it_only_while_on_not_while_waiting() {
+    let nfs = ResourceId::new("basestar-nfs");
+    let wants = |switch: &str, stored| {
+        dependents_plan(
+            &[
+                switch_obs("ha-wikijs", switch, T),
+                demand("paperless-ocr", "paperless-ocr-pending", 0, 2, None),
+            ],
+            None,
+            stored,
+        )
+        .power_up
+        .get(&nfs)
+        .copied()
+    };
+    assert_eq!(wants("on", None), Some(PowerWant::Workload));
+    assert_eq!(
+        wants("off", None),
+        None,
+        "waiting: the class itself wakes nothing"
+    );
+    assert_eq!(wants("off", Some(sched_model::Withdrawal::Pending)), None);
+    assert_eq!(wants("off_now", None), None);
+}

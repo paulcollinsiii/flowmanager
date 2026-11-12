@@ -4,7 +4,6 @@
 //! state it was derived from, and pod observations must not change any decision.
 
 use proptest::prelude::*;
-use sched_model::test_support::{example_config, example_config_managed};
 use sched_model::{
     ClassId, Fidelity, Lease, LeaseId, LeaseKind, Millis, ModePhase, ModelId, ObservedValue,
     ResourceId, SourceId, Step, WaitReason, classes_of_model,
@@ -35,6 +34,10 @@ struct Raw {
     refresh: bool,
     /// The `wikijs` switch reading this frame: 0 on, 1 off, 2 off_now (`None`: no reading).
     switch: Option<u8>,
+    /// The `nfs-app` switch reading this frame, as `switch`. `nfs-app` is the switched class on
+    /// the powered NFS host that `paperless-ocr` (a dependent) reads from, in the config of
+    /// [`config_for`].
+    nfs_app: Option<u8>,
 }
 
 fn raw() -> impl Strategy<Value = Raw> {
@@ -53,9 +56,10 @@ fn raw() -> impl Strategy<Value = Raw> {
         prop::option::weighted(0.3, prop::collection::vec(0usize..9, 0..4)),
         prop::bool::weighted(0.6),
         prop::option::weighted(0.7, 0u8..3),
+        prop::option::weighted(0.8, 0u8..3),
     )
         .prop_map(
-            |(dt, pods, up, mounts, demand, leases, refresh, switch)| Raw {
+            |(dt, pods, up, mounts, demand, leases, refresh, switch, nfs_app)| Raw {
                 dt,
                 pods,
                 up,
@@ -64,6 +68,7 @@ fn raw() -> impl Strategy<Value = Raw> {
                 leases,
                 refresh,
                 switch,
+                nfs_app,
             },
         )
 }
@@ -186,6 +191,21 @@ fn scenario(frames: &[Raw]) -> Scenario {
                 },
             });
         }
+        if let Some(s) = r.nfs_app {
+            observe.push(Observe {
+                source: SourceId::new("ha-wikijs"),
+                observed_at: None,
+                fidelity: Fidelity::Polled,
+                value: ObservedValue::Switch {
+                    class: ClassId::new("nfs-app"),
+                    state: match s {
+                        0 => sched_model::SwitchState::On,
+                        1 => sched_model::SwitchState::Off,
+                        _ => sched_model::SwitchState::OffNow,
+                    },
+                },
+            });
+        }
         let leases = r.leases.as_ref().map(|ks| {
             ks.iter()
                 .enumerate()
@@ -209,6 +229,19 @@ fn scenario(frames: &[Raw]) -> Scenario {
     }
 }
 
+/// The example (managed power or not) plus `nfs-app`, a switched class on the powered NFS host
+/// that `paperless-ocr` reads from (`reads_from`): the graceful off, its stored wait and the
+/// dependents' offline demand are all in the generated worlds.
+fn config_for(managed: bool) -> sched_model::Config {
+    let yaml = sched_model::test_support::example_yaml_switched_dependents();
+    let yaml = if managed {
+        yaml
+    } else {
+        yaml.replace("      control: managed\n", "      control: manual\n")
+    };
+    sched_model::Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"))
+}
+
 /// The same world without a single pod observation.
 fn without_pods(frames: &[Raw]) -> Vec<Raw> {
     frames
@@ -226,7 +259,7 @@ proptest! {
 
     #[test]
     fn no_invariant_is_violated_in_any_world(frames in prop::collection::vec(raw(), 1..40), managed in any::<bool>()) {
-        let config = if managed { example_config_managed() } else { example_config() };
+        let config = config_for(managed);
         let sc = scenario(&frames);
         let results = run(&config, &sc).unwrap();
         for (i, r) in results.iter().enumerate() {
@@ -283,7 +316,7 @@ proptest! {
     fn pod_observations_only_ever_hold_back_a_recovery(frames in prop::collection::vec(raw(), 1..40)) {
         // Without power management: under it a pod reading also holds a power-off back (the
         // veto), which the sequencer tests cover.
-        let config = example_config();
+        let config = config_for(false);
         let with = run(&config, &scenario(&frames)).unwrap();
         let without = run(&config, &scenario(&without_pods(&frames))).unwrap();
         for (i, (a, b)) in with.iter().zip(&without).enumerate() {
@@ -306,7 +339,7 @@ proptest! {
 
     #[test]
     fn replays_are_repeatable(frames in prop::collection::vec(raw(), 1..25)) {
-        let config = example_config();
+        let config = config_for(false);
         let sc = scenario(&frames);
         let a = run(&config, &sc).unwrap();
         let b = run(&config, &sc).unwrap();
@@ -327,7 +360,7 @@ proptest! {
         ago in 0u64..1_500_000,
         idle in any::<bool>(),
     ) {
-        let config = example_config_managed();
+        let config = config_for(true);
         let mut sc = scenario(&frames);
         let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1), ours: false });
         st.set_ours(true);

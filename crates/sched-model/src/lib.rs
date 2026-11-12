@@ -53,9 +53,12 @@ pub use source_params::{
 };
 pub use state::{
     DrainMode, ModePhase, PowerPhase, PowerTransition, ResourceState, SchedState, Shutdown,
-    ShutdownCause, Veto, WindDown, Withdrawal,
+    ShutdownCause, SwitchOff, Veto, WindDown, Withdrawal,
 };
 pub use store::ConfigStore;
 pub use time::Millis;
 pub use validate::Problem;
-pub use work::{ClassSwitch, ClassWork, class_switch, class_work, classes_of_model, host_is_up};
+pub use work::{
+    ClassSwitch, ClassWork, SwitchPhase, class_switch, class_work, classes_of_model, dependents,
+    host_is_up, reads_from_class, switch_offs_next, switch_phase,
+};

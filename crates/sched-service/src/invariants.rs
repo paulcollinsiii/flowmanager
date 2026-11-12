@@ -10,14 +10,17 @@
 //! leases straight from the snapshot with its own small readers, derives "locked_out",
 //! "forced" and "held" from the leases rather than from the intent, and shares only the
 //! data types and config accessors with the code it checks. It re-uses none of
-//! `sched_model`'s query helpers (`class_work`, `fresh_*`, `holds_host`, ...).
+//! `sched_model`'s query helpers (`class_work`, `fresh_*`, `holds_host`, ...), with two
+//! exceptions that are one rule by design: `class_switch` (what a switch reads) and
+//! `switch_phase` (whether a switched class is off, read only to tell which demand is
+//! offline; invariant 21's own graceful-wait test is derived here).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use sched_model::{
     Capability, ClassId, ClassSpec, Config, Intent, LeaseKind, Millis, ModePhase, ModelId,
     Observation, ObservedValue, PowerPhase, PowerTransition, ResourceId, ResourceKind, SchedState,
-    Snapshot, SourceId, Step,
+    Snapshot, SourceId, Step, SwitchOff, Withdrawal,
 };
 use sched_sequencer::Decision;
 
@@ -129,8 +132,29 @@ fn model_of(config: &Config, res: &ResourceId, model: &ModelId) -> bool {
 /// `Some((busy, in_flight))` for a class, `None` when its demand is unknown (missing, stale
 /// or future-dated). Conservative over ties: the busiest reading. A source listed as
 /// unobservable that has no reading is no demand, and so is one with no usable reading while
-/// a host the class requires is freshly seen down (offline).
-fn demand(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<(bool, bool)> {
+/// a host the class requires is freshly seen down (offline). A class whose source
+/// `reads_from` a switched class that is off (wait over) has none whatever it reports, and
+/// while the wait runs only its in-flight work counts (`sched_model::switch_phase` on the
+/// state the tick began with, the rule the planner and sequencer read).
+fn demand(
+    config: &Config,
+    snap: &Snapshot,
+    prev: &SchedState,
+    class: &ClassSpec,
+) -> Option<(bool, bool)> {
+    let reported = reported_demand(config, snap, class);
+    let Some(from) = sched_model::reads_from_class(config, class) else {
+        return reported;
+    };
+    match sched_model::switch_phase(config, snap, prev, from) {
+        Some(sched_model::SwitchPhase::Off) => Some((false, false)),
+        Some(sched_model::SwitchPhase::Waiting { .. }) => reported.map(|(_, f)| (f, f)),
+        _ => reported,
+    }
+}
+
+/// The demand as the class's source reports it, before any switch-off.
+fn reported_demand(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<(bool, bool)> {
     let src = &class.demand.as_ref()?.source;
     let offline = class.requires.iter().any(|r| {
         host_seen_down(
@@ -170,6 +194,32 @@ fn demand(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Option<(bool, 
         at.iter().any(|x| x.1 > 0 || x.2 > 0),
         at.iter().any(|x| x.2 > 0),
     ))
+}
+
+/// Whether a graceful off of the switched class is pending at this tick (invariant 21): the
+/// wait began at the `since` of a `Pending` entry in the previous state (or begins now, with
+/// no entry), less than `drain_timeout` has passed, and a dependent reports in-flight work or
+/// unknown demand (which counts as in flight).
+fn graceful_wait(config: &Config, snap: &Snapshot, prev: &SchedState, class: &ClassSpec) -> bool {
+    let since = match prev.classes.get(&class.id) {
+        Some(SwitchOff {
+            withdrawal: Withdrawal::Pending,
+            since,
+        }) => *since,
+        Some(_) => return false,
+        None => snap.now,
+    };
+    snap.now < since.saturating_add(config.policy().drain_timeout)
+        && config
+            .classes()
+            .iter()
+            .filter(|d| {
+                d.demand
+                    .as_ref()
+                    .and_then(|x| config.source(&x.source))
+                    .is_some_and(|s| s.reads_from.as_ref() == Some(&class.id))
+            })
+            .any(|d| reported_demand(config, snap, d).is_none_or(|(_, in_flight)| in_flight))
 }
 
 fn active(kind: &LeaseKind, now: Millis) -> bool {
@@ -367,9 +417,12 @@ pub fn check(
             }
         }
         // 21. A switched class is allowed only while its switch reads `on` (a missing or
-        // stale reading is off-now). Phase 3 adds the graceful wait for dependents.
+        // stale reading is off-now), or while a graceful `off` waits for a dependent's
+        // in-flight (or unknown) work within `drain_timeout`.
         if let Some(switch) = sched_model::class_switch(config, snapshot, spec)
             && !switch.on()
+            && !(switch.state == sched_model::SwitchState::Off
+                && graceful_wait(config, snapshot, prev, spec))
         {
             out.push(format!(
                 "invariant 21: switched class {class} allowed while its switch is {:?}{}",
@@ -410,7 +463,7 @@ pub fn check(
             .classes()
             .iter()
             .filter(|c| c.demand.is_some() && needs(c, id))
-            .any(|c| demand(config, snapshot, c).is_some_and(|d| d.0));
+            .any(|c| demand(config, snapshot, prev, c).is_some_and(|d| d.0));
         if leased || busy {
             out.push(format!(
                 "invariant 12: idle drain of {id} still set while something holds the host"
@@ -519,7 +572,10 @@ pub fn check(
                 let workload = config.classes().iter().any(|c| {
                     c.may_change_power
                         && needs(c, resource)
-                        && demand(config, snapshot, c).is_some_and(|d| d.0)
+                        && (demand(config, snapshot, prev, c).is_some_and(|d| d.0)
+                            // A switched class reading `on` wants its hosts up.
+                            || sched_model::class_switch(config, snapshot, c)
+                                .is_some_and(|s| s.on()))
                 });
                 // A shared hold is a scheduled job's: jobs are workloads allowed to change
                 // power (a hold only ever exists for a running or waiting job).
@@ -627,7 +683,7 @@ pub fn check(
                                 .classes()
                                 .iter()
                                 .filter(|c| c.demand.is_some() && needs(c, resource))
-                                .all(|c| demand(config, snapshot, c).is_some_and(|x| !x.1));
+                                .all(|c| demand(config, snapshot, prev, c).is_some_and(|x| !x.1));
                         if !scaled {
                             out.push(format!(
                                 "invariant 11: powered off {resource} on a graceful drain before its consumers were scaled down"
@@ -639,7 +695,7 @@ pub fn check(
                         .iter()
                         .filter(|c| !draining && c.demand.is_some() && needs(c, resource))
                     {
-                        if demand(config, snapshot, class).is_none_or(|d| d.0) {
+                        if demand(config, snapshot, prev, class).is_none_or(|d| d.0) {
                             out.push(format!(
                                 "invariant 10: powered off {resource} while {} has or may have work",
                                 class.id
@@ -705,7 +761,7 @@ pub fn check(
                                         .classes()
                                         .iter()
                                         .filter(|c| c.demand.is_some() && needs(c, resource))
-                                        .all(|c| demand(config, snapshot, c).is_some_and(|x| !x.1));
+                                        .all(|c| demand(config, snapshot, prev, c).is_some_and(|x| !x.1));
                                 if !waited {
                                     out.push(format!(
                                         "invariant 11: powered off locked out shared {resource} before its in-flight work had lockout_timeout"
@@ -782,7 +838,7 @@ pub fn check(
                     ));
                     continue;
                 };
-                if demand(config, snapshot, spec).is_some_and(|d| !d.1) {
+                if demand(config, snapshot, prev, spec).is_some_and(|d| !d.1) {
                     out.push(format!(
                         "invariant 16: stopped {class} though nothing of it is in flight"
                     ));
@@ -868,7 +924,7 @@ pub fn check(
                     }))
                     .collect();
                 for class in on_model(config, model) {
-                    let d = demand(config, snapshot, class);
+                    let d = demand(config, snapshot, prev, class);
                     let unsure = class.demand.is_some() && d.is_none_or(|d| d.1);
                     if unsure && !killed.contains(&class.id) {
                         out.push(format!(

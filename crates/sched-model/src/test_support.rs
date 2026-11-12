@@ -114,6 +114,34 @@ pub fn example_config_managed() -> Config {
     Config::from_yaml(&example_yaml_managed()).expect("managed example config is valid")
 }
 
+/// The managed example plus `nfs-app`, a switched class on the powered NFS host (it may change
+/// power) whose switch is read from the example's `ha-wikijs` source, and with
+/// `paperless-ocr-pending` declaring `reads_from: nfs-app`: `paperless-ocr` is its one
+/// dependent. The example itself keeps `paperless-ngx` a plain gate class, so this is where a
+/// switched class on a host with a power section, and a dependent, are exercised.
+pub fn example_yaml_switched_dependents() -> String {
+    let class = "  - id: nfs-app\n    requires:\n      - { resource: basestar-nfs }\n    priority: 0\n    preemptibility: kill\n    may_change_power: true\n    switch: { source: ha-wikijs }\n\nsources:\n";
+    let reads = "  - id: paperless-ocr-pending\n    kind: http_json\n    reads_from: nfs-app\n";
+    let yaml = example_yaml_managed()
+        .replacen("\nsources:\n", &format!("\n{class}"), 1)
+        .replacen(
+            "  - id: paperless-ocr-pending\n    kind: http_json\n",
+            reads,
+            1,
+        );
+    assert!(
+        yaml.contains("reads_from: nfs-app") && yaml.contains("id: nfs-app"),
+        "the example changed shape"
+    );
+    yaml
+}
+
+/// [`example_yaml_switched_dependents`], loaded.
+pub fn example_config_switched_dependents() -> Config {
+    Config::from_yaml(&example_yaml_switched_dependents())
+        .unwrap_or_else(|e| panic!("switched example config is invalid: {e}"))
+}
+
 /// A bundled fixture by name, checked against the example config.
 pub fn fixture(name: &str) -> Fixture {
     let (_, yaml) = FIXTURES

@@ -2,8 +2,11 @@
 //! here so the two cannot disagree about what counts as work.
 
 use crate::config::{ClassSpec, Config};
-use crate::ids::ModelId;
+use std::collections::BTreeMap;
+
+use crate::ids::{ClassId, ModelId};
 use crate::observation::{ObservedValue, Snapshot, SwitchState};
+use crate::state::{SchedState, SwitchOff, Withdrawal};
 use crate::time::Millis;
 
 /// The demand for one class as the scheduler may rely on it.
@@ -26,7 +29,16 @@ pub struct ClassWork {
     /// The observation is missing or stale but a host the class requires is freshly seen down:
     /// known to have no work. Derived on every read, never stored; only reports tell it apart
     /// from an empty queue.
+    ///
+    /// Also set when the switched class the demand source `reads_from` is off and its
+    /// graceful wait is over (`switched_off` says which cause).
     pub offline: bool,
+    /// `offline` because the switched class the demand source reads from is switched off, not
+    /// because a host is down.
+    pub switched_off: bool,
+    /// Ready items not counted in `ready` because the switched class the demand source reads
+    /// from is waiting out a graceful off: they want no model and wake no host.
+    pub withheld: u64,
 }
 
 impl ClassWork {
@@ -37,6 +49,8 @@ impl ClassWork {
         oldest_ready_at: None,
         known: true,
         offline: false,
+        switched_off: false,
+        withheld: 0,
     };
 
     /// Ready or in-flight work is known to exist.
@@ -61,7 +75,60 @@ impl ClassWork {
 /// The current work of `class`. Classes without a demand source never have work, nor do
 /// classes whose source is listed in `Snapshot::unobservable` and has not reported, nor
 /// offline ones (see [`ClassWork::offline`]).
-pub fn class_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> ClassWork {
+///
+/// `state` is the sequencer's state as the tick began. A class whose demand source
+/// `reads_from` a switched class is offline once that class is off and its graceful wait is
+/// over, and has no ready work while the wait runs (see [`switch_phase`], the one rule the
+/// planner and the sequencer both read).
+pub fn class_work(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+    class: &ClassSpec,
+) -> ClassWork {
+    let work = demand_work(config, snapshot, class);
+    let Some(switched) = reads_from_class(config, class) else {
+        return work;
+    };
+    match switch_phase(config, snapshot, state, switched) {
+        // The person turned the app off and the wait is over: offline, whatever a fresh
+        // demand reading says (it does not win over a switch-off, unlike a host-offline).
+        Some(SwitchPhase::Off) => ClassWork {
+            offline: true,
+            switched_off: true,
+            ..ClassWork::NONE
+        },
+        // The wait: in-flight work is still honoured, ready work wants nothing.
+        Some(SwitchPhase::Waiting { .. }) => ClassWork {
+            ready: 0,
+            oldest_ready_at: None,
+            withheld: work.ready,
+            ..work
+        },
+        Some(SwitchPhase::On) | None => work,
+    }
+}
+
+/// The switched class the demand source of `class` reads from, if any.
+pub fn reads_from_class<'a>(config: &'a Config, class: &ClassSpec) -> Option<&'a ClassSpec> {
+    let source = config.source(&class.demand.as_ref()?.source)?;
+    config.class(source.reads_from.as_ref()?)
+}
+
+/// The classes whose demand source declares `reads_from` the switched class `class`, in
+/// configuration order.
+pub fn dependents<'a>(
+    config: &'a Config,
+    class: &'a ClassId,
+) -> impl Iterator<Item = &'a ClassSpec> {
+    config
+        .classes()
+        .iter()
+        .filter(move |k| reads_from_class(config, k).is_some_and(|s| &s.id == class))
+}
+
+/// The demand a class's source reports, before any switch-off is applied.
+fn demand_work(config: &Config, snapshot: &Snapshot, class: &ClassSpec) -> ClassWork {
     let Some(demand) = &class.demand else {
         return ClassWork::NONE;
     };
@@ -136,9 +203,9 @@ pub struct ClassSwitch {
 }
 
 impl ClassSwitch {
-    /// The class may run on the switch's say-so. In this release only `on` does: `off`
-    /// behaves as `off-now` (the graceful wait for dependents comes later), but the three
-    /// values stay distinct here so that wait can be added in one place.
+    /// The switch itself reads `on`. A class may also run while a graceful `off` waits, which
+    /// is not this switch's say-so but [`switch_phase`]'s; use that to decide whether a class
+    /// is allowed.
     pub fn on(&self) -> bool {
         self.state == SwitchState::On
     }
@@ -176,6 +243,110 @@ pub fn class_switch(
     Some(ClassSwitch { state, read: true })
 }
 
+/// Where a switched class stands: the one decision "is this class off, its wait over?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchPhase {
+    /// The switch reads `on`.
+    On,
+    /// The switch reads `off` and a graceful wait is running: some dependent has in-flight or
+    /// unknown work and `drain_timeout` has not passed since `off` was first read, at
+    /// `until` minus the timeout. The class stays allowed.
+    Waiting { until: Millis },
+    /// Off with the wait over (or none needed): `off-now`, an unusable reading, a timed-out or
+    /// finished wait, or an `off` read while no dependent has work.
+    Off,
+}
+
+impl SwitchPhase {
+    /// A class in this phase may run (switch `on`, or still waiting).
+    pub fn allows(&self) -> bool {
+        !matches!(self, SwitchPhase::Off)
+    }
+}
+
+/// Whether a dependent of a switched class has work in flight, or unknown demand (which
+/// counts as in flight). Reads the demand as reported, before any switch-off is applied.
+fn dependents_unsettled(config: &Config, snapshot: &Snapshot, class: &ClassId) -> bool {
+    dependents(config, class).any(|d| {
+        let w = demand_work(config, snapshot, d);
+        w.in_flight > 0 || !w.known
+    })
+}
+
+/// The phase of the switched class `class`, or `None` for a class that is not switched. The
+/// one rule for whether a switched class is off (graceful wait over), read by the planner
+/// (wakes, dependents' ready work), the sequencer (allowed set, holds, offline dependents),
+/// the status text and the invariant check, from the switch observation and the sequencer's
+/// state as the tick began (`SchedState::classes`).
+///
+/// - `on`: [`SwitchPhase::On`].
+/// - `off-now`, or a reading that is missing, stale or unmapped: `Off` at once.
+/// - `off`: the wait starts at the stored `since`; with no entry yet it starts now, if every
+///   resource the class requires is up (a class that was not running has nothing to wait for).
+///   It ends, as `Off`, at `since + drain_timeout` or when no dependent has work in flight or
+///   unknown; a stored `Done` ends it for good. Otherwise `Waiting`.
+pub fn switch_phase(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+    class: &ClassSpec,
+) -> Option<SwitchPhase> {
+    let switch = class_switch(config, snapshot, class)?;
+    match switch.state {
+        SwitchState::On => return Some(SwitchPhase::On),
+        SwitchState::OffNow => return Some(SwitchPhase::Off),
+        SwitchState::Off => {}
+    }
+    let since = match state.classes.get(&class.id) {
+        Some(SwitchOff {
+            withdrawal: Withdrawal::Pending,
+            since,
+        }) => *since,
+        Some(_) => return Some(SwitchPhase::Off),
+        None if class
+            .requires
+            .iter()
+            .all(|r| host_is_up(config, snapshot, state, &r.resource)) =>
+        {
+            snapshot.now
+        }
+        None => return Some(SwitchPhase::Off),
+    };
+    let until = since.saturating_add(config.policy().drain_timeout);
+    if snapshot.now >= until || !dependents_unsettled(config, snapshot, &class.id) {
+        return Some(SwitchPhase::Off);
+    }
+    Some(SwitchPhase::Waiting { until })
+}
+
+/// The `SchedState::classes` after a tick that began with `state`: an entry for every
+/// switched class whose switch does not read `on`, `Pending` while its wait runs and `Done`
+/// once the class has left, each keeping its original `since`; none for a class that reads
+/// `on` or is no longer configured. A pure transition, applied by the sequencer.
+pub fn switch_offs_next(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+) -> BTreeMap<ClassId, SwitchOff> {
+    let mut next = BTreeMap::new();
+    for class in config.classes() {
+        let Some(phase) = switch_phase(config, snapshot, state, class) else {
+            continue;
+        };
+        let since = state
+            .classes
+            .get(&class.id)
+            .map_or(snapshot.now, |prev| prev.since);
+        let withdrawal = match phase {
+            SwitchPhase::On => continue,
+            SwitchPhase::Waiting { .. } => Withdrawal::Pending,
+            SwitchPhase::Off => Withdrawal::Done,
+        };
+        next.insert(class.id.clone(), SwitchOff { since, withdrawal });
+    }
+    next
+}
+
 /// Classes that require `model`, in configuration order.
 pub fn classes_of_model<'a>(
     config: &'a Config,
@@ -211,9 +382,13 @@ pub fn host_is_up(
 }
 
 #[cfg(test)]
+mod graceful_off_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::observation::{Fidelity, Observation};
+    use crate::state::SchedState;
     use crate::test_support::example_config;
 
     #[test]
@@ -236,11 +411,11 @@ mod tests {
             }],
             ..Snapshot::default()
         };
-        let w = class_work(&config, &snap(3), class);
+        let w = class_work(&config, &snap(3), &SchedState::default(), class);
         assert_eq!(w.failed, 3);
         assert!(w.wanted() && !w.busy() && w.oldest_ready_at.is_none());
         assert_eq!(w.oldest_age(Millis(1_000_000)), Millis::ZERO);
-        let w = class_work(&config, &snap(0), class);
+        let w = class_work(&config, &snap(0), &SchedState::default(), class);
         assert!(!w.wanted());
     }
 
@@ -264,7 +439,7 @@ mod tests {
                 observations,
                 ..Snapshot::default()
             };
-            class_work(&config, &snap, class)
+            class_work(&config, &snap, &SchedState::default(), class)
         };
         let w = work(vec![nfs(false, now)]);
         assert!(w.offline && w.known && !w.busy(), "fresh down: {w:?}");
@@ -304,10 +479,10 @@ mod tests {
             ..Snapshot::default()
         };
         // Missing reading of an ordinary source: unknown.
-        assert!(!class_work(&config, &snap, class).known);
+        assert!(!class_work(&config, &snap, &SchedState::default(), class).known);
         // Listed as unobservable: known, no work.
         snap.unobservable.insert("llm-sessions".into());
-        let w = class_work(&config, &snap, class);
+        let w = class_work(&config, &snap, &SchedState::default(), class);
         assert!(w.known && !w.busy());
         // A reading always wins, and a stale one is unknown again.
         snap.observations.push(Observation {
@@ -322,9 +497,9 @@ mod tests {
                 oldest_ready_at: None,
             },
         });
-        assert!(!class_work(&config, &snap, class).known);
+        assert!(!class_work(&config, &snap, &SchedState::default(), class).known);
         snap.observations[0].observed_at = Millis(999_000);
-        let w = class_work(&config, &snap, class);
+        let w = class_work(&config, &snap, &SchedState::default(), class);
         assert!(w.known && w.busy());
     }
 

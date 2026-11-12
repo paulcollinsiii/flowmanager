@@ -614,6 +614,28 @@ fn sources(c: &Config, p: &mut Problems) {
     }
     for s in c.sources() {
         let at = format!("sources[{}]", s.id);
+        if let Some(from) = &s.reads_from {
+            if !s.observe.contains(&Capability::Demand) {
+                p.add(
+                    format!("{at}.reads_from"),
+                    "only a source that declares the demand capability (observe: [demand]) can read from a switched class",
+                );
+            }
+            match c.class(from) {
+                None => p.add(
+                    format!("{at}.reads_from"),
+                    format!("references unknown class {:?}", from.as_str()),
+                ),
+                Some(k) if k.switch.is_none() => p.add(
+                    format!("{at}.reads_from"),
+                    format!(
+                        "class {:?} is not a switched class (it has no switch:)",
+                        from.as_str()
+                    ),
+                ),
+                Some(_) => {}
+            }
+        }
         if s.resync == Millis::ZERO {
             p.add(&at, "resync must be greater than zero");
             continue;
@@ -2001,6 +2023,49 @@ sources:
         ));
         assert!(
             has(&ps, "source \"s1\" does not declare the switch capability"),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn reads_from_names_a_switched_class_on_a_demand_source() {
+        let c = Config::from_yaml(&switch_with(
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand], reads_from: app }",
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            c.source(&"s1".into()).unwrap().reads_from,
+            Some("app".into())
+        );
+        // An unknown class.
+        let ps = problems(&switch_with(
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand], reads_from: ghost }",
+        ));
+        assert!(
+            has(
+                &ps,
+                "sources[s1].reads_from: references unknown class \"ghost\""
+            ),
+            "{ps:?}"
+        );
+        // A class that is not switched.
+        let ps = problems(&switch_with(
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+            "{ id: s1, kind: http_json, resync: 30s, observe: [demand], reads_from: c1 }",
+        ));
+        assert!(has(&ps, "class \"c1\" is not a switched class"), "{ps:?}");
+        // A source that does not declare demand.
+        let ps = problems(&switch_with(
+            "{ id: hook, kind: webhook, resync: 30s }",
+            "{ id: hook, kind: webhook, resync: 30s, reads_from: app }",
+        ));
+        assert!(
+            has(
+                &ps,
+                "sources[hook].reads_from: only a source that declares the demand"
+            ),
             "{ps:?}"
         );
     }

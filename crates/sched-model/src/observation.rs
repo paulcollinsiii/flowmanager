@@ -483,6 +483,7 @@ impl HostUse {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::state::SchedState;
     use crate::test_support::example_config;
     use crate::work::class_work;
 
@@ -734,18 +735,18 @@ mod tests {
             demand(900, 1, 2, Some(300)),
         ]);
         s.now = Millis(1000);
-        let a = class_work(&config, &s, class);
+        let a = class_work(&config, &s, &SchedState::default(), class);
         s.observations.reverse();
-        assert_eq!(a, class_work(&config, &s, class));
+        assert_eq!(a, class_work(&config, &s, &SchedState::default(), class));
         assert_eq!(
             (a.ready, a.in_flight, a.oldest_ready_at, a.known),
             (3, 2, Some(Millis(300)), true)
         );
 
         let future = snap(vec![demand(1001, 0, 0, None)]);
-        assert!(!class_work(&config, &future, class).known);
+        assert!(!class_work(&config, &future, &SchedState::default(), class).known);
         let missing = snap(vec![]);
-        assert!(!class_work(&config, &missing, class).known);
+        assert!(!class_work(&config, &missing, &SchedState::default(), class).known);
     }
 
     // ---- source filtering, cross-source/fidelity ties ----
@@ -905,14 +906,17 @@ mod tests {
         };
         // A newer stray observation of the class must not displace the configured source's.
         let s = snap(vec![demand(500, 3, 0, Some(400)), stray(900, 0)]);
-        let w = class_work(&config, &s, class);
+        let w = class_work(&config, &s, &SchedState::default(), class);
         assert_eq!((w.known, w.ready), (true, 3));
         // Nor does a future-dated one.
         let s = snap(vec![demand(500, 3, 0, Some(400)), stray(5000, 0)]);
-        assert_eq!(class_work(&config, &s, class).ready, 3);
+        assert_eq!(
+            class_work(&config, &s, &SchedState::default(), class).ready,
+            3
+        );
         // A stray alone is no demand reading at all.
         let s = snap(vec![stray(900, 5)]);
-        assert!(!class_work(&config, &s, class).known);
+        assert!(!class_work(&config, &s, &SchedState::default(), class).known);
         assert!(s.demand(&config, &class.id).is_none());
     }
 
@@ -929,7 +933,7 @@ mod tests {
             with(Fidelity::Derived, demand(900, 1, 0, Some(300))),
         ];
         for order in all_orders(&readings) {
-            let w = class_work(&config, &snap(order), class);
+            let w = class_work(&config, &snap(order), &SchedState::default(), class);
             assert_eq!(
                 (w.ready, w.in_flight, w.oldest_ready_at, w.known),
                 (5, 3, Some(Millis(100)), true)
@@ -940,7 +944,7 @@ mod tests {
             with(Fidelity::Event, demand(900, 0, 0, None)),
             with(Fidelity::Polled, demand(900, 2, 0, Some(700))),
         ]) {
-            let w = class_work(&config, &snap(order), class);
+            let w = class_work(&config, &snap(order), &SchedState::default(), class);
             assert_eq!((w.ready, w.oldest_ready_at), (2, Some(Millis(700))));
         }
     }

@@ -223,7 +223,7 @@ pub(crate) fn holds(cx: &Cx, ignore_work: bool) -> Holds {
         if class.demand.is_none() {
             continue;
         }
-        let w = class_work(cx.config, cx.snapshot, class);
+        let w = class_work(cx.config, cx.snapshot, cx.state, class);
         if !w.known {
             h.unknown = true;
         } else if w.busy() {
@@ -506,7 +506,7 @@ fn no_work_in_flight(cx: &Cx) -> bool {
         .iter()
         .filter(|c| needs(c, cx) && c.demand.is_some())
         .all(|c| {
-            let w = class_work(cx.config, cx.snapshot, c);
+            let w = class_work(cx.config, cx.snapshot, cx.state, c);
             w.known && w.in_flight == 0
         })
 }

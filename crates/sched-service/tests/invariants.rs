@@ -1144,6 +1144,115 @@ fn kill_llm() -> Step {
     }
 }
 
+/// Invariant 21 on the switched example: `nfs-app` is allowed, its switch reads `switch`
+/// (`None`: no reading), the dependent `paperless-ocr` reports `ocr` (`None`: no reading,
+/// unknown) as (ready, in flight) and the stored switch-off is `stored`.
+fn graceful_violations(
+    switch: Option<sched_model::SwitchState>,
+    ocr: Option<(u64, u64)>,
+    stored: Option<(u64, sched_model::Withdrawal)>,
+) -> Vec<String> {
+    use sched_model::{Fidelity, Observation, ObservedValue, SwitchOff};
+    let mut observations = vec![];
+    observations.extend(switch.map(|state| Observation {
+        source: "ha-wikijs".into(),
+        observed_at: Millis(NOW),
+        fidelity: Fidelity::Polled,
+        value: ObservedValue::Switch {
+            class: ClassId::new("nfs-app"),
+            state,
+        },
+    }));
+    observations.extend(ocr.map(|(ready, in_flight)| Observation {
+        source: "paperless-ocr-pending".into(),
+        observed_at: Millis(NOW),
+        fidelity: Fidelity::Polled,
+        value: ObservedValue::Demand {
+            class: ClassId::new("paperless-ocr"),
+            ready,
+            in_flight,
+            failed: 0,
+            oldest_ready_at: None,
+        },
+    }));
+    let mut before = SchedState::default();
+    before.classes.extend(stored.map(|(ago, withdrawal)| {
+        (
+            ClassId::new("nfs-app"),
+            SwitchOff {
+                since: Millis(NOW - ago),
+                withdrawal,
+            },
+        )
+    }));
+    let mut d = decision(vec![]);
+    d.allowed.classes.insert(ClassId::new("nfs-app"));
+    check(
+        &sched_model::test_support::example_config_switched_dependents(),
+        &snap(observations, vec![]),
+        &before,
+        &Intent::default(),
+        &d,
+    )
+    .into_iter()
+    .filter(|m| m.contains("invariant 21"))
+    .collect()
+}
+
+#[test]
+fn a_switched_class_waiting_for_a_dependents_work_within_the_timeout_is_not_a_violation() {
+    use sched_model::SwitchState::{Off, OffNow, On};
+    use sched_model::Withdrawal::Pending;
+    // The first read of `off` (no entry yet), a running wait, and unknown dependent demand
+    // (which counts as in flight).
+    for (name, ocr, stored) in [
+        ("first read", Some((0, 2)), None),
+        ("running", Some((9, 2)), Some((5 * MIN, Pending))),
+        ("just inside", Some((0, 1)), Some((10 * MIN - 1, Pending))),
+        ("unknown", None, Some((MIN, Pending))),
+    ] {
+        let v = graceful_violations(Some(Off), ocr, stored);
+        assert!(v.is_empty(), "{name}: {v:?}");
+    }
+    // The switch on needs no wait; off-now is never excused.
+    assert!(graceful_violations(Some(On), Some((0, 0)), None).is_empty());
+    assert!(!graceful_violations(Some(OffNow), Some((0, 2)), Some((MIN, Pending))).is_empty());
+}
+
+#[test]
+fn a_switched_class_allowed_beyond_its_graceful_wait_is_a_violation() {
+    use sched_model::SwitchState::Off;
+    use sched_model::Withdrawal::{Done, Pending};
+    for (name, switch, ocr, stored) in [
+        // Nothing in flight (ready work does not count).
+        (
+            "nothing in flight",
+            Some(Off),
+            Some((5, 0)),
+            Some((MIN, Pending)),
+        ),
+        ("no entry, nothing in flight", Some(Off), Some((5, 0)), None),
+        // The timeout is over.
+        (
+            "timed out",
+            Some(Off),
+            Some((0, 2)),
+            Some((10 * MIN, Pending)),
+        ),
+        // The wait already ended: it does not come back with new work.
+        ("done", Some(Off), Some((0, 2)), Some((MIN, Done))),
+        // No usable reading is off-now, which no wait excuses.
+        ("no reading", None, Some((0, 2)), Some((MIN, Pending))),
+    ] {
+        let v = graceful_violations(switch, ocr, stored);
+        assert!(
+            v.iter()
+                .any(|m| m.contains("nfs-app") && m.contains("switch")),
+            "{name}: {v:?}"
+        );
+    }
+}
+
 #[test]
 fn a_switched_class_allowed_while_its_switch_is_not_on_is_a_violation() {
     use sched_model::{Fidelity, Observation, ObservedValue, SwitchState};

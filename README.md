@@ -366,7 +366,10 @@ others. Version 2 of `scheduler_state` replaced each resource's `drain`, `mounts
 `host_idle_since` and `shutdown_confirmed_at` with `shutdown`, `idle_since` and `off_since`;
 version 3 renamed the `reclaim` shutdown cause and wind-down flag to `lockout` and added
 `locked_down`; version 4 replaced the per-resource `managed` flag with `ours` on the `off` and
-`on` power phases (`planning/power-model.md`). **There is no migration for `scheduler_state`**
+`on` power phases (`planning/power-model.md`). The `classes` map of switched classes' switch-offs
+was added without a version bump (an absent `classes` reads as none), so a build before it
+cannot read a state that has some: discard `scheduler_state` when rolling back past it.
+**There is no migration for `scheduler_state`**
 (but see the operator step below for a stored reclaim lease). A
 `scheduler_state` of an *older* version (version 1, 2 or 3, as the builds before wrote it) is read as
 an absent document: the first tick logs one warning (`event="state_version_discarded"`: the
@@ -1184,18 +1187,46 @@ Notes:
     model on any requirement and requires at least one resource (for an app that needs no host
     of its own, a shared resource without a `power:` section). The reading is a scheduling input
     (stale after `policy.queue_reading_stale_after`).
-  **The switch gates its class** (phase 2; `sched_model::class_switch` is the one rule the
-  planner, the sequencer, the status text and the invariant check all read). A switched class
-  is allowed only while its requirements hold (hosts up, no lockout or requested shutdown) **and**
-  the switch reads `on`. Fail closed: a missing, stale or future-dated reading, or one from a
-  source other than the class's own, is `off_now`. In this release `off` is immediate, like
-  `off_now`; the graceful wait for dependents comes later. While it reads `on` the class holds
-  the hosts it requires against an idle shutdown (a requested shutdown or a lockout still wins),
-  and with `may_change_power: true` it wants its powered hosts up. Off, or no usable reading,
-  wakes nothing and holds nothing. The decision's `reason` names the class as switched off,
-  as having no usable switch reading, or as switched on but kept out by a host. The reading is
-  counted in the input ages as capability `switch`. `config/example.yaml` has the `blade-runner`
-  resource, the `wikijs` class and the `ha-wikijs` source.
+  **The switch gates its class** (`sched_model::class_switch` reads the switch and
+  `sched_model::switch_phase` decides whether the class is off; the planner, the sequencer, the
+  status text and the invariant check all read them). A switched class is allowed only while its
+  requirements hold (hosts up, no lockout or requested shutdown) **and** the switch reads `on`,
+  or a graceful off still waits (below). Fail closed: a missing, stale or future-dated reading,
+  or one from a source other than the class's own, is `off_now`. While it reads `on` the class
+  holds the hosts it requires against an idle shutdown (a requested shutdown or a lockout still
+  wins), and with `may_change_power: true` it wants its powered hosts up. Off, or no usable
+  reading, wakes nothing and holds nothing. The decision's `reason` names the class as switched
+  off, as switching off (waiting), as having no usable switch reading, or as switched on but
+  kept out by a host. The reading is counted in the input ages as capability `switch`.
+  `config/example.yaml` has the `blade-runner` resource, the `wikijs` class and the `ha-wikijs`
+  source.
+  **`reads_from` and the graceful off** (phase 3). A source that observes `demand` may declare
+  `reads_from: <switched class id>` (source level, not in `params`): the service it polls is that
+  app. The classes whose `demand.source` declares it are that class's **dependents**. Loading
+  refuses a `reads_from` that names no class or a class without `switch:`, and one on a source
+  that does not declare `demand`.
+  - **`off` (graceful)** keeps the class allowed while some dependent reports work in flight, or
+    unknown demand (which counts as in flight), for at most `policy.drain_timeout` from when
+    `off` was first read. During the wait the dependents' *ready* work counts as nothing: it
+    wants no model and wakes no host, while their in-flight work keeps holding its model and
+    hosts as it always does. With no dependents, or none with work in flight, `off` is
+    immediate. `off_now` or an unusable reading ends a wait at once; `on` cancels it. A lockout
+    or a requested shutdown of a required host withdraws the class whatever the switch says.
+  - **Offline dependents.** Once the class is off and its wait is over, its dependents' demand
+    is **offline**, as when a host they require is down: it holds no model and no host, wakes
+    nothing, stops nothing and does not prevent `idle`. Unlike host-offline, a fresh demand
+    reading does not win: the person switched the app off. The reason says "demand offline for
+    [...] (the switched app its source reads from is switched off)", apart from the host-down
+    text, and the class is listed in `offline_demand`.
+  - **Stored state.** The one stored fact is `classes` in the scheduler state: per switched
+    class whose switch does not read `on`, `{ since, withdrawal }` (`pending` while the wait
+    runs, `done` once the class has left). It keeps the wait from starting again every tick;
+    `on` removes it, and entries for classes no longer configured are dropped. A restart that
+    lost it starts a new bounded wait. The field is additive (serde default), so the state
+    version is unchanged.
+  `config/example.yaml` describes `reads_from` in comments with a switched `paperless-ngx`
+  (kept commented out: enabling it would change every test that takes `paperless-ngx` for a
+  plain gate class).
 - A `429` response is recorded in the source error text with its `Retry-After`; the polling
   cadence is not changed.
 - **Reachability sources for hosts outside the cluster**: `tcp_probe` (params `host`,
@@ -1215,7 +1246,9 @@ Notes:
   requires is down is `demand_offline` (listed in `offline_demand`, and `offline` in the queue
   report). The work cannot run, so the class has no demand: with basestar off, the classes that
   need basestar hold neither a model nor cuda-central. A stale host reading is unknown, and a
-  fresh demand reading always counts.
+  fresh demand reading counts, with one exception: a class whose source `reads_from` a switched
+  class that is switched off (its graceful wait over) is offline whatever the source reports,
+  and is listed the same way (the reason text names the cause).
 
 ## Known blind spots
 

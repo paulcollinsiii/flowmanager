@@ -171,7 +171,11 @@ pub fn with_hosts(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DemandGaps {
     pub unknown: Vec<sched_model::ClassId>,
+    /// Offline because a host the class requires is down.
     pub offline: Vec<sched_model::ClassId>,
+    /// Offline because the switched class its source reads from is switched off (its
+    /// graceful wait over): counted as no demand, like `offline`, but a different cause.
+    pub switched_off: Vec<sched_model::ClassId>,
     pub unsupported: Vec<sched_model::ClassId>,
     pub unpolled: Vec<sched_model::ClassId>,
 }
@@ -180,6 +184,7 @@ impl DemandGaps {
     pub fn is_empty(&self) -> bool {
         self.unknown.is_empty()
             && self.offline.is_empty()
+            && self.switched_off.is_empty()
             && self.unsupported.is_empty()
             && self.unpolled.is_empty()
     }
@@ -195,12 +200,25 @@ pub struct SwitchGaps {
     /// The switch reads `on`, so a host the class requires is the reason (down, locked out
     /// or being shut down).
     pub blocked: Vec<sched_model::ClassId>,
+    /// The switch reads `off` and the class still runs: a graceful wait for in-flight work.
+    pub waiting: Vec<SwitchWait>,
 }
 
-/// Which switched classes are out of the allowed set and why.
+/// A switched class whose graceful off is waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchWait {
+    pub class: sched_model::ClassId,
+    /// The dependents with in-flight or unknown work.
+    pub dependents: Vec<sched_model::ClassId>,
+    pub until: sched_model::Millis,
+}
+
+/// Which switched classes are out of the allowed set, or waiting to leave, and why. `state` is
+/// the state the tick began with, the one `sched_model::switch_phase` reads.
 pub fn switch_gaps(
     config: &sched_model::Config,
     snapshot: &sched_model::Snapshot,
+    state: &sched_model::SchedState,
     allowed: &sched_model::AllowedSet,
 ) -> SwitchGaps {
     let mut gaps = SwitchGaps::default();
@@ -208,7 +226,22 @@ pub fn switch_gaps(
         let Some(switch) = sched_model::class_switch(config, snapshot, class) else {
             continue;
         };
-        if !switch.read {
+        if let Some(sched_model::SwitchPhase::Waiting { until }) =
+            sched_model::switch_phase(config, snapshot, state, class)
+        {
+            let dependents = sched_model::dependents(config, &class.id)
+                .filter(|d| {
+                    let w = sched_model::class_work(config, snapshot, state, d);
+                    w.in_flight > 0 || !w.known
+                })
+                .map(|d| d.id.clone())
+                .collect();
+            gaps.waiting.push(SwitchWait {
+                class: class.id.clone(),
+                dependents,
+                until,
+            });
+        } else if !switch.read {
             gaps.unreadable.push(class.id.clone());
         } else if !switch.on() {
             gaps.off.push(class.id.clone());
@@ -228,6 +261,14 @@ pub fn switch_text(gaps: &SwitchGaps) -> String {
             .join(", ")
     };
     let mut out = String::new();
+    for w in &gaps.waiting {
+        out.push_str(&format!(
+            "; switching off: {} is waiting for in-flight work in [{}], until {}ms (a person switched the app off gracefully; its dependents' ready work wants no model and wakes no host meanwhile)",
+            w.class,
+            ids(&w.dependents),
+            w.until.as_u64()
+        ));
+    }
     if !gaps.off.is_empty() {
         out.push_str(&format!(
             "; switched off, not allowed: [{}] (a person switched the app off; nothing holds or wakes its hosts for it)",
@@ -272,7 +313,7 @@ pub fn kinds(steps: &[Step], gaps: &DemandGaps, pinned: bool) -> Vec<&'static st
     if !gaps.unknown.is_empty() {
         set.insert(KIND_DEMAND_UNKNOWN);
     }
-    if !gaps.offline.is_empty() {
+    if !gaps.offline.is_empty() || !gaps.switched_off.is_empty() {
         set.insert(KIND_DEMAND_OFFLINE);
     }
     if !gaps.unsupported.is_empty() {
@@ -532,6 +573,12 @@ pub fn reason(intent: &Intent, steps: &[Step], gaps: &DemandGaps) -> String {
             ids(&gaps.offline)
         ));
     }
+    if !gaps.switched_off.is_empty() {
+        out.push_str(&format!(
+            "; demand offline for [{}] (the switched app its source reads from is switched off): counted as no demand, whatever the source reports",
+            ids(&gaps.switched_off)
+        ));
+    }
     if !gaps.unpolled.is_empty() {
         out.push_str(&format!(
             "; demand not polled for [{}] (the source is configured without params and has never reported): counted as no demand",
@@ -591,6 +638,7 @@ mod tests {
         let gap = |u: &[&str], s: &[&str], p: &[&str]| DemandGaps {
             unknown: u.iter().map(|n| (*n).into()).collect(),
             offline: vec![],
+            switched_off: vec![],
             unsupported: s.iter().map(|n| (*n).into()).collect(),
             unpolled: p.iter().map(|n| (*n).into()).collect(),
         };
@@ -886,7 +934,12 @@ mod tests {
             if allowed {
                 set.classes.insert("wikijs".into());
             }
-            switch_text(&switch_gaps(&config, &snapshot, &set))
+            switch_text(&switch_gaps(
+                &config,
+                &snapshot,
+                &sched_model::SchedState::default(),
+                &set,
+            ))
         };
         // (a) switched off, however it was said.
         for state in [SwitchState::Off, SwitchState::OffNow] {
@@ -915,5 +968,114 @@ mod tests {
         );
         // Allowed: nothing to say.
         assert_eq!(text(vec![reading(SwitchState::On, now)], true), "");
+    }
+
+    #[test]
+    fn a_graceful_wait_says_what_it_waits_for_and_until_when() {
+        use sched_model::{
+            Fidelity, Observation, ObservedValue, SchedState, SwitchOff, SwitchState,
+        };
+        use sched_model::{Millis, Withdrawal};
+        let config = sched_model::test_support::example_config_switched_dependents();
+        let now = 1_000_000;
+        let obs = |source: &str, value| Observation {
+            source: source.into(),
+            observed_at: Millis(now),
+            fidelity: Fidelity::Polled,
+            value,
+        };
+        let switch = obs(
+            "ha-wikijs",
+            ObservedValue::Switch {
+                class: "nfs-app".into(),
+                state: SwitchState::Off,
+            },
+        );
+        let ocr = |in_flight| {
+            obs(
+                "paperless-ocr-pending",
+                ObservedValue::Demand {
+                    class: "paperless-ocr".into(),
+                    ready: 0,
+                    in_flight,
+                    failed: 0,
+                    oldest_ready_at: None,
+                },
+            )
+        };
+        let text = |mut observations: Vec<Observation>, since: Option<u64>| {
+            // The NFS host is up (a class whose hosts are not up has nothing to wait for).
+            observations.push(obs(
+                "cluster-pods",
+                ObservedValue::ResourceUp {
+                    resource: "basestar-nfs".into(),
+                    up: true,
+                },
+            ));
+            let snapshot = sched_model::Snapshot {
+                now: Millis(now),
+                observations,
+                ..sched_model::Snapshot::default()
+            };
+            let mut state = SchedState::default();
+            state.classes.extend(since.map(|s| {
+                (
+                    "nfs-app".into(),
+                    SwitchOff {
+                        since: Millis(s),
+                        withdrawal: Withdrawal::Pending,
+                    },
+                )
+            }));
+            let mut set = sched_model::AllowedSet::default();
+            set.classes.insert("nfs-app".into());
+            switch_text(&switch_gaps(&config, &snapshot, &state, &set))
+        };
+        // Waiting: the dependent with work in flight, and when it ends (since + drain_timeout,
+        // 10 minutes in the example).
+        let t = text(vec![switch.clone(), ocr(2)], Some(now - 60_000));
+        assert!(
+            t.contains("switching off: nfs-app is waiting for in-flight work in [paperless-ocr], until 1540000ms"),
+            "{t}"
+        );
+        assert!(!t.contains("switched off, not allowed: [nfs-app]"), "{t}");
+        // Unknown dependent demand counts as in flight: it names the dependent too.
+        let t = text(vec![switch.clone()], None);
+        assert!(
+            t.contains("waiting for in-flight work in [paperless-ocr]"),
+            "{t}"
+        );
+        // Nothing in flight: no wait (it is not allowed in real life; here it is, to show the
+        // text is silent), and past the timeout the same.
+        assert!(!text(vec![switch.clone(), ocr(0)], None).contains("switching off"));
+        assert!(!text(vec![switch, ocr(2)], Some(now - 600_000)).contains("switching off"));
+    }
+
+    #[test]
+    fn demand_offline_because_of_a_switch_off_is_said_apart_from_a_host_being_down() {
+        let gaps = DemandGaps {
+            switched_off: vec!["paperless-ocr".into()],
+            offline: vec!["immich-ml".into()],
+            ..DemandGaps::default()
+        };
+        let r = reason(&Intent::default(), &[], &gaps);
+        assert!(
+            r.contains("demand offline for [paperless-ocr] (the switched app its source reads from is switched off)"),
+            "{r}"
+        );
+        assert!(
+            r.contains("demand offline for [immich-ml] (a host it requires is down)"),
+            "{r}"
+        );
+        // Either cause lists the same kind, and neither prevents idle.
+        let only_switch = DemandGaps {
+            switched_off: vec!["paperless-ocr".into()],
+            ..DemandGaps::default()
+        };
+        assert_eq!(
+            kinds(&[], &only_switch, false),
+            vec![KIND_DEMAND_OFFLINE, KIND_IDLE]
+        );
+        assert!(!only_switch.is_empty());
     }
 }
