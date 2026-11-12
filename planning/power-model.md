@@ -55,7 +55,33 @@ What wants a host up has not changed (`intent.power_up`, planner `fifo.rs`): a `
   NFS host, the models' pods for a GPU host. Unknown counts as "in use". Bounded; on expiry
   flowmanager stops and alerts (today's `mounts_timeout` behaviour, generalised).
 - **Any hold arriving** during Withdrawing or Vetoing cancels an *idle* shutdown. A
-  *requested* shutdown is cancelled only by a new manual lease (as today).
+  *requested* shutdown is cancelled by a new manual lease, and a *graceful* one also by a
+  waker (2.1d) (*target*).
+
+### 2.1d Wakers: a graceful off never ends in a bounce (*target*)
+
+A host's **wakers** are the classes that would power it back on if it went down now: each
+class with `may_change_power` that requires the host and is busy (queued or in-flight work),
+or is a switched class reading `on`. Demand classes and switched classes are the same here:
+a busy class and an app switched on want the host alike. A job's hold is not a waker: it is a
+lease, which a graceful drain already waits for. Unknown demand is not a waker (it wakes
+nothing, 2.1c). A locked-out host has none, since nothing wakes it. One pure function in
+`sched-model` lists them; the planner's wake for a class and everything below read it, so
+they cannot disagree.
+
+- **`off` (graceful) is refused** while the host has wakers, judged on the last tick. Nothing
+  changes: a manual host lease stays held and no shutdown is recorded. The refusal names the
+  wakers and why each wants the host (switched on, queued work).
+- **A waker appearing during a graceful requested shutdown cancels it**, before the host is
+  powered off: the person's off would otherwise end in a bounce. A class that may not wake
+  the host is withdrawn as before and does not cancel it.
+- **`off-now` is never refused.** When the host has wakers it is accepted with a warning that
+  they will power it back on after `min_off`: in effect a reboot. A wake after it is
+  ordinary.
+- **A lockout is the override that keeps a host down**, whatever wants it (2.3).
+
+The wakers are reported per host with its status, so a person can see before pressing `off`
+why it would be refused.
 
 ### 2.1b Ownership: who started it decides
 
@@ -182,8 +208,8 @@ manual host lease yet, no active lockout lease.
 | --- | --- |
 | `on` | take a manual host lease (power on if off) |
 | `release` | drop the lease; the host goes down when idle like any other |
-| `off` | requested shutdown, graceful |
-| `off-now` | requested shutdown, immediate |
+| `off` | requested shutdown, graceful; refused while the host has wakers, and nothing changes (2.1d, *target*) |
+| `off-now` | requested shutdown, immediate; never refused, warns when the host has wakers (2.1d, *target*) |
 | `resume` | clear a `Stopped` shutdown or a failed power transition |
 | `lockout` on / off | see below (replaces reclaim) |
 
