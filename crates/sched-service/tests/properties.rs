@@ -254,6 +254,115 @@ fn without_pods(frames: &[Raw]) -> Vec<Raw> {
         .collect()
 }
 
+/// Whether `st` is a host that is on and carries an idle drain without the idle clock that
+/// started it (a state the sequencer must not leave: the next power-off would skip the grace).
+fn idle_drain_without_clock(st: &sched_model::ResourceState) -> bool {
+    st.is_on()
+        && st.idle_since.is_none()
+        && st
+            .shutdown
+            .is_some_and(|s| s.is_drain() && s.cause() == sched_model::ShutdownCause::Idle)
+}
+
+/// A frame with no reading but the two reachability ones.
+fn quiet(dt: u64, up: [bool; 2]) -> Raw {
+    Raw {
+        dt,
+        pods: vec![None; 4],
+        up: up.iter().map(|u| Some(*u)).collect(),
+        mounts: None,
+        demand: vec![None; 6],
+        leases: None,
+        refresh: false,
+        switch: None,
+        nfs_app: None,
+    }
+}
+
+/// The NFS host as the sequencer leaves it with an idle drain started at `since`: the drain
+/// only starts once the idle clock has run for `idle_grace`, and the clock stays set while the
+/// drain stands (`power.rs`: `idle_since.get_or_insert`).
+fn nfs_with_idle_drain(config: &sched_model::Config, since: Millis) -> sched_model::ResourceState {
+    let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On {
+        since: Millis(1),
+        ours: false,
+    });
+    st.set_ours(true);
+    st.idle_since = Some(Millis(since.0.saturating_sub(config.policy().idle_grace.0)));
+    st.shutdown = Some(sched_model::Shutdown::idle_withdrawn(since));
+    st
+}
+
+/// Regression for the flake in `a_drain_under_way_violates_no_invariant`: one quiet frame (no
+/// demand, no mounts, both switches off) on top of an idle drain that has its idle clock.
+/// (Without the clock, which the sequencer never leaves with an idle drain, the checker rightly
+/// reported invariant 10 for the power-off.)
+#[test]
+fn an_idle_drain_with_its_idle_clock_may_power_off() {
+    let config = config_for(true);
+    let mut f = quiet(1, [false, true]);
+    f.mounts = Some(0);
+    f.demand = vec![Some((0, 0, 0, 0)); 6];
+    f.switch = Some(1);
+    f.nfs_app = Some(1);
+    let mut sc = scenario(&[f]);
+    sc.initial_state.resources.insert(
+        "basestar-nfs".into(),
+        nfs_with_idle_drain(&config, Millis(50_000_000)),
+    );
+    let results = run(&config, &sc).unwrap();
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
+    }
+}
+
+/// A host that has been idle for the whole grace period, taken through the ways an idle drain
+/// can be held back and resumed (mounts, a manual lease, an unknown reading): the state the
+/// sequencer itself produces never powers it off early, and an idle drain never stands
+/// without the idle clock that started it.
+#[test]
+fn an_idle_drain_keeps_its_idle_clock_while_it_stands() {
+    let config = config_for(true);
+    let nfs = || sched_model::ResourceId::new("basestar-nfs");
+    let mut frames = Vec::new();
+    for (mounts, leases, dt) in [
+        (Some(1), None, 1u64),
+        (Some(1), Some(vec![0]), 10_000),
+        (Some(1), Some(vec![]), 10_000),
+        (None, None, 10_000),
+        (Some(1), None, 700_000),
+        (Some(0), None, 10_000),
+    ] {
+        let mut f = quiet(dt, [true, true]);
+        f.mounts = mounts;
+        f.leases = leases;
+        f.demand = vec![Some((0, 0, 0, 0)); 6];
+        f.switch = Some(1);
+        f.nfs_app = Some(1);
+        frames.push(f);
+    }
+    let mut sc = scenario(&frames);
+    let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On {
+        since: Millis(1),
+        ours: false,
+    });
+    st.set_ours(true);
+    st.idle_since = Some(Millis(50_000_000 - config.policy().idle_grace.0));
+    sc.initial_state.resources.insert(nfs(), st);
+    let results = run(&config, &sc).unwrap();
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
+        let st = r.decision.state.resource(&nfs()).unwrap();
+        // (Once the power-off is issued the host is no longer on and the clock is gone with it.)
+        assert!(
+            !idle_drain_without_clock(st),
+            "frame {}: idle drain without clock: {:?}",
+            i,
+            st
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
@@ -264,6 +373,9 @@ proptest! {
         let results = run(&config, &sc).unwrap();
         for (i, r) in results.iter().enumerate() {
             prop_assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
+            for st in r.decision.state.resources.values() {
+                prop_assert!(!idle_drain_without_clock(st), "frame {}: {:?}", i, st);
+            }
             // The allowed set agrees with the state it came from.
             for class in &r.decision.allowed.classes {
                 for req in &config.class(class).unwrap().requires {
@@ -362,21 +474,23 @@ proptest! {
     ) {
         let config = config_for(true);
         let mut sc = scenario(&frames);
-        let mut st = sched_model::ResourceState::new(sched_model::PowerPhase::On { since: Millis(1), ours: false });
-        st.set_ours(true);
-        // An idle drain (the scheduler's own) is always immediate and already scaled down.
         let since = Millis(50_000_000 - ago);
-        st.shutdown = Some(if idle {
-            sched_model::Shutdown::idle_withdrawn(since)
-        } else {
+        // An idle drain (the scheduler's own) is always immediate and already scaled down, and
+        // starts only once the idle clock has run for `idle_grace` (it stays set meanwhile).
+        let mut st = nfs_with_idle_drain(&config, since);
+        if !idle {
+            st.idle_since = None;
             let mode = if immediate { sched_model::DrainMode::Immediate } else { sched_model::DrainMode::Graceful };
             let requested = sched_model::Shutdown::requested(mode, since);
-            if scaled_down { requested.withdrawn() } else { requested }
-        });
+            st.shutdown = Some(if scaled_down { requested.withdrawn() } else { requested });
+        }
         sc.initial_state.resources.insert("basestar-nfs".into(), st);
         let results = run(&config, &sc).unwrap();
         for (i, r) in results.iter().enumerate() {
             prop_assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
+            for st in r.decision.state.resources.values() {
+                prop_assert!(!idle_drain_without_clock(st), "frame {}: {:?}", i, st);
+            }
             let draining = r
                 .decision
                 .state
