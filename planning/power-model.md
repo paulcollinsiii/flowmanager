@@ -55,8 +55,8 @@ What wants a host up has not changed (`intent.power_up`, planner `fifo.rs`): a `
   NFS host, the models' pods for a GPU host. Unknown counts as "in use". Bounded; on expiry
   flowmanager stops and alerts (today's `mounts_timeout` behaviour, generalised).
 - **Any hold arriving** during Withdrawing or Vetoing cancels an *idle* shutdown. A
-  *requested* shutdown is cancelled by a new manual lease, and a *graceful* one also by a
-  waker (2.1d) (*enforced*: `drain_step` in `crates/sched-sequencer/src/power.rs`).
+  *requested* shutdown is cancelled by a new manual lease, and a *graceful* one that is not
+  stopped also by a waker (2.1d) (*enforced*: `drain_step` in `crates/sched-sequencer/src/power.rs`).
 
 ### 2.1d Wakers: a graceful off never ends in a bounce (*enforced*)
 
@@ -76,7 +76,9 @@ restates the rule on purpose).
   wakers and why each wants the host (switched on, queued work).
 - **A waker appearing during a graceful requested shutdown cancels it**, before the host is
   powered off: the person's off would otherwise end in a bounce. A class that may not wake
-  the host is withdrawn as before and does not cancel it.
+  the host is withdrawn as before and does not cancel it. Nor does a waker clear a stopped
+  one (veto `Stopped`): it never powers the host off, so there is no bounce, and it needs a
+  person.
 - **`off-now` is never refused.** When the host has wakers it is accepted with a warning that
   they will power it back on after `min_off`: in effect a reboot. A wake after it is
   ordinary.

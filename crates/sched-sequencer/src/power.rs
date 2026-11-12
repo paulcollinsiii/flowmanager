@@ -532,11 +532,14 @@ pub(crate) fn drain_step(cx: &Cx, st: &mut ResourceState) {
     // A waker (a class that may change power and is busy, or switched on) cancels a graceful
     // requested shutdown before the host goes down: the person's off would otherwise end in a
     // bounce (power-model 2.1d). An immediate one is not cancelled, nor is an idle or lockout
-    // one; a class that may not wake the host is no waker and is withdrawn as before.
+    // one; a class that may not wake the host is no waker and is withdrawn as before. One the
+    // veto gave up on (`Veto::Stopped`) is left alone: it never powers the host off, so there
+    // is no bounce, and it clears only as invariant 12 says.
     if s.cause()
         == (ShutdownCause::Requested {
             mode: DrainMode::Graceful,
         })
+        && s.stopped_since().is_none()
         && !sched_model::wakers(cx.config, cx.snapshot, cx.state, &cx.res.id).is_empty()
     {
         st.shutdown = None;

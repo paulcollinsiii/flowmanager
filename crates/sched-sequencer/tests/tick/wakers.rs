@@ -262,3 +262,64 @@ fn the_status_of_each_powered_host_lists_its_wakers_with_why() {
     });
     assert!(hosts.iter().all(|h| h.wakers.is_empty()), "{hosts:?}");
 }
+
+/// Whether the status of `r` after the decision shows the host as needing attention.
+fn needs_attention(c: &Case, d: &Decision, r: &str) -> bool {
+    let state = c.state();
+    let snapshot = c.snapshot_at(T);
+    let (hosts, _) = derive(&Decided {
+        config: &c.config,
+        snapshot: &snapshot,
+        prev: &state,
+        next: &d.state,
+        steps: &d.steps,
+        now: sched_model::Millis(T),
+        adopted: &[],
+        ended: &[],
+    });
+    hosts
+        .iter()
+        .find(|h| h.resource == rid(r))
+        .unwrap()
+        .attention
+}
+
+fn stopped_graceful() -> String {
+    format!(
+        "{{ power: {}, mode: {}, shutdown: {{ cause: {{ kind: requested, mode: graceful }}, since: {}, withdrawal: done, veto: {{ phase: stopped, since: {} }} }} }}",
+        on_ours(),
+        mode_idle(),
+        T - 5 * MIN,
+        T - MIN
+    )
+}
+
+#[test]
+fn a_stopped_graceful_shutdown_survives_a_waker_on_a_shared_host() {
+    let mut c = Case::new().nfs_state(&stopped_graceful()).obs(batch(3, 1));
+    c.config = batch_config();
+    let d = c.run();
+    let s = shutdown_of(&d, N).expect("the stopped shutdown stays");
+    assert_eq!(s.stopped_since(), Some(sched_model::Millis(T - MIN)));
+    assert_eq!(requested(&d, N), Some(DrainMode::Graceful));
+    assert!(!powers_off(&d, N), "{:?}", d.steps);
+    assert_steps(
+        &d,
+        vec![wait(N, WaitReason::ShutdownStopped)],
+        "stays stopped",
+    );
+    assert!(needs_attention(&c, &d, N));
+}
+
+#[test]
+fn a_stopped_graceful_shutdown_survives_a_waker_on_an_exclusive_host() {
+    let mut c = Case::new()
+        .gpu_state(&stopped_graceful())
+        .obs(sw("gpu-app", "on"));
+    c.config = gpu_app_config(true);
+    let d = c.run();
+    let s = shutdown_of(&d, G).expect("the stopped shutdown stays");
+    assert_eq!(s.stopped_since(), Some(sched_model::Millis(T - MIN)));
+    assert!(!powers_off(&d, G), "{:?}", d.steps);
+    assert!(needs_attention(&c, &d, G));
+}

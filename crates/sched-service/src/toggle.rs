@@ -760,7 +760,9 @@ impl Toggle {
                 if ack.refused {
                     return Err(refused_by_wakers(name, &ack.wakers));
                 }
-                if drain == DrainMode::Immediate && !ack.wakers.is_empty() {
+                // Only when the immediate off was recorded: a request that did not apply (the
+                // host is not up under managed control) changes nothing to warn about.
+                if drain == DrainMode::Immediate && ack.drain.is_some() && !ack.wakers.is_empty() {
                     warning = Some(waker_warning(name, &ack.wakers));
                 }
                 (None, HostRequest::Answered { drain: ack.drain })
@@ -2457,6 +2459,26 @@ mod tests {
         // A host without wakers: no warning.
         let (s, v) = r.post("/v1/resources/cuda-central/off-now", "").await;
         assert_eq!(s, 200, "{v}");
+        assert!(v.get("warning").is_none(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn off_now_does_not_warn_when_it_was_not_recorded() {
+        // The host is not up, so the request does not apply, though the host has a waker.
+        let r = rig(&waker_yaml());
+        r.hosts_up(false);
+        r.tick().await;
+        r.app("gpu-app", sched_model::SwitchState::On);
+        r.tick().await;
+        let (_, v) = r.get("/v1/resources/cuda-central").await;
+        assert_eq!(
+            v["wakers"],
+            json!([{ "class": "gpu-app", "why": "switched_on" }]),
+            "{v}"
+        );
+        let (s, v) = r.post("/v1/resources/cuda-central/off-now", "").await;
+        assert_eq!(s, 200, "{v}");
+        assert!(v.get("drain").is_none(), "nothing was recorded: {v}");
         assert!(v.get("warning").is_none(), "{v}");
     }
 

@@ -491,6 +491,11 @@ pub async fn release_host_lease<C: ObjectCtx>(
         // A refusal changes nothing: neither the state nor the lease book is stored, so the
         // manual lease stays held.
         if !refused_by.is_empty() {
+            tracing::info!(
+                resource = %req.resource,
+                wakers = ?refused_by.iter().map(|w| w.class.as_str()).collect::<Vec<_>>(),
+                "drain refused: classes that would wake the host are waiting on it (wakers)"
+            );
             return Err(lease_refused(&LeaseError::HostHasWakers {
                 resource: req.resource.clone(),
                 wakers: refused_by,
@@ -629,6 +634,12 @@ pub async fn drain_host<C: ObjectCtx>(
             lease_released = ack.released,
             "host taken down on request ({}): queued and in-flight work no longer holds it",
             d.mode.as_str()
+        );
+    } else if ack.refused {
+        tracing::info!(
+            resource = %ack.resource,
+            wakers = ?ack.wakers.iter().map(|w| w.class.as_str()).collect::<Vec<_>>(),
+            "drain refused: classes that would wake the host are waiting on it (wakers)"
         );
     } else {
         tracing::info!(
