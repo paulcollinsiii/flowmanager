@@ -22,8 +22,9 @@ not know that one deployment must go down before another can come up.
 ## What flowmanager does
 
 flowmanager watches the work waiting for each service (a document queue, a transcription
-backlog) through [sources](concepts.md#demand-and-observation) such as HTTP APIs, Prometheus
-(a metrics server) and the Kubernetes API. It decides which [model](concepts.md#workloads) the
+backlog) through the services' HTTP APIs, and host and pod state through the Kubernetes API,
+TCP probes or Prometheus (a metrics server), all as [sources](concepts.md#demand-and-observation).
+It decides which [model](concepts.md#workloads) the
 GPU should hold next and publishes the [allowed set](concepts.md#choosing-and-serving). It is
 KEDA's external scaler: KEDA asks it which Deployments may run, and scales each to 0 or 1.
 
