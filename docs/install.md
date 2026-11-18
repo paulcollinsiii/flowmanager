@@ -10,8 +10,7 @@ the namespace `flowmanager` and the ids of `config/example.yaml`. Terms are in
 `docker build -t registry.example.internal/flowmanager:1.0.0 .`, then push it. The
 `Dockerfile` compiles the release binary `flowmanager` in the build stage (it installs
 `protoc` for the KEDA proto) and copies it into `gcr.io/distroless/cc-debian12:nonroot`: no
-shell, UID 65532, CA certificates and tzdata included. The pod runs under Pod Security
-`restricted`, with a read-only root filesystem and no capabilities.
+shell, UID 65532, CA certificates and tzdata included.
 
 ## 2. Configuration
 
