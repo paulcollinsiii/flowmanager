@@ -11,15 +11,16 @@ explanations of it.
 | CLI flags and env | `crates/sched-service/src/main.rs` (`struct Args`) | [install.md](install.md) |
 | Config keys and types | `crates/sched-model/src/{config,power_params,source_params,recovery_params}.rs` | [configuration/README.md](configuration/README.md) |
 | Config validation | `crates/sched-model/src/validate.rs` | [configuration/README.md](configuration/README.md) |
-| Ingress handlers | `crates/sched-service/src/{scheduler,object,leases,resume,recovery,power}.rs` (`#[handler]`; `observe` is private) | [operations.md](operations.md) |
+| Ingress handlers | `crates/sched-service/src/scheduler.rs` defines every `#[handler]`, across the scheduler, Recovery and Power objects (`observe` is private). The work is done in `object.rs`, `leases.rs`, `resume.rs`, `recovery.rs` and `power.rs` | [operations.md](operations.md) |
+| Config reload loop and its outcomes | `crates/sched-service/src/config_source.rs` | [configuration/README.md](configuration/README.md) |
 | Metrics | `crates/sched-service/src/metrics.rs` | [operations.md](operations.md) |
 | Invariants | `crates/sched-service/src/invariants.rs` (each check is an `out.push`) | [architecture.md](architecture.md) |
 | Persisted documents and versions | `crates/sched-service/src/persist.rs` | [operations.md](operations.md) |
-| Planner (which model owns the GPU) | `crates/sched-planner/src/fifo.rs` | [concepts.md](concepts.md), [architecture.md](architecture.md) |
+| Planner (which model owns the GPU) | `crates/sched-planner/src/{lib,fifo}.rs` (`plan` entry point in `lib.rs`) | [concepts.md](concepts.md), [architecture.md](architecture.md) |
 | Power lifecycle, drains, exclusive hosts, status | `crates/sched-sequencer/src/{power,drain,exclusive,status,switch,adopt}.rs` | [architecture/power.md](architecture/power.md), [configuration/power.md](configuration/power.md) |
 | Scheduled jobs | `crates/sched-sequencer/src/jobs.rs`, `crates/sched-service/src/jobs.rs` | [configuration/jobs.md](configuration/jobs.md) |
 | What each source kind emits | `crates/sched-observe/src/{kube_watch,kube_mounts,kube_jobs,http_json,prometheus,tcp_probe}.rs`, `nudge.rs` (webhook nudges) | [configuration/sources.md](configuration/sources.md) |
-| Toggle and webhook listeners | `crates/sched-service/src/{toggle,webhook}.rs` | [home-assistant.md](home-assistant.md) |
+| Toggle and webhook listeners | `crates/sched-service/src/{toggle,webhook}.rs`, and `listener.rs` (shared by both) | [home-assistant.md](home-assistant.md) |
 | KEDA scaler | `crates/sched-keda/src/lib.rs`, `crates/sched-service/src/keda_scaler.rs` | [overview.md](overview.md), [architecture.md](architecture.md) |
 | Power actuators | `crates/sched-actuate/src/{power,wol,ssh}.rs` | [configuration/power.md](configuration/power.md) |
 
@@ -35,8 +36,9 @@ Code wins over docs, and over code comments, which can be stale. A complete exam
 ## Invariant numbering
 
 Invariants 1-5 and 16-21 are in [architecture.md](architecture.md); 6-15 are in
-[architecture/power.md](architecture/power.md). Every check is in
-`crates/sched-service/src/invariants.rs`. Enumerate the `out.push` calls there rather than
+[architecture/power.md](architecture/power.md). The runtime checks are in
+`crates/sched-service/src/invariants.rs`; not every invariant has one, and the "Held by" column
+in each table says how that invariant is kept. Enumerate the `out.push` calls rather than
 trusting a count, in this file or any other.
 
 ## Pitfalls
