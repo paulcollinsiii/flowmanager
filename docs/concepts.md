@@ -124,8 +124,7 @@ class is off, its dependents' demand is offline.
 
 **Tick**. One decision cycle: a snapshot, then the planner (pure), the sequencer (pure) and
 publication. The **planner** decides what is wanted: which model next, which hosts to power.
-The **sequencer** turns that into ordered, safe steps and the allowed set. If the planner
-wants a model on a host that is down, the sequencer waits for the host.
+The **sequencer** turns that into safe steps and the allowed set, and waits for a down host.
 
 **Allowed set**. What each tick publishes: the allowed models (at most one per exclusive
 resource) and the allowed classes. KEDA (the Kubernetes event-driven autoscaler, for which
