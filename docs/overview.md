@@ -43,7 +43,8 @@ KEDA's external scaler: KEDA asks it which Deployments may run, and scales each 
   ([what wakes a host](concepts.md#hosts-and-power)).
 - **Takes manual overrides.** A person can take a [lease](concepts.md#leases-and-manual-control)
   to keep a host on or pin a model, switch an app on or off from Home Assistant (a
-  home-automation server), or tell flowmanager to stay away from a host.
+  home-automation server; [home-assistant.md](home-assistant.md)), or tell flowmanager to stay
+  away from a host ([operations.md](operations.md#restate-handlers)).
 - **Fails safe.** Missing or stale readings are handled conservatively; see
   [unknown demand](concepts.md#demand-and-observation).
 

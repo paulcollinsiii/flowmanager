@@ -56,6 +56,6 @@ Optional: a `power` section on a resource, and with `control: managed` the rows 
 | Requirement | Why | Without it |
 | --- | --- | --- |
 | Prometheus scraping `/metrics` (optional) | Metrics and alerts | No metrics; flowmanager still works |
-| Home Assistant, able to call HTTP with a bearer token (optional) | The toggle listener: switches for leases and for switched apps. Enabled by `--toggle-listen` | No toggles; leases and switches go through the Restate ingress |
-| Services that can send a `POST` on a state change (optional, *untested*) | The webhook listener polls a source at once instead of at its `resync`. Enabled by `--webhook-listen` | Sources are polled at their `resync` only |
+| Home Assistant, able to call HTTP with a bearer token (optional) | The [toggle listener](home-assistant.md): switches for leases and for switched apps. Enabled by `--toggle-listen` | No toggles; leases and switches go through the Restate ingress |
+| Services that can send a `POST` on a state change (optional, *untested*) | The [webhook listener](home-assistant.md#webhook-listener-untested) polls a source at once instead of at its `resync`. Enabled by `--webhook-listen` | Sources are polled at their `resync` only |
 | A `CronJob` template for each scheduled job (optional) | A scheduled job creates a Job from it | No scheduled jobs |

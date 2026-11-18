@@ -265,7 +265,9 @@ Outbound from the pod:
 | The router (443), each managed host (22), a `tcp_probe` target | No: `traffic.sidecar.istio.io/excludeOutboundIPRanges` | A sidecar accepts every connect before trying the upstream, so a probe would always read up; the router's certificate is verified directly, which Envoy would only pass through |
 
 If the router's name resolves to several interfaces, pin the LAN address with `hostAliases`:
-the exclusion works on an address and the certificate names one host.
+the exclusion works on an address and the certificate names one host. If the mesh's outbound
+policy is `REGISTRY_ONLY`, the Kubernetes API and the hosts other sources reach need
+`ServiceEntry`s (*untested*).
 
 ## 10. Check it works
 
@@ -283,3 +285,6 @@ the exclusion works on an address and the certificate names one host.
 4. **The scaler.** `kubectl get scaledobject -A` shows each `READY True`, and `ACTIVE`
    follows the allowed set; `kubectl describe` shows no scaler errors (`Unavailable` for a few
    seconds after a restart is normal). `--log-level debug` logs each `scaler answer`.
+
+Day-to-day use is in [operations.md](operations.md); the Home Assistant and webhook listeners
+are in [home-assistant.md](home-assistant.md).

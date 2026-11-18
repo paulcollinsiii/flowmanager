@@ -127,9 +127,9 @@ configured, so it is not allowed from the next tick.
 
 Restate keeps this for the `Scheduler` object and its companions
 (`crates/sched-service/src/persist.rs`). A value that cannot be decoded, or was written by a
-newer build, is reported rather than retried. A `scheduler_state` of another version is an
-error until it is discarded; the scheduler then starts from observation, and leases and jobs
-are kept.
+newer build, is reported rather than retried ([operations.md](operations.md#reading-and-changing-state)).
+A `scheduler_state` of an older version is dropped at the first tick and the scheduler starts
+from observation; leases and jobs are kept.
 
 | Key | Holds |
 | --- | --- |
