@@ -3,8 +3,8 @@
 The one place each term is defined. Config keys are in `code`; handler and API names are given
 where a person calls them. A term used before its entry links to the section that defines it.
 
-The scheduling knobs `min_dwell`, `max_dwell`, `idle_grace`, `age_threshold`, `drain_timeout`,
-`lockout_timeout`, `host_reading_stale_after` and `queue_reading_stale_after` are keys of the
+The scheduling knobs (`min_dwell`, `max_dwell`, `idle_grace`, `age_threshold`, `drain_timeout`,
+`lockout_timeout`, `host_reading_stale_after`, `queue_reading_stale_after`) are keys of the
 config's `policy` section, defined where used below.
 
 ## Hosts and power
@@ -20,10 +20,9 @@ server, or an always-on node.
 **Power control** (`power.control`). Who changes a host's power.
 - `manual` (default): a person does. flowmanager never emits a power step for the host, its
   state follows observed reachability, and work that needs it waits until it is up.
-- `managed`: flowmanager powers it on and off. It needs both `wake_on_lan` and `shutdown`.
-
-**Power methods**. `power.wake_on_lan`: the OPNsense router API sends the magic packet.
-`power.shutdown`: SSH with a forced-command key to a pinned host key.
+- `managed`: flowmanager powers it on with `power.wake_on_lan` (the OPNsense router API sends
+  the magic packet) and off with `power.shutdown` (SSH, forced-command key, pinned host key).
+  Both are required.
 
 **Power timeouts** (`power_on_timeout` 10m, `shutdown_timeout` 15m, `veto_timeout` 30m). How
 long a managed host may take to be observed up, to be observed down, or to pass the
@@ -33,12 +32,13 @@ a person fixes the host and calls [`resume`](#leases-and-manual-control).
 **Minimum off time** (`min_off`, default 0). After flowmanager confirms a shutdown it started,
 it does not power the host on again by itself for this long. A manual lease overrides it.
 
-**Waker**. A class that would power a host on if it went down now: a class with
-`may_change_power: true` that has queued or in-flight work, or a [switched class](#workloads)
-reading `on`. A class without `may_change_power` waits for the host to be up.
+**Waker**. A class that would power a host on if it went down now: it has
+`may_change_power: true`, requires the host, and has ready or in-flight work (not failed) or
+is a [switched class](#workloads) reading `on`. A locked-out host has no wakers. Other
+classes wait for the host to be up.
 
 **What wakes a host**. Only under managed control, and only when something wants it: a manual
-host or model lease, a scheduled job's `nfs` hold, or a waker.
+host or model lease, a scheduled job's `nfs` [hold](#leases-and-manual-control), or a waker.
 
 **Ownership and adoption**. A host flowmanager powers on is flowmanager's, whatever wanted it,
 and goes down by the [idle cause](#shutdown). Under managed control, a host something else
@@ -67,11 +67,11 @@ reachability, mounts, pods and job runs, `queue_reading_stale_after` for demand 
 
 **Demand**. The work waiting for a class, in three buckets: *ready* (can start), *in-flight*
 (running) and *failed*. Failed items wait for the class's recovery and never age into
-starvation priority. They make the model wanted but never hold the serving model.
+[starvation priority](#workloads). They make the model wanted but never hold the serving model.
 
 **Unknown demand**. No usable reading. It is not zero: it holds the model and host as if work
-existed, and it wakes nothing. Two cases are not unknown: offline demand, and a source that
-can never report, which counts as no demand.
+existed, and it wakes nothing. Two cases are not unknown: [offline demand](#demand-and-observation)
+(next), and a source that can never report, which counts as no demand.
 
 **Offline demand**. No work, and nothing held. It applies when the demand reading is unknown
 and a required host is freshly seen down (a fresh reading wins), or when the switched class
@@ -81,7 +81,7 @@ the source `reads_from` is off and its graceful wait is over.
 
 **Model** (`models[]`). A mode of an exclusive resource, implemented by one or more Kubernetes
 workloads (`workloads`). `load_time` is its estimated load time, used only as a tie-break
-between candidates (see Priority). `namespaces` lists where the workloads run, for the veto.
+between candidates (see [Priority](#workloads)). `namespaces` lists where the workloads run, for the veto.
 
 **Workload class** (`classes[]`). A unit of demand with `requires` (resources, and for an
 exclusive one optionally a model), a `priority`, a `preemptibility`, `may_change_power`, and
@@ -103,13 +103,12 @@ counted as ready until its upstream step is done.
 **Preemptibility** (`preemptibility`). What a class's busy work does to a model switch the
 planner wants.
 - `none`: the planner does not switch away while the class is busy, with no timeout. A
-  *forced* wind-down (a lockout, a requested `off` or `off-now`, or a manual model lease)
-  skips that wait and goes straight to the [drain](#choosing-and-serving).
+  [forced wind-down](#choosing-and-serving) skips that wait and goes straight to the drain.
 - `pause_intake`: the work is drained. `kill`: the same, for work that is safe to retry.
 
 **Recovery** (`recovery: {action, source, params}`). The one action is `requeue_failed`: it
 re-queues failed items through the service's API while the class's model is allowed, in its
-own Restate object (`Recovery`) so it cannot delay a decision. The attempt cap is durable.
+own Restate object (`Recovery`) so it cannot delay a decision.
 
 **Switch** (`switch: {source}`). The control of a switched class, an app a person turns on and
 off, usually from Home Assistant (a home-automation server). The reading is `on`, `off` or
@@ -148,12 +147,13 @@ only after it has been idle for `idle_grace` and served for `min_dwell`, even if
 model has ready work.
 
 **Wind-down and drain**. A wind-down removes a model or host's *consumers* (the classes that
-use it) from the allowed set. It starts for a planner switch, a manual model lease, a lockout
-or a requested shutdown. Intake stops, and in-flight work runs for a bounded time, the drain,
-before it is cut off. The time is `drain_timeout`, or `lockout_timeout` (default
-`drain_timeout`) for a lockout, or none for `off-now`. On an exclusive host's model wind-down a
-class's `kill_timeout` replaces it for that class, except under a graceful `off`, which always
-gets `drain_timeout`. A shared host's drain uses only `drain_timeout` and `lockout_timeout`.
+use it) from the allowed set. It starts for a planner switch or, *forced*, for a [manual model
+lease, lockout](#leases-and-manual-control) or requested shutdown. Intake stops, and in-flight
+work runs for a bounded time, the drain, before it is cut off. The time is `drain_timeout`, or
+`lockout_timeout` (default `drain_timeout`) for a lockout, or none for `off-now`. On an
+exclusive host's model wind-down a class's `kill_timeout` replaces it for that class, except
+under a graceful `off`, which always gets `drain_timeout`. A shared host's drain uses only
+`drain_timeout` and `lockout_timeout`.
 
 ## Leases and manual control
 
@@ -191,7 +191,8 @@ the host back on after `min_off`.
 
 **Veto**. Before power-off a fresh reading must show that nothing uses the host: no pods
 mounting an NFS host (`mounts`), no pods of the host's models (`pods`). An unknown reading
-counts as in use. Expiry of `veto_timeout` is a power timeout and the host stays up.
+counts as in use. `veto_timeout` expiry is a power timeout; the host stays up. Without an
+applicable `mounts` or `pods` reading a host has no veto.
 
 **Stages**: withdrawing (the wind-down), vetoing, power-off (SSH), then confirmed down (the
 host is observed down). Any hold arriving cancels an idle shutdown. A new manual lease cancels
@@ -202,7 +203,7 @@ a requested one, and a waker appearing also cancels a graceful one.
 **Scheduled job** (`jobs[]`). A cron schedule (five fields, `timezone` default UTC) that
 creates a Kubernetes Job from the `jobTemplate` of a referenced CronJob (`cronjob`).
 - `needs`: a list of `{ type: nfs, resource: <id> }`; `nfs` is the only need type. It is a
-  shared hold while the run waits and runs, and wakes the host first if it is managed and off.
+  shared hold while the run waits and runs.
 - `retries`, with a `retry_backoff` that doubles after each retry.
 - `missed_run`: `skip` (default) or `catch_up`.
 - `start_window`: how long after its time a run may still start. Past it, `skip` drops the

@@ -38,8 +38,8 @@ KEDA's external scaler: KEDA asks it which Deployments may run, and scales each 
   flowmanager wakes it with Wake-on-LAN (through the router's OPNsense API) and shuts it down
   over SSH when nothing needs it, after checking that no pod still uses it.
 - **Runs [scheduled jobs](concepts.md#scheduled-jobs).** A cron schedule starts a Kubernetes
-  Job (a backup, say). If the job needs a managed host that is off, flowmanager wakes it first;
-  for a manual host it waits for a person to power it on.
+  Job (a backup, say) once the hosts it needs are up
+  ([what wakes a host](concepts.md#hosts-and-power)).
 - **Takes manual overrides.** A person can take a [lease](concepts.md#leases-and-manual-control)
   to keep a host on or pin a model, switch an app on or off from Home Assistant (a
   home-automation server), or tell flowmanager to stay away from a host.
@@ -70,7 +70,8 @@ manual control.
    for the `paperless-ocr` class.
 2. The planner sees ready work for `paperless-ocr`, which needs the `mineru` model (an OCR
    model). If `basestar-nfs` is up, it chooses `mineru`, even while `cuda-central` is down. In
-   that case the sequencer waits until a person starts the host.
+   that case the [sequencer](concepts.md#choosing-and-serving) (the part that turns the plan
+   into safe steps) waits until a person starts the host.
 3. Once the host is up and the previous model is idle, `mineru` enters the allowed set and the
    old model leaves in the same decision. KEDA scales `mineru` to 1, and Kubernetes starts its
    pod once the GPU is free. A busy old model would be drained first.
