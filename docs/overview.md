@@ -1,88 +1,86 @@
 # Overview
 
 flowmanager decides what runs on a scarce, power-hungry machine in a homelab Kubernetes
-cluster, and when that machine is on. Terms in *italics* are defined in
-[concepts.md](concepts.md).
+cluster, and when that machine is on. Terms are defined in [concepts.md](concepts.md).
 
 ## The problem
 
 A typical homelab has one GPU node. Several services want it: document OCR, an LLM,
-speech-to-text, photo machine learning. Each service loads a large model, and the GPU has room
-for one at a time. Three things go wrong when nothing coordinates them:
+speech-to-text, photo machine learning. Each loads a large model, and the GPU has room for one
+at a time. Without coordination:
 
-- Services fight for the GPU. Pods crash, stay pending, or thrash model loads.
+- Services fight for the GPU. Pods stay pending, or models are loaded and dropped in turn.
 - The GPU node runs all day for work that arrives in bursts, because nobody dares to switch it
   off.
-- Other hosts the workloads depend on, such as an NFS server, have the same problem: switching
-  them off while a pod still mounts them breaks the pod.
+- Other hosts the workloads depend on, such as an NFS server, cannot be switched off safely
+  while a pod still mounts them.
 
-Kubernetes autoscaling does not help. It scales on load a pod already generates, and it has no
-idea that scaling one deployment up requires another to go down first.
+Kubernetes autoscaling does not help. It scales on load a pod already generates, and it does
+not know that one deployment must go down before another can come up.
 
 ## What flowmanager does
 
 flowmanager watches the work waiting for each service (a document queue, a transcription
-backlog) and decides which *model* the GPU should hold next. It publishes the result as the
-*allowed set*: the models and workload *classes* that may run right now. A KEDA external scaler
-serves that set, so each Deployment is scaled to 0 or 1 replicas by its own ScaledObject.
+backlog) and decides which [model](concepts.md#workloads) the GPU should hold next. It
+publishes the [allowed set](concepts.md#choosing-and-serving), and a KEDA external scaler
+turns it into 0 or 1 replicas for each Deployment.
 
-- **Chooses by queue, not by pod state.** The next model is the one with the highest-*priority*
-  ready work. A loaded model keeps serving while it has work, up to a time limit, or until
-  another queue has waited too long.
-- **Protects work in progress.** A class marked non-preemptible is never interrupted.
-  Others get a bounded time to finish before they are cut off.
-- **Optionally powers hosts.** When a host is set to *managed* control, flowmanager wakes it
-  with Wake-on-LAN and shuts it down over SSH once nothing needs it. Before a shutdown it checks
-  that no pod still uses the host.
-- **Runs scheduled jobs.** A cron schedule starts a Kubernetes Job (a nightly backup, say)
-  and first makes sure the hosts it needs are up.
-- **Takes manual overrides.** A person can keep a host on, pin a model, switch an app on or
-  off from Home Assistant, or tell flowmanager to stay away from a host.
-- **Fails safe.** Missing or stale readings count as *unknown*, and a power-off waits for a fresh
-  reading that the host is unused.
+- **Chooses by queue.** The next model is the one with the highest-priority ready work.
+  A loaded model keeps serving while it has work, within [limits](concepts.md#choosing-and-serving).
+- **Protects work in progress.** Work gets a bounded time to finish before it is cut off.
+  A class can ask never to be displaced by another model's work.
+- **Optionally powers hosts.** For a host set to [managed control](concepts.md#hosts-and-power),
+  flowmanager wakes it with Wake-on-LAN and shuts it down over SSH when nothing needs it,
+  after checking that no pod still uses it.
+- **Runs [scheduled jobs](concepts.md#scheduled-jobs).** A cron schedule starts a Kubernetes
+  Job (a backup, say) and first makes sure the hosts it needs are up.
+- **Takes [manual overrides](concepts.md#leases-and-manual-control).** A person can keep a host
+  on, pin a model, switch an app on or off from Home Assistant, or tell flowmanager to stay
+  away from a host.
+- **Fails safe.** A reading that is missing or too old is treated as [unknown](concepts.md#demand-and-observation),
+  and unknown is never read as "nothing to do".
 
-Decisions are made by pure planning code from a snapshot of observations, and are stored in
-Restate, so a restart changes nothing: the scaler answers "unavailable" until the first
-decision, and KEDA then keeps the replica counts it has.
+Each decision is made by pure planning code from a snapshot of observations. State is kept in
+Restate, a durable-execution server, so decisions, leases and half-finished transitions
+survive a restart.
 
 ## What it does not do
 
-- It does not schedule pods. Kubernetes enforces one model per GPU (`nvidia.com/gpu: 1`, one
-  GPU exposed, a tainted node). On a switch the old model leaves and the new one enters the
-  allowed set in the same decision, and the new pod waits until the GPU is free.
+- It does not schedule pods or enforce one model per GPU. Kubernetes does that
+  ([GPU exclusivity](concepts.md#choosing-and-serving)).
 - It does not scale beyond 0 or 1 replicas.
-- It does not read pod state to make decisions. The one exception is the check before a
-  power-off.
-- It does not retry a failed power action. It raises an alert and stops, and a person acts.
-- It does not power a host unless that host is configured as managed and a class or a person
-  asks for it.
-- It does not replace your workloads' own queues. It reads them.
+- It does not decide from pod state, apart from two named exceptions
+  ([pods](concepts.md#demand-and-observation)).
+- It does not retry a failed power action. It alerts and stops, and a person acts.
+- It does not power a host unless that host is configured as managed and something asks for
+  it ([what wakes a host](concepts.md#hosts-and-power)).
+- It does not own your workloads' queues. It reads them.
 
 ## Example: one scanned document
 
-This follows the reference environment: `cuda-central` is the GPU node, `basestar` is the NFS
-host, and `blade-runner` is the always-on node that runs flowmanager, Restate and KEDA.
+The example environment: `cuda-central` is the GPU node, `basestar-nfs` is the NFS server
+(on the host basestar), and `blade-runner` is the always-on node running flowmanager, Restate
+and KEDA.
 
-1. A scan lands in paperless and gets the `ocr-pending` tag. The `paperless-ocr` source
-   (an HTTP query against paperless) now reports one ready item.
+1. A scan lands in paperless and carries the `ocr-pending` tag. The `paperless-ocr` source
+   queries paperless for that tag and reports one ready item.
 2. The planner sees ready work for the `paperless-ocr` class, which needs the `mineru` model.
-   If `cuda-central` and `basestar` are up, it chooses `mineru`.
-   *Opt-in:* if the host is *manual*, as in the reference configuration, a person must have
-   powered it on, and the work waits until it is up. If the host is *managed* and the class
-   may change power, flowmanager wakes it first.
-3. In one decision, `mineru` enters the allowed set and whatever model held the GPU leaves.
-   KEDA scales `mineru` to 1. Kubernetes starts its pod once the GPU is free.
-4. `mineru` serves its whole queue. It keeps the GPU for at least `min_dwell` and at most
-   `max_dwell`, unless another queue's oldest item exceeds `age_threshold`.
-5. When OCR finishes, the document carries the `post-ocr` tag, and the tagging step counts as
-   ready. Tagging is a different class on the `llm` model, so the next decision switches to
-   `llm`. The order of OCR before tagging comes from this readiness rule, not from priority.
-6. Both queues are empty. After `idle_grace`, the model is withdrawn and its pod scales to 0.
-7. *Opt-in:* if flowmanager powered `cuda-central` on for this work, nothing now holds it,
-   so it starts a shutdown. It first withdraws the consumers, then waits for a fresh reading
-   that no pod of the host's models remains, then powers the host off over SSH. A host that something
-   else started is held for the person until they release it, and a manual host is never powered
-   off by flowmanager.
+   If `cuda-central` and `basestar-nfs` are up, it chooses `mineru`. If a host is down, the
+   work waits for a person to start it. Waking a host takes managed control on the host and
+   `may_change_power` on the class; the example configuration sets neither.
+3. In one decision `mineru` enters the allowed set and the model that held the GPU leaves.
+   KEDA scales `mineru` to 1, and Kubernetes starts its pod once the GPU is free.
+4. `mineru` serves the whole OCR queue, subject to the dwell limits.
+5. Whatever tags the document after OCR is outside flowmanager; the `paperless-post-ocr`
+   source reads the `post-ocr` tag. Once that tag is present the tagging step is ready, and
+   the next decision switches to `llm`. OCR runs before tagging because tagging is not ready
+   until then, not because of priority.
+6. Both queues are empty. After the idle grace period the model is withdrawn and its pod
+   scales to 0.
+7. If flowmanager powered `cuda-central` on for this work, nothing now holds it, so it starts
+   a [shutdown](concepts.md#shutdown) and powers the host off once the checks pass. A host that
+   something else started is held for the person until they release it. A manual host is never
+   powered off by flowmanager.
 
-Steps 1 to 6 need no power configuration. Steps 2 (waking) and 7 (shutting down) happen only
-for a managed host.
+Steps 1 to 6 need no power configuration. Waking in step 2 and the shutdown in step 7 happen
+only for a managed host.
