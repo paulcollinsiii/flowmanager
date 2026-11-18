@@ -568,7 +568,7 @@ proptest! {
             let wakers = sched_model::wakers(&config, &r.snapshot, &before, &nfs);
             if graceful(&before, false) && !wakers.is_empty() {
                 prop_assert!(
-                    !graceful(&r.decision.state, false),
+                    !(graceful(&r.decision.state, false) || graceful(&r.decision.state, true)),
                     "frame {}: a graceful shutdown stands with wakers {:?}", i, wakers
                 );
             }
