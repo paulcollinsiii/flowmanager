@@ -84,12 +84,18 @@ Each `POST` is logged and counted ([operations.md](operations.md#logs)).
 Generalised from a configuration in use, but not run in this form. The token is the HA
 environment variable `FLOWMANAGER_TOGGLE_AUTH`, holding the whole header value `Bearer <token>`.
 
-One command calls the listener (`configuration.yaml`):
+Two commands call the listener (`configuration.yaml`):
 
 ```yaml
 rest_command:
   flowmanager_set:             # kind: models | resources | lockouts; state: on | off
     url: "http://flowmanager.flowmanager.svc.cluster.local:9096/v1/{{ kind }}/{{ name }}/{{ state }}"
+    method: post
+    headers:
+      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH Bearer unset
+    timeout: 20
+  flowmanager_resume:
+    url: "http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/{{ resource }}/resume"
     method: post
     headers:
       Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH Bearer unset
@@ -115,9 +121,20 @@ rest:
         value_template: >-
           {% set m = value_json.models | selectattr('id', 'eq', 'llm') | list %}
           {{ m[0].held if m | count == 1 else None }}
+    sensor:
+      - name: Flowmanager GPU host wakers
+        value_template: >-
+          {% set r = value_json.resources | selectattr('id', 'eq', 'cuda-central') | list %}
+          {% if r | count != 1 %}{{ None }}{% else %}
+          {% set out = namespace(items=[]) %}
+          {% for w in r[0].wakers | default([]) %}
+          {% set why = 'switched on' if w.why == 'switched_on' else 'work' %}
+          {% set out.items = out.items + [w['class'] ~ ' (' ~ why ~ ')'] %}
+          {% endfor %}
+          {{ out.items | join(', ') if out.items else 'none' }}{% endif %}
 ```
 
-The switch (`templates.yaml`); `update_entity` re-reads the lease at once:
+The switch and the resume button (`templates.yaml`); `update_entity` re-reads the lease at once:
 
 ```yaml
 - switch:
@@ -134,11 +151,16 @@ The switch (`templates.yaml`); `update_entity` re-reads the lease at once:
           data: { kind: models, name: llm, state: "off" }
         - action: homeassistant.update_entity
           target: { entity_id: binary_sensor.flowmanager_llm_lease_held }
+- button:
+    - name: Flowmanager resume cuda-central
+      press:
+        - action: rest_command.flowmanager_resume
+          data: { resource: cuda-central }
 ```
 
 A host switch is the same with `kind: resources`. Its `off` is graceful, so a `409` from a host
-with wakers makes the switch snap back; read `wakers` from the same poll and show it beside the
-switch. `resume` and `off-now` are buttons that `POST` those paths with a second `rest_command`.
+with wakers makes the switch snap back to its sensor; show the wakers sensor beside it, and
+give `off-now` its own button (`rest_command` with the path `/off-now`).
 
 ### Switched apps (*untested*)
 
