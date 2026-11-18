@@ -5,7 +5,7 @@
 //! as that blip was ago, so a few blips added up to `idle_grace` and forced a switch the
 //! queues never justified.
 //!
-//! This also records a known limit (README, *How a model is chosen and kept*): while such
+//! This also records a known limit (`docs/architecture.md`, *Tick and events*): while such
 //! blips keep dropping the wind-down, its clock restarts and the switch is postponed, so
 //! the documented end-to-end bound holds only while the planner's intent is stable.
 

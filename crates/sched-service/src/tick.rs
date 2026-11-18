@@ -440,7 +440,7 @@ impl Shared {
             forced: vec![],
             kinds: vec![reason::KIND_ERROR.to_string()],
             reason: format!(
-                "no decision: the persisted state cannot be read ({text}); nothing is published and the stored state is left as it is (see the README section 'Versions, and recovering the persisted state')"
+                "no decision: the persisted state cannot be read ({text}); nothing is published and the stored state is left as it is (see docs/operations.md, 'Reading and changing state')"
             ),
             steps: vec![],
             not_executed: vec![],

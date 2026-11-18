@@ -21,7 +21,7 @@
 //!
 //! - [`Auth::Mesh`]: this process authenticates nobody. The service mesh must: STRICT
 //!   mTLS on the port and an `AuthorizationPolicy` naming the callers (see
-//!   `docs/kubernetes_setup.md`). Anything that can reach the port can nudge a poll, which
+//!   `docs/install.md`, section 9). Anything that can reach the port can nudge a poll, which
 //!   costs at most one poll per source per interval.
 //! - [`Auth::Token`]: `Authorization: Bearer <token>`, the token read from a file on every
 //!   request. It is checked first, before the path is looked up and before any of the

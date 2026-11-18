@@ -143,7 +143,7 @@ fn unreadable(shared: &Shared, e: &StateError) -> HandlerError {
     TerminalError::new_with_code(
         503,
         format!(
-            "the persisted {e}; see the README section 'Versions, and recovering the persisted state' (the discard_state handler)"
+            "the persisted {e}; see docs/operations.md, 'Reading and changing state' (the discard_state handler)"
         ),
     )
     .into()
