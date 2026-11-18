@@ -611,7 +611,7 @@ impl Shared {
             );
             (s.book, s.leases, s.events, s.creates)
         };
-        // Ownership (`planning/power-model.md`, 2.1b): the sequencer decides which hosts found
+        // Ownership (`docs/architecture/power.md`, *Ownership and adoption*): the sequencer decides which hosts found
         // running are adopted (a manual host lease with origin `adopted`, before the planner
         // looks, so this very tick sees it) and which adopted leases end because the host was
         // seen down, and gives back the lease book and the previous state to use. This applies

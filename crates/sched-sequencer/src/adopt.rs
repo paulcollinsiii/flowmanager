@@ -1,4 +1,4 @@
-//! Adoption of a host found running: the ownership rule of `planning/power-model.md` (2.1b)
+//! Adoption of a host found running: the ownership rule of `docs/architecture/power.md` (*Ownership and adoption*)
 //! as one pure function, [`adopt`].
 //!
 //! A host flowmanager powers on is flowmanager's (`ours`, on `PowerPhase::Off` and `On`) and
@@ -26,7 +26,7 @@
 //!   and once the lockout is cleared a host that is up is found running like any other.
 //!
 //! A job's hold plays no part: a host found running while a job holds it is adopted at once
-//! (D6), and one the job woke itself is ours and never found.
+//! (even while a job holds it), and one the job woke itself is ours and never found.
 //!
 //! An adopted lease ends when a fresh reading shows its host down ([`gone_down`]): the
 //! person (or a power cut) took it down, so the claim is over and the host is no longer ours,

@@ -547,7 +547,7 @@ pub struct DrainAck {
     /// is under `control: manual`, so there is nothing for flowmanager to take down). Only a
     /// requested one ([`Drain::requested`]), so its JSON is `{mode, since, scaled_down}`.
     pub drain: Option<Drain>,
-    /// The host's wakers as of the last tick (power-model 2.1d). Empty when there were none or
+    /// The host's wakers as of the last tick (`docs/architecture/power.md`, *Wakers*). Empty when there were none or
     /// no tick has been reported yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wakers: Vec<Waker>,

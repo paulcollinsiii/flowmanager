@@ -16,7 +16,7 @@ use sched_model::{
 pub enum Requested {
     /// The drain is recorded.
     Recorded,
-    /// A graceful request was refused because the host has wakers (power-model 2.1d): nothing
+    /// A graceful request was refused because the host has wakers (`docs/architecture/power.md`, *Wakers*): nothing
     /// was recorded or changed.
     Refused,
     /// Nothing was recorded: the host's power is under `control: manual` (flowmanager never
@@ -36,7 +36,7 @@ pub enum Requested {
 /// one was), with the start and the scale-down kept.
 ///
 /// `wakers` are the host's wakers as of the last tick (`HostStatus::wakers`). A `graceful`
-/// request is refused while there are any (a graceful off must never end in a bounce, 2.1d):
+/// request is refused while there are any (a graceful off must never end in a bounce, see `docs/architecture/power.md`, *Wakers*):
 /// [`Requested::Refused`], with nothing changed. An `immediate` one is never refused. A request
 /// that is not applicable is reported as such, whatever the wakers.
 pub fn request(

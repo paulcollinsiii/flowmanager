@@ -1,4 +1,4 @@
-//! The wakers of a host (`planning/power-model.md`, 2.1d): the classes that would power it
+//! The wakers of a host (`docs/architecture/power.md`, *Wakers*): the classes that would power it
 //! back on if it went down now. One pure rule, read by the planner (the wake for a class), the
 //! sequencer (a graceful requested shutdown is cancelled by a waker), the status the report
 //! carries per host, and the refusal of a graceful `off`, so they cannot disagree.

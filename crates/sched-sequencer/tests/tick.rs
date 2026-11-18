@@ -4294,7 +4294,7 @@ fn a_lockout_on_a_host_whose_veto_stopped_still_waits_and_never_powers_off() {
     }
 }
 
-// ---- lockout on any host with a power section (power-model.md 2.3, phase 4a) ----
+// ---- lockout on any host with a power section (`docs/architecture/power.md`, *Actions*) ----
 
 fn lockout_nfs(mut c: Case) -> Case {
     c.intent.lockout.insert(rid(N));

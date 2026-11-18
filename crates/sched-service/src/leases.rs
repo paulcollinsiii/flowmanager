@@ -74,7 +74,7 @@ pub enum LeaseError {
     NoLeaseOnResource { resource: ResourceId, kind: String },
     /// No lease has this id.
     UnknownLease { id: LeaseId },
-    /// A graceful take-down of a host that has wakers (power-model 2.1d): it would be powered
+    /// A graceful take-down of a host that has wakers (`docs/architecture/power.md`, *Wakers*): it would be powered
     /// back on. Nothing was changed.
     HostHasWakers {
         resource: ResourceId,

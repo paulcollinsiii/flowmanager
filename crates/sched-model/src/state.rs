@@ -42,7 +42,7 @@ pub enum PowerPhase {
         since: Millis,
     },
     /// Up. `ours` is whether flowmanager started this host and so powers it down when
-    /// nothing holds it (`planning/power-model.md`, 2.1b). Set by flowmanager's own power-on
+    /// nothing holds it (`docs/architecture/power.md`, *Ownership and adoption*). Set by flowmanager's own power-on
     /// (whatever wanted the host) and by a manual want; carried across a blip (`On`, `Off`,
     /// `On`); false after a confirmed shutdown, a failed transition, under manual control, on
     /// a stopped veto and when an adopted lease ends because the host went down. A host that

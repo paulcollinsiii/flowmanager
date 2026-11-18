@@ -236,7 +236,7 @@ fn scenario(frames: &[Raw]) -> Scenario {
 /// that `paperless-ocr` reads from (`reads_from`): the graceful off, its stored wait and the
 /// dependents' offline demand are all in the generated worlds. `nfs-batch`, a class on the same
 /// host that may change power and has a demand source, is there too: with `nfs-app` switched on
-/// it is a waker of the NFS host (power-model 2.1d), so a graceful drain meets wakers appearing.
+/// it is a waker of the NFS host (`docs/architecture/power.md`, *Wakers*), so a graceful drain meets wakers appearing.
 fn config_for(managed: bool) -> sched_model::Config {
     let yaml = sched_model::test_support::with_nfs_batch(
         &sched_model::test_support::example_yaml_switched_dependents(),

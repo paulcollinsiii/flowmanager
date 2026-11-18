@@ -1,10 +1,10 @@
 //! One derived status per host, and the one-time events between two ticks
-//! (`planning/power-model.md`, 2.4).
+//! (`docs/architecture/power.md`, *Who decides what*).
 //!
 //! The sequencer's state, steps and the readings of the tick say what a host is doing, but in
 //! pieces: a power phase, a shutdown with two axes, a lease book, a wait step, config. Logs,
 //! the reason text, metrics and the toggle listener all need the same answer in the model's
-//! words (2.1 to 2.3). [`derive`] makes it once, purely, and everything else reads it:
+//! words (`docs/architecture/power.md`). [`derive`] makes it once, purely, and everything else reads it:
 //!
 //! - [`HostStatus`]: what is true of the host after the tick (a level: it is reported every
 //!   tick for as long as it holds);
@@ -243,7 +243,7 @@ pub struct HostStatus {
     pub min_off: Option<MinOff>,
     /// Why the host holds something back this tick (the decision's wait step for it).
     pub wait: Option<WaitReason>,
-    /// The classes that would power the host back on if it went down now (power-model 2.1d),
+    /// The classes that would power the host back on if it went down now (`docs/architecture/power.md`, *Wakers*),
     /// judged on the state and readings of this tick. Empty for a host without wakers, a
     /// locked-out one, and one without a power section.
     #[serde(default)]

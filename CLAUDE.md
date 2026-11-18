@@ -31,8 +31,9 @@ that was in fact broken — hooks reported green while failing, and a check
 reported as "no issues" that could not execute at all in the image it runs in.
 
 **Reviewers also check fit to the model, not only the phase's criteria.** Some
-areas have an agreed model document (host power: `planning/power-model.md`
-sections 2–3; overall design and the invariant list: `planning/architecture.md`).
+areas have an agreed model document (host power: `docs/architecture/power.md`;
+overall design and the invariant list: `docs/architecture.md`, with the power
+invariants 6–15 in `docs/architecture/power.md`).
 The Orchestrator includes the relevant one in every Reviewer dispatch. The
 Reviewer reports a model-fit section with a verdict for each item below (found /
 none found), so an empty section cannot be mistaken for a skipped one:

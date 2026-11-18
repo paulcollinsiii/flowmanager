@@ -1,4 +1,4 @@
-//! Wakers (`planning/power-model.md` 2.1d): a waker appearing cancels a graceful requested
+//! Wakers (`docs/architecture/power.md`, *Wakers*): a waker appearing cancels a graceful requested
 //! shutdown before the host is powered off, on a shared and on an exclusive host; nothing else
 //! does. The status of each host lists them.
 

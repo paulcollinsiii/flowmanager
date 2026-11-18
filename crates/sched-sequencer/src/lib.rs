@@ -7,8 +7,8 @@
 //! to prefer is the planner's job.
 //!
 //! Safety rules enforced here, regardless of the intent it is given: the numbered invariants
-//! of `planning/architecture.md` (*Safety invariants*), the one canonical list. The host
-//! power ones follow the model in `planning/power-model.md`. The checker that tests them
+//! of `docs/architecture.md` (*Safety invariants*), the one canonical list. The host
+//! power ones follow the model in `docs/architecture/power.md` (invariants 6 to 15). The checker that tests them
 //! against every decision is `sched-service/src/invariants.rs`; its messages carry the same
 //! numbers.
 

@@ -1,4 +1,4 @@
-//! What each switch of the toggle listener says (`planning/power-model.md`, 2.4): a pure
+//! What each switch of the toggle listener says (`docs/architecture/power.md`, *Who decides what*): a pure
 //! function per switch (a host's manual lease, a model's lease, a lockout) from a host's
 //! [`HostStatus`] plus what only the listener knows: the fresh lease book, what a request has
 //! just done, whether the last tick saw the lease.
