@@ -123,8 +123,7 @@ spec:                                   # Deployment
           securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
 ```
 
-Drop the volumes, mounts and env of a feature you do not use. `/healthz` shows only that the
-metrics listener answers ([section 10](#10-check-it-works) shows ticks).
+Drop the volumes, mounts and env of a feature you do not use. `/healthz` shows only that the metrics listener answers.
 
 | Port | Service port name | Serves | Enabled by |
 | --- | --- | --- | --- |
