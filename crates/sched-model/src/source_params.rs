@@ -1304,7 +1304,7 @@ mod tests {
         ] {
             // reachability_confirmations already appears once in the example's params.
             let y = probe_with(from, to).replace(
-                "      reachability_confirmations: 0\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
+                "      reachability_confirmations: 0\n      reachability_confirmations: 3\n",
                 "      reachability_confirmations: 0\n",
             );
             let ps = problems_of(&y);
@@ -1429,7 +1429,7 @@ mod tests {
         }
         for (n, ok) in [("0", false), ("1", true), ("100", true), ("101", false)] {
             let y = EXAMPLE_CONFIG.replace(
-                &format!("{TCP}      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n"),
+                &format!("{TCP}      reachability_confirmations: 3\n"),
                 &format!("{TCP}      reachability_confirmations: {n}\n"),
             );
             assert_ne!(y, EXAMPLE_CONFIG);
@@ -1470,7 +1470,7 @@ mod tests {
         );
         assert_eq!(tcp_params(&y).timeout, crate::Millis(60_000));
         let p = tcp_params(&EXAMPLE_CONFIG.replace(
-            "      timeout: 2s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
+            "      timeout: 2s\n      reachability_confirmations: 3\n",
             "",
         ));
         assert_eq!(p.reachability_confirmations, 3);

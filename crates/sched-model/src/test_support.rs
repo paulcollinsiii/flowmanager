@@ -31,11 +31,11 @@ pub const FIXTURES: &[(&str, &str)] = &[
 ];
 
 /// The example's `basestar-probe` source, a `tcp_probe`, as written in [`EXAMPLE_CONFIG`].
-pub const EXAMPLE_TCP_PROBE_SOURCE: &str = "  - id: basestar-probe\n    kind: tcp_probe\n    observe: [reachability]\n    resync: 10s\n    params:\n      host: basestar\n      port: 2049\n      resource: basestar-nfs\n      timeout: 2s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n";
+pub const EXAMPLE_TCP_PROBE_SOURCE: &str = "  - id: basestar-probe\n    kind: tcp_probe\n    observe: [reachability]\n    resync: 10s\n    params:\n      host: basestar\n      port: 2049\n      resource: basestar-nfs\n      timeout: 2s\n      reachability_confirmations: 3\n";
 
 /// The same source as a `prometheus` probe, for tests of that kind; see
 /// [`example_with_prometheus_probe`].
-pub const PROMETHEUS_PROBE_SOURCE: &str = "  - id: basestar-probe\n    kind: prometheus\n    observe: [reachability]\n    resync: 10s\n    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n      resource: basestar-nfs\n      timeout: 5s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n";
+pub const PROMETHEUS_PROBE_SOURCE: &str = "  - id: basestar-probe\n    kind: prometheus\n    observe: [reachability]\n    resync: 10s\n    params:\n      url: http://prometheus.monitoring.svc:9090\n      query: probe_success{instance=\"basestar\"}\n      resource: basestar-nfs\n      timeout: 5s\n      reachability_confirmations: 3\n";
 
 /// [`EXAMPLE_CONFIG`] with `basestar-probe` read through Prometheus instead of a TCP probe,
 /// so the `prometheus` kind keeps a realistic test configuration.
@@ -448,7 +448,7 @@ mod tests {
     /// The example with the NFS host's power section removed (an always-on resource).
     fn example_without_nfs_power() -> String {
         EXAMPLE_CONFIG.replace(
-            "    power:\n      wake_on_lan: { router_url: \"https://router.example.internal\", interface: lan, mac: \"02:00:00:00:00:02\" }\n      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n      control: manual\n      # Set per resource: the NFS host boots and stops faster than the GPU host.\n      power_on_timeout: 5m\n      shutdown_timeout: 10m\n      # Under managed control, how long a shutdown may wait for pods to stop mounting this\n      # host (see the basestar-mounts source) before the scheduler alerts and stops, without\n      # shutting it down and without retrying (default 30m, at most 1d).\n      veto_timeout: 30m\n",
+            "    power:\n      wake_on_lan: { router_url: \"https://router.example.internal\", interface: lan, mac: \"02:00:00:00:00:02\" }\n      shutdown: { host: basestar, port: 22, user: poweroff, host_key: \"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" }\n      control: manual\n      power_on_timeout: 5m\n      shutdown_timeout: 10m\n      veto_timeout: 30m\n",
             "",
         )
     }

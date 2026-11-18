@@ -319,7 +319,7 @@ fn reachability_from_a_probe_source_drives_decisions_end_to_end() {
     );
     // The tcp_probe-shaped params would not be valid http_json params.
     let text = text.replace(
-        "    params:\n      host: basestar\n      port: 2049\n      resource: basestar-nfs\n      timeout: 2s\n      # Consecutive agreeing readings before up/down flips (as for cluster-pods).\n      reachability_confirmations: 3\n",
+        "    params:\n      host: basestar\n      port: 2049\n      resource: basestar-nfs\n      timeout: 2s\n      reachability_confirmations: 3\n",
         "",
     );
     assert_ne!(text, managed);

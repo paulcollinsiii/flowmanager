@@ -1,10 +1,9 @@
-# Example scheduler configuration describing the current workloads.
-# Service-specific names live here only; the crates treat them as opaque ids.
-# Durations accept plain milliseconds or a suffix: ms, s, m, h, d.
+# A complete example config. Every key is explained in docs/configuration/.
+# Durations take plain milliseconds or a suffix: ms, s, m, h, d.
 
+# docs/configuration/README.md
 policy:
   strategy: fifo-exhaustive
-  # Counted from the tick a model is allowed, so it includes its load time.
   min_dwell: 5m
   max_dwell: 2h
   idle_grace: 10m
@@ -12,59 +11,23 @@ policy:
   queue_reading_stale_after: 10m
   host_reading_stale_after: 30s
   interactive_ttl: 15m
-  # Once the planner wants another model, in-flight work (whatever its preemptibility,
-  # except a busy `none` class) is cut off this long after the wind-down starts, unless a
-  # class sets its own kill_timeout. Cutting off means the model is withdrawn.
   drain_timeout: 10m
-  # How long in-flight work may run after a lockout (on any host, shared or exclusive) before
-  # it is cut off. Defaults to drain_timeout. (Called reclaim_timeout before phase 4a.)
   # lockout_timeout: 10m
 
+# docs/configuration/power.md
 resources:
-  # A shared resource with no `power:` section is always up, with nothing to wake or stop. It
-  # is what a switched class that needs no host of its own requires (see the commented-out
-  # wikijs class below):
+  # No power section: always up.
   - id: blade-runner
     kind: shared
   - id: cuda-central
     kind: exclusive
     power:
-      # Power-on: Wake-on-LAN, sent by the router (flowmanager runs in the cluster and
-      # cannot broadcast on the LAN) through the OPNsense os-wol API. `router_url` must be
-      # https. `interface` is the router interface the packet leaves by (default lan).
-      # The router credentials (a `key:secret` file) and an optional CA bundle are NOT here:
-      # they are files mounted from Kubernetes Secrets (see the service's
-      # --opnsense-credentials-file and --opnsense-ca-file), read on every call.
       wake_on_lan: { router_url: "https://router.example.internal", interface: lan, mac: "02:00:00:00:00:01" }
-      # Power-off: SSH to a forced-command key, which runs the host's shutdown whatever
-      # command is sent. `host_key` is the host's pinned SHA256 fingerprint (ssh-keygen -lf);
-      # any other key is refused. The private key is a file mounted from a Kubernetes Secret
-      # (--ssh-key-file), read on every call.
       shutdown: { host: cuda-central, port: 22, user: poweroff, host_key: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
-      # manual: a person powers the host; the scheduler never emits power steps for it and
-      # follows its observed reachability. managed: the scheduler powers it on and off
-      # (both sections above are then required) and never retries a failed power action.
-      # Under managed control this exclusive host is powered on only by a manual host lease
-      # (acquire_host_lease), a manual model lease, or a class with may_change_power: queued
-      # work never wakes it. A host lease keeps it up and pins no model (the queues still
-      # choose); releasing it is a plain release (no drain): once idle the model is withdrawn
-      # and idle_grace later the host is shut down. `off` / `off-now` (release_host_lease with a
-      # drain, drain_host) take it down despite queued work, as for a shared host, and a lockout
-      # (lockout_timeout) takes it down and keeps flowmanager away from it until cleared. A host
-      # found running is adopted like a shared one (held by the user until released).
+      # manual: a person powers the host. managed: flowmanager does, and needs both sections above.
       control: manual
-      # Under managed control, how long the host may take to be observed up after a
-      # power-on (default 10m) or down after a shutdown (default 15m). On expiry the
-      # scheduler raises an alert (log event `power_timeout`, metric
-      # `sched_resource_power_failed`), allows nothing on the host and stops: it never
-      # retries by itself, a person acts. Each must be above host_reading_stale_after and
-      # at most 1d.
       power_on_timeout: 10m
       shutdown_timeout: 15m
-      # Before the host is powered off, the cluster-pods source (below) must show a fresh
-      # zero pods for every model of this host (the pods veto); a missing or stale reading
-      # counts as in use. The wait is bounded by veto_timeout (default 30m): then the
-      # scheduler alerts and stops, without shutting it down and without retrying.
       veto_timeout: 30m
   - id: basestar-nfs
     kind: shared
@@ -72,38 +35,26 @@ resources:
       wake_on_lan: { router_url: "https://router.example.internal", interface: lan, mac: "02:00:00:00:00:02" }
       shutdown: { host: basestar, port: 22, user: poweroff, host_key: "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
       control: manual
-      # Set per resource: the NFS host boots and stops faster than the GPU host.
       power_on_timeout: 5m
       shutdown_timeout: 10m
-      # Under managed control, how long a shutdown may wait for pods to stop mounting this
-      # host (see the basestar-mounts source) before the scheduler alerts and stops, without
-      # shutting it down and without retrying (default 30m, at most 1d).
       veto_timeout: 30m
-      # Under managed control, the least time flowmanager keeps this host off after a
-      # shutdown it started and saw confirmed, before it powers it on again by itself (a
-      # workload, a scheduled job's hold); a manual lease does not wait. Default 0 (disabled),
-      # at most 1d. Meant to stop slow power flapping of the NFS host; keep it well inside a
-      # job's start_window. Shown commented out so the shipped behaviour is the default.
       # min_off: 10m
 
+# docs/configuration/workloads.md
 models:
-  # `namespaces`: where the model's workloads run. Before cuda-central is powered off the pods
-  # source must see zero pods of every model, and it sees only the namespaces it watches
-  # (cluster-pods below); a namespace it does not watch is refused for a managed host, since
-  # the workloads there would read as zero pods unseen.
   - { id: mineru, resource: cuda-central, load_time: 120s, workloads: [mineru], namespaces: [ai] }
   - { id: llm, resource: cuda-central, load_time: 90s, workloads: [ollama], namespaces: [ai] }
   - { id: whisperx, resource: cuda-central, load_time: 60s, workloads: [whisperx], namespaces: [ai] }
   - { id: immich-ml, resource: cuda-central, load_time: 45s, workloads: [immich-machine-learning-gpu], namespaces: [media] }
 
+# docs/configuration/workloads.md
 classes:
+  # Demand classes: a model and a demand source.
   - id: paperless-ocr
     requires:
       - { resource: cuda-central, model: mineru }
       - { resource: basestar-nfs }
     priority: 50
-    # Cut off after drain_timeout (or kill_timeout) when another model is wanted.
-    # paperless-gpt reprocesses documents it did not finish, so nothing needs re-queuing.
     preemptibility: kill
     demand: { source: paperless-ocr-pending }
 
@@ -112,7 +63,6 @@ classes:
       - { resource: cuda-central, model: llm }
       - { resource: basestar-nfs }
     priority: 50
-    # As paperless-ocr: paperless-gpt reprocesses unfinished documents.
     preemptibility: kill
     demand: { source: paperless-post-ocr }
 
@@ -121,15 +71,9 @@ classes:
       - { resource: cuda-central, model: whisperx }
       - { resource: basestar-nfs }
     priority: 60
-    # speakr marks interrupted jobs failed. Its failed transcriptions are the `failed` demand
-    # of this class (see speakr-pending), and `recovery` re-queues them through speakr's API
-    # while whisperx is allowed: at most `max_attempts` times per recording, then the
-    # recording stays failed and leaves speakr-pending's window. The same list request is
-    # written twice (here and in speakr-pending) on purpose: keep `list.url`, `where` and
-    # `since` in step with it. Needs `SPEAKR_API_TOKEN` with the read AND process scopes
-    # (re-queueing is `process`), and a token user who may edit the recordings.
     preemptibility: kill
     demand: { source: speakr-pending }
+    # Re-queues failed transcriptions while whisperx is allowed.
     recovery:
       action: requeue_failed
       source: speakr-pending
@@ -144,19 +88,11 @@ classes:
         requeue:
           method: POST
           url: http://speakr.media.svc:8899/api/v1/recordings/{id}/transcribe
-          # Sent as JSON with Content-Type: application/json. Leave it out for no body.
           body: {}
-          # Queued only if the answer says so: {"success": true, "job_id": ..., "status": "QUEUED"}.
           expect:
             - { field: /success, equals: true }
             - { field: /status, equals: QUEUED }
         auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
-        # `max_attempts` re-queue requests per recording, remembered for `retention` (24h,
-        # at least `window`, the list's since window) whether or not the recording is still
-        # listed: a recording that used its attempts must not get fresh ones when an edit
-        # lists it again; after `retention` an edited recording may get a fresh set. At
-        # most `max_per_run` requests per run, runs at least `min_interval` apart (one list request plus the POSTs: well inside
-        # speakr's limit of 120 requests a minute), each request bounded by `timeout`.
         max_attempts: 2
         window: 15m
         retention: 24h
@@ -169,9 +105,6 @@ classes:
       - { resource: cuda-central, model: llm }
       - { resource: basestar-nfs }
     priority: 60
-    # Not `kill`, to mark the difference: this work is cut off after drain_timeout all the
-    # same (nothing waits for a model without a bound), but an interrupted summary is NOT
-    # re-queued automatically; the speakr recovery covers failed transcriptions only.
     preemptibility: pause_intake
     demand: { source: speakr-summaries }
 
@@ -179,14 +112,11 @@ classes:
     requires:
       - { resource: cuda-central, model: immich-ml }
       - { resource: basestar-nfs }
-    # An accelerator only: a CPU replica always serves, so it ranks below work that would wait.
     priority: 10
-    # immich leaves interrupted work pending and easy to find. Its queues stay active
-    # through a large import, so this class is cut off after drain_timeout when another
-    # model is wanted (a bounded wait is what lets the GPU change hands).
     preemptibility: kill
     demand: { source: immich-queues }
 
+  # Inert: the session kind has no observer (docs/configuration/sources.md).
   - id: interactive-llm
     requires:
       - { resource: cuda-central, model: llm }
@@ -194,23 +124,7 @@ classes:
     preemptibility: none
     demand: { source: llm-sessions }
 
-  # NFS-only services: no demand of their own; they run whenever NFS is up.
-  #
-  # Paperless-ngx as a switched app with dependents (kept as a comment: enabling it here
-  # would make every test that expects paperless-ngx to be a plain gate class a different
-  # test). The switched class wakes basestar when it is on (may_change_power), and the demand
-  # sources that poll Paperless say so with `reads_from` (see paperless-ocr-pending below).
-  # When it is switched off and its graceful wait is over, paperless-ocr and
-  # paperless-tagging are offline: no demand, whatever the source reports, so the OCR queues
-  # hold neither cuda-central nor basestar.
-  #
-  #   - id: paperless-ngx
-  #     requires:
-  #       - { resource: basestar-nfs }
-  #     priority: 0
-  #     preemptibility: none
-  #     may_change_power: true
-  #     switch: { source: ha-paperless }     # a switch source like ha-wikijs below
+  # Plain classes: no demand; they run while their shared hosts are up.
   - id: paperless-ngx
     requires:
       - { resource: basestar-nfs }
@@ -223,13 +137,7 @@ classes:
     priority: 0
     preemptibility: none
 
-  # Gate classes: a requirement on an exclusive resource WITHOUT a model means only "that
-  # host is up". A gate class has no demand source and never influences which model is
-  # chosen. GPU contention is not gated by flowmanager at all: Kubernetes enforces it (every
-  # GPU workload requests nvidia.com/gpu: 1 and the node exposes one GPU), so consumers are
-  # gated on host readiness only. paperless-gpt's deployment scales on this class: it runs
-  # only while cuda-central is up and paperless-ngx (its documents on basestar-nfs) is
-  # reachable. Its OCR and tagging work are still the demand classes above.
+  # Gate class: an exclusive host without a model means only that the host is up.
   - id: paperless-gpt
     requires:
       - { resource: cuda-central }
@@ -237,18 +145,7 @@ classes:
     priority: 0
     preemptibility: none
 
-  # A switched class: an app a person switches on and off from Home Assistant. It names no
-  # model and has no demand; `switch.source` is a source that observes `switch`. The reading
-  # is `on`, `off` or `off_now` (see the ha-wikijs source) and it gates the class: the class
-  # is allowed only while its hosts are up and the reading is `on`, or while a graceful `off`
-  # still waits: `off` keeps the class allowed while a *dependent* (a class whose demand
-  # source declares `reads_from: <this class>`, see the commented example at paperless-ngx
-  # below) has work in flight, or unknown, for at most policy.drain_timeout from when `off`
-  # was first read. `off_now` ends the class at once and ends a wait that is running, and
-  # `on` cancels it. wikijs has no dependents, so `off` is immediate for it too. A missing or
-  # stale reading counts as `off_now` (fail closed). A class that requires only a resource
-  # without a `power:` section (blade-runner, the node the app runs on) has nothing to wake,
-  # so may_change_power stays false. A class has `demand` or `switch`, never both.
+  # Switched class: an app a person turns on and off.
   - id: wikijs
     requires:
       - { resource: blade-runner }
@@ -256,6 +153,7 @@ classes:
     preemptibility: kill
     switch: { source: ha-wikijs }
 
+# docs/configuration/sources.md
 sources:
   - id: cluster-pods
     kind: kubernetes_watch
@@ -263,28 +161,11 @@ sources:
     observe: [pods, reachability]
     params:
       namespaces: [ai, media, docs]
-      # Pod label whose value is the model's workload name (models[].workloads).
       workload_label: app.kubernetes.io/name
-      # Resource -> Kubernetes node name. Only listed resources get reachability.
       nodes: { cuda-central: cuda-central }
-      # Consecutive agreeing checks (one per resync) before a host's up/down flips.
       reachability_confirmations: 3
 
-  # basestar is not a Kubernetes node: its reachability comes from a TCP connect probe,
-  # the same check power.py makes (a plain connect to the NFS port, 2049). Each resync
-  # makes one connect to host:port, closing the connection at once. `timeout` bounds the
-  # whole probe, name lookup included.
-  # - connected: up.
-  # - the host does not answer or answers no: down. That is connection refused, no answer
-  #   within `timeout`, or "no route to host" (what Linux reports, after about 3s, for an
-  #   address on the local network that does not answer ARP, as a powered-off basestar).
-  # - anything else is a failed read (the reading goes stale), never "down": the name does
-  #   not resolve (or its lookup does not finish within `timeout`), "network unreachable"
-  #   (no route at all), an unusable address, or any other local error.
-  # If the name has several addresses, all are tried at once: up if any connects, down
-  # only if every one answered down, otherwise a failed read.
-  # It checks that the host accepts connections on the port, not that the NFS export works.
-  # Only basestar-nfs gets reachability from this source.
+  # basestar is not a Kubernetes node, so a TCP connect to its NFS port says whether it is up.
   - id: basestar-probe
     kind: tcp_probe
     observe: [reachability]
@@ -294,18 +175,9 @@ sources:
       port: 2049
       resource: basestar-nfs
       timeout: 2s
-      # Consecutive agreeing readings before up/down flips (as for cluster-pods).
       reachability_confirmations: 3
 
-  # Before flowmanager powers basestar off, no pod may mount its NFS export: the pods are
-  # read from the Kubernetes API (pods, PersistentVolumeClaims and PersistentVolumes; see
-  # docs/kubernetes_setup.md for the RBAC) and counted when a volume, directly or through a
-  # claim, is an NFS volume of one of `nfs_servers` (the name or address exactly as the pod
-  # specs and PersistentVolumes write it; list both if both are used). One list per resync.
-  # `namespaces` is optional: absent means every namespace, which is what a safety check
-  # wants (a pod in a namespace not listed here would be missed).
-  # A failed read, or a reading older than policy.host_reading_stale_after, is "possibly
-  # mounted", never "no mounts". Required for a managed shared resource.
+  # Pods that mount basestar's NFS export: the veto before it is powered off.
   - id: basestar-mounts
     kind: kubernetes_watch
     observe: [mounts]
@@ -313,10 +185,7 @@ sources:
     params:
       nfs_servers: { basestar-nfs: [basestar] }
 
-  # The state of the Kubernetes Jobs flowmanager creates for its scheduled jobs (see `jobs`
-  # below): one list per resync of the Jobs it labelled `app.kubernetes.io/managed-by:
-  # flowmanager`, in `job_namespaces`, which must include each job's CronJob namespace. A
-  # reading that is stale or failed is never taken as "the Job finished": the hold stays.
+  # The Jobs flowmanager made for `jobs` below.
   - id: scheduled-jobs
     kind: kubernetes_watch
     observe: [jobs]
@@ -324,29 +193,6 @@ sources:
     params:
       job_namespaces: [backups]
 
-  # The `prometheus` kind is also available for reachability: one instant query per resync
-  # that must return exactly one series, 1 up and 0 down (anything else is a failed read).
-  # Not used here, as no blackbox exporter probes basestar. For a probed host it would be:
-  #   - id: some-host-probe
-  #     kind: prometheus
-  #     observe: [reachability]
-  #     resync: 10s
-  #     params:
-  #       url: http://prometheus.monitoring.svc:9090
-  #       query: probe_success{instance="some-host", job="blackbox-ssh"}
-  #       resource: some-resource
-  #       timeout: 5s
-  #       reachability_confirmations: 3
-  #       # Optional, as for http_json: auth: { header: Authorization, prefix: "Bearer ", env: PROMETHEUS_TOKEN }
-
-  # Secrets are never in this file: `auth` names an environment variable (or a mounted
-  # file) that holds the token.
-  #
-  # `reads_from: <switched class>` (a source-level field, only on a source that observes
-  # `demand`) says this source polls that app. While the app is switched off and its graceful
-  # wait is over, the classes reading the source are offline, even if the source still
-  # answers. Add `reads_from: paperless-ngx` to the two paperless sources below together with
-  # the switched paperless-ngx class above.
   - id: paperless-ocr-pending
     kind: http_json
     observe: [demand]
@@ -355,12 +201,9 @@ sources:
       timeout: 10s
       auth: { header: Authorization, prefix: "Token ", env: PAPERLESS_API_TOKEN }
       requests:
-        # page_size=1: only the `count` of the document list is used.
+        # page_size=1: only the `count` is used.
         - url: http://paperless-ngx.docs.svc:8000/api/documents/?tags__name__iexact=ocr-pending&page_size=1
           count: /count
-      # A POST to this path of the webhook listener (--webhook-listen) makes this source poll
-      # now, no more often than --webhook-min-interval; the body is ignored. resync stays the
-      # safety net, and without the listener the source is polled at its resync only.
       webhook: { path: /hooks/paperless }
 
   - id: paperless-post-ocr
@@ -375,53 +218,7 @@ sources:
           count: /count
       webhook: { path: /hooks/paperless }
 
-  # Speakr transcription demand.
-  #
-  # Field names and behaviour come from speakr's v1 API reference and source
-  # (src/api/api_v1.py, src/services/job_queue.py):
-  # - Enqueueing a job sets the recording to QUEUED, which NO list status filter matches
-  #   (`pending` is only the state before enqueue). So waiting work is counted from
-  #   GET /api/v1/stats instead: `recordings.pending` plus `queue.jobs_queued` (ProcessingJob
-  #   rows, of ALL job types for the token's user), with `queue.jobs_processing` as in-flight
-  #   work. Queued summary (and other non-transcription) jobs are therefore also counted
-  #   here: a deliberate, conservative overcount (they are GPU/LLM demand of some class, not
-  #   necessarily transcription), and the planner treats ready > 0 as work.
-  # - Failed transcriptions are `failed` demand (counts_as: failed, a third bucket next to
-  #   ready and in-flight), so that a whisperX outage brings whisperX in, to re-queue them
-  #   (the class's `recovery`), rather than hiding the work. They are NOT ready work: they
-  #   never age (so never reach starvation priority, however long they stay listed), never
-  #   count toward the oldest ready item and never keep whisperX loaded. Retries are
-  #   immediate (JOB_MAX_RETRIES = 3), so with
-  #   whisperX unloaded a job fails within seconds and leaves the queue counts above. When a
-  #   job gives up, speakr sets the recording FAILED and stores the error in `summary` for
-  #   summarize/reprocess_summary jobs and in `transcription` for every other job type; list
-  #   items expose only `has_summary` / `has_transcription`. So the second request lists
-  #   FAILED recordings and counts those with `has_summary: false` (a failed transcription).
-  #   `equals: false` is the JSON boolean; `equals: "false"` would be the text.
-  #   A reprocess_transcription failure on a recording that already has a summary is missed
-  #   (accepted), and a failed merge/stitch job counts as transcription (overcount).
-  #   The window: only recordings updated in the last `since.ago` (15m) are listed; that
-  #   bounds how long a failure can bring whisperX in. Failed items have no age, so the
-  #   window is not what keeps them from starving: nothing ages them.
-  #   - A failure counts as failed demand until it is re-queued or 15m pass.
-  #   - Any later edit of a FAILED recording (tags, title, inbox, highlight, share) bumps its
-  #     `updated_at` and restarts its window.
-  #   - Permanent failures (a bad file, an unsupported codec) count too, until the window
-  #     passes.
-  #   - Failed transcriptions are re-queued automatically (the class's recovery), at most
-  #     twice per recording; after that it stays FAILED and ages out of the window.
-  #   A full page of failures (100 in the window, `max_items`) counts the items on the page
-  #   that pass the `where` filter ("at least N", 0 if none) instead of failing the poll, so a
-  #   mass failure keeps demand fresh. The list is one page sorted by updated_at (newest
-  #   first): a page entirely filled with failures the filter rejects (failed summaries)
-  #   hides transcription failures beyond it. A full page for a ready/in-flight request
-  #   still fails the poll. An item whose `has_summary` is not a boolean (null aside)
-  #   also fails the poll, rather than counting low.
-  # Cost: 2 requests per poll here plus 1 for speakr-summaries below, at one poll a minute
-  # each: 3 requests per minute in total on the one token, against speakr's read limit of
-  # 120/min (add up all speakr sources before raising `resync` rates).
-  # Auth: `Authorization: Bearer <token>`. This source only reads, but the same token
-  # (SPEAKR_API_TOKEN) also re-queues, so it needs the `read` AND `process` scopes.
+  # Ready and in-flight work from the stats, and failed items from a filtered list.
   - id: speakr-pending
     kind: http_json
     observe: [demand]
@@ -435,7 +232,6 @@ sources:
           also:
             - { count: /queue/jobs_queued, counts_as: ready }
             - { count: /queue/jobs_processing, counts_as: in_flight }
-        # Failed transcriptions in the last 15m (updated_since=<now - 15m> is appended).
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=failed&per_page=100&sort_by=updated_at&sort_order=desc
           length: /recordings
           where: { field: /has_summary, equals: false }
@@ -444,11 +240,6 @@ sources:
           counts_as: failed
       webhook: { path: /hooks/speakr }
 
-  # Summarization. The status filter has no `summarizing` value, but `status=processing`
-  # returns both PROCESSING and SUMMARIZING recordings (speakr src/api/api_v1.py:
-  # `Recording.status.in_(['PROCESSING', 'SUMMARIZING'])`), so this lists that page and keeps
-  # those whose `status` is SUMMARIZING. Enqueueing a summary job sets SUMMARIZING at once,
-  # so queued and running summary jobs are both visible here.
   - id: speakr-summaries
     kind: http_json
     observe: [demand]
@@ -463,19 +254,7 @@ sources:
           max_items: 100
       webhook: { path: /hooks/speakr }
 
-  # immich ML demand: the three ML-backed queues (smartSearch, faceDetection, ocr), read
-  # with GET /api/queues/{name} (upstream spec: from immich v2.4.0, not in
-  # v2.3.1, where GET /api/jobs became deprecated; the deployment is expected to run v4.0 or
-  # later, which could not be matched to a release). The endpoint is marked alpha in immich
-  # (`.alpha('v2.4.0')` in queue.controller.ts), so its shape may still change; a changed
-  # shape fails the poll rather than counting zero. Each returns `{"name", "isPaused",
-  # "statistics": {"active", "completed", "failed", "delayed", "waiting", "paused"}}`:
-  # `waiting` + `delayed` count as ready, `active` as in-flight, summed over the three
-  # queues. A paused queue counts as zero (ready and in-flight): in the versions this was written against a paused queue
-  # reports its jobs under `waiting`, so `when` skips a response whose top-level `isPaused`
-  # is not false (a missing or non-boolean `isPaused` fails the poll).
-  # Auth: an API key with the `queue.read` permission (the endpoint is admin-only), sent as
-  # `x-api-key: <key>` with no prefix. Cost: 3 requests per poll, every 120s.
+  # Three queues, skipped while paused; `waiting` and `delayed` are ready, `active` is in flight.
   - id: immich-queues
     kind: http_json
     observe: [demand]
@@ -503,18 +282,13 @@ sources:
             - { count: /statistics/delayed, counts_as: ready }
             - { count: /statistics/active, counts_as: in_flight }
 
+  # Inert: the session kind has no observer.
   - id: llm-sessions
     kind: session
     observe: [demand]
     resync: 30s
 
-  # A switch source (http_json only): one request, and it reads one value. `value` is a JSON
-  # pointer to a string or a boolean in the response; `map` turns its text into on, off or
-  # off_now (a boolean's text is `true` / `false`). Anything not in the map, a number, null or
-  # a missing field fails the poll: the reading is then missing, and stale after
-  # policy.queue_reading_stale_after. It must observe `switch` and nothing else. The same
-  # `map` (strings to numbers, e.g. { "true": 1, "false": 0 }) also works on a demand
-  # request's `count` and an `also` entry's `count`.
+  # A switch source: `map` turns the app's state into on, off or off_now.
   - id: ha-wikijs
     kind: http_json
     observe: [switch]
@@ -526,39 +300,19 @@ sources:
         - url: http://homeassistant.example.internal:8123/api/states/input_select.app_wikijs
           value: /state
           map: { "on": on, "off": off, "off-now": off_now }
-      # `webhook: { path: ... }` works as on any http_json source: a Home Assistant automation
-      # can then ask for a poll on each change instead of waiting for `resync`.
 
-# Scheduled jobs: flowmanager starts a Kubernetes Job from a CronJob on a cron schedule, after
-# taking what the job needs. The CronJob is only the template: keep it `suspend: true` (its
-# own schedule never fires) and manage it in your own manifests; flowmanager copies its
-# `spec.jobTemplate` the way `kubectl create job --from=cronjob/<name>` does and adds the
-# labels `app.kubernetes.io/managed-by: flowmanager` and `flowmanager/job: <id>` and the
-# annotations `invoked-by: flowmanager` and `flowmanager/scheduled-at` (RFC3339 UTC). It never
-# deletes a Job. The backup Jobs check their own preconditions in init containers.
+# Scheduled jobs: docs/configuration/jobs.md
 jobs:
   - id: backup
-    # Five-field crontab, evaluated in `timezone` (an IANA name, default UTC). Here: Sundays
-    # at 03:00. Daylight saving: a time inside the skipped spring hour does not run that day,
-    # a time inside the repeated autumn hour runs twice; use UTC for a strict once.
+    # Five-field crontab in `timezone`: Sundays at 03:00.
     cron: "0 3 * * 0"
     timezone: UTC
     cronjob: { namespace: backups, name: postgres-backup }
-    # A hold on a shared resource, taken when the run is due (it wakes basestar if its power
-    # is managed; under `manual` a person powers it on) and released when the run ends, fails
-    # for good, is missed, or the Job is gone. More kinds of need can be added later.
     needs:
       - { type: nfs, resource: basestar-nfs }
-    # Retries after a failed Job (default 1; 0 for none), the first after `retry_backoff`
-    # (default 5m), then doubling up to 1h. A job whose needs never came up is a missed run,
-    # not a failed attempt: it uses no retries.
+    # Retries after a failed Job; the wait doubles from `retry_backoff`.
     retries: 1
     retry_backoff: 5m
-    # skip (default): a run that could not start within `start_window` of its time is dropped,
-    # logged and alerted. catch_up: it keeps waiting for its needs and runs late, at most once,
-    # as long as the next scheduled time has not arrived; then it is dropped. Backups: catch_up.
     missed_run: catch_up
     start_window: 30m
-    # A started run that takes longer is alerted and counted as failed (the Job is not
-    # deleted, and no new run starts while it is still active). Default 6h.
     deadline: 6h
