@@ -323,6 +323,67 @@ fn an_idle_drain_with_its_idle_clock_may_power_off() {
     }
 }
 
+/// Regression for `a_graceful_drain_never_outlives_a_waker`: a graceful requested shutdown the
+/// veto gives up on (no mounts reading for `veto_timeout`) is `Stopped`; a waker appearing on the
+/// next tick leaves it alone and nothing powers the host off (`docs/architecture/power.md`,
+/// *Lifecycle*: a stopped shutdown is never cancelled by a waker).
+#[test]
+fn a_waker_leaves_a_stopped_graceful_shutdown_alone() {
+    let config = config_for(true);
+    let nfs = sched_model::ResourceId::new("basestar-nfs");
+    let blank = |dt| Raw {
+        up: vec![None, None],
+        ..quiet(dt, [false, false])
+    };
+    let mut f0 = blank(156_509);
+    f0.up = vec![None, Some(true)];
+    let f1 = blank(521_045);
+    let mut f2 = blank(1_278_955);
+    f2.up = vec![None, Some(true)];
+    let mut f3 = blank(1);
+    f3.demand[6] = Some((0, 1, 0, 0));
+    let mut sc = scenario(&[f0, f1, f2, f3]);
+    let ago = 443_491;
+    let mut st = nfs_with_idle_drain(&config, Millis(50_000_000 - ago));
+    st.idle_since = None;
+    st.shutdown = Some(sched_model::Shutdown::requested(
+        sched_model::DrainMode::Graceful,
+        Millis(50_000_000 - ago),
+    ));
+    sc.initial_state.resources.insert(nfs.clone(), st);
+    let results = run(&config, &sc).unwrap();
+    let shutdown = |i: usize| {
+        results[i]
+            .decision
+            .state
+            .resource(&nfs)
+            .and_then(|s| s.shutdown)
+    };
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
+        assert!(
+            !r.decision.steps.contains(&Step::PowerOff {
+                resource: nfs.clone()
+            }),
+            "frame {i}: powered off"
+        );
+    }
+    let stopped = shutdown(2).expect("a shutdown on frame 2");
+    assert!(stopped.stopped_since().is_some(), "frame 2: {stopped:?}");
+    let wakers = sched_model::wakers(
+        &config,
+        &results[3].snapshot,
+        &results[2].decision.state,
+        &nfs,
+    );
+    assert!(!wakers.is_empty(), "frame 3 has no wakers");
+    assert_eq!(
+        shutdown(3),
+        Some(stopped),
+        "frame 3: the stopped shutdown changed"
+    );
+}
+
 /// A host that has been idle for the whole grace period, taken through the ways an idle drain
 /// can be held back and resumed (mounts, a manual lease, an unknown reading): the state the
 /// sequencer itself produces never powers it off early, and an idle drain never stands
@@ -470,8 +531,9 @@ proptest! {
 
     /// A graceful requested shutdown under way on the NFS host meets a may-wake class becoming
     /// busy or a switched class reading on (the generated frames have both): whenever the host
-    /// has a waker the shutdown is cancelled, it is never powered off, and no invariant is
-    /// violated (including the one that a graceful shutdown never powers off over a waker).
+    /// has a waker the shutdown is cancelled unless the veto has stopped it (a stopped one is
+    /// left alone), the host is never powered off, and no invariant is violated (including the
+    /// one that a graceful shutdown never powers off over a waker).
     #[test]
     fn a_graceful_drain_never_outlives_a_waker(
         frames in prop::collection::vec(raw(), 1..40),
@@ -493,19 +555,24 @@ proptest! {
         let results = run(&config, &sc).unwrap();
         for (i, r) in results.iter().enumerate() {
             prop_assert!(r.violations.is_empty(), "frame {}: {:?}", i, r.violations);
-            let graceful = |s: &sched_model::SchedState| {
+            // A graceful requested shutdown, and whether the veto has given up on it: a waker
+            // cancels one that is not stopped, and leaves a stopped one alone (it never powers
+            // the host off, so nothing bounces: `docs/architecture/power.md`, *Lifecycle*).
+            let graceful = |s: &sched_model::SchedState, stopped: bool| {
                 s.resource(&nfs).and_then(|x| x.shutdown).is_some_and(|x| {
                     x.cause() == sched_model::ShutdownCause::Requested {
                         mode: sched_model::DrainMode::Graceful,
-                    }
+                    } && x.stopped_since().is_some() == stopped
                 })
             };
             let wakers = sched_model::wakers(&config, &r.snapshot, &before, &nfs);
-            if graceful(&before) && !wakers.is_empty() {
+            if graceful(&before, false) && !wakers.is_empty() {
                 prop_assert!(
-                    !graceful(&r.decision.state),
+                    !graceful(&r.decision.state, false),
                     "frame {}: a graceful shutdown stands with wakers {:?}", i, wakers
                 );
+            }
+            if (graceful(&before, false) || graceful(&before, true)) && !wakers.is_empty() {
                 prop_assert!(
                     !r.decision.steps.contains(&Step::PowerOff { resource: nfs.clone() }),
                     "frame {}: powered off with wakers {:?}", i, wakers
