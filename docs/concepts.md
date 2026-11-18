@@ -32,20 +32,16 @@ a person fixes the host and calls [`resume`](#leases-and-manual-control).
 **Minimum off time** (`min_off`, default 0). After flowmanager confirms a shutdown it started,
 it does not power the host on again by itself for this long. A manual lease overrides it.
 
-**Waker**. A class that would power a host on if it went down now: it has
-`may_change_power: true`, requires the host, and has ready or in-flight work (not failed) or
-is a [switched class](#workloads) reading `on`. A locked-out host has no wakers. Other
-classes wait for the host to be up.
+**Waker**. A class with `may_change_power: true` that requires a host and is busy, or is a
+switched class reading `on`: it would power the host back on. A graceful `off` is refused
+while a host has one. See [Wakers](architecture/power.md#wakers).
 
-**What wakes a host**. Only under managed control, and only when something wants it: a manual
-host or model lease, a scheduled job's `nfs` [hold](#leases-and-manual-control), or a waker.
+**What wakes a host**. Only under managed control: a manual lease, a scheduled job's `nfs`
+hold, or a waker. See [Ownership and adoption](architecture/power.md#ownership-and-adoption).
 
-**Ownership and adoption**. A host flowmanager powers on is flowmanager's, whatever wanted it,
-and goes down by the [idle cause](#shutdown). Under managed control, a host something else
-started is *adopted*: flowmanager takes an adopted manual host
-[lease](#leases-and-manual-control) for the user. This covers a power button, a manual wake, a
-host found running after state loss, and a host that came up after flowmanager's own power-on
-timed out. The adopted lease ends when the host is seen down.
+**Ownership and adoption**. A host flowmanager powers on is its own and goes down when idle. A
+host something else started is *adopted*: flowmanager takes a manual host lease for the user.
+See [Ownership and adoption](architecture/power.md#ownership-and-adoption).
 
 ## Demand and observation
 
@@ -125,6 +121,7 @@ class is off, its dependents' demand is offline.
 **Tick**. One decision cycle: a snapshot, then the planner (pure), the sequencer (pure) and
 publication. The **planner** decides what is wanted: which model next, which hosts to power.
 The **sequencer** turns that into safe steps and the allowed set, and waits for a down host.
+What triggers a tick is in [Tick and events](architecture.md#tick-and-events).
 
 **Allowed set**. What each tick publishes: the allowed models (at most one per exclusive
 resource) and the allowed classes. KEDA (the Kubernetes event-driven autoscaler, for which
@@ -143,16 +140,13 @@ load time. A model with ready work keeps serving. It yields only when it has ser
 `min_dwell` and either longer than `max_dwell` or another queue is starved, and only to a
 better competing candidate; with none it serves on. A model with no work of its own gives way
 only after it has been idle for `idle_grace` and served for `min_dwell`, even if another
-model has ready work.
+model has ready work. This is intended: it prevents the GPU thrashing between models.
 
 **Wind-down and drain**. A wind-down removes a model or host's *consumers* (the classes that
 use it) from the allowed set. It starts for a planner switch or, *forced*, for a [manual model
 lease, lockout](#leases-and-manual-control) or requested shutdown. Intake stops, and in-flight
-work runs for a bounded time, the drain, before it is cut off. The time is `drain_timeout`, or
-`lockout_timeout` (default `drain_timeout`) for a lockout, or none for `off-now`. On an
-exclusive host's model wind-down a class's `kill_timeout` replaces it for that class, except
-under a graceful `off`, which always gets `drain_timeout`. A shared host's drain uses only
-`drain_timeout` and `lockout_timeout`.
+work runs for a bounded time, the drain, before it is cut off. The time depends on the cause
+and host kind: see [Timeouts](architecture/power.md#timeouts).
 
 ## Leases and manual control
 
@@ -165,12 +159,9 @@ person) or `adopted`. Every lease except a lockout is a *hold*: it keeps its hos
   expiry; a person releases it.
 - **Lockout**: see below.
 
-**Lockout**. A person tells flowmanager to keep away from a host (shared or exclusive, with a
-power section) despite pending work, which stays queued. A drain starts at once. The host is
-shut down once (power actions only under managed control). After that nothing wakes, adopts
-or schedules it until the person clears it, and a host that boots again under the lockout is
-left alone. Clearing it while the host is up makes it adopted; while it is off, the host is
-woken only if something wants it. Handlers: `lockout`, `clear_lockout`.
+**Lockout**. A person tells flowmanager to keep away from a host despite pending work: it is
+shut down once, and nothing wakes, adopts or schedules it until the lockout is cleared.
+Handlers: `lockout`, `clear_lockout`. See [Actions](architecture/power.md#actions).
 
 **Manual actions**. On any host with a power section, shared or exclusive: `on`
 (`acquire_host_lease`), `release` (drops the lease, with no shutdown request), `off` and
@@ -181,21 +172,16 @@ host. HTTP: `/v1/resources/{resource}/<action>`; lockouts: `/v1/lockouts/{resour
 ## Shutdown
 
 **Causes**. *Idle*: nothing holds the host and `idle_grace` has passed. *Requested*: `off` or
-`off-now`. *Lockout*.
+`off-now`. *Lockout*. See [State](architecture/power.md#state).
 
-**Graceful and immediate**. A graceful shutdown gives in-flight work the drain. An immediate
-one withdraws the consumers at once. A graceful `off` is refused while the host has wakers, and
-the refusal names them. `off-now` is never refused; with wakers it warns that they will power
-the host back on after `min_off`.
+**Graceful and immediate**. A graceful shutdown gives in-flight work the drain; an immediate
+one withdraws the consumers at once. See [Actions](architecture/power.md#actions).
 
-**Veto**. Before power-off a fresh reading must show that nothing uses the host: no pods
-mounting an NFS host (`mounts`), no pods of the host's models (`pods`). An unknown reading
-counts as in use. `veto_timeout` expiry is a power timeout; the host stays up. Without an
-applicable `mounts` or `pods` reading a host has no veto.
+**Veto**. A fresh reading, before power-off, that nothing uses the host; an unknown reading
+counts as in use. See [Veto](architecture/power.md#veto).
 
-**Stages**: withdrawing (the wind-down), vetoing, power-off (SSH), then confirmed down (the
-host is observed down). Any hold arriving cancels an idle shutdown. A new manual lease cancels
-a requested one, and a waker appearing also cancels a graceful one.
+**Stages**: withdrawing (the wind-down), vetoing, power-off (SSH), then confirmed down. See
+[Lifecycle](architecture/power.md#lifecycle).
 
 ## Scheduled jobs
 
