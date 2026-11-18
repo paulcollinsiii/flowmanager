@@ -25,8 +25,8 @@
 //! - it is locked out, on either kind of host: a locked-out host that boots is left alone,
 //!   and once the lockout is cleared a host that is up is found running like any other.
 //!
-//! A job's hold plays no part: a host found running while a job holds it is adopted at once
-//! (even while a job holds it), and one the job woke itself is ours and never found.
+//! A job's hold plays no part: a host found running is adopted at once, even while a job
+//! holds it, and one the job woke itself is ours and never found.
 //!
 //! An adopted lease ends when a fresh reading shows its host down ([`gone_down`]): the
 //! person (or a power cut) took it down, so the claim is over and the host is no longer ours,

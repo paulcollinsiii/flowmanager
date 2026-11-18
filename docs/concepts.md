@@ -33,8 +33,8 @@ a person fixes the host and calls [`resume`](#leases-and-manual-control).
 it does not power the host on again by itself for this long. A manual lease overrides it.
 
 **Waker**. A class with `may_change_power: true` that requires a host and is busy, or is a
-switched class reading `on`: it would power the host back on. A graceful `off` is refused
-while a host has one. See [Wakers](architecture/power.md#wakers).
+switched class reading `on`: it would power the host back on. See
+[Wakers](architecture/power.md#wakers).
 
 **What wakes a host**. Only under managed control: a manual lease, a scheduled job's `nfs`
 hold, or a waker. See [Ownership and adoption](architecture/power.md#ownership-and-adoption).
@@ -130,10 +130,8 @@ flowmanager is the external scaler) scales a workload through a ScaledObject wit
 while that subject is allowed. Replicas are 0 or 1 because the ScaledObject sets
 `maxReplicaCount: 1`.
 
-**GPU exclusivity**. A deployment requirement that Kubernetes enforces, not flowmanager: every
-GPU workload requests `nvidia.com/gpu: 1`, the node exposes one GPU and is tainted. When the
-old model is idle, a switch withdraws it and allows the new one in the same tick, and the new
-pod stays Pending until the GPU is free. A busy old model is drained first.
+**GPU exclusivity**. Kubernetes, not flowmanager, keeps one model on the GPU: invariant 2 in
+[Safety invariants](architecture.md#safety-invariants). A busy old model is drained first.
 
 **Dwell and idle grace**. `min_dwell` counts from the tick a model was allowed, so it includes
 load time. A model with ready work keeps serving. It yields only when it has served for

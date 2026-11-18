@@ -166,7 +166,7 @@ fn a_host_that_is_up_and_not_ours_is_adopted_even_while_a_job_holds_it() {
     // was up, or one whose stopped shutdown was cleared by `resume`.
     let old = state("{ power: { phase: \"on\", since: 5 }, mode: { phase: idle } }");
     assert_eq!(found(&config, &up, &old), vec![N]);
-    // A job's hold plays no part (even while a job holds it): the host is adopted at once.
+    // A job's hold plays no part: the host is adopted at once.
     let hold =
         "{ id: h, resource: basestar-nfs, granted_at: 1, kind: { type: shared_hold, holder: x } }";
     let held = snapshot(Some(true), None, &[hold]);
