@@ -2,6 +2,8 @@
 
 Start with [README.md](README.md) for the layout. This file covers only what an
 agent would otherwise get wrong, and points into `docs/` rather than restating it.
+Agents that use or operate flowmanager, rather than change it, should read
+[docs/agents.md](docs/agents.md).
 
 ## Three-role orchestration
 

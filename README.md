@@ -7,16 +7,8 @@ scaler. It is written in Rust and keeps its decisions and leases in Restate.
 
 ## Documentation
 
-| Read | For |
-| --- | --- |
-| [docs/overview.md](docs/overview.md) | What it is and how it behaves |
-| [docs/requirements.md](docs/requirements.md) | What your cluster needs |
-| [docs/install.md](docs/install.md) | Build, deploy, check |
-| [docs/configuration/README.md](docs/configuration/README.md) | The config file |
-| [docs/operations.md](docs/operations.md) | Handlers, metrics, alerts, state, blind spots |
-| [docs/home-assistant.md](docs/home-assistant.md) | The toggle and webhook listeners |
-| [docs/architecture.md](docs/architecture.md) | Components, invariants, design |
-| [CHANGELOG.md](CHANGELOG.md) | Upgrade and rollback notes |
+Start at [docs/README.md](docs/README.md), the index of all pages by reader. Common entry
+points: [overview](docs/overview.md) and [install](docs/install.md).
 
 ## Development
 
