@@ -36,13 +36,13 @@ Every flag has an environment variable. Durations take plain milliseconds or `ms
 | `--listen` | `SCHED_LISTEN` | `0.0.0.0:9080` | Restate endpoint (HTTP/2, no TLS) |
 | `--metrics-listen` | `SCHED_METRICS_LISTEN` | `0.0.0.0:9090` | `/metrics` and `/healthz` |
 | `--keda-listen` | `SCHED_KEDA_LISTEN` | `0.0.0.0:9095` | KEDA scaler (plaintext gRPC) |
-| `--restate-ingress` | `SCHED_RESTATE_INGRESS` | `http://localhost:8080` | Always in a cluster: the process calls the ingress to request ticks and arm the backstop |
+| `--restate-ingress` | `SCHED_RESTATE_INGRESS` | `http://localhost:8080` | Always in a cluster: the `localhost` default only suits a process beside the ingress. The process calls it to request ticks and arm the backstop |
 | `--toggle-listen` | `SCHED_TOGGLE_LISTEN` | off | Home Assistant toggles; requires `--toggle-token-file`. Suggested `0.0.0.0:9096` |
 | `--toggle-token-file` | `SCHED_TOGGLE_TOKEN_FILE` | none | With `--toggle-listen`, and only with it |
-| `--webhook-listen` | `SCHED_WEBHOOK_LISTEN` | off | Webhooks; requires `--webhook-auth`. Suggested `0.0.0.0:9097` |
-| `--webhook-auth` | `SCHED_WEBHOOK_AUTH` | none, no default | With `--webhook-listen`: `mesh` (this process authenticates no one) or `token` |
-| `--webhook-token-file` | `SCHED_WEBHOOK_TOKEN_FILE` | none | With `--webhook-auth token`; refused with `mesh` |
-| `--webhook-min-interval` | `SCHED_WEBHOOK_MIN_INTERVAL` | `10s` | Least time between polls of a nudged source; above zero |
+| `--webhook-listen` | `SCHED_WEBHOOK_LISTEN` | off | Webhooks (*untested*); requires `--webhook-auth`. Suggested `0.0.0.0:9097` |
+| `--webhook-auth` | `SCHED_WEBHOOK_AUTH` | none, no default | With `--webhook-listen` (*untested*): `mesh` (this process authenticates no one) or `token` |
+| `--webhook-token-file` | `SCHED_WEBHOOK_TOKEN_FILE` | none | With `--webhook-auth token` (*untested*); refused with `mesh` |
+| `--webhook-min-interval` | `SCHED_WEBHOOK_MIN_INTERVAL` | `10s` | Least time between polls of a webhook-nudged source (*untested*); above zero |
 | `--backstop` | `SCHED_BACKSTOP` | `30s` | Periodic tick that covers a missed event; above zero |
 | `--reload-interval` | `SCHED_RELOAD_INTERVAL` | `5s` | How often the config file is checked; above zero |
 | `--trigger-debounce` | `SCHED_TRIGGER_DEBOUNCE` | `250ms` | Merges bursts of changes into one tick |
@@ -67,8 +67,8 @@ rotated Secret needs no restart.
 | Router CA, a PEM bundle: the only CA trusted for the router, whose URL must be https (verification is never off) | `--opnsense-ca-file` | The router's certificate is from a private CA |
 | SSH shutdown private key, unencrypted | `--ssh-key-file` | A managed host has `shutdown` |
 | Toggle bearer token, one line | `--toggle-token-file` | `--toggle-listen` is set |
-| Webhook bearer token, one line | `--webhook-token-file` | `--webhook-auth token` |
-| A source's API token | `auth: { header, prefix, file: PATH }` or `env: NAME` in an `http_json` or `prometheus` source or a recovery action | The service needs a token. A `file` is re-read on every poll; an `env` variable is fixed when the pod starts, so rotating it needs a restart |
+| Webhook bearer token, one line (*untested*) | `--webhook-token-file` | `--webhook-auth token` |
+| A source's API token | `auth: { header, prefix, file: PATH }` in an `http_json` source; `env: NAME`, a `prometheus` source and a recovery action's `auth` are *untested* | The service needs a token. A `file` is re-read on every poll; an `env` variable is fixed when the pod starts, so rotating it needs a restart |
 
 A missing source token is not a start error: the source reports an error at each poll and its
 demand reads as unknown. Keep a Secret volume's default file mode: the pod runs as 65532 and
@@ -76,10 +76,9 @@ sets no `fsGroup`, so `0400` would leave the files readable by root alone.
 
 ## 5. Workload
 
-One replica with the `Recreate` strategy, not a rolling update: two pods would each hold their
-own allowed set (see [requirements](requirements.md#cluster)). Restate holds the state, so the
-pod needs no volume. The gap while the pod is replaced is safe
-([KEDA scaler](concepts.md#decisions-and-durability)).
+One replica with the `Recreate` strategy, not a rolling update
+([why](requirements.md#cluster)). Restate holds the state, so the pod needs no volume. The gap
+while the pod is replaced is safe ([KEDA scaler](concepts.md#decisions-and-durability)).
 
 | Object | Notes |
 | --- | --- |
@@ -110,6 +109,7 @@ spec:                                   # Deployment
             - { name: SCHED_OPNSENSE_CREDENTIALS_FILE,  value: /run/flowmanager/opnsense/credentials }
             - { name: SCHED_OPNSENSE_CA_FILE,           value: /run/flowmanager/router-ca/ca.crt }
             - { name: SCHED_SSH_KEY_FILE,               value: /run/flowmanager/ssh-key/id_ed25519 }
+            - { name: NO_COLOR,                         value: "1" }   # else the log carries ANSI colour codes
             - { name: SCHED_TOGGLE_LISTEN,              value: "0.0.0.0:9096" }
             - { name: SCHED_TOGGLE_TOKEN_FILE,          value: /run/flowmanager/toggle/token }
           ports: [{ name: http2, containerPort: 9080 }, { name: http-metrics, containerPort: 9090 }, { name: grpc-keda, containerPort: 9095 }, { name: http-toggle, containerPort: 9096 }]
@@ -155,7 +155,7 @@ flowmanager never deletes or patches anything. Only the pods source watches; mou
 Register the deployment with the Restate admin API; `restate deployments register` needs the
 admin address (the CLI default is `http://localhost:9070`, so port-forward the server's admin
 port or point the CLI at it). The URL given must be reachable from the Restate server, which
-makes a discovery request to it. Tested with Restate server 1.8.1.
+makes a discovery request to it.
 
 ```sh
 restate deployments register http://flowmanager.flowmanager.svc.cluster.local:9080
@@ -166,10 +166,10 @@ class id) and `Power` (key: a resource id). Registering an unchanged URL does no
 that adds or changes a handler needs `--force` (or a new URL). Until the deployment is
 registered no tick runs.
 
-`--restate-ingress` is the ingress the process calls (`POST /Scheduler/main/tick/send` and
-`.../arm_backstop/send`); the `localhost` default is wrong in a cluster. The same ingress
-reaches the handlers for leases, drains and state. `Scheduler/main/observe`,
-`Recovery/<class>/run` and `Power/<resource>/run` are ingress-private.
+The process itself calls the ingress (`--restate-ingress`) at `POST /Scheduler/main/tick/send`
+and `.../arm_backstop/send`. The same ingress reaches the handlers for leases, drains and
+state; `Scheduler/main/observe`, `Recovery/<class>/run` and `Power/<resource>/run` are
+ingress-private.
 
 ## 8. KEDA
 
@@ -201,7 +201,7 @@ spec:
 | `minReplicaCount: 0`, `maxReplicaCount: 1` | The scaler answers 1 while allowed and 0 otherwise |
 | Short `pollingInterval` and `cooldownPeriod` | Hysteresis is flowmanager's (`min_dwell`, `idle_grace`); a long cooldown only postpones a withdrawal it is waiting for |
 | The scaler is the only trigger | KEDA activates on any trigger, so a cpu or cron trigger could start a model that is not allowed |
-| No `fallback` | Without one KEDA keeps the replica count when the scaler errors, so a flowmanager restart scales nothing; a `fallback` would set a count the scheduler never decided |
+| No `fallback` | Without one KEDA keeps the count while the scaler is unavailable ([KEDA scaler](concepts.md#decisions-and-durability)); a `fallback` would set a count the scheduler never decided |
 | No `autoscaling.keda.sh/paused-replicas` annotation | While set, KEDA holds the count whatever the scaler says |
 
 `scalerAddress` is required by KEDA; it, `enableTLS` and `unsafeSsl` are otherwise ignored: the
@@ -216,9 +216,9 @@ at once, inactive until a tick allows it.
 
 ## 9. Istio and network policy
 
-Optional, but the Restate endpoint and the scaler authenticate no caller, so restrict them
-([requirements](requirements.md#cluster)). The policy below is for a namespace under STRICT
-mTLS (`PeerAuthentication` mode `STRICT`). Ports are those of the table in
+Strongly recommended, for the reason and the alternatives in
+[requirements](requirements.md#cluster). The policy below is for a namespace under STRICT mTLS
+(`PeerAuthentication` mode `STRICT`). Ports are those of the table in
 [section 5](#5-workload).
 
 | Port | Who may call | Auth | Mesh and network |
@@ -246,10 +246,15 @@ spec:
 
 A workload-selector `PeerAuthentication` with `mtls: { mode: STRICT }` and
 `portLevelMtls: { "9096": { mode: PERMISSIVE } }` admits a client with no sidecar; Istio
-applies one such object per workload, so put every port exemption in it. A `NetworkPolicy`
-with `policyTypes: [Ingress]` mirrors the table: Restate's pods to 9080, the operator's pods to
-9095, and an `ipBlock` per Home Assistant node address to 9096 (a hostNetwork client's packets
-carry its node address).
+applies one such object per workload, so put every port exemption in it.
+
+A `NetworkPolicy` with `policyTypes: [Ingress]` mirrors the table: Restate's pods to 9080, the
+operator's pods to 9095, and an `ipBlock` per Home Assistant node address to 9096 (a
+hostNetwork client's packets carry its node address). It must also admit what the table's
+9090 row leaves to the sidecar, or it blocks both: your Prometheus agent's pods to 15020 (the
+merged metrics endpoint), and kubelet probe traffic from the node network. Some CNIs pass a
+node's own traffic to its pods whatever the policy (the tested cluster's does); on others add
+an `ipBlock` for the node addresses.
 
 Outbound from the pod:
 
