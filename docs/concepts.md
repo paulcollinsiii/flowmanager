@@ -18,8 +18,8 @@ node. **Shared resource** (`kind: shared`). Any number of holders, reference cou
 server, or an always-on node.
 
 **Power control** (`power.control`). Who changes a host's power.
-- `manual` (default): a person does. flowmanager never emits a power step for the host. Its
-  power phase follows observed reachability, and work that needs it waits until it is up.
+- `manual` (default): a person does. flowmanager never emits a power step for the host, its
+  state follows observed reachability, and work that needs it waits until it is up.
 - `managed`: flowmanager powers it on and off. It needs both `wake_on_lan` and `shutdown`.
 
 **Power methods**. `power.wake_on_lan`: the OPNsense router API sends the magic packet.
@@ -33,12 +33,12 @@ a person fixes the host and calls [`resume`](#leases-and-manual-control).
 **Minimum off time** (`min_off`, default 0). After flowmanager confirms a shutdown it started,
 it does not power the host on again by itself for this long. A manual lease overrides it.
 
-**What wakes a host**. Only under managed control, and only when something wants it: a manual
-host or model lease, a scheduled job's `nfs` hold, or a *waker*.
-
 **Waker**. A class that would power a host on if it went down now: a class with
 `may_change_power: true` that has queued or in-flight work, or a [switched class](#workloads)
 reading `on`. A class without `may_change_power` waits for the host to be up.
+
+**What wakes a host**. Only under managed control, and only when something wants it: a manual
+host or model lease, a scheduled job's `nfs` hold, or a waker.
 
 **Ownership and adoption**. A host flowmanager powers on is flowmanager's, whatever wanted it,
 and goes down by the [idle cause](#shutdown). Under managed control, a host something else
@@ -70,7 +70,8 @@ reachability, mounts, pods and job runs, `queue_reading_stale_after` for demand 
 starvation priority. They make the model wanted but never hold the serving model.
 
 **Unknown demand**. No usable reading. It is not zero: it holds the model and host as if work
-existed, and it wakes nothing.
+existed, and it wakes nothing. Two cases are not unknown: offline demand, and a source that
+can never report, which counts as no demand.
 
 **Offline demand**. No work, and nothing held. It applies when the demand reading is unknown
 and a required host is freshly seen down (a fresh reading wins), or when the switched class
@@ -79,30 +80,32 @@ the source `reads_from` is off and its graceful wait is over.
 ## Workloads
 
 **Model** (`models[]`). A mode of an exclusive resource, implemented by one or more Kubernetes
-workloads (`workloads`). `load_time` is the estimated load time, used as the cost of
-switching. `namespaces` lists where the workloads run, for the veto.
+workloads (`workloads`). `load_time` is its estimated load time, used only as a tie-break
+between candidates (see Priority). `namespaces` lists where the workloads run, for the veto.
 
 **Workload class** (`classes[]`). A unit of demand with `requires` (resources, and for an
 exclusive one optionally a model), a `priority`, a `preemptibility`, `may_change_power`, and
 optionally `demand`, `switch`, `recovery` and `kill_timeout`. A class is *allowed* when every
 requirement is met. Kinds:
 - **Demand class**: names a model and a demand source. Its queue drives which model is chosen.
-- **Gate class**: requires an exclusive resource with no model, which means only "that host is
-  up". It has no demand and never influences model choice.
+- **Gate class**: requires an exclusive resource with no model, meaning only "that host is
+  up". No demand; it never influences model choice.
 - **Plain class**: no demand, only shared resources. It runs whenever they are up.
 - **Switched class**: hosts only, with a [switch](#workloads) instead of demand.
 
-**Priority** (`priority`). Higher wins when choosing which ready model to load next. It never
-orders the steps of one piece of work: that is *precedence* (OCR before tagging), handled by
-readiness, so a step is not counted as ready until its upstream step is done.
+**Priority** (`priority`). A model's priority is the highest among its classes with ready (or
+failed) work, and the higher tier wins. A *starved* model, whose oldest ready item is older
+than `age_threshold`, outranks every tier. Within a tier the longest-waiting item wins, then
+the lower `load_time`, then the lower id. Priority never orders the steps of one piece of
+work: that is *precedence* (OCR before tagging), handled by readiness, so a step is not
+counted as ready until its upstream step is done.
 
 **Preemptibility** (`preemptibility`). What a class's busy work does to a model switch the
 planner wants.
 - `none`: the planner does not switch away while the class is busy, with no timeout. A
   *forced* wind-down (a lockout, a requested `off` or `off-now`, or a manual model lease)
   skips that wait and goes straight to the [drain](#choosing-and-serving).
-- `pause_intake`: the work is drained.
-- `kill`: the same, for work that is safe to retry.
+- `pause_intake`: the work is drained. `kill`: the same, for work that is safe to retry.
 
 **Recovery** (`recovery: {action, source, params}`). The one action is `requeue_failed`: it
 re-queues failed items through the service's API while the class's model is allowed, in its
@@ -112,17 +115,18 @@ own Restate object (`Recovery`) so it cannot delay a decision. The attempt cap i
 off, usually from Home Assistant (a home-automation server). The reading is `on`, `off` or
 `off_now`; `off` and `off_now` are the [graceful and immediate](#shutdown) forms. A missing or
 unknown reading, or one the source cannot map, is `off_now`, so the class fails closed. The
-class is allowed while its hosts are up and the reading is `on`, or while a graceful `off`
-waits, for at most `drain_timeout`, for its *dependents* to finish in-flight work or report
-unknown demand. A dependent is a class whose demand source has
-[`reads_from`](#demand-and-observation) the switched class. Once the class is off, its
-dependents' demand is offline.
+class is allowed while its hosts are up and the reading is `on`, or during a graceful wait.
+The wait opens when `off` is first read, only if every required host is up, and lasts while
+a *dependent* has in-flight or unknown demand, at most `drain_timeout`. A dependent is a class
+whose demand source has [`reads_from`](#demand-and-observation) the switched class. Once the
+class is off, its dependents' demand is offline.
 
 ## Choosing and serving
 
 **Tick**. One decision cycle: a snapshot, then the planner (pure), the sequencer (pure) and
 publication. The **planner** decides what is wanted: which model next, which hosts to power.
-The **sequencer** turns that into ordered, safe steps and the allowed set.
+The **sequencer** turns that into ordered, safe steps and the allowed set. If the planner
+wants a model on a host that is down, the sequencer waits for the host.
 
 **Allowed set**. What each tick publishes: the allowed models (at most one per exclusive
 resource) and the allowed classes. KEDA (the Kubernetes event-driven autoscaler, for which
@@ -131,33 +135,33 @@ flowmanager is the external scaler) scales a workload through a ScaledObject wit
 while that subject is allowed. Replicas are 0 or 1 because the ScaledObject sets
 `maxReplicaCount: 1`.
 
-**GPU exclusivity**. Enforced by Kubernetes (`nvidia.com/gpu: 1`, one GPU exposed, a tainted
-node), not by flowmanager. On a switch the old model leaves and the new one enters the allowed
-set in the same tick; the new pod stays Pending until the GPU is free.
+**GPU exclusivity**. A deployment requirement that Kubernetes enforces, not flowmanager: every
+GPU workload requests `nvidia.com/gpu: 1`, the node exposes one GPU and is tainted. When the
+old model is idle, a switch withdraws it and allows the new one in the same tick, and the new
+pod stays Pending until the GPU is free. A busy old model is drained first.
 
 **Dwell and idle grace**. `min_dwell` counts from the tick a model was allowed, so it includes
 load time. A model with ready work keeps serving. It yields only when it has served for
-`min_dwell` and either longer than `max_dwell` or another queue is *starved* (its oldest ready
-item is older than `age_threshold`), and only to a better competing candidate; with none it
-serves on. A model with no work of its own gives way only after it has been idle for
-`idle_grace` and served for `min_dwell`, even if another model has ready work. `idle_grace` also
-applies to a host: how long it sits idle before release.
+`min_dwell` and either longer than `max_dwell` or another queue is starved, and only to a
+better competing candidate; with none it serves on. A model with no work of its own gives way
+only after it has been idle for `idle_grace` and served for `min_dwell`, even if another
+model has ready work.
 
-**Drain**. When a wind-down of a model or host starts (a planner switch, a manual model
-lease, a lockout, a requested shutdown) intake stops, and in-flight work runs for a bounded
-time before it is cut off and the model withdrawn. The time is `drain_timeout`, or
-`lockout_timeout` (default `drain_timeout`) for a lockout, or none for `off-now`. On an
-exclusive host's model wind-down a class's `kill_timeout` replaces it for that class, except
-under a graceful `off`, which always gets `drain_timeout`. A shared host's drain uses only
-`drain_timeout` and `lockout_timeout`.
+**Wind-down and drain**. A wind-down removes a model or host's *consumers* (the classes that
+use it) from the allowed set. It starts for a planner switch, a manual model lease, a lockout
+or a requested shutdown. Intake stops, and in-flight work runs for a bounded time, the drain,
+before it is cut off. The time is `drain_timeout`, or `lockout_timeout` (default
+`drain_timeout`) for a lockout, or none for `off-now`. On an exclusive host's model wind-down a
+class's `kill_timeout` replaces it for that class, except under a graceful `off`, which always
+gets `drain_timeout`. A shared host's drain uses only `drain_timeout` and `lockout_timeout`.
 
 ## Leases and manual control
 
 **Lease**. A durable claim recorded in Restate state, with an origin of `requested` (by a
-person) or `adopted`. Kinds:
+person) or `adopted`. Every lease except a lockout is a *hold*: it keeps its host up. Kinds:
 - **Shared hold**: a running consumer, such as a scheduled job, holds a shared resource.
-- **Manual host lease**: a person's `on`. It keeps the host up. Releasing it does not shut the
-  host down; the host then goes down as any other (the idle cause).
+- **Manual host lease**: a person's `on`. Releasing it does not shut the host down; the host
+  then goes down as any other (the idle cause).
 - **Manual model lease**: pins a model and cuts batch work short with a drain. It has no
   expiry; a person releases it.
 - **Lockout**: see below.
@@ -185,29 +189,25 @@ one withdraws the consumers at once. A graceful `off` is refused while the host 
 the refusal names them. `off-now` is never refused; with wakers it warns that they will power
 the host back on after `min_off`.
 
-**Stages**.
-1. **Withdrawing**: consumers leave the allowed set. On an exclusive host this is the model
-   wind-down.
-2. **Vetoing**: a fresh reading must show that nothing uses the host: no pods mounting an NFS
-   host (`mounts`), no pods of the host's models (`pods`). An unknown reading counts as in
-   use. Expiry of `veto_timeout` is a power timeout and the host stays up.
-3. **Power-off**: the SSH forced command runs.
-4. **Confirmed down**: the host is observed down.
+**Veto**. Before power-off a fresh reading must show that nothing uses the host: no pods
+mounting an NFS host (`mounts`), no pods of the host's models (`pods`). An unknown reading
+counts as in use. Expiry of `veto_timeout` is a power timeout and the host stays up.
 
-**Cancelling**. Any hold arriving cancels an idle shutdown. A new manual lease cancels a
-requested one, and a waker appearing also cancels a graceful one.
+**Stages**: withdrawing (the wind-down), vetoing, power-off (SSH), then confirmed down (the
+host is observed down). Any hold arriving cancels an idle shutdown. A new manual lease cancels
+a requested one, and a waker appearing also cancels a graceful one.
 
 ## Scheduled jobs
 
 **Scheduled job** (`jobs[]`). A cron schedule (five fields, `timezone` default UTC) that
 creates a Kubernetes Job from the `jobTemplate` of a referenced CronJob (`cronjob`).
 - `needs`: a list of `{ type: nfs, resource: <id> }`; `nfs` is the only need type. It is a
-  shared hold that keeps the host up while the run waits and runs, and wakes it first if it is
-  managed and off.
+  shared hold while the run waits and runs, and wakes the host first if it is managed and off.
 - `retries`, with a `retry_backoff` that doubles after each retry.
-- `missed_run`: `skip` (default) drops a run that could not start in time. `catch_up` runs it
-  late, at most once, and only before the next scheduled time.
-- `start_window`: how long after its time a run may still start.
+- `missed_run`: `skip` (default) or `catch_up`.
+- `start_window`: how long after its time a run may still start. Past it, `skip` drops the
+  run; `catch_up` alerts and keeps waiting, running it late at most once and only before the
+  next scheduled time.
 - `deadline`: a longer run is alerted and counted as failed. The Job is not deleted.
 
 ## Decisions and durability
