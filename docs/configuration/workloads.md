@@ -45,13 +45,12 @@ The kind follows from the keys; there is no `kind` field.
 
 | Kind | `requires` | `demand` | `switch` |
 | --- | --- | --- | --- |
-| Demand | Each exclusive entry names a `model` | Required for the kind | Forbidden |
+| Demand | Each exclusive entry names a `model` | Set | Forbidden |
 | Gate | At least one exclusive entry with no `model` (only that the host is up) | Forbidden | Not set |
 | Plain | Shared resources | Not set | Not set |
 | Switched | Hosts only: no `model` on any entry | Forbidden | Required |
 
-A class with `switch` is switched whatever it requires. `recovery` needs
-`preemptibility: kill`.
+A class with `switch` is switched whatever it requires. A class that names a model but sets no `demand` loads and never has work. `recovery` needs `preemptibility: kill`. What each kind does: [concepts](../concepts.md#workloads).
 
 ```yaml
 classes:
@@ -95,14 +94,9 @@ Each entry is `{ resource, model }`.
 
 ### `preemptibility`
 
-What the class's busy work does when the planner wants another model
-([concepts](../concepts.md#workloads)).
-
-| Value | Effect | Note |
-| --- | --- | --- |
-| `none` | The planner does not switch away while the class is busy, with no timeout | The only unbounded wait |
-| `pause_intake` | Intake stops and in-flight work runs to its timeout, then the model is withdrawn | Nothing re-queues the work unless the class has a `recovery` |
-| `kill` | As `pause_intake`; the scheduler treats the two alike | For work that is safe to retry. Required for `recovery` |
+One of `none`, `pause_intake` or `kill`; what they do is in [concepts](../concepts.md#workloads).
+`kill` is required for a class with a `recovery`; the scheduler treats `pause_intake` and `kill`
+alike.
 
 ### `switch` and `demand`
 
@@ -125,7 +119,7 @@ recovery:
 | --- | --- | --- |
 | `action` | yes | `requeue_failed`, the only action |
 | `source` | no | An existing source, usually the class's demand source |
-| `params` | yes | Below. Unknown keys are refused |
+| `params` | yes | Below |
 
 The class must have `preemptibility: kill`.
 

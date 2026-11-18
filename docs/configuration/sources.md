@@ -14,25 +14,23 @@ deployment has exercised.
 | `resync` | required | How often the source is polled. Above `0`; see [staleness](#staleness) |
 | `observe` | `[]` | The capabilities the source reports; only those are accepted from it. Each must be one its kind can supply |
 | `reads_from` | none | The id of a switched class whose app this source polls ([concepts](../concepts.md#workloads)). Only on a source that observes `demand`; the class must have a `switch` |
-| `params` | none | The kind's own keys, below. Unknown keys are refused. A source with no `params` is accepted but never polled |
+| `params` | none | The kind's own keys, below. A source with no `params` is accepted but never polled |
 
 ## Kinds and capabilities
 
-| Kind | Can supply | Observer |
-| --- | --- | --- |
-| `kubernetes_watch` | `pods`, `reachability`, `mounts`, `jobs` | yes |
-| `http_json` | `reachability`, `demand`, `switch` | yes |
-| `prometheus` | `reachability`, `demand` (see below) | yes, *untested* |
-| `tcp_probe` | `reachability` | yes |
-| `sql`, `session` | `demand` | no |
-| `webhook` | nothing | no |
+| Kind | Supplies |
+| --- | --- |
+| `kubernetes_watch` | `pods`, `reachability`, `mounts`, `jobs` |
+| `http_json` | `demand`, `switch` |
+| `prometheus` | `reachability` (*untested*) |
+| `tcp_probe` | `reachability` |
 
-`sql`, `session` and `webhook` parse but have no observer in this build. A demand source of
-such a kind, or with no `params`, never reports, and its class counts as no demand, not
-unknown demand ([concepts](../concepts.md#demand-and-observation);
-`crates/sched-model/src/work.rs`, `crates/sched-observe/src/supervisor.rs`). A `prometheus`
-source with `params` must observe `reachability` and nothing else, so it cannot supply
-`demand` in practice.
+Validation also accepts `reachability` on `http_json` and `demand` on `prometheus`, but
+neither produces a reading (`crates/sched-observe/src/http_json.rs`, `prometheus.rs`), so do
+not use them. The kinds `sql`, `session` and `webhook` parse but have no observer in this
+build. A demand source of such a kind, or with no `params`, never reports, and its class counts
+as no demand, not unknown demand ([concepts](../concepts.md#demand-and-observation);
+`crates/sched-model/src/work.rs`, `crates/sched-observe/src/supervisor.rs`).
 
 A source that observes `jobs` or `switch` must observe nothing else, and at most one source
 may observe `jobs`.
@@ -95,7 +93,7 @@ addresses are tried at once: up if any connects, down only if every one answered
 
 | Key | Default | Meaning and limits |
 | --- | --- | --- |
-| `host` | required | A bare host name or IP address (IPv6 without brackets); no scheme, path or space |
+| `host` | required | A host name or IP address (IPv6 without brackets). No scheme, path, space, control character, `@`, `[` or `]`; a `:` only if the whole value is an IPv6 address |
 | `port` | required | 1 to 65535 |
 | `resource` | required | The resource whose reachability this is. Must exist |
 | `timeout` | `2s` | Name lookup and connect together. `100ms` to `60s`, and at most `resync` |
@@ -165,7 +163,7 @@ A demand request sets exactly one of `count` and `length`. Counts of requests wi
 | `where` | none | With `length`: [filter](#filters-and-counts) the elements |
 | `max_items` | none | With `length`: the most elements one answer holds (the page size in the URL). Above `0`. A full answer may be truncated, so the poll fails rather than under-count; a `failed` request instead counts the matching items on the page |
 | `also` | `[]` | More numbers from the same answer: `{ count, map, counts_as }`. A pointer and `counts_as` already counted is refused |
-| `when` | none | `{ field, equals }`: count the answer only if the field has the value. Otherwise the request, and its `also`, contribute zero. A missing field or another JSON type fails the poll |
+| `when` | none | `{ field, equals }`: count the answer only if the field has the value (a paused queue, for example). Otherwise the request, and its `also`, contribute zero. A missing field or another JSON type fails the poll |
 | `since` | none | [A time window](#since) |
 | `map` | none | With `count`, or on an `also` entry: turns text or a boolean at the pointer into a number. Values must be non-negative integers |
 
@@ -217,17 +215,6 @@ filtered and bounded list:
           max_items: 100
           since: { param: updated_since, ago: 15m }
           counts_as: failed
-```
-
-A `when` clause skips a paused queue:
-
-```yaml
-        - url: http://immich-server.media.svc:2283/api/queues/ocr
-          when: { field: /isPaused, equals: false }
-          count: /statistics/waiting
-          also:
-            - { count: /statistics/delayed, counts_as: ready }
-            - { count: /statistics/active, counts_as: in_flight }
 ```
 
 ### `since`

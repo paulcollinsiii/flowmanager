@@ -53,8 +53,8 @@ says otherwise.
 | `max_dwell` | required | The longest a model serves while other queues wait. See [dwell](../concepts.md#choosing-and-serving) |
 | `idle_grace` | required | How long a model or host with nothing to do waits before it is released. May be `0`. See [dwell and idle grace](../concepts.md#choosing-and-serving) |
 | `age_threshold` | required | The age of another queue's oldest ready item at which it counts as starved. See [priority](../concepts.md#workloads) |
-| `queue_reading_stale_after` | required | The oldest a demand or switch reading may be and still count. At least `host_reading_stale_after`; each source's `resync` must not exceed it. See [staleness](../concepts.md#demand-and-observation) |
-| `host_reading_stale_after` | required | The oldest a reachability, mounts, pods or job reading may be. At most `queue_reading_stale_after`; the `resync` of a source that supplies one of these must not exceed it, and a managed host's [power timeouts](power.md#the-power-section) must be above it. See [staleness](../concepts.md#demand-and-observation) |
+| `queue_reading_stale_after` | required | The oldest a demand or switch reading may be and still count. At least `host_reading_stale_after`. See [staleness](../concepts.md#demand-and-observation) |
+| `host_reading_stale_after` | required | The oldest a reachability, mounts, pods or job reading may be. At most `queue_reading_stale_after`. Limits on [`resync`](sources.md#staleness) and on [power timeouts](power.md#the-power-section) refer to it. See [staleness](../concepts.md#demand-and-observation) |
 | `interactive_ttl` | required | Required by the schema and unused: nothing issues an interactive lease. At most `1d` |
 | `drain_timeout` | required | How long in-flight work runs once a wind-down starts. At most `1d`. See [Timeouts](../architecture/power.md#timeouts) |
 | `lockout_timeout` | `drain_timeout` | As `drain_timeout`, after a lockout. At most `1d`. See [Timeouts](../architecture/power.md#timeouts) |

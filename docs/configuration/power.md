@@ -20,7 +20,7 @@ resources:
 
 ## The `power` section
 
-Every key is optional except where `control: managed` requires it. Unknown keys are refused.
+Every key is optional except where `control: managed` requires it.
 
 | Key | Default | Meaning and limits |
 | --- | --- | --- |
@@ -83,47 +83,36 @@ compare case-insensitively).
 
 ## Host-side setup
 
-`managed` control needs two things set up outside flowmanager, and two files mounted into the
-pod ([install.md](../install.md#4-secrets)). Both fail without any other effect: the power
-step fails, is counted and alerted, and is not retried.
+`managed` control needs a router and a host prepared as listed in
+[requirements](../requirements.md#host-power), and the files and flags of
+[install.md](../install.md#4-secrets) (`--opnsense-credentials-file` with its `key:secret` line,
+`--opnsense-ca-file`, `--ssh-key-file`). What that leaves:
 
-### Power-on: the router
+### Power-on
 
-flowmanager sends one authenticated `POST <router_url>/api/wol/wol/set` with the interface and
-MAC to the OPNsense `os-wol` plugin (`crates/sched-actuate/src/wol.rs`). The pod itself cannot
-broadcast on your LAN.
+flowmanager sends one authenticated `POST <router_url>/api/wol/wol/set` carrying the interface
+and MAC (`crates/sched-actuate/src/wol.rs`). A non-2xx answer fails the request, and so does a
+2xx body with a `status` string that is not `ok`, compared case-insensitively. Redirects are
+not followed.
 
-1. Install the `os-wol` plugin on the router.
-2. Create an OPNsense user whose only privilege is the Wake on LAN page, and an API key for it.
-3. Store the key and secret as one line, `key:secret`, in the file given by
-   `--opnsense-credentials-file`. If the router's certificate is from a private CA, give the
-   CA bundle with `--opnsense-ca-file`; it is then the only CA trusted.
-4. Enable Wake-on-LAN in the host's firmware and NIC.
-
-Redirects are not followed and certificate verification is never off. An HTTP error other than
-2xx, or a body whose `status` is not `ok`, fails the request.
-
-### Power-off: a forced-command SSH user
+### Power-off
 
 flowmanager connects with the key from `--ssh-key-file`, checks the host's key against
-`host_key`, authenticates as `user`, and sends an exec request for `poweroff`
-(`crates/sched-actuate/src/ssh.rs`). The host side must make that request harmless to anything
-but shutting down:
+`host_key`, authenticates as `user` and sends an exec request for `poweroff`
+(`crates/sched-actuate/src/ssh.rs`). On the host:
 
-1. Create a user on the host, or reuse one, that is allowed to power the host off.
-2. Generate an unencrypted key pair. Put the private key in the Secret that
-   `--ssh-key-file` reads.
-3. Add the public key to the user's `authorized_keys` with a forced command and restrictions,
+1. Add the public key to the user's `authorized_keys` with a forced command and restrictions,
    so the key can do nothing else, whatever command is sent:
 
    ```
    command="/sbin/poweroff",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... flowmanager
    ```
 
-   The command string is whatever powers your host off, run with the rights that user has
-   (a `sudo` rule, for example); flowmanager ignores it.
-4. Read the host's fingerprint with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` and put
-   it in `host_key`. A reinstalled host has a new key and needs the config updated.
+   The command string is whatever powers your host off with the rights that user has (a
+   `sudo` rule, for example); flowmanager ignores what it sends.
+2. Read the fingerprint for `host_key`:
+   `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. A reinstalled host has a new key and
+   needs the config updated.
 
 Once the exec is accepted the host is going down: a dropped link or a missing exit status is
 success, a non-zero exit status is a failure. Connecting, authenticating and the exec must

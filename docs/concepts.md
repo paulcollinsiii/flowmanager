@@ -18,18 +18,18 @@ node. **Shared resource** (`kind: shared`). Any number of holders, reference cou
 server, or an always-on node.
 
 **Power control** (`power.control`). Who changes a host's power.
-- `manual` (default): a person does. flowmanager never emits a power step for the host, its
+- `manual`: a person does. flowmanager never emits a power step for the host, its
   state follows observed reachability, and work that needs it waits until it is up.
 - `managed`: flowmanager powers it on with `power.wake_on_lan` (the OPNsense router API sends
   the magic packet) and off with `power.shutdown` (SSH, forced-command key, pinned host key).
   Both are required.
 
-**Power timeouts** (`power_on_timeout` 10m, `shutdown_timeout` 15m, `veto_timeout` 30m). How
+**Power timeouts** (`power_on_timeout`, `shutdown_timeout`, `veto_timeout`). How
 long a managed host may take to be observed up, to be observed down, or to pass the
 [veto](#shutdown). When one expires flowmanager raises an alert and stops. It never retries;
 a person fixes the host and calls [`resume`](#leases-and-manual-control).
 
-**Minimum off time** (`min_off`, default 0). After flowmanager confirms a shutdown it started,
+**Minimum off time** (`min_off`). After flowmanager confirms a shutdown it started,
 it does not power the host on again by itself for this long. A manual lease overrides it.
 
 **Waker**. A class with `may_change_power: true` that requires a host and is busy, or is a
@@ -51,8 +51,8 @@ declares (only those are accepted from it). Kinds with an observer: `kubernetes_
 a [switched class](#workloads) whose app the source polls.
 
 **Capabilities** (`observe`).
-- `demand`: queue sizes of classes (`http_json`, `prometheus`).
-- `reachability`: whether a host is up (all four kinds).
+- `demand`: queue sizes of classes (`http_json`).
+- `reachability`: whether a host is up (`kubernetes_watch`, `tcp_probe`, `prometheus`).
 - `pods`: pod counts of models (`kubernetes_watch`), read only by recovery and the veto.
 - `mounts`: how many pods mount an NFS host (`kubernetes_watch`).
 - `jobs`: the state of Jobs flowmanager created (`kubernetes_watch`).
