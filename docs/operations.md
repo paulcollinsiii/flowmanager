@@ -22,7 +22,7 @@ call() { curl -sS -X POST "$INGRESS/$1" -H 'content-type: application/json' ${2:
 
 | Handler | Input | What it does and answers |
 | --- | --- | --- |
-| `Scheduler/main/last_decision` | none | The latest tick report this process published: inputs and their ages, `reason`, `kinds`, steps, `not_executed`, allowed set, leases, `hosts` (one status each) and `events`. `null` until the first tick after a restart. Start here for "why is nothing running" |
+| `Scheduler/main/last_decision` | none | The latest tick report this process published: inputs and their ages, `reason`, `kinds`, steps, `not_executed`, allowed set, `leases`, `ignored_leases`, `hosts` (one status each) and `events`. `null` until the first tick after a restart. Start here for "why is nothing running" |
 | `Scheduler/main/leases` | none | Every lease, as an array: `id`, `resource`, `kind` (`type`: `manual_model`, `manual_host`, `lockout`, `shared_hold`), `granted_at` (ms), `origin`. Ids are `manual-model-N`, `manual-host-N`, `lockout-N`, `hold-job-<job>-<resource>` |
 | `Scheduler/main/acquire_model_lease` | `{"model": id}` | Pin a model on its resource until released; batch work is cut short. `{"lease": ..., "created": bool}`. `400` unknown model or a model of a shared resource; `409` another model of the resource is pinned |
 | `Scheduler/main/release_lease` | `{"id": lease id}` | Release any lease by id and return it. `404` unknown id. A job's hold is derived from its run and returns on the next tick |
@@ -42,7 +42,9 @@ call() { curl -sS -X POST "$INGRESS/$1" -H 'content-type: application/json' ${2:
 | `Power/{resource}/last_action` | none | The last power action: `action`, `at`, `outcome` (`requested` or `failed`), `error`. `null` if none |
 
 Any handler that reads a document it cannot decode answers `503` and counts it in
-`sched_persisted_state_errors_total`. Examples:
+`sched_persisted_state_errors_total`. A lease whose model or resource has left the config is
+kept in the book but ignored: it is listed in `ignored_leases` and logged at each tick.
+Examples:
 
 ```sh
 call Scheduler/main/acquire_model_lease '{"model": "llm"}'     # pin the LLM
@@ -136,15 +138,21 @@ what a healthy start looks like. Key lines:
 
 | Line | Level | Key fields |
 | --- | --- | --- |
-| `tick` | info | `generation`, `decision`, `reason`, `allowed_models`, `allowed_classes`, `leases`, `forced`, `unknown_demand`, `offline_demand`, `unsupported_demand`, `unpolled_demand`, `drains` (`resource:cause:mode:scaled_down`), `inputs`, `replayed` |
-| `tick failed; the previous state and allowed set stay` | error | as `tick`; nothing was published |
+| `tick` | info | `generation`, `at_ms`, `decision`, `reason`, `allowed_models`, `allowed_classes`, `leases`, `forced`, `unknown_demand`, `offline_demand`, `unsupported_demand`, `unpolled_demand`, `drains` (`resource:cause:mode:scaled_down`), `inputs`, `input_changed`, `replayed` |
+| `tick failed; the previous state and allowed set stay` | error | `generation`, `at_ms`, `decision`, `reason`, `inputs`, `replayed`; nothing was published |
+| `leases ignored: ...` | warn | `leases`: ids kept in the book but ignored because their model or resource left the config |
 | `event=queue` | info | `class`, `ready`, `in_flight`, `failed`, `oldest_ready_age_ms`, `known`, `offline`. One per class per tick, not on a replay |
-| `event=drain` | info | `resource`, `mode`, `cause`, `since_ms`, `scaled_down` |
+| `event=drain` | info | `resource`, `mode`, `cause`, `since_ms`, `scaled_down`, `replayed` |
+| `event=drain_requested` | info | `resource`, `mode`, and `lease_released` (`drain_host`) or `lease` (`release_host_lease` with `drain`) |
 | `event=host_adopted`, `host_adoption_ended` | info | `resource` |
-| `event=power_timeout`, `shutdown_veto_timeout` | error | `resource`, `during` or `blocking`. A replayed tick logs `<event>_replayed` at info, so a log alert fires once |
-| `event=power_requested`, `power_request_failed`, `power_not_wired`, `power_resumed` | | `resource`, action |
+| `event=power_timeout`, `shutdown_veto_timeout` | error | `resource`; `during` (`power_timeout`), `readings` and `blocking` (`shutdown_veto_timeout`). A replayed tick logs `<event>_replayed` at info, so a log alert fires once |
+| `event=power_requested` | info | `resource`, `action` |
+| `event=power_request_failed` | error | `resource`, `action`, `error`; not retried |
+| `event=power_not_wired` | warn | `resource`, `action` |
+| `event=power_resumed` | warn | `resource`, `cleared` |
 | `event=job_started`, `job_succeeded`, ... | info | `job`, `scheduled_at_ms`, `detail`. The alert-grade ones (`job_failed`, `job_missed`, `job_skipped_overlap`, `job_start_late`, `job_create_failed`) are errors, `ALERT: ...`, and `<event>_replayed` at info on a replay |
-| `event=toggle`, `webhook` | info | kind, name, action, outcome, status. Rate-limited, with a count of the lines left out |
+| `event=toggle` | info on 200, else warn | `kind`, `name`, `action`, `outcome`, `status`, `suppressed`. Rate-limited; `suppressed` counts the lines left out; never the token |
+| `event=webhook` | info on 202, else warn | `path`, `outcome`, `status`, `sources`, `nudged`, `suppressed`. Rate-limited as `toggle` |
 | `event=state_version_discarded`, `legacy_adopted_lease_dropped`, `job_book_unreadable` | warn, warn, error | See [state](#reading-and-changing-state) |
 
 ## Reading and changing state
@@ -163,13 +171,14 @@ main`, `restate state get Recovery <class>`. To query the KEDA scaler by hand,
 invocation, which Restate would retry for ever. Instead the tick reports an `error`, logs it,
 counts it in `sched_persisted_state_errors_total{key}` and stores and publishes nothing, so
 KEDA keeps what it had. The exceptions:
-- An *older* `scheduler_state` is not migrated: it is dropped at the tick, with one
-  `state_version_discarded` warning, and the sequencer starts from observation. An older
-  `lease_book` (version 1) is read, with its adopted leases dropped.
+- An *older* `scheduler_state` is not an error ([architecture.md](architecture.md#durable-state)):
+  look for one `state_version_discarded` warning at the first tick. An older `lease_book`
+  (version 1) is read, with a `legacy_adopted_lease_dropped` warning per adopted lease.
 - An unreadable `job_book` switches off only the job step (an error `job_book_unreadable`).
-- With only `scheduler_state` unreadable, the lease handlers keep working, except `drain_host`
-  and a `release_host_lease` with `drain`, which read it too. An unreadable `lease_book` makes
-  every lease handler and `leases` answer `503`.
+- With only `scheduler_state` unreadable, the lease handlers keep working, except `drain_host`,
+  `resume` and a `release_host_lease` with `drain`, which read it too and answer `503` like
+  every handler that reads an unreadable document. An unreadable `lease_book` makes every lease
+  handler and `leases` answer `503`.
 
 The fix is the build that wrote the document, or discarding it.
 
@@ -216,7 +225,8 @@ class runs the action, so a slow service never delays a tick.
 - **The attempt book.** `Recovery/{class}/attempts` shows
   `{"version":1,"data":{"last_run_at":..., "attempts":{"<id>":{"count":N,"last_at":...}}}}`.
   A request counts whether or not it succeeded. Records are kept `retention` after the latest
-  attempt, listed or not.
+  attempt, listed or not. Metrics for a class key that is not in the config use
+  `class="unknown"`.
 - **A stuck item.** One with `max_attempts` used is skipped (`skipped_cap`, once per run) and
   stays failed until it leaves the list's `since` window; re-queue it by hand. An item edited
   more than `retention` after its last attempt gets a fresh set. It stays in the `failed`
@@ -244,10 +254,13 @@ run now (the same path as a scheduled run: it waits for its needs, then the Job 
   deleted, and the job stays blocked, `lingering`, while the Job is active.
 - **A missed run.** Needs that did not come up within `start_window` make a run `missed`, using
   no retry (`job_missed`). A `catch_up` run alerts once (`job_start_late`) and runs late if the
-  needs come up before the next time. Of the times missed while flowmanager was down only the
-  latest can run, and the older ones are dropped in one `missed` event.
+  needs come up before the next time. Times missed during downtime are dropped in one `missed`
+  event ([jobs.md](configuration/jobs.md#missed-runs)).
 - **An overlap.** A run that comes due while the previous is waiting, running, in backoff or
-  `lingering` is skipped, logged and alerted (`job_skipped_overlap`), never queued.
+  `lingering` is skipped, logged and alerted (`job_skipped_overlap`), never queued. A job
+  removed from the config while its Job may be active keeps a `lingering` tombstone, so adding
+  it back does not start a second instance; a reading that shows the Job not active frees it.
+- **Timing.** A scheduled time is noticed up to one backstop interval late (`--backstop`).
 - **Readings.** A Job's state comes from the `jobs` source each `resync`. A stale or failed
   reading never means finished; a Job absent from a reading is deleted only if the reading came
   more than 20 s after the creation call returned. A Job whose `ttlSecondsAfterFinished` expires

@@ -12,16 +12,15 @@ tick ([architecture/power.md](architecture/power.md#who-decides-what)).
 
 ## Toggle listener
 
-Plain HTTP, started by `--toggle-listen`. Every request needs `Authorization: Bearer <token>`
-(the contents of `--toggle-token-file`, re-read on every request); a missing or wrong token is
-`401`. Names in paths are config ids, percent-decoded. A `POST` takes its wish from the path
-(`/on`, `/off`) or from a body of at most 1024 bytes.
+Plain HTTP, started by `--toggle-listen`. Every request needs the bearer token
+([install.md](install.md#4-secrets)). Names in paths are config ids, percent-decoded. A `POST`
+takes its wish from the path (`/on`, `/off`) or from a body of at most 1024 bytes.
 
 ### Routes
 
 | Method and path | What it does |
 | --- | --- |
-| `GET /v1/leases` | Every model, every resource with a `power` section and every lockout, with its state, and `needs_attention` (a host is in a failed power phase or a stopped shutdown) |
+| `GET /v1/leases` | Every model, powered resource and lockout with its state, and `needs_attention` (a failed power phase or stopped shutdown) |
 | `GET /v1/models/{model}` | One model's state |
 | `POST /v1/models/{model}/on`, `/off` | Take or release the manual model lease (`acquire_model_lease`, `release_lease`). `off` with none held is a plain `200` |
 | `GET /v1/resources/{resource}` | One host's state. A host found running reads `on` |
@@ -62,42 +61,35 @@ Errors are `{"error": "..."}`. The wakers refusal adds the classes, and nothing 
 
 ### State
 
-Every switch carries `kind` (`model`, `resource`, `lockout`), `id`, `held` (a lease is held),
-`state` and, when held, `origin` (`requested` or `adopted`), `held_since_ms` and
-`held_for_seconds`. `state` is `on` or `off`; a host also reads `draining` (no lease, a shutdown
-under way) or `locked_out`. The rest is from the last tick and is absent before the first.
+Every switch carries `kind` (`model`, `resource`, `lockout`), `id`, `held`, `state` (`on` or
+`off`; a host also `draining` or `locked_out`) and, when held, `origin`, `held_since_ms` and
+`held_for_seconds`. The rest is from the last tick and is absent before the first.
 
 | Switch | Further fields |
 | --- | --- |
-| Model | `resource`; `status` and `detail`, when they say something: `active`, `waiting_for_host`, `host_failed`, `draining`, `locked_out` or `pending` |
-| Host | `resource_kind`, `lease_supported`, `power` (`{"phase": "on", "since": ..., "ours": false}`, phase as in [State](architecture/power.md#state)), `needs_attention`, `wakers` (always present), `locked_out`; `drain` (`mode`, `cause`, `since_ms`, `scaled_down`) while one is under way; `wait`, a list of why something is held back; `warning` |
-| Lockout | `supported`, `power`, `needs_attention`; `status` and `detail`: `pending`, `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_alone` (up again after the lockout shut it down) or `left_for_person` (`control: manual`); `tick_reason` |
+| Model | `resource`; `status` and `detail`: `active`, `waiting_for_host`, `host_failed`, `draining`, `locked_out` or `pending` |
+| Host | `resource_kind`, `lease_supported`, `power` (`{"phase": "on", "since": ..., "ours": false}`, [State](architecture/power.md#state)), `needs_attention`, `wakers` (always present), `locked_out`, `drain` (`mode`, `cause`, `since_ms`, `scaled_down`) while one is under way, `wait`, `warning` |
+| Lockout | `supported`, `power`, `needs_attention`, `status` and `detail` (`pending`, `host_failed`, `powered_off`, `shutting_down`, `draining`, `left_alone`, `left_for_person`), `tick_reason` |
 
-A `wait` entry is `shutdown_held_by_veto` (with `readings`, `blocking`, `stopped`), `min_off`
-(with `remaining_seconds`) or `locked_out`. `warning` appears on an `off-now` of a host with
-wakers: they will power it back on after `min_off`. The `detail` text is worded in
-`crates/sched-service/src/toggle.rs` from `crates/sched-sequencer/src/switch.rs`.
+A `wait` entry has a `reason`: `shutdown_held_by_veto` (with `readings`, `blocking`, `stopped`),
+`min_off` (with `remaining_seconds`) or `locked_out`. `warning` appears on an `off-now` of a
+host with wakers: they will power it back on after `min_off`. A host that is locked out records
+no `drain`: the lockout decides. The `detail` text is in `crates/sched-service/src/toggle.rs`,
+from `crates/sched-sequencer/src/switch.rs`.
 
-Each `POST` logs one `toggle` line (kind, name, action, outcome, status; never the token) and
-counts in `sched_toggle_requests_total`.
+Each `POST` is logged and counted ([operations.md](operations.md#logs)).
 
-### A Home Assistant setup
+### A Home Assistant setup (*untested*)
 
-This is a generalisation of a configuration in use. The token is the HA environment variable
-`FLOWMANAGER_TOGGLE_AUTH`, holding the whole header value `Bearer <token>`.
+Generalised from a configuration in use, but not run in this form. The token is the HA
+environment variable `FLOWMANAGER_TOGGLE_AUTH`, holding the whole header value `Bearer <token>`.
 
-Two commands call the listener (`configuration.yaml`):
+One command calls the listener (`configuration.yaml`):
 
 ```yaml
 rest_command:
   flowmanager_set:             # kind: models | resources | lockouts; state: on | off
     url: "http://flowmanager.flowmanager.svc.cluster.local:9096/v1/{{ kind }}/{{ name }}/{{ state }}"
-    method: post
-    headers:
-      Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH Bearer unset
-    timeout: 20
-  flowmanager_resume:
-    url: "http://flowmanager.flowmanager.svc.cluster.local:9096/v1/resources/{{ resource }}/resume"
     method: post
     headers:
       Authorization: !env_var FLOWMANAGER_TOGGLE_AUTH Bearer unset
@@ -123,20 +115,9 @@ rest:
         value_template: >-
           {% set m = value_json.models | selectattr('id', 'eq', 'llm') | list %}
           {{ m[0].held if m | count == 1 else None }}
-    sensor:
-      - name: Flowmanager GPU host wakers
-        value_template: >-
-          {% set r = value_json.resources | selectattr('id', 'eq', 'cuda-central') | list %}
-          {% if r | count != 1 %}{{ None }}{% else %}
-          {% set out = namespace(items=[]) %}
-          {% for w in r[0].wakers | default([]) %}
-          {% set why = 'switched on' if w.why == 'switched_on' else 'work' %}
-          {% set out.items = out.items + [w['class'] ~ ' (' ~ why ~ ')'] %}
-          {% endfor %}
-          {{ out.items | join(', ') if out.items else 'none' }}{% endif %}
 ```
 
-The switch and the resume button (`templates.yaml`); `update_entity` re-reads the lease at once:
+The switch (`templates.yaml`); `update_entity` re-reads the lease at once:
 
 ```yaml
 - switch:
@@ -153,23 +134,19 @@ The switch and the resume button (`templates.yaml`); `update_entity` re-reads th
           data: { kind: models, name: llm, state: "off" }
         - action: homeassistant.update_entity
           target: { entity_id: binary_sensor.flowmanager_llm_lease_held }
-- button:
-    - name: Flowmanager resume cuda-central
-      press:
-        - action: rest_command.flowmanager_resume
-          data: { resource: cuda-central }
 ```
 
 A host switch is the same with `kind: resources`. Its `off` is graceful, so a `409` from a host
-with wakers makes the switch snap back to its sensor; show the wakers sensor beside it, and
-give `off-now` its own button (`rest_command` with the path `/off-now`).
+with wakers makes the switch snap back; read `wakers` from the same poll and show it beside the
+switch. `resume` and `off-now` are buttons that `POST` those paths with a second `rest_command`.
 
-### Switched apps
+### Switched apps (*untested*)
 
 A [switched class](concepts.md#workloads) reads its switch from an HA entity, not from the
 toggle listener. Make the entity an `input_select` with the options `off`, `on` and `off-now`
-(no `initial`, so a restart keeps the last choice), and a template switch that sets it `on` or
-`off`, plus a "stop now" button that sets `off-now`:
+(no `initial`, so a restart keeps the last choice), a template switch that sets it `on` or
+`off`, and a "stop now" button that sets `off-now`. This snippet is a rewrite and has not been
+run:
 
 ```yaml
 input_select:
@@ -215,14 +192,14 @@ send a `POST` when its queue changes, instead of waiting for `resync`. A source 
 | A body over 64 KiB, or unreadable | `413`, `400` |
 | No observer running yet for the path, or the token file unreadable | `503` |
 
-Authentication is chosen at start and has no default. `--webhook-auth mesh` checks nothing
-here: the service mesh must (STRICT mTLS and an `AuthorizationPolicy` naming the callers).
-`--webhook-auth token` needs `Authorization: Bearer <token>` from `--webhook-token-file`, read on
-every request.
+Authentication (`mesh` or `token`), the token file and `--webhook-min-interval` are in
+[install.md](install.md#3-flags-and-environment).
 
 A webhook only nudges. The body is ignored, and the poll's result enters the pipeline like a
 scheduled one, so nothing about a decision depends on who called. Each observer merges the
-nudges it gets and starts a poll no sooner than `--webhook-min-interval` (default `10s`) after
-the previous one began, so a flood costs one poll per source per interval. A lost webhook costs
-nothing but delay: `resync` still polls. Each request logs one rate-limited `webhook` line and
-counts in `sched_webhook_requests_total`; `sched_webhook_nudges_total` counts the sources asked.
+nudges it gets and starts a poll no sooner than the minimum interval after the previous one
+began, so a flood costs one poll per source per interval. A nudge during a poll causes one more
+poll, because that poll may have read before the change; a nudged poll restarts the `resync`
+clock. The nudge handle survives a config reload and is lost when its source is removed. A lost
+webhook costs only delay: `resync` still polls. Requests are logged and counted
+([operations.md](operations.md#logs)).

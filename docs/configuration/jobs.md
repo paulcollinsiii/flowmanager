@@ -32,6 +32,17 @@ a schedule that must run exactly once.
 | Needs not up within `start_window` of the scheduled time | The run is dropped, logged and alerted. So is a run that flowmanager only notices after the window | An alert is raised at the end of the window and the run keeps waiting for its needs |
 | How late it may run | Never late | At most once, and only while the next scheduled time has not arrived; then it is dropped |
 
+Of the times missed while flowmanager was down only the latest can run; the older ones are
+dropped together. A new job, or one whose `cron` or `timezone` changed, never runs for the
+past. `start_window` and `deadline` are not checked against the schedule's period: a `skip` run
+stops waiting at the next scheduled time anyway, and a `deadline` longer than the period makes
+a due run skip while the Job still runs.
+
+A host's [`min_off`](../architecture/power.md#min_off) delays the power-on a job's hold asks
+for, while the start window keeps running. Under `skip` a run whose window ends inside the wait
+is missed and its hold released; under `catch_up` it alerts `start_late` and runs late, once,
+after the host is up. Keep `min_off` well inside `start_window`.
+
 ## The CronJob
 
 The CronJob is only a template. flowmanager copies its `spec.jobTemplate` the way
