@@ -68,7 +68,7 @@ rotated Secret needs no restart.
 | SSH shutdown private key, unencrypted | `--ssh-key-file` | A managed host has `shutdown` |
 | Toggle bearer token, one line | `--toggle-token-file` | `--toggle-listen` is set |
 | Webhook bearer token, one line (*untested*) | `--webhook-token-file` | `--webhook-auth token` |
-| A source's API token | `auth: { header, prefix, file: PATH }` in an `http_json` source; `env: NAME`, a `prometheus` source and a recovery action's `auth` are *untested* | The service needs a token. A `file` is re-read on every poll; an `env` variable is fixed when the pod starts, so rotating it needs a restart |
+| A source's API token | `auth: { header, prefix, file: PATH }` in an `http_json` source or a recovery action; `env: NAME` and a `prometheus` source's `auth` are *untested* | The service needs a token. A `file` is re-read on every poll; an `env` variable is fixed when the pod starts, so rotating it needs a restart |
 
 A missing source token is not a start error: the source reports an error at each poll and its
 demand reads as unknown. Keep a Secret volume's default file mode: the pod runs as 65532 and
