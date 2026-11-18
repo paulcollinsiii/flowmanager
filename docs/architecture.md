@@ -10,10 +10,10 @@ resource. KEDA and Restate carry the step out, and the effects are observed on t
 
 | Component | Owns | Never does |
 | --- | --- | --- |
-| Observers | Turning each external source into observations with a timestamp | Decide; write to services |
+| Observers | Reading each external source and reporting what they saw (a failed read is reported as failed, never as a reused value) | Decide; write to services; stamp time: the scheduler dates each report on receipt with its own clock |
 | Observation cache | The latest observation per source, its age, a dirty flag | Interpret observations |
 | Planner | Intent: which model each exclusive resource should serve, which hosts must be up | I/O; read pods, drain timing or transitional state |
-| Sequencer | Per-resource state machines; the next safe step toward the intent; the allowed set | I/O; scheduling policy |
+| Sequencer | Per-resource state machines; the next safe step toward the intent; the allowed set | I/O; scheduling policy beyond the hysteresis guards (min dwell, idle grace) |
 | Lease book | Durable leases: manual model and host leases (including adopted ones), a running job's hold, the lockout | Grant a lease on its own |
 | KEDA scaler | Serving the allowed set to KEDA, which converges replicas | Any logic beyond a lookup |
 | Restate objects | `Scheduler` (ticks, state, leases), `Recovery` (one per class: re-queue failed items), `Power` (wake and shutdown commands) | Choose when to act; report success as truth without an observation |
@@ -74,7 +74,8 @@ Observation and config triggers are merged by a debounce (`--trigger-debounce`, 
 objects never request a tick; their effects arrive as observations.
 
 Observers run outside the tick and push into the cache on their own schedules, so a slow
-source never delays a decision or a lease request. Each observation carries its age, and a
+source never delays a decision or a lease request. Every source also has a slow periodic
+`resync`, so a missed event cannot leave it stuck. Each observation carries its age, and a
 reading older than its limit is unknown; invariant 5 says where freshness is required. No
 decision reads pod state, except the veto and recovery.
 
@@ -82,8 +83,7 @@ decision reads pod state, except the veto and recovery.
 
 1. The intent changes to whisperX. The sequencer withdraws mineru's classes from the allowed
    set and waits for in-flight OCR work, but only for `drain_timeout` (or the class's
-   `kill_timeout`) from the start of the wind-down. A busy `none` class blocks without a
-   timeout.
+   `kill_timeout`) from the start of the wind-down.
 2. With no work in flight, or at the timeout, one tick on a fresh "up" reading of the host
    removes mineru and allows whisperX together. KEDA scales mineru to 0 and whisperX to 1.
 3. Kubernetes keeps the whisperX pod Pending until mineru's pod has released the GPU.
@@ -127,7 +127,9 @@ configured, so it is not allowed from the next tick.
 
 Restate keeps this for the `Scheduler` object and its companions
 (`crates/sched-service/src/persist.rs`). A value that cannot be decoded, or was written by a
-newer build, is reported rather than retried.
+newer build, is reported rather than retried. A `scheduler_state` of another version is an
+error until it is discarded; the scheduler then starts from observation, and leases and jobs
+are kept.
 
 | Key | Holds |
 | --- | --- |
@@ -154,9 +156,9 @@ tests compare decisions; the others are structural.
 | 3 | A model is allowed only if configured on that resource, only on a host observed up, and never on a locked-out host except while winding down; a newly allowed model needs an allow step in the same decision. A class is allowed only while its host is up and not locked out, its model is allowed and not winding down, its intake is not paused and, if switched, its switch allows it (21). The one exception: a shared host's consumers stay allowed while a lockout's withdrawal is pending (rule 14) | checked by `invariants.rs` |
 | 4 | A resource gets at most one acting step per tick, except a switch | checked by `invariants.rs` |
 | 5 | Allowing a model on a powered resource, or powering a host off, needs a reachability reading newer than `host_reading_stale_after` showing it up. Otherwise the sequencer holds, and a switch waits as a whole | checked by `invariants.rs` |
-| 16 | Work is switched away from early only for a class that declares it safe, or when forced (lockout, manual model lease, requested shutdown). Every switch gives in-flight work only a timeout; a busy `none` class holds an unforced switch without one. In-flight work is stopped only on a forced switch, per class at its own timeout, and only if reported in flight. A manual model lease pins its model against batch eviction. A model is not withdrawn before `min_dwell` unless forced. Unknown demand counts as possibly in flight; offline demand is no work | checked by `invariants.rs` |
+| 16 | Work is switched away from early only for a class that declares it safe, or when forced (lockout, manual model lease, requested shutdown). Every switch gives in-flight work only a timeout; a busy `none` class holds an unforced switch without one. A class's in-flight work is stopped only if it is in flight and only in that class's own running wind-down for the current cause, when the class's own timeout runs out ([Timeouts](architecture/power.md#timeouts)). A manual model lease pins its model against batch eviction. A model is not withdrawn before `min_dwell` unless forced. Unknown and offline demand: [Offline demand](architecture/power.md#offline-demand) | checked by `invariants.rs` |
 | 17 | A recovery action runs only for a class in the allowed set that declares one, and only for failed items a fresh reading reports | checked by `invariants.rs` |
 | 18 | Planner and sequencer are deterministic and side-effect free: the same snapshot and config give the same result, so a tick can be repeated or replayed. Each tick is pinned to one config generation; a mismatched snapshot is an error | type of the tick (`TickError::GenerationMismatch`); replay and property tests |
 | 19 | Only the planner and sequencer decide; actuators, observers and KEDA carry out or report and never decide | structural |
 | 20 | An invalid config never replaces the last good one | config loader |
-| 21 | A switched class is allowed only while a fresh switch reading says `on`, or while a graceful `off` waits: a dependent reports in-flight or unknown demand and less than `drain_timeout` has passed since `off` was first read. A missing, stale or unmapped reading is `off-now`. `off-now` ends a wait at once and `on` cancels it; while it waits, the dependents' ready work wants no model and wakes no host. Host rules come first | checked by `invariants.rs` |
+| 21 | A switched class is allowed only while a fresh switch reading says `on`, or while a graceful `off` waits: a dependent reports in-flight or unknown demand and less than `drain_timeout` has passed since `off` was first read. A missing, stale or unmapped reading is `off-now`. `off-now` ends a wait at once and `on` cancels it; while it waits, the dependents' ready work wants no model and wakes no host. Host rules come first: a lockout or a requested shutdown of a host the class requires withdraws it by that host's rules, whatever the switch says | checked by `invariants.rs` |

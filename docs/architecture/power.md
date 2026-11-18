@@ -33,7 +33,7 @@ Withdrawing, Vetoing and Stopped are the axes of a [shutdown](#state) while the 
 
 | Stage | Meaning |
 | --- | --- |
-| Withdrawing | The host's consumers leave the allowed set: on an exclusive host the model wind-down, on a shared host scaling the classes that need it down. Graceful waits for in-flight work up to a timeout ([Timeouts](#timeouts)); immediate does not wait. Unknown demand counts as in flight; [offline demand](#offline-demand) does not |
+| Withdrawing | The host's consumers leave the allowed set: on an exclusive host the model wind-down, on a shared host scaling the classes that need it down. Graceful waits for in-flight work up to a timeout ([Timeouts](#timeouts)); immediate does not wait. Unknown demand counts as in flight ([Offline demand](#offline-demand)) |
 | Vetoing | A fresh reading must show nothing still uses the host ([Veto](#veto)) |
 | ShuttingDown | The power-off command was sent; waiting to observe the host down |
 | Failed | A transition timed out (invariant 9). Clears when a fresh reading shows the state the transition was after, on `resume`, or under manual control |
@@ -44,7 +44,7 @@ Cancellation, during Withdrawing or Vetoing:
 | Shutdown | Cancelled by |
 | --- | --- |
 | Idle | Any hold arriving |
-| Requested | A new manual lease; a graceful one that is not stopped also by a waker |
+| Requested | A new manual lease; a graceful one that is not stopped also by a waker ([Wakers](#wakers)) |
 | Stopped | Never by a waker: it never powers the host off, so nothing bounces |
 
 ## State
@@ -66,7 +66,7 @@ down when nothing holds it.
 | --- | --- |
 | Set | By flowmanager's own power-on, whatever wanted the host; by a manual want; by a person's `off` or `off-now` request |
 | Kept | Across a blip (`on`, `off`, `on`) |
-| Cleared | By a confirmed shutdown, a failed transition, manual control, a stopped veto, or an adopted lease ending because the host went down |
+| Cleared | By a confirmed shutdown, a failed transition, manual control, a stopped veto, an adopted lease ending because the host went down, the host being seen off under a lockout, or a locked-down host being found up |
 
 A `Shutdown` exists only while a host is up and on its way down. Its fields are private and
 every transition is a method, so a combination that cannot occur cannot be built or read back.
@@ -115,10 +115,8 @@ shutdown logic both read it.
 
 | Action | With wakers |
 | --- | --- |
-| `off` (graceful) | Refused, judged on the last tick; nothing changes and the refusal names each waker and why (the toggle answers `409`) |
-| A waker appears during a graceful requested shutdown | Cancels it, before power-off |
+| `off` (graceful) | Refused, judged on the last tick; nothing changes and the refusal names each waker and why (the toggle answers `409`). A waker appearing later cancels a graceful shutdown already under way, before power-off |
 | `off-now` | Never refused; accepted with a warning that the wakers will power the host back on after `min_off`, in effect a reboot |
-| Lockout | Keeps the host down whatever wants it |
 
 Wakers are reported with each host's status, so a person can see why `off` would be refused.
 
@@ -144,7 +142,7 @@ The same vocabulary on shared and exclusive hosts.
 | `on` | Take a manual host lease; power on if off |
 | `release` | Drop the lease. The host goes down when idle like any other; release never shuts it down by itself |
 | `off` | Requested shutdown, graceful. Refused while the host has wakers |
-| `off-now` | Requested shutdown, immediate. Never refused |
+| `off-now` | Requested shutdown, immediate. Never refused; anything may wake the host again afterwards |
 | `resume` | Clear a `Stopped` shutdown or a failed transition (`crates/sched-service/src/resume.rs`) |
 | `lockout` on / off | Below |
 
@@ -156,8 +154,11 @@ shuts the host down once (managed control only), and then nothing wakes, adopts 
 it: no waker, job hold or manual lease. While locked out the host may be up running something
 else (another OS, physical work); flowmanager neither adopts nor powers it off. Clearing the
 lockout returns the host to the normal model: if it is up it is found running and adopted; if
-it is off it is woken only if something wants it. `off-now` differs in that anything may wake
-the host again afterwards.
+it is off it is woken only if something wants it.
+
+While a lockout's withdrawal is pending, a shared host's consumers stay allowed: the
+withdrawal gives their in-flight work `lockout_timeout` ([Timeouts](#timeouts)). An exclusive
+host's classes never stay allowed.
 
 **A lockout takes over a shutdown in progress.** The shutdown becomes the lockout's. A
 withdrawal still pending gives in-flight work `lockout_timeout` from the takeover, whatever
@@ -175,8 +176,7 @@ overrides; the veto waits for its pods, up to `veto_timeout`.
 ## Timeouts
 
 How long in-flight work may run before it is cut off depends on the cause and the host kind.
-An exclusive host winds down per class; a shared host withdraws all its consumers in one
-step, so it has no per-class clock.
+An exclusive host winds down per class; a shared host withdraws all its consumers together.
 
 | Cause | Exclusive host (model wind-down, per class) | Shared host (consumers withdrawn together) |
 | --- | --- | --- |
@@ -191,18 +191,15 @@ All of these end early when nothing is in flight. `lockout_timeout` defaults to
 `drain_timeout`.
 
 Reasons:
-- `kill_timeout` is honoured only in an exclusive host's model wind-down. A shared host has
-  no per-class clock, so it cannot honour one. The difference is deliberate.
+- `kill_timeout` is honoured only in an exclusive host's model wind-down; a shared host has
+  no per-class clock. The difference is deliberate.
 - A person's graceful `off` gets a predictable bound, `drain_timeout` from the request, that
-  no class setting and no earlier wind-down's start changes. A lockout, being stricter, keeps
-  its own timeout under a graceful request.
+  no earlier wind-down's start changes. A lockout, being stricter, keeps its own timeout.
 - On an exclusive host each class is cut off at its own timeout, but the model is withdrawn
   only when no class still blocks, so the bound is the largest blocking timeout.
 - A lockout starting or ending mid wind-down restarts the clock. A lockout ending gives the
   work a fresh `drain_timeout`. Switch, manual lease and release share `drain_timeout` and
   keep the start, so the cut-off neither moves nor is extended by them.
-- A busy `none` class holds an unforced exclusive switch without a timeout; a forced
-  wind-down skips that wait.
 
 Code: `crates/sched-sequencer/src/exclusive.rs`, `power.rs` (`graceful_wait_over`).
 
@@ -217,8 +214,7 @@ host. Every reading that applies must be clear:
 | `pods` | The host has models and a source observes `pods` | Zero pods of every model. A model whose `namespaces` are not all listed in some `pods` source's `namespaces` is not covered and reads as unknown, never zero |
 
 A missing, stale, failed or uncovered reading is unknown and counts as in use: the shutdown
-waits. At `veto_timeout` flowmanager stops (the host stays up, no retry) and alerts, until the
-host is seen down, a person sends `resume`, or a new manual request takes it over. A host with
+waits. At `veto_timeout` the shutdown is `Stopped` ([Lifecycle](#lifecycle)). A host with
 no applicable reading has no veto (`Config::veto_readings`,
 `crates/sched-model/src/config.rs`).
 
@@ -255,9 +251,9 @@ detail.
 | 7 | flowmanager powers a host off only if it owns it: the previous state shows `ours`, or it is a lockout's one shutdown ([Ownership](#ownership-and-adoption)) | checked by `invariants.rs` |
 | 8 | An automatic power-on waits for `min_off` after a confirmed shutdown ([min_off](#min_off)) | checked by `invariants.rs` |
 | 9 | A power transition is bounded by `power_on_timeout` or `shutdown_timeout`. On expiry the resource is `failed`: nothing is allowed on it and no power step is emitted for it. Other resources are unaffected | checked by `invariants.rs` |
-| 10 | A host is never powered down while a lease holds it (manual, adopted, job hold), while a class that needs it has or may have work (unknown counts; offline does not), while a switched class that requires it reads `on`, or while a model is allowed on it; nor before `idle_grace` ends. Two overrides: a requested shutdown overrides work and waives the grace, but not a lease; a lockout overrides work and leases. A graceful requested shutdown never powers a host down while it has a waker | checked by `invariants.rs` |
-| 11 | Consumers are withdrawn before power-off, within the bound in [Timeouts](#timeouts) | checked by `invariants.rs` for a shared host (consumers scaled down first, lockout timeout honoured) and an exclusive one (no model allowed at power-off) |
+| 10 | A host is never powered down while a lease holds it (manual, adopted, job hold), while a class that needs it has or may have work ([Offline demand](#offline-demand)), while a switched class that requires it reads `on`, or while a model is allowed on it; nor before `idle_grace` ends. Two overrides: a requested shutdown overrides work and waives the grace, but not a lease; a lockout overrides work and leases | checked by `invariants.rs` (including "no model allowed at power-off") |
+| 11 | Consumers are withdrawn before power-off, within the bound in [Timeouts](#timeouts) | checked by `invariants.rs` for a shared host (consumers scaled down first, lockout timeout honoured); for an exclusive host the "no model allowed at power-off" check is reported as 10 |
 | 12 | Shutdowns are cancelled only as in [Lifecycle](#lifecycle) | checked by `invariants.rs` for the idle case; sequencer tests for the rest |
 | 13 | A host is powered off only after the [veto](#veto) is clear | checked by `invariants.rs` |
-| 14 | While locked out, nothing wakes, adopts or schedules the host, and it is shut down once ([Actions](#actions)) | checked by `invariants.rs` (no model or class allowed, no power-on, no power-off after the first confirmed off, shared withdrawal first); "nothing adopted" and "no job starts" by `crates/sched-sequencer/tests/adopt.rs` and the service tick tests |
+| 14 | While locked out, nothing wakes, adopts or schedules the host, and it is shut down once; a shared host's consumers stay allowed only while the withdrawal is pending ([Actions](#actions)) | checked by `invariants.rs` (no model or class allowed, no power-on, no power-off after the first confirmed off, shared withdrawal first); "nothing adopted" and "no job starts" by `crates/sched-sequencer/tests/adopt.rs` and the service tick tests |
 | 15 | A host found running gets an adopted lease at once ([Ownership](#ownership-and-adoption)) | not checked by `invariants.rs` (it checks power steps, not leases); decided by `adopt::adopt`; tested in `crates/sched-sequencer/tests/adopt.rs` and `crates/sched-service/src/jobs/scenarios/ownership.rs` |

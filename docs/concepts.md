@@ -161,11 +161,9 @@ person) or `adopted`. Every lease except a lockout is a *hold*: it keeps its hos
 shut down once, and nothing wakes, adopts or schedules it until the lockout is cleared.
 Handlers: `lockout`, `clear_lockout`. See [Actions](architecture/power.md#actions).
 
-**Manual actions**. On any host with a power section, shared or exclusive: `on`
-(`acquire_host_lease`), `release` (drops the lease, with no shutdown request), `off` and
-`off-now` ([shutdown](#shutdown) requests, which apply only to a managed host that is up and
-not locked out), and `resume`, which clears a stopped power transition after a person fixed the
-host. HTTP: `/v1/resources/{resource}/<action>`; lockouts: `/v1/lockouts/{resource}[/on|/off]`.
+**Manual actions**. What a person can do to a host: `on`, `release`, `off`, `off-now`,
+`resume` and lockout, defined in [Actions](architecture/power.md#actions). HTTP:
+`/v1/resources/{resource}/<action>`; lockouts: `/v1/lockouts/{resource}[/on|/off]`.
 
 ## Shutdown
 
