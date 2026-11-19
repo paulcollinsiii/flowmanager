@@ -241,6 +241,14 @@ fn config_for(managed: bool) -> sched_model::Config {
     let yaml = sched_model::test_support::with_nfs_batch(
         &sched_model::test_support::example_yaml_switched_dependents(),
     );
+    // Classes that declare `allowed: with_work` (invariant 22): one of the GPU classes, one with a
+    // recovery and failed items, and the dependent of `nfs-app` (offline demand).
+    let mut yaml = yaml;
+    for class in ["paperless-ocr", "paperless-tagging", "speakr-transcription"] {
+        let anchor = format!("  - id: {class}\n");
+        assert!(yaml.contains(&anchor), "the example has no class {class}");
+        yaml = yaml.replacen(&anchor, &format!("{anchor}    allowed: with_work\n"), 1);
+    }
     let yaml = if managed {
         yaml
     } else {

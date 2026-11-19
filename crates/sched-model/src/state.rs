@@ -1015,4 +1015,30 @@ mod tests {
             serde_json::from_str::<SwitchOff>(r#"{"since":1,"withdrawal":"done","x":1}"#).is_err()
         );
     }
+
+    #[test]
+    fn work_seen_round_trips_and_a_state_without_it_reads_as_none() {
+        let mut st = SchedState::default();
+        st.work_seen.insert("lightrag-indexing".into(), Millis(42));
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(
+            json.contains(r#""work_seen":{"lightrag-indexing":42}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<SchedState>(&json).unwrap(), st);
+        // A state stored before the field has none, so no recent work.
+        let old = r#"{"resources":{}}"#;
+        assert!(
+            serde_json::from_str::<SchedState>(old)
+                .unwrap()
+                .work_seen
+                .is_empty()
+        );
+        // And none is not written.
+        assert!(
+            !serde_json::to_string(&SchedState::default())
+                .unwrap()
+                .contains("work_seen")
+        );
+    }
 }

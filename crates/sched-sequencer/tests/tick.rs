@@ -5237,3 +5237,6 @@ fn the_shared_host_goes_idle_once_both_switched_classes_are_off_and_their_waits_
 
 #[path = "tick/wakers.rs"]
 mod wakers;
+
+#[path = "tick/with_work.rs"]
+mod with_work;

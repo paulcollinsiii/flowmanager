@@ -2220,4 +2220,75 @@ sources:
         ));
         assert!(has(&ps, "map is only valid with count or value"), "{ps:?}");
     }
+
+    #[test]
+    fn with_work_needs_a_demand_source() {
+        let with = |class: &str| {
+            VALID.replace("    priority: 10\n", &format!("    priority: 10\n{class}"))
+        };
+        // A demand class may declare it (and `always` is the default).
+        let y = with("    allowed: with_work\n");
+        let c = Config::from_yaml(&y).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.classes()[0].allowed, crate::config::Allowed::WithWork);
+        let c = Config::from_yaml(VALID).unwrap();
+        assert_eq!(c.classes()[0].allowed, crate::config::Allowed::Always);
+        let c = Config::from_yaml(&with("    allowed: always\n")).unwrap();
+        assert_eq!(c.classes()[0].allowed, crate::config::Allowed::Always);
+        // A plain class has no work to read.
+        let plain = "  - id: plain\n    requires: [ { resource: nfs } ]\n    priority: 0\n    preemptibility: none\n    allowed: with_work\n";
+        let ps = problems(&VALID.replace("\nsources:\n", &format!("\n{plain}sources:\n")));
+        assert!(
+            has(
+                &ps,
+                "classes[plain].allowed: with_work needs a demand source"
+            ),
+            "{ps:?}"
+        );
+        // A gate class too (it may not have demand).
+        let gate = "  - id: gate\n    requires: [ { resource: gpu } ]\n    priority: 0\n    preemptibility: none\n    allowed: with_work\n";
+        let ps = problems(&VALID.replace("\nsources:\n", &format!("\n{gate}sources:\n")));
+        assert!(
+            has(
+                &ps,
+                "classes[gate].allowed: with_work needs a demand source"
+            ),
+            "{ps:?}"
+        );
+        // An unknown value is refused.
+        assert!(Config::from_yaml(&with("    allowed: sometimes\n")).is_err());
+    }
+
+    #[test]
+    fn a_demand_source_that_counts_failed_needs_a_class_recovery() {
+        let source = |req: &str| {
+            VALID.replace(
+                "{ id: s1, kind: http_json, resync: 30s, observe: [demand] }",
+                &format!(
+                    "{{ id: s1, kind: http_json, resync: 30s, observe: [demand], params: {{ requests: [ {{ url: 'http://x/r', count: /r }}, {req} ] }} }}"
+                ),
+            )
+        };
+        let no_recovery = |y: String| {
+            let i = y.find("    recovery:").unwrap();
+            let j = y[i..].find('\n').unwrap() + i;
+            format!("{}{}", &y[..i], &y[j + 1..])
+        };
+        let own = "{ url: 'http://x/f', count: /n, counts_as: failed }";
+        let also = "{ url: 'http://x/f', count: /n, also: [ { count: /f, counts_as: failed } ] }";
+        for req in [own, also] {
+            // With the class's recovery (VALID has one) it loads.
+            Config::from_yaml(&source(req)).unwrap_or_else(|e| panic!("{req}: {e}"));
+            // Without, it is refused, naming the class and the source.
+            let y = no_recovery(source(req));
+            assert!(!y.contains("recovery:"));
+            let ps = problems(&y);
+            assert!(
+                has(&ps, "classes[c1].demand: source \"s1\" counts failed items"),
+                "{req}: {ps:?}"
+            );
+        }
+        // A source that counts only ready and in-flight work needs none.
+        let ok = "{ url: 'http://x/f', count: /n, also: [ { count: /a, counts_as: in_flight } ] }";
+        Config::from_yaml(&no_recovery(source(ok))).unwrap_or_else(|e| panic!("{e}"));
+    }
 }
