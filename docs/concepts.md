@@ -92,7 +92,8 @@ requirement is met. Kinds:
 A demand class with `allowed: with_work` is allowed only while it has
 work (ready, in-flight or failed items, or an unknown count; offline demand is none) or within
 `idle_grace` after a tick last saw it with work. The workloads that scale on it then follow its
-own queue rather than its model, which may stay allowed for other classes.
+own queue rather than its model, which may stay allowed for other classes. With
+`idle_grace: 0` there is no linger: the class is allowed only on ticks that see it with work.
 
 **Priority** (`priority`). A model's priority is the highest among its classes with ready (or
 failed) work, and the higher tier wins. A *starved* model, whose oldest ready item is older

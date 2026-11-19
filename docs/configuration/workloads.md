@@ -37,7 +37,7 @@ models:
 | `demand` | none | `{ source: <id> }`: the demand source. The source must declare `demand` |
 | `switch` | none | `{ source: <id> }`: the switch source. The source must declare `switch` |
 | `recovery` | none | [Re-queue of failed items](#recovery) |
-| `allowed` | `always` | `always`: allowed whenever its requirements hold. `with_work`: also only while the class has work, or within `idle_grace` after it last had ([concepts](../concepts.md#workloads)). `with_work` needs `demand`; on any other class the config is rejected |
+| `allowed` | `always` | `always`: allowed whenever its requirements hold. `with_work`: also only while the class has work, or within `idle_grace` after it last had ([concepts](../concepts.md#workloads)); with `idle_grace: 0`, only on ticks that see it with work. `with_work` needs `demand`; on any other class the config is rejected |
 | `kill_timeout` | see below | How long this class's in-flight work may run once a wind-down starts. Above `0`, at most `1d`. Which timeout applies when it is not set, and where it is ignored, is the [timeouts table](../architecture/power.md#timeouts) |
 
 ### Class kinds
