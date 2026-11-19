@@ -643,6 +643,11 @@ pub struct SchedState {
     /// seen so): absent while it is on. See [`SwitchOff`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub classes: BTreeMap<ClassId, SwitchOff>,
+    /// The time of the last tick that saw each `allowed: with_work` class with work, kept for
+    /// `policy.idle_grace` after it. Written whether or not the class's requirements hold;
+    /// absent means no recent work.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub work_seen: BTreeMap<ClassId, Millis>,
 }
 
 impl SchedState {

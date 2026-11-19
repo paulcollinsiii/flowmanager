@@ -28,9 +28,9 @@ pub mod work;
 pub mod test_support;
 
 pub use config::{
-    Capability, ClassSpec, Config, ConfigError, DemandRef, ModelSpec, PolicyConfig, PowerControl,
-    PowerSpec, Preemptibility, RecoverySpec, Requirement, ResourceKind, ResourceSpec, SourceKind,
-    SourceSpec, SwitchRef, VetoReading,
+    Allowed, Capability, ClassSpec, Config, ConfigError, DemandRef, ModelSpec, PolicyConfig,
+    PowerControl, PowerSpec, Preemptibility, RecoverySpec, Requirement, ResourceKind, ResourceSpec,
+    SourceKind, SourceSpec, SwitchRef, VetoReading,
 };
 pub use fixture::{Fixture, FixtureError};
 pub use ids::{ClassId, HolderId, JobId, LeaseId, ModelId, ResourceId, SourceId};
@@ -61,6 +61,7 @@ pub use time::Millis;
 pub use validate::Problem;
 pub use wakers::{WakeReason, Waker, wakers, wakers_label};
 pub use work::{
-    ClassSwitch, ClassWork, SwitchPhase, class_switch, class_work, classes_of_model, dependents,
-    host_is_up, reads_from_class, switch_offs_next, switch_phase,
+    ClassSwitch, ClassWork, SwitchPhase, class_has_work, class_switch, class_work,
+    classes_of_model, dependents, gated_by_work, host_is_up, reads_from_class, switch_offs_next,
+    switch_phase, work_grace_holds, work_seen_next,
 };

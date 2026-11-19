@@ -4,7 +4,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::config::{Capability, Config, MAX_LEASE_DURATION, ResourceKind, SourceKind};
+use crate::config::{Allowed, Capability, Config, MAX_LEASE_DURATION, ResourceKind, SourceKind};
+use crate::source_params::CountsAs;
 use crate::time::Millis;
 
 /// One validation failure: where it is and what is wrong.
@@ -511,8 +512,30 @@ fn classes(c: &Config, p: &mut Problems) {
                         d.source.as_str()
                     ),
                 ),
-                Some(_) => {}
+                Some(s) => {
+                    let failed = s.http_json_params().ok().flatten().is_some_and(|hp| {
+                        hp.requests.iter().any(|r| {
+                            r.counts_as == CountsAs::Failed
+                                || r.also.iter().any(|e| e.counts_as == CountsAs::Failed)
+                        })
+                    });
+                    if failed && k.recovery.is_none() {
+                        p.add(
+                            format!("{at}.demand"),
+                            format!(
+                                "source {:?} counts failed items (counts_as: failed) but the class has no recovery to re-queue them",
+                                d.source.as_str()
+                            ),
+                        );
+                    }
+                }
             }
+        }
+        if k.allowed == Allowed::WithWork && k.demand.is_none() {
+            p.add(
+                format!("{at}.allowed"),
+                "with_work needs a demand source: a class without demand has no work to read",
+            );
         }
         if let Some(sw) = &k.switch {
             if k.demand.is_some() {

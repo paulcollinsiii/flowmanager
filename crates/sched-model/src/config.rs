@@ -189,6 +189,18 @@ pub struct RecoverySpec {
     pub params: Value,
 }
 
+/// When a demand class is allowed, beyond its requirements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Allowed {
+    /// Whenever its other rules allow it, whatever its demand.
+    #[default]
+    Always,
+    /// Only while the class has work (ready, in-flight, failed or unknown), or within
+    /// `policy.idle_grace` after a tick last saw it with work. Demand classes only.
+    WithWork,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClassSpec {
@@ -200,6 +212,9 @@ pub struct ClassSpec {
     /// Whether this class may cause its resources to be powered on or off.
     #[serde(default)]
     pub may_change_power: bool,
+    /// `with_work` allows the class only while it has work (see [`Allowed`]). Needs `demand`.
+    #[serde(default)]
+    pub allowed: Allowed,
     /// Absent for classes with no demand of their own; they run whenever their
     /// requirements are up (for example services that only need the NFS share, or gate
     /// classes on host readiness). Forbidden for a class that requires an exclusive

@@ -73,6 +73,7 @@ pub fn tick(
     // read; the allowed set reads the result.
     let mut next = SchedState {
         classes: sched_model::switch_offs_next(config, snapshot, state),
+        work_seen: sched_model::work_seen_next(config, snapshot, state),
         ..SchedState::default()
     };
     let mut steps = Vec::new();
@@ -240,6 +241,10 @@ fn lockout_withdrawal_pending(
 /// waits (`sched_model::switch_phase`, the one rule the planner's wakes, the holds and the
 /// dependents' offline demand read too; `state` is the new one, whose switch-offs agree with
 /// it).
+///
+/// A class with `allowed: with_work` also needs a stamp in the new state's `work_seen` within
+/// `idle_grace`: the tick stamps `now` for a class with work (`work_seen_next`), so work or
+/// the grace after it.
 fn class_allowed(
     config: &Config,
     snapshot: &Snapshot,
@@ -250,6 +255,11 @@ fn class_allowed(
     requirements_hold(config, class, state, intent)
         && sched_model::switch_phase(config, snapshot, state, class)
             .is_none_or(|phase| phase.allows())
+        && (!sched_model::gated_by_work(class)
+            || state
+                .work_seen
+                .get(&class.id)
+                .is_some_and(|&stamp| sched_model::work_grace_holds(config, stamp, snapshot.now)))
 }
 
 fn requirements_hold(

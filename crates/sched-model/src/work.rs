@@ -1,7 +1,7 @@
 //! Queries over a config and a snapshot that both the planner and the sequencer need, kept
 //! here so the two cannot disagree about what counts as work.
 
-use crate::config::{ClassSpec, Config};
+use crate::config::{Allowed, ClassSpec, Config};
 use std::collections::BTreeMap;
 
 use crate::ids::{ClassId, ModelId};
@@ -63,6 +63,12 @@ impl ClassWork {
     /// Starvation never looks at failed items; only `ready` ages.
     pub fn wanted(&self) -> bool {
         self.busy() || self.failed > 0
+    }
+
+    /// Work that keeps an `allowed: with_work` class allowed: [`ClassWork::wanted`], or a count
+    /// that is not known. Offline is none.
+    pub fn has_work(&self) -> bool {
+        !self.offline && (self.wanted() || !self.known)
     }
 
     /// Age of the oldest ready item; zero if it has no timestamp.
@@ -343,6 +349,51 @@ pub fn switch_offs_next(
             SwitchPhase::Off => Withdrawal::Done,
         };
         next.insert(class.id.clone(), SwitchOff { since, withdrawal });
+    }
+    next
+}
+
+/// Whether `class` is a demand class that declares `allowed: with_work`.
+pub fn gated_by_work(class: &ClassSpec) -> bool {
+    class.allowed == Allowed::WithWork && class.demand.is_some()
+}
+
+/// Whether a stamp made at `stamp` is still within `policy.idle_grace` at `now`. A stamp in
+/// the future (the clock went back) counts as just made.
+pub fn work_grace_holds(config: &Config, stamp: Millis, now: Millis) -> bool {
+    now.saturating_sub(stamp) < config.policy().idle_grace
+}
+
+/// Whether `class` has work in the sense of `allowed: with_work`: `ClassWork::has_work` of
+/// the class as `state` (the one the tick began with) reads it.
+pub fn class_has_work(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+    class: &ClassSpec,
+) -> bool {
+    class_work(config, snapshot, state, class).has_work()
+}
+
+/// The `SchedState::work_seen` after a tick that began with `state`: for every class that
+/// declares `allowed: with_work`, `now` if it has work, else the earlier stamp while it is
+/// within `policy.idle_grace`. Written whether or not the class's requirements hold. None for
+/// a class without the key or no longer configured. A pure transition, applied by the
+/// sequencer.
+pub fn work_seen_next(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+) -> BTreeMap<ClassId, Millis> {
+    let mut next = BTreeMap::new();
+    for class in config.classes().iter().filter(|c| gated_by_work(c)) {
+        if class_has_work(config, snapshot, state, class) {
+            next.insert(class.id.clone(), snapshot.now);
+        } else if let Some(&stamp) = state.work_seen.get(&class.id)
+            && work_grace_holds(config, stamp, snapshot.now)
+        {
+            next.insert(class.id.clone(), stamp);
+        }
     }
     next
 }
