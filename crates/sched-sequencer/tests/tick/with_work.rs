@@ -210,23 +210,42 @@ fn with_idle_grace_zero_work_allows_the_class_and_the_next_tick_without_work_rem
 #[test]
 fn a_dependent_of_a_graceful_off_has_work_only_in_flight_during_the_wait() {
     use sched_model::Withdrawal::Pending;
-    let yaml = sched_model::test_support::example_yaml_switched_dependents().replacen(
-        "  - id: paperless-ocr\n",
-        "  - id: paperless-ocr\n    allowed: with_work\n",
-        1,
-    );
+    // A second dependent of `nfs-app`, `paperless-tagging`, has work in flight, so the wait
+    // stays open: `paperless-ocr` having no stamp is then the wait's rule, not the demand
+    // being offline once the wait is over.
+    let read = "  - id: paperless-post-ocr\n    kind: http_json\n";
+    let yaml = sched_model::test_support::example_yaml_switched_dependents()
+        .replacen(
+            "  - id: paperless-ocr\n",
+            "  - id: paperless-ocr\n    allowed: with_work\n",
+            1,
+        )
+        .replacen(read, &format!("{read}    reads_from: nfs-app\n"), 1);
+    assert!(!yaml.contains("reads_from: nfs-app2"));
     let config = Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"));
     let run = |ready: u64, in_flight: u64| {
-        let mut c = Case::new().obs(sw("nfs-app", "off")).obs(demand(
-            "paperless-ocr",
-            "paperless-ocr-pending",
-            ready,
-            in_flight,
-            0,
-        ));
+        let mut c = Case::new()
+            .obs(sw("nfs-app", "off"))
+            .obs(demand(
+                "paperless-ocr",
+                "paperless-ocr-pending",
+                ready,
+                in_flight,
+                0,
+            ))
+            .obs(demand("paperless-tagging", "paperless-post-ocr", 0, 1, 0));
         c.config = config.clone();
         // The wait began a minute ago and is still running.
-        c.run_at(&wait_state_of(&c, MIN, Pending), T)
+        let d = c.run_at(&wait_state_of(&c, MIN, Pending), T);
+        // The wait is open: the class is still allowed and the stored wait is Pending.
+        assert!(allowed(&d, "nfs-app"), "{:?}", d.allowed);
+        assert_eq!(
+            d.state.classes.get(&cid("nfs-app")).map(|s| s.withdrawal),
+            Some(Pending),
+            "{:?}",
+            d.state.classes
+        );
+        d
     };
     // Ready work is withheld while the wait runs: not work.
     assert_eq!(stamp(&run(5, 0), "paperless-ocr"), None);
