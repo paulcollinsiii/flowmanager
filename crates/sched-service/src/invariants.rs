@@ -391,7 +391,7 @@ pub fn check(
         let stamp = decision.state.work_seen.get(class).copied();
         if decision.allowed.classes.contains(class)
             && !work
-            && !stamp.is_some_and(|s| now.saturating_sub(s) < policy.idle_grace)
+            && !stamp.is_some_and(|s| s >= now || now.saturating_sub(s) < policy.idle_grace)
         {
             out.push(format!(
                 "invariant 22: class {class} allowed with no work and no work seen within idle_grace"
@@ -400,6 +400,13 @@ pub fn check(
         if work && stamp != Some(now) {
             out.push(format!(
                 "invariant 22: class {class} has work but its work_seen stamp is {stamp:?}, not now"
+            ));
+        }
+        // A stamp made this tick (not one carried over from an earlier tick at the same time)
+        // needs work.
+        if !work && stamp == Some(now) && prev.work_seen.get(class) != Some(&now) {
+            out.push(format!(
+                "invariant 22: class {class} stamped now with no work"
             ));
         }
     }

@@ -256,6 +256,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reload_adding_with_work_to_a_class_without_demand_keeps_the_last_good_config() {
+        let path = scratch("with-work-reload");
+        std::fs::write(&path, EXAMPLE_CONFIG).unwrap();
+        let h = ConfigHolder::load(&path).unwrap();
+        let bad = EXAMPLE_CONFIG.replacen(
+            "  - id: paperless-ngx\n",
+            "  - id: paperless-ngx\n    allowed: with_work\n",
+            1,
+        );
+        assert_ne!(bad, EXAMPLE_CONFIG);
+        std::fs::write(&path, &bad).unwrap();
+        assert!(matches!(
+            h.reload_from(&path).await,
+            ReloadOutcome::Rejected(_)
+        ));
+        assert_eq!(h.current().generation(), 1);
+        // The same key on a demand class is accepted.
+        let good = EXAMPLE_CONFIG.replacen(
+            "  - id: paperless-tagging\n",
+            "  - id: paperless-tagging\n    allowed: with_work\n",
+            1,
+        );
+        std::fs::write(&path, &good).unwrap();
+        assert_eq!(h.reload_from(&path).await, ReloadOutcome::Applied(2));
+    }
+
+    #[tokio::test]
     async fn the_watcher_applies_good_files_counts_outcomes_and_ignores_bad_ones() {
         let path = scratch("watch");
         std::fs::write(&path, EXAMPLE_CONFIG).unwrap();

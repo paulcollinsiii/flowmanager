@@ -7,8 +7,14 @@
 //! caller gets a [`StateError`] and decides what to do (see `object`).
 //!
 //! Bump a document's version whenever its shape changes in a way an older build cannot
-//! read (a field added under `deny_unknown_fields`, a field renamed or retyped). A build
-//! reads only its own version; an absent key reads as the default (a fresh start).
+//! read and that matters for every stored document: a field renamed or retyped, or a field
+//! whose absence would change meaning. A field added with `default` and
+//! `skip_serializing_if` empty (`classes`, `work_seen` of the sequencer state) may be added
+//! without a bump when `CHANGELOG.md` records that an older build cannot read a state that
+//! holds it: such a build sees the same version and fails to decode the document (an unknown
+//! field under `deny_unknown_fields`), not a version mismatch, and only while the field is
+//! non-empty. A build reads only its own version; an absent key reads as the default (a fresh
+//! start).
 
 use std::collections::BTreeSet;
 
@@ -261,6 +267,42 @@ mod tests {
                 .state
                 .classes
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn work_seen_survives_a_restart_and_an_older_build_cannot_decode_it() {
+        use sched_model::Millis;
+        let mut s = CoreState::default();
+        s.state
+            .work_seen
+            .insert("lightrag-indexing".into(), Millis(9_000));
+        let bytes = encode_state(&s);
+        assert_eq!(decode_state(Some(&bytes)).unwrap(), s);
+        let text = String::from_utf8(bytes).unwrap();
+        // No version bump; an empty map is not written, so a state without it is as before.
+        assert!(text.starts_with("{\"version\":4,\"data\":"), "{text}");
+        assert!(
+            text.contains(r#""work_seen":{"lightrag-indexing":9000}"#),
+            "{text}"
+        );
+        let old = text.replace(r#","work_seen":{"lightrag-indexing":9000}"#, "");
+        assert_ne!(old, text);
+        assert!(
+            decode_state(Some(old.as_bytes()))
+                .unwrap()
+                .state
+                .work_seen
+                .is_empty()
+        );
+        // What a build before the field sees is the same version with a field it does not know
+        // (`SchedState` denies unknown fields): a decode error, not a version mismatch. Shown
+        // here with a field this build does not know either.
+        let unknown = text.replace("work_seen", "field_of_a_later_build");
+        let e = decode_state(Some(unknown.as_bytes())).unwrap_err();
+        assert!(
+            e.problem.contains("cannot decode version 4") && e.problem.contains("unknown field"),
+            "{e}"
         );
     }
 

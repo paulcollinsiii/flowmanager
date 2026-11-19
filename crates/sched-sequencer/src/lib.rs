@@ -259,7 +259,7 @@ fn class_allowed(
             || state
                 .work_seen
                 .get(&class.id)
-                .is_some_and(|&stamp| sched_model::work_grace_holds(config, stamp, snapshot.now)))
+                .is_some_and(|&stamp| sched_model::work_stamp_allows(config, stamp, snapshot.now)))
 }
 
 fn requirements_hold(

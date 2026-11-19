@@ -63,5 +63,5 @@ pub use wakers::{WakeReason, Waker, wakers, wakers_label};
 pub use work::{
     ClassSwitch, ClassWork, SwitchPhase, class_has_work, class_switch, class_work,
     classes_of_model, dependents, gated_by_work, host_is_up, reads_from_class, switch_offs_next,
-    switch_phase, work_grace_holds, work_seen_next,
+    switch_phase, work_grace_holds, work_seen_next, work_stamp_allows,
 };

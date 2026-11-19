@@ -364,6 +364,12 @@ pub fn work_grace_holds(config: &Config, stamp: Millis, now: Millis) -> bool {
     now.saturating_sub(stamp) < config.policy().idle_grace
 }
 
+/// Whether a class whose last stamp is `stamp` may be allowed at `now`: the stamp is this tick's
+/// (it has work now, whatever `idle_grace` is, even 0) or still within `idle_grace`.
+pub fn work_stamp_allows(config: &Config, stamp: Millis, now: Millis) -> bool {
+    stamp >= now || work_grace_holds(config, stamp, now)
+}
+
 /// Whether `class` has work in the sense of `allowed: with_work`: `ClassWork::has_work` of
 /// the class as `state` (the one the tick began with) reads it.
 pub fn class_has_work(

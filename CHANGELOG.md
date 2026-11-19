@@ -31,8 +31,10 @@ map reads as none, so a build before it cannot read a state that has some. The `
 same instant, and as idle).
 
 The map of when each `allowed: with_work` class last had work (`work_seen`) was added the same
-way, without a version bump: an absent map reads as no recent work, so a build before it cannot
-read a state that has some.
+way, without a version bump: an absent map reads as no recent work. A build before it reads the
+same version but cannot decode a state whose map is not empty (`cannot decode version 4: unknown
+field`, not a version mismatch): its ticks report an error until the state is discarded with
+`discard_state`. The same holds for `classes`.
 
 **`lease_book`, version 2.** Every lease has an `origin`, `requested` or `adopted`. Version 1
 marked an adopted lease only by the id prefix `adopted-host-`. A version 1 book is read with
@@ -62,6 +64,8 @@ lost) and take the leases you still want again.
 - **Roll the config back with the binary.** An older build rejects keys it does not know
   (`min_off`, the `jobs:` section), and the build before queue-only switching rejects a gate
   class (a requirement on an exclusive resource with no model) and a config with no pods source.
+  A build before `allowed` rejects a config that sets it (`allowed: with_work`), so remove the key
+  first.
 - **Discard what the older build cannot read.** A build before `scheduler_state` 4 and
   `lease_book` 2 reads neither: its ticks report an error until both are discarded with
   `discard_state`, which drops every lease. Rolling forward again needs nothing.
@@ -89,6 +93,11 @@ KEDA external scaler.
 
 ## Configuration
 
+- **A demand source that counts `failed` needs a recovery.** A config whose class has a `demand`
+  source with a request or an `also` entry of `counts_as: failed` and no `recovery` loaded before
+  and is now rejected, naming the class and the source. A reload that fails keeps the last good
+  config, but a restart with such a config does not start: add the class's `recovery` (or drop
+  the `failed` count) before upgrading.
 - **A source kind `schedule` is gone.** Scheduled work is the `jobs:` section.
 - **`reclaim_timeout`** is refused: see above.
 - **`http_json` `where` with `equals`.** A number after `equals:` was once compared as text. An

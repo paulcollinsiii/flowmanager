@@ -191,3 +191,46 @@ fn stamps_of_classes_without_the_key_or_no_longer_configured_are_dropped() {
         vec![&cid("paperless-tagging")]
     );
 }
+
+#[test]
+fn with_idle_grace_zero_work_allows_the_class_and_the_next_tick_without_work_removes_it() {
+    let mut c = llm(2, 0);
+    c.config = Config::from_yaml(&gated_yaml().replace("idle_grace: 10m", "idle_grace: 0"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let d = c.run();
+    assert!(allowed(&d, "paperless-tagging"), "{:?}", d.allowed);
+    assert_eq!(stamp(&d, "paperless-tagging"), Some(Millis(T)));
+    // No work any more: the stamp of the previous tick is not within a grace of 0.
+    let c = c.obs(demand("paperless-tagging", "paperless-post-ocr", 0, 0, 0));
+    let d2 = c.run_at(&d.state, T + 1);
+    assert!(!allowed(&d2, "paperless-tagging"), "{:?}", d2.allowed);
+    assert_eq!(stamp(&d2, "paperless-tagging"), None);
+}
+
+#[test]
+fn a_dependent_of_a_graceful_off_has_work_only_in_flight_during_the_wait() {
+    use sched_model::Withdrawal::Pending;
+    let yaml = sched_model::test_support::example_yaml_switched_dependents().replacen(
+        "  - id: paperless-ocr\n",
+        "  - id: paperless-ocr\n    allowed: with_work\n",
+        1,
+    );
+    let config = Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}"));
+    let run = |ready: u64, in_flight: u64| {
+        let mut c = Case::new().obs(sw("nfs-app", "off")).obs(demand(
+            "paperless-ocr",
+            "paperless-ocr-pending",
+            ready,
+            in_flight,
+            0,
+        ));
+        c.config = config.clone();
+        // The wait began a minute ago and is still running.
+        c.run_at(&wait_state_of(&c, MIN, Pending), T)
+    };
+    // Ready work is withheld while the wait runs: not work.
+    assert_eq!(stamp(&run(5, 0), "paperless-ocr"), None);
+    // In-flight work is.
+    assert_eq!(stamp(&run(0, 2), "paperless-ocr"), Some(Millis(T)));
+    assert_eq!(stamp(&run(5, 2), "paperless-ocr"), Some(Millis(T)));
+}
