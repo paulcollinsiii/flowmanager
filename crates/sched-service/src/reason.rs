@@ -290,6 +290,38 @@ pub fn switch_text(gaps: &SwitchGaps) -> String {
     out
 }
 
+/// The `allowed: with_work` classes that are out of the allowed set with no work and no work
+/// seen within `idle_grace` (`state` is the new one, whose `work_seen` holds the stamps). Text
+/// only: the sequencer decides. A class with work that is out is blocked by something else.
+pub fn idle_classes(
+    config: &sched_model::Config,
+    state: &sched_model::SchedState,
+    allowed: &sched_model::AllowedSet,
+) -> Vec<sched_model::ClassId> {
+    config
+        .classes()
+        .iter()
+        .filter(|c| sched_model::gated_by_work(c))
+        .filter(|c| !allowed.classes.contains(&c.id) && !state.work_seen.contains_key(&c.id))
+        .map(|c| c.id.clone())
+        .collect()
+}
+
+/// The text for [`idle_classes`], empty when there are none.
+pub fn idle_text(idle: &[sched_model::ClassId]) -> String {
+    if idle.is_empty() {
+        return String::new();
+    }
+    let ids = idle
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "; no work, not allowed: [{ids}] (allowed: with_work, and no ready, in-flight, failed or unknown work for idle_grace)"
+    )
+}
+
 /// The resources a manual model lease pins, with their model: forced to a model (a lockout
 /// is forced to none).
 pub fn pinned(intent: &Intent) -> Vec<(ResourceId, ModelId)> {

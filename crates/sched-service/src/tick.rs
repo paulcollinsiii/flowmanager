@@ -712,6 +712,12 @@ impl Shared {
                         &prev_state,
                         &decision.allowed,
                     ));
+                let reason = reason
+                    + &reason::idle_text(&reason::idle_classes(
+                        &config,
+                        &decision.state,
+                        &decision.allowed,
+                    ));
                 (
                     kinds,
                     reason,

@@ -196,6 +196,23 @@ fn reported_demand(config: &Config, snap: &Snapshot, class: &ClassSpec) -> Optio
     ))
 }
 
+/// Whether a class has work in the sense of invariant 22, derived here from the readings and
+/// the state the tick began with, not from `sched_model::class_work`: ready, in-flight or
+/// failed items, or a count that is not known. Offline (a host freshly seen down with no
+/// usable reading, or the class the source `reads_from` switched off past its wait) is none.
+fn has_work(config: &Config, snap: &Snapshot, prev: &SchedState, class: &ClassSpec) -> bool {
+    let Some((busy, _)) = demand(config, snap, prev, class) else {
+        return true;
+    };
+    if busy {
+        return true;
+    }
+    let switched_off = sched_model::reads_from_class(config, class).is_some_and(|from| {
+        sched_model::switch_phase(config, snap, prev, from) == Some(sched_model::SwitchPhase::Off)
+    });
+    !switched_off && failed_items(config, snap, class).is_some_and(|n| n > 0)
+}
+
 /// Whether a graceful off of the switched class is pending at this tick (invariant 21): the
 /// wait began at the `since` of a `Pending` entry in the previous state (or begins now, with
 /// no entry), less than `drain_timeout` has passed, and a dependent reports in-flight work or
@@ -357,6 +374,32 @@ pub fn check(
         if !before_allowed.contains(model) && !allowed_now {
             out.push(format!(
                 "invariant 3: {model} entered the allowed set without an allow step"
+            ));
+        }
+    }
+
+    // 22. A class with `allowed: with_work` is allowed only while it has work or less than
+    // `idle_grace` has passed since a tick last saw it with work; and a tick that sees it with
+    // work stamps `now`, whether or not its requirements hold.
+    for spec in config
+        .classes()
+        .iter()
+        .filter(|c| sched_model::gated_by_work(c))
+    {
+        let class = &spec.id;
+        let work = has_work(config, snapshot, prev, spec);
+        let stamp = decision.state.work_seen.get(class).copied();
+        if decision.allowed.classes.contains(class)
+            && !work
+            && !stamp.is_some_and(|s| now.saturating_sub(s) < policy.idle_grace)
+        {
+            out.push(format!(
+                "invariant 22: class {class} allowed with no work and no work seen within idle_grace"
+            ));
+        }
+        if work && stamp != Some(now) {
+            out.push(format!(
+                "invariant 22: class {class} has work but its work_seen stamp is {stamp:?}, not now"
             ));
         }
     }
