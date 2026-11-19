@@ -253,3 +253,36 @@ fn a_dependent_of_a_graceful_off_has_work_only_in_flight_during_the_wait() {
     assert_eq!(stamp(&run(0, 2), "paperless-ocr"), Some(Millis(T)));
     assert_eq!(stamp(&run(5, 2), "paperless-ocr"), Some(Millis(T)));
 }
+
+/// The classes `held_for_lack_of_work` lists for the decision `d` of `c`.
+fn held(c: &Case, d: &Decision) -> Vec<sched_model::ClassId> {
+    sched_sequencer::held_for_lack_of_work(&c.config, &c.snapshot_at(T), &d.state, &c.intent)
+}
+
+#[test]
+fn a_class_with_requirements_holding_and_no_work_past_the_grace_is_held_for_lack_of_work() {
+    let c = llm(0, 0);
+    let d = c.run();
+    assert!(!allowed(&d, "paperless-tagging"));
+    assert_eq!(held(&c, &d), vec![cid("paperless-tagging")]);
+    // Within the grace it is allowed, so not held; with work too.
+    let d = c.run_at(&stamped(&c, "paperless-tagging", GRACE - 1), T);
+    assert_eq!(held(&c, &d), vec![]);
+    let c = llm(1, 0);
+    assert_eq!(held(&c, &c.run()), vec![]);
+}
+
+#[test]
+fn a_class_blocked_by_its_model_not_serving_is_not_held_for_lack_of_work() {
+    // The GPU idle: `paperless-tagging`'s model is not serving, and it has no work either.
+    let mut c = Case::new().obs(demand("paperless-tagging", "paperless-post-ocr", 0, 0, 0));
+    c.config = gated_config();
+    let d = c.run();
+    assert!(!allowed(&d, "paperless-tagging"), "{:?}", d.allowed);
+    assert_eq!(stamp(&d, "paperless-tagging"), None);
+    assert!(
+        !held(&c, &d).contains(&cid("paperless-tagging")),
+        "{:?}",
+        held(&c, &d)
+    );
+}

@@ -713,10 +713,11 @@ impl Shared {
                         &decision.allowed,
                     ));
                 let reason = reason
-                    + &reason::idle_text(&reason::idle_classes(
+                    + &reason::idle_text(&sched_sequencer::held_for_lack_of_work(
                         &config,
+                        &snapshot,
                         &decision.state,
-                        &decision.allowed,
+                        &intent,
                     ));
                 (
                     kinds,

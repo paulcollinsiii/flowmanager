@@ -290,24 +290,8 @@ pub fn switch_text(gaps: &SwitchGaps) -> String {
     out
 }
 
-/// The `allowed: with_work` classes that are out of the allowed set with no work and no work
-/// seen within `idle_grace` (`state` is the new one, whose `work_seen` holds the stamps). Text
-/// only: the sequencer decides. A class with work that is out is blocked by something else.
-pub fn idle_classes(
-    config: &sched_model::Config,
-    state: &sched_model::SchedState,
-    allowed: &sched_model::AllowedSet,
-) -> Vec<sched_model::ClassId> {
-    config
-        .classes()
-        .iter()
-        .filter(|c| sched_model::gated_by_work(c))
-        .filter(|c| !allowed.classes.contains(&c.id) && !state.work_seen.contains_key(&c.id))
-        .map(|c| c.id.clone())
-        .collect()
-}
-
-/// The text for [`idle_classes`], empty when there are none.
+/// The text for the classes `sched_sequencer::held_for_lack_of_work` lists (held out only by the
+/// `allowed: with_work` gate, the sequencer decides), empty when there are none.
 pub fn idle_text(idle: &[sched_model::ClassId]) -> String {
     if idle.is_empty() {
         return String::new();

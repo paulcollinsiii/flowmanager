@@ -252,14 +252,59 @@ fn class_allowed(
     state: &SchedState,
     intent: &Intent,
 ) -> bool {
+    allowed_but_for_work(config, snapshot, class, state, intent)
+        && work_gate_allows(config, snapshot, class, state)
+}
+
+/// Every condition of [`class_allowed`] except the `allowed: with_work` gate.
+fn allowed_but_for_work(
+    config: &Config,
+    snapshot: &Snapshot,
+    class: &ClassSpec,
+    state: &SchedState,
+    intent: &Intent,
+) -> bool {
     requirements_hold(config, class, state, intent)
         && sched_model::switch_phase(config, snapshot, state, class)
             .is_none_or(|phase| phase.allows())
-        && (!sched_model::gated_by_work(class)
-            || state
-                .work_seen
-                .get(&class.id)
-                .is_some_and(|&stamp| sched_model::work_stamp_allows(config, stamp, snapshot.now)))
+}
+
+/// The `allowed: with_work` gate alone: open for a class without the key, else a stamp in
+/// `state.work_seen` within `idle_grace`.
+fn work_gate_allows(
+    config: &Config,
+    snapshot: &Snapshot,
+    class: &ClassSpec,
+    state: &SchedState,
+) -> bool {
+    !sched_model::gated_by_work(class)
+        || state
+            .work_seen
+            .get(&class.id)
+            .is_some_and(|&stamp| sched_model::work_stamp_allows(config, stamp, snapshot.now))
+}
+
+/// The `allowed: with_work` classes held out of the allowed set only by the work gate: their
+/// requirements hold and their switch allows, but they have no work and none within
+/// `idle_grace`. `state` and `intent` are those of the tick that produced `state` (the new
+/// state), the ones `tick` built the allowed set from. A class blocked by anything else is
+/// not listed. In configuration order.
+pub fn held_for_lack_of_work(
+    config: &Config,
+    snapshot: &Snapshot,
+    state: &SchedState,
+    intent: &Intent,
+) -> Vec<sched_model::ClassId> {
+    config
+        .classes()
+        .iter()
+        .filter(|c| {
+            sched_model::gated_by_work(c)
+                && allowed_but_for_work(config, snapshot, c, state, intent)
+                && !work_gate_allows(config, snapshot, c, state)
+        })
+        .map(|c| c.id.clone())
+        .collect()
 }
 
 fn requirements_hold(
