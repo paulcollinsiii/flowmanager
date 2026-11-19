@@ -159,7 +159,7 @@ A demand request sets exactly one of `count` and `length`. Counts of requests wi
 | `url` | required | `http://` or `https://` |
 | `count` | | Pointer to a number in the answer |
 | `length` | | Pointer to an array; its length, after `where`, is the number |
-| `counts_as` | `ready` | `ready` (waiting), `in_flight` (running) or `failed` (waiting for [recovery](workloads.md#recovery), never ages) |
+| `counts_as` | `ready` | `ready` (waiting), `in_flight` (running) or `failed` (waiting for [recovery](workloads.md#recovery), never ages; *target:* a class with this source as its `demand` must then declare a `recovery`) |
 | `where` | none | With `length`: [filter](#filters-and-counts) the elements |
 | `max_items` | none | With `length`: the most elements one answer holds (the page size in the URL). Above `0`. A full answer may be truncated, so the poll fails rather than under-count; a `failed` request instead counts the matching items on the page |
 | `also` | `[]` | More numbers from the same answer: `{ count, map, counts_as }`. A pointer and `counts_as` already counted is refused |

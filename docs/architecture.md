@@ -133,7 +133,7 @@ from observation; leases and jobs are kept.
 
 | Key | Holds |
 | --- | --- |
-| `scheduler_state` | The sequencer state (per-resource phase, wind-downs, shutdowns) and which sources have ever reported |
+| `scheduler_state` | The sequencer state (per-resource phase, wind-downs, shutdowns; per switched class the start of a switch-off; *target:* per `allowed: with_work` class the time a tick last saw it with work) and which sources have ever reported |
 | `lease_book` | All leases |
 | `job_book` | Scheduled jobs' state |
 | `recovery_attempts` | The recovery action's per-item attempts, per class |
@@ -162,3 +162,4 @@ tests compare decisions; the others are structural.
 | 19 | Only the planner and sequencer decide; actuators, observers and KEDA carry out or report and never decide | structural |
 | 20 | An invalid config never replaces the last good one | config loader |
 | 21 | A switched class is allowed only while a fresh switch reading says `on`, or while a graceful `off` waits: a dependent reports in-flight or unknown demand and less than `drain_timeout` has passed since `off` was first read. A missing, stale or unmapped reading is `off-now`. `off-now` ends a wait at once and `on` cancels it; while it waits, the dependents' ready work wants no model and wakes no host. Host rules come first: a lockout or a requested shutdown of a host the class requires withdraws it by that host's rules, whatever the switch says | checked by `invariants.rs` |
+| 22 | *Target, not yet built.* A class with `allowed: with_work` is allowed only while it has work (ready, in-flight or failed items, or an unknown count; offline demand is none) or less than `idle_grace` has passed since a tick last saw it with work. Its other rules (invariants 3 and 21) come first. Only a demand class may declare it | *target:* `invariants.rs` (allowed), config loader (demand only) |

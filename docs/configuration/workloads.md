@@ -37,6 +37,7 @@ models:
 | `demand` | none | `{ source: <id> }`: the demand source. The source must declare `demand` |
 | `switch` | none | `{ source: <id> }`: the switch source. The source must declare `switch` |
 | `recovery` | none | [Re-queue of failed items](#recovery) |
+| `allowed` | `always` | *Target, not yet built.* `always`: allowed whenever its requirements hold. `with_work`: also only while the class has work, or within `idle_grace` after it last had ([concepts](../concepts.md#workloads)). `with_work` needs `demand`; on any other class the config is rejected |
 | `kill_timeout` | see below | How long this class's in-flight work may run once a wind-down starts. Above `0`, at most `1d`. Which timeout applies when it is not set, and where it is ignored, is the [timeouts table](../architecture/power.md#timeouts) |
 
 ### Class kinds
@@ -122,6 +123,10 @@ recovery:
 | `params` | yes | Below |
 
 The class must have `preemptibility: kill`.
+
+*Target, not yet built:* the reverse also holds. A class whose demand source counts `failed`
+(a request or an `also` entry with `counts_as: failed`) must declare a `recovery`, or the config
+is rejected: without one, failed items would hold the model with nothing to re-queue them.
 
 ### `requeue_failed` params
 
