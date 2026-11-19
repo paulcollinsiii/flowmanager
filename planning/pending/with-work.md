@@ -84,7 +84,7 @@ Config, homesvr shape:
 - **A long `cooldownPeriod` on the ScaledObjects as the only linger:** it works without code,
   but `idle_grace` keeps one idea of "idle" across hosts and classes (decision 2).
 
-## 5. Model-document changes (approved; written, marked *target* until built)
+## 5. Model-document changes (approved; written, built in phase 1)
 
 Also written: the `failed` rule (decision 6) in `docs/configuration/sources.md` (`counts_as`)
 and `docs/configuration/workloads.md` (`recovery`).
