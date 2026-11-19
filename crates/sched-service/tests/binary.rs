@@ -130,3 +130,87 @@ async fn the_binary_serves_the_restate_endpoint_metrics_and_the_keda_scaler() {
         "the binary is still running"
     );
 }
+
+/// Start the binary on `yaml` and wait for it to exit: its status and stderr. The child is
+/// killed (and the test fails) if it is still running at the deadline.
+fn start_and_expect_exit(tag: &str, yaml: &str) -> (std::process::ExitStatus, String) {
+    use std::io::Read;
+    let dir = std::env::temp_dir().join(format!("sched-binary-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.yaml");
+    std::fs::write(&config, yaml).unwrap();
+    let (restate, metrics, keda, ingress) = (free_addr(), free_addr(), free_addr(), free_addr());
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_flowmanager"))
+            .arg("--config")
+            .arg(&config)
+            .args(["--listen", &restate.to_string()])
+            .args(["--metrics-listen", &metrics.to_string()])
+            .args(["--keda-listen", &keda.to_string()])
+            .args(["--restate-ingress", &format!("http://{ingress}")])
+            .env_remove("KUBERNETES_SERVICE_HOST")
+            .env_remove("KUBERNETES_SERVICE_PORT")
+            .env("KUBECONFIG", dir.join("no-such-kubeconfig"))
+            .env("HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start sched-service"),
+        dir,
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        // The guard kills the child when this panics.
+        assert!(
+            Instant::now() < deadline,
+            "the binary did not exit on an invalid config"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status, stderr)
+}
+
+#[test]
+fn the_binary_refuses_to_start_on_a_class_whose_failed_source_has_no_recovery() {
+    // Break only this rule: take the recovery block off `speakr-transcription`, whose source
+    // `speakr-pending` counts failed items.
+    let start = EXAMPLE_CONFIG
+        .find("    recovery:\n")
+        .expect("the example has a recovery");
+    let end_marker = "        timeout: 10s\n";
+    let end = start + EXAMPLE_CONFIG[start..].find(end_marker).unwrap() + end_marker.len();
+    let yaml = format!("{}{}", &EXAMPLE_CONFIG[..start], &EXAMPLE_CONFIG[end..]);
+    assert!(!yaml.contains("recovery:") && yaml.contains("counts_as: failed"));
+    let (status, stderr) = start_and_expect_exit("norecovery", &yaml);
+    assert!(!status.success(), "{status}: {stderr}");
+    assert!(
+        stderr.contains("speakr-transcription") && stderr.contains("speakr-pending"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("no recovery"), "{stderr}");
+}
+
+#[test]
+fn the_binary_refuses_to_start_on_a_with_work_class_without_demand() {
+    let anchor = "  - id: wikijs\n";
+    assert!(EXAMPLE_CONFIG.contains(anchor));
+    let yaml = EXAMPLE_CONFIG.replacen(anchor, &format!("{anchor}    allowed: with_work\n"), 1);
+    let (status, stderr) = start_and_expect_exit("nodemand", &yaml);
+    assert!(!status.success(), "{status}: {stderr}");
+    assert!(
+        stderr.contains("wikijs") && stderr.contains("with_work needs a demand source"),
+        "{stderr}"
+    );
+}
