@@ -30,6 +30,10 @@ map reads as none, so a build before it cannot read a state that has some. The `
 `draining` mode phases written before queue-only switching are still read (as serving since the
 same instant, and as idle).
 
+The map of when each `allowed: with_work` class last had work (`work_seen`) was added the same
+way, without a version bump: an absent map reads as no recent work, so a build before it cannot
+read a state that has some.
+
 **`lease_book`, version 2.** Every lease has an `origin`, `requested` or `adopted`. Version 1
 marked an adopted lease only by the id prefix `adopted-host-`. A version 1 book is read with
 those leases dropped, one warning each (`legacy_adopted_lease_dropped`); nothing is lost,

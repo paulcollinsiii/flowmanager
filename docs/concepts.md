@@ -81,7 +81,7 @@ between candidates (see [Priority](#workloads)). `namespaces` lists where the wo
 
 **Workload class** (`classes[]`). A unit of demand with `requires` (resources, and for an
 exclusive one optionally a model), a `priority`, a `preemptibility`, `may_change_power`, and
-optionally `demand`, `switch`, `recovery`, `kill_timeout` and `allowed` (*target*). A class is *allowed* when every
+optionally `demand`, `switch`, `recovery`, `kill_timeout` and `allowed`. A class is *allowed* when every
 requirement is met. Kinds:
 - **Demand class**: names a model and a demand source. Its queue drives which model is chosen.
 - **Gate class**: requires an exclusive resource with no model, meaning only "that host is
@@ -89,7 +89,7 @@ requirement is met. Kinds:
 - **Plain class**: no demand, only shared resources. It runs whenever they are up.
 - **Switched class**: hosts only, with a [switch](#workloads) instead of demand.
 
-*Target, not yet built:* a demand class with `allowed: with_work` is allowed only while it has
+A demand class with `allowed: with_work` is allowed only while it has
 work (ready, in-flight or failed items, or an unknown count; offline demand is none) or within
 `idle_grace` after a tick last saw it with work. The workloads that scale on it then follow its
 own queue rather than its model, which may stay allowed for other classes.

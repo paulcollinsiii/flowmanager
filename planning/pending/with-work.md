@@ -1,7 +1,7 @@
 # Pending: a demand class allowed only while it has work
 
-Status: **approved 2026-11-19 (decisions 1–6); section 5 is written into the model documents,
-marked *target*.** Facts marked *(read)* were checked by reading the code, not by running it.
+Status: **approved 2026-11-19 (decisions 1–6); phase 1 is built (flowmanager); the section 5 text
+in the model documents describes current behaviour. The homesvr follow-up is not done.** Facts marked *(read)* were checked by reading the code, not by running it.
 
 ## 1. Problem
 
