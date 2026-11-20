@@ -158,7 +158,10 @@ async fn a_host_found_running_while_a_job_holds_it_is_adopted_at_once_and_stays_
     // A person powers the host on just as the job comes due: the job's hold is in the lease
     // book in this very tick, and the host is found running all the same.
     let r = w.tick_idle(DUE, true, false).await;
-    assert!(adopted_nfs(&r), "adopted at once (even while a job holds it): {r:?}");
+    assert!(
+        adopted_nfs(&r),
+        "adopted at once (even while a job holds it): {r:?}"
+    );
     assert_eq!(w.holds(), vec![hold()], "the hold is still there");
     let held = host_leases(&w);
     assert_eq!(held.len(), 1);
