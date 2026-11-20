@@ -1,7 +1,7 @@
 # flowmanager
 
 [![CI](https://github.com/paulcollinsiii/flowmanager/actions/workflows/ci.yml/badge.svg)](https://github.com/paulcollinsiii/flowmanager/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
 
 flowmanager decides what runs on a scarce, power-hungry machine in a homelab Kubernetes
@@ -102,5 +102,4 @@ Working conventions for agents are in [CLAUDE.md](CLAUDE.md).
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT), at your option.
+[MIT](LICENSE)
