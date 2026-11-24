@@ -1376,6 +1376,32 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_key_in_a_filter_is_refused_in_both_forms() {
+        for json in [
+            r#"{"field": "/f", "equals": true, "nope": 1}"#,
+            r#"[{"field": "/a", "equals": true}, {"field": "/f", "is_null": true, "nope": 1}]"#,
+        ] {
+            let e = serde_json::from_str::<super::ElementFilters>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("unknown field") && e.contains("nope"), "{e}");
+        }
+        let failed = "where: { field: /has_summary, equals: false }";
+        for w in [
+            "where: { field: /has_summary, equals: false, nope: 1 }",
+            "where: [ { field: /has_summary, equals: false, nope: 1 } ]",
+        ] {
+            assert!(
+                matches!(
+                    Config::from_yaml(&EXAMPLE_CONFIG.replace(failed, w)),
+                    Err(ConfigError::Parse(_) | ConfigError::Invalid(_))
+                ),
+                "{w}"
+            );
+        }
+    }
+
+    #[test]
     fn where_problems_name_the_filter_and_refuse_empty_lists_and_is_null_false() {
         let failed = "where: { field: /has_summary, equals: false }";
         let ps = problems_of(&EXAMPLE_CONFIG.replace(failed, "where: []"));

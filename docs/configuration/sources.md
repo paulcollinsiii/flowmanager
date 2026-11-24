@@ -201,8 +201,9 @@ match too.
 when every filter in the list matches it (all of them, there is no "or"). Each filter is
 checked on its own: one whose field is missing from every element of a non-empty array, or
 that meets a field of the wrong type, fails the poll as above. An empty list is refused when
-the config is loaded, and a problem in a list is reported with its index, for example
-`where[1]`. The single form is a list of one.
+the config is loaded, and a problem in a list of more than one filter is reported with its
+index, for example `where[1]` (a one-filter list is reported without an index). The single
+form is a list of one.
 
 ```yaml
 # Completed recordings whose summary exists but was never timed (a failed summary).

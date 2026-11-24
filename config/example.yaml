@@ -108,8 +108,7 @@ classes:
     preemptibility: kill
     demand: { source: speakr-summaries }
     # Re-queues recordings whose automatic summary failed (the list form of `where`, as in
-    # speakr-summaries). The summarize endpoint below is an assumption; check it against
-    # your Speakr version.
+    # speakr-summaries).
     recovery:
       action: requeue_failed
       source: speakr-summaries
@@ -129,6 +128,7 @@ classes:
           body: {}
           expect:
             - { field: /success, equals: true }
+            - { field: /status, equals: QUEUED }
         auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
         max_attempts: 2
         window: 30m
@@ -284,7 +284,9 @@ sources:
         # Speakr 0.11.4 and later: a failed automatic summary after a transcript leaves the
         # recording COMPLETED with the error text in `summary` (has_summary true) and no
         # summarization_duration_seconds. Caveat: a summary written by hand on a recording
-        # that was never summarized automatically looks the same and would be counted.
+        # that was never summarized automatically looks the same: it would be counted, and
+        # the speakr-summarization recovery would POST /summarize on it (up to max_attempts),
+        # which could overwrite the hand-written text.
         - url: http://speakr.media.svc:8899/api/v1/recordings?status=completed&per_page=100&sort_by=updated_at&sort_order=desc
           length: /recordings
           where:
