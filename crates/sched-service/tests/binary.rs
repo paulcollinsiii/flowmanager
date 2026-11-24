@@ -186,12 +186,17 @@ fn start_and_expect_exit(tag: &str, yaml: &str) -> (std::process::ExitStatus, St
 fn the_binary_refuses_to_start_on_a_class_whose_failed_source_has_no_recovery() {
     // Break only this rule: take the recovery block off `speakr-transcription`, whose source
     // `speakr-pending` counts failed items.
-    let start = EXAMPLE_CONFIG
-        .find("    recovery:\n")
-        .expect("the example has a recovery");
+    // The example has more than one recovery (speakr-summarization has one too); take them
+    // all off, so the refusal names `speakr-transcription` among the classes left bare.
     let end_marker = "        timeout: 10s\n";
-    let end = start + EXAMPLE_CONFIG[start..].find(end_marker).unwrap() + end_marker.len();
-    let yaml = format!("{}{}", &EXAMPLE_CONFIG[..start], &EXAMPLE_CONFIG[end..]);
+    let mut yaml = EXAMPLE_CONFIG.to_string();
+    let mut removed = 0;
+    while let Some(start) = yaml.find("    recovery:\n") {
+        let end = start + yaml[start..].find(end_marker).unwrap() + end_marker.len();
+        yaml.replace_range(start..end, "");
+        removed += 1;
+    }
+    assert!(removed >= 1, "the example has a recovery");
     assert!(!yaml.contains("recovery:") && yaml.contains("counts_as: failed"));
     let (status, stderr) = start_and_expect_exit("norecovery", &yaml);
     assert!(!status.success(), "{status}: {stderr}");

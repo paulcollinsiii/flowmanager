@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RecoverySpec;
 use crate::source_params::{
-    AuthSpec, ElementFilter, MAX_SINCE_AGO, ResponseCondition, SinceSpec, auth_problems,
-    pointer_problem, timeout_problem,
+    AuthSpec, ElementFilters, MAX_SINCE_AGO, ResponseCondition, SinceSpec, auth_problems,
+    pointer_problem, timeout_problem, where_problems,
 };
 use crate::time::Millis;
 
@@ -33,9 +33,9 @@ pub struct ListSpec {
     pub items: String,
     /// JSON pointer, relative to one item, to its identifier (a string or an integer).
     pub id: String,
-    /// Only items matching this are re-queued (see `ElementFilter`).
+    /// Only items matching this are re-queued (see `ElementFilters`).
     #[serde(default, rename = "where")]
-    pub filter: Option<ElementFilter>,
+    pub filter: Option<ElementFilters>,
     /// Only items changed within a window ending now (as for an `http_json` request).
     #[serde(default)]
     pub since: Option<SinceSpec>,
@@ -200,10 +200,7 @@ fn requeue_problems(p: &RequeueFailedParams) -> Vec<String> {
         out.extend(pointer_problem(&c.field).map(|m| format!("requeue.expect[{i}]: {m}")));
     }
     if let Some(f) = &p.list.filter {
-        out.extend(pointer_problem(&f.field).map(|m| format!("list.where: {m}")));
-        if f.contains.is_some() == f.equals.is_some() {
-            out.push("list.where: set exactly one of contains and equals".to_string());
-        }
+        out.extend(where_problems("list.where", f));
     }
     if let Some(sc) = &p.list.since {
         let plain = !sc.param.is_empty()
@@ -309,8 +306,50 @@ requeue: { url: 'http://x/api/{id}/again' }";
     }
 
     #[test]
+    fn list_where_takes_one_filter_or_a_list() {
+        let params = |w: &str| {
+            spec(&format!(
+                "list: {{ url: 'http://x', items: /r, id: /id, where: {w} }}\nrequeue: {{ url: 'http://x/{{id}}' }}"
+            ))
+        };
+        let one = params("{ field: /f, equals: true }");
+        assert_eq!(one.problems(), Vec::<String>::new());
+        assert_eq!(
+            one.requeue_failed_params()
+                .unwrap()
+                .list
+                .filter
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        let many = params("[ { field: /f, equals: true }, { field: /g, is_null: true } ]");
+        assert_eq!(many.problems(), Vec::<String>::new());
+        let f = many.requeue_failed_params().unwrap().list.filter.unwrap();
+        assert_eq!(f.0.len(), 2);
+        assert_eq!(f.0[1].is_null, Some(true));
+    }
+
+    #[test]
     fn bad_params_are_reported_clearly() {
         let cases: &[(&str, &str)] = &[
+            (
+                "list: { url: 'http://x', items: /r, id: /id, where: [] }\nrequeue: { url: 'http://x/{id}' }",
+                "list.where: the list is empty",
+            ),
+            (
+                "list: { url: 'http://x', items: /r, id: /id, where: { field: /f, is_null: false } }\nrequeue: { url: 'http://x/{id}' }",
+                "list.where: is_null must be true",
+            ),
+            (
+                "list: { url: 'http://x', items: /r, id: /id, where: { field: /f, is_null: true, equals: 1 } }\nrequeue: { url: 'http://x/{id}' }",
+                "list.where: set exactly one of contains, equals and is_null",
+            ),
+            (
+                "list: { url: 'http://x', items: /r, id: /id, where: [ { field: /a, equals: true }, { field: /b } ] }\nrequeue: { url: 'http://x/{id}' }",
+                "list.where[1]: set exactly one of contains, equals and is_null",
+            ),
             (
                 "list: { url: 'ftp://x', items: /r, id: /id }\nrequeue: { url: 'http://x/{id}' }",
                 "list.url must start with http",

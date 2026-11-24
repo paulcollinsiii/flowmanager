@@ -105,8 +105,37 @@ classes:
       - { resource: cuda-central, model: llm }
       - { resource: basestar-nfs }
     priority: 60
-    preemptibility: pause_intake
+    preemptibility: kill
     demand: { source: speakr-summaries }
+    # Re-queues recordings whose automatic summary failed (the list form of `where`, as in
+    # speakr-summaries). The summarize endpoint below is an assumption; check it against
+    # your Speakr version.
+    recovery:
+      action: requeue_failed
+      source: speakr-summaries
+      params:
+        list:
+          url: http://speakr.media.svc:8899/api/v1/recordings?status=completed&per_page=100&sort_by=updated_at&sort_order=desc
+          items: /recordings
+          id: /id
+          where:
+            - { field: /has_summary, equals: true }
+            - { field: /summarization_duration_seconds, is_null: true }
+          since: { param: updated_since, ago: 30m }
+          max_items: 100
+        requeue:
+          method: POST
+          url: http://speakr.media.svc:8899/api/v1/recordings/{id}/summarize
+          body: {}
+          expect:
+            - { field: /success, equals: true }
+        auth: { header: Authorization, prefix: "Bearer ", env: SPEAKR_API_TOKEN }
+        max_attempts: 2
+        window: 30m
+        retention: 24h
+        min_interval: 60s
+        max_per_run: 5
+        timeout: 10s
 
   - id: immich-ml
     requires:
@@ -252,6 +281,18 @@ sources:
           length: /recordings
           where: { field: /status, equals: SUMMARIZING }
           max_items: 100
+        # Speakr 0.11.4 and later: a failed automatic summary after a transcript leaves the
+        # recording COMPLETED with the error text in `summary` (has_summary true) and no
+        # summarization_duration_seconds. Caveat: a summary written by hand on a recording
+        # that was never summarized automatically looks the same and would be counted.
+        - url: http://speakr.media.svc:8899/api/v1/recordings?status=completed&per_page=100&sort_by=updated_at&sort_order=desc
+          length: /recordings
+          where:
+            - { field: /has_summary, equals: true }
+            - { field: /summarization_duration_seconds, is_null: true }
+          max_items: 100
+          since: { param: updated_since, ago: 30m }
+          counts_as: failed
       webhook: { path: /hooks/speakr }
 
   # Three queues, skipped while paused; `waiting` and `delayed` are ready, `active` is in flight.

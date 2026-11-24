@@ -160,7 +160,7 @@ A demand request sets exactly one of `count` and `length`. Counts of requests wi
 | `count` | | Pointer to a number in the answer |
 | `length` | | Pointer to an array; its length, after `where`, is the number |
 | `counts_as` | `ready` | `ready` (waiting), `in_flight` (running) or `failed` (waiting for [recovery](workloads.md#recovery), never ages; a class with this source as its `demand` must then declare a `recovery`, or the config is rejected) |
-| `where` | none | With `length`: [filter](#filters-and-counts) the elements |
+| `where` | none | With `length`: [filter](#filters-and-counts) the elements; one filter, or a list that must all match |
 | `max_items` | none | With `length`: the most elements one answer holds (the page size in the URL). Above `0`. A full answer may be truncated, so the poll fails rather than under-count; a `failed` request instead counts the matching items on the page |
 | `also` | `[]` | More numbers from the same answer: `{ count, map, counts_as }`. A pointer and `counts_as` already counted is refused |
 | `when` | none | `{ field, equals }`: count the answer only if the field has the value (a paused queue, for example). Otherwise the request, and its `also`, contribute zero. A missing field or another JSON type fails the poll |
@@ -182,16 +182,34 @@ A demand request sets exactly one of `count` and `length`. Counts of requests wi
 
 ### Filters and counts
 
-`where: { field, contains | equals }` keeps the elements whose `field` (a pointer relative to
-one element) matches; set exactly one of the two.
+`where: { field, contains | equals | is_null }` keeps the elements whose `field` (a pointer
+relative to one element) matches; set exactly one of the three.
 
 | Key | Matches |
 | --- | --- |
 | `contains` | A case-insensitive substring of a string field |
 | `equals` | A string, boolean or number field exactly. An unquoted YAML scalar keeps its type: `equals: false` is the boolean, `equals: "false"` the text, `equals: 3` the number (so `3.0` matches) |
+| `is_null` | `true`: a field that is present and JSON `null`. Only `true` is accepted; `is_null: false` is refused when the config is loaded |
 
-A `null` or missing field is no match. A non-null field of another JSON type than `equals`
-fails the poll, so the source's demand becomes unknown instead of reading low.
+A `null` or missing field is no match for `contains` and `equals`. A non-null field of another
+JSON type than `contains` or `equals` compares fails the poll, so the source's demand becomes
+unknown instead of reading low. `is_null` compares nothing but null-ness, so a field of any
+other type is simply no match, never a type error; a field missing from one element is no
+match too.
+
+`where` may also be a list of filters, `where: [ { ... }, { ... } ]`: an element is kept only
+when every filter in the list matches it (all of them, there is no "or"). Each filter is
+checked on its own: one whose field is missing from every element of a non-empty array, or
+that meets a field of the wrong type, fails the poll as above. An empty list is refused when
+the config is loaded, and a problem in a list is reported with its index, for example
+`where[1]`. The single form is a list of one.
+
+```yaml
+# Completed recordings whose summary exists but was never timed (a failed summary).
+where:
+  - { field: /has_summary, equals: true }
+  - { field: /summarization_duration_seconds, is_null: true }
+```
 
 This example counts ready and in-flight work from one answer, and failed items from a second,
 filtered and bounded list:

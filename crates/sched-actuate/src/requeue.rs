@@ -224,6 +224,32 @@ params:
     }
 
     #[tokio::test]
+    async fn a_list_form_where_keeps_only_items_matching_every_filter() {
+        use sched_model::{ElementFilter, ElementFilters, FilterValue};
+        let server = TestServer::start().await;
+        server.set(
+            LIST_PATH,
+            list_reply(&[item(3, false), item(4, true), item(5, false)]),
+        );
+        let mut p = params(&server, "");
+        let filter = |field: &str, equals: FilterValue| ElementFilter {
+            field: field.into(),
+            contains: None,
+            equals: Some(equals),
+            is_null: None,
+        };
+        p.list.filter = Some(ElementFilters(vec![
+            filter("/has_summary", FilterValue::Bool(false)),
+            filter("/id", FilterValue::Number(5.0)),
+        ]));
+        let a = auth(&p, &token).await.unwrap();
+        let got = list(&client(&p).unwrap(), &p, a.as_ref(), NOW)
+            .await
+            .unwrap();
+        assert_eq!(got.ids, ["5"]);
+    }
+
+    #[tokio::test]
     async fn list_failures_are_errors_never_panics() {
         let server = TestServer::start().await;
         let p = params(&server, "");

@@ -135,7 +135,7 @@ is rejected: without one, failed items would hold the model with nothing to re-q
 | `list.url` | required | The request that lists failed items. `http://` or `https://`, no `user@` |
 | `list.items` | required | JSON pointer to the array of items |
 | `list.id` | required | JSON pointer, relative to one item, to its id (a string or an integer). Not empty |
-| `list.where` | none | Keep only matching items; exactly one of `contains` or `equals` ([filters](sources.md#filters-and-counts)) |
+| `list.where` | none | Keep only matching items: one filter, or a list that must all match; each sets exactly one of `contains`, `equals` or `is_null` ([filters](sources.md#filters-and-counts)) |
 | `list.since` | none | Only items changed in a window ending now ([since](sources.md#since)) |
 | `list.max_items` | none | The most items one response can hold (the page size in the URL). Above `0`. A full page is re-queued now and the rest on a later run |
 | `requeue.url` | required | `http://` or `https://`, with `{id}` exactly once and no other braces. An id that is not letters, digits and `-_.` is skipped |

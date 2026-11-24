@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sched_model::{
-    AuthSpec, Capability, ClassId, CountsAs, ElementFilter, Fidelity, FilterValue, HttpJsonParams,
-    MapValue, Millis, ObservedValue, RequestSpec, ResponseCondition, SinceSpec, SourceSpec,
-    SwitchState, ValueMap,
+    AuthSpec, Capability, ClassId, CountsAs, ElementFilter, ElementFilters, Fidelity, FilterValue,
+    HttpJsonParams, MapValue, Millis, ObservedValue, RequestSpec, ResponseCondition, SinceSpec,
+    SourceSpec, SwitchState, ValueMap,
 };
 use serde_json::Value;
 
@@ -173,6 +173,9 @@ fn matches(filter: &ElementFilter, element: &Value) -> bool {
     let Some(value) = element.pointer(&filter.field) else {
         return false;
     };
+    if filter.is_null == Some(true) {
+        return value.is_null();
+    }
     match (&filter.contains, &filter.equals) {
         (Some(needle), _) => value
             .as_str()
@@ -184,7 +187,8 @@ fn matches(filter: &ElementFilter, element: &Value) -> bool {
 
 /// Whether `value` (present at the filter's field) has the type the filter compares.
 fn comparable(filter: &ElementFilter, value: &Value) -> bool {
-    has_type(value, filter_type(filter))
+    // `is_null` compares nothing but null-ness, so any JSON type is comparable.
+    filter.is_null == Some(true) || has_type(value, filter_type(filter))
 }
 
 /// Whether the response is to be counted: `true` without a `when`, else whether its field
@@ -315,30 +319,36 @@ pub fn extract(doc: &Value, req: &RequestSpec) -> Result<u64, ExtractError> {
     Ok(select_items(items, req.filter.as_ref())?.len() as u64)
 }
 
-/// The elements of `items` that pass `filter` (all of them without one). A filter whose
-/// field is in none of a non-empty array's items, or whose field holds a value of another
-/// JSON type than the filter compares, is an error rather than a quiet "matches nothing".
+/// The elements of `items` that pass every filter of `filter` (all of them without one).
+/// Each filter is checked on its own: one whose field is in none of a non-empty array's
+/// items, or whose field holds a value of another JSON type than the filter compares, is
+/// an error rather than a quiet "matches nothing".
 pub fn select_items<'a>(
     items: &'a [Value],
-    filter: Option<&ElementFilter>,
+    filter: Option<&ElementFilters>,
 ) -> Result<Vec<&'a Value>, ExtractError> {
-    let Some(f) = filter else {
+    let Some(filters) = filter else {
         return Ok(items.iter().collect());
     };
-    if !items.is_empty() && items.iter().all(|e| e.pointer(&f.field).is_none()) {
-        return Err(ExtractError::FilterFieldMissing(f.field.clone()));
+    for f in &filters.0 {
+        if !items.is_empty() && items.iter().all(|e| e.pointer(&f.field).is_none()) {
+            return Err(ExtractError::FilterFieldMissing(f.field.clone()));
+        }
+        if items
+            .iter()
+            .filter_map(|e| e.pointer(&f.field))
+            .any(|v| !v.is_null() && !comparable(f, v))
+        {
+            return Err(ExtractError::FilterTypeMismatch {
+                field: f.field.clone(),
+                expected: filter_type(f),
+            });
+        }
     }
-    if items
+    Ok(items
         .iter()
-        .filter_map(|e| e.pointer(&f.field))
-        .any(|v| !v.is_null() && !comparable(f, v))
-    {
-        return Err(ExtractError::FilterTypeMismatch {
-            field: f.field.clone(),
-            expected: filter_type(f),
-        });
-    }
-    Ok(items.iter().filter(|e| matches(f, e)).collect())
+        .filter(|e| filters.0.iter().all(|f| matches(f, e)))
+        .collect())
 }
 
 /// The non-negative whole number at `ptr`.
@@ -678,7 +688,7 @@ mod tests {
             value: None,
             map: None,
             length: length.map(Into::into),
-            filter,
+            filter: filter.map(Into::into),
             counts_as: CountsAs::Ready,
             max_items: None,
             also: Vec::new(),
@@ -726,12 +736,14 @@ mod tests {
             field: "/e".into(),
             contains: Some("connection".into()),
             equals: None,
+            is_null: None,
         };
         assert_eq!(extract(&d, &req(None, Some(""), Some(contains))), Ok(2));
         let equals = ElementFilter {
             field: "/e".into(),
             contains: None,
             equals: Some("bad audio".into()),
+            is_null: None,
         };
         assert_eq!(extract(&d, &req(None, Some(""), Some(equals))), Ok(1));
     }
@@ -1108,6 +1120,7 @@ mod tests {
                 field: "/nope".into(),
                 contains: None,
                 equals: Some(true.into()),
+                is_null: None,
             }),
         );
         r.counts_as = CountsAs::Failed;
@@ -1180,6 +1193,7 @@ mod tests {
             field: "/error_message".into(),
             contains: Some("connection".into()),
             equals: None,
+            is_null: None,
         };
         let r = req(None, Some("/recordings"), Some(filter));
         // The list items do not carry the field at all: do not report "0 failed".
@@ -1224,7 +1238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_example_summaries_source_counts_summarizing_recordings() {
+    async fn the_example_summaries_source_counts_summarizing_and_failed_summaries() {
         let server = TestServer::start().await;
         let (spec, params, classes) = example_source("speakr-summaries", &server);
         server.set(
@@ -1233,15 +1247,22 @@ mod tests {
                 r#"{"recordings": [{"status": "PROCESSING"}, {"status": "SUMMARIZING"}, {"status": "SUMMARIZING"}]}"#,
             ),
         );
-        let report = poll(
-            &build_client(&params).unwrap(),
-            &spec,
-            &params,
-            &classes,
-            &env,
-        )
-        .await;
-        assert_eq!(demand(&report), (2, 0));
+        // Speakr 0.11.4+: COMPLETED recordings; only the one with a summary (the stored
+        // error text) and a null summarization duration is a failed summary.
+        server.set(
+            "/api/v1/recordings?status=completed&per_page=100&sort_by=updated_at&sort_order=desc&updated_since=2023-11-14T21%3A43%3A20Z",
+            Reply::json(
+                r#"{"recordings": [
+                    {"id": 1, "has_summary": true, "summarization_duration_seconds": null},
+                    {"id": 2, "has_summary": true, "summarization_duration_seconds": 41.5},
+                    {"id": 3, "has_summary": false, "summarization_duration_seconds": null},
+                    {"id": 4, "has_summary": false, "summarization_duration_seconds": 3}
+                ]}"#,
+            ),
+        );
+        let client = reqwest::Client::new();
+        let report = poll_now(&client, &spec, &params, &classes, &env).await;
+        assert_eq!(demand3(&report), (2, 0, 1));
     }
 
     #[test]
@@ -1349,6 +1370,7 @@ mod tests {
             field: "/f".into(),
             contains: None,
             equals: Some(equals),
+            is_null: None,
         };
         let d = doc(r#"[{"f": false}, {"f": true}, {"f": null}, {}, {"f": false}]"#);
         let r = req(None, Some(""), Some(filter(false.into())));
@@ -1378,10 +1400,102 @@ mod tests {
             field: "/f".into(),
             contains: Some("x".into()),
             equals: None,
+            is_null: None,
         };
         let d = doc(r#"[{"f": "x"}, {"f": 5}]"#);
         assert!(matches!(
             extract(&d, &req(None, Some(""), Some(contains))),
+            Err(ExtractError::FilterTypeMismatch { .. })
+        ));
+    }
+
+    fn where_list(filters: Vec<ElementFilter>) -> ElementFilters {
+        ElementFilters(filters)
+    }
+
+    fn eq_filter(field: &str, v: FilterValue) -> ElementFilter {
+        ElementFilter {
+            field: field.into(),
+            contains: None,
+            equals: Some(v),
+            is_null: None,
+        }
+    }
+
+    fn null_filter(field: &str) -> ElementFilter {
+        ElementFilter {
+            field: field.into(),
+            contains: None,
+            equals: None,
+            is_null: Some(true),
+        }
+    }
+
+    fn selected(d: &str, w: &ElementFilters) -> Result<usize, ExtractError> {
+        let d = doc(d);
+        select_items(d.as_array().unwrap(), Some(w)).map(|v| v.len())
+    }
+
+    #[test]
+    fn is_null_matches_a_present_null_and_never_a_type_mismatch() {
+        let w = where_list(vec![null_filter("/f")]);
+        // Null matches; a value of any other type is no match, not an error; a field
+        // missing from one item is no match.
+        let d = r#"[{"f": null}, {"f": 1}, {"f": "x"}, {"f": true}, {"f": [1]}, {"f": {}}, {}]"#;
+        assert_eq!(selected(d, &w), Ok(1));
+        // Missing from every item is an error, as for any filter.
+        assert_eq!(
+            selected(r#"[{}, {"g": null}]"#, &w),
+            Err(ExtractError::FilterFieldMissing("/f".into()))
+        );
+        // An empty array has nothing to check.
+        assert_eq!(selected("[]", &w), Ok(0));
+    }
+
+    #[test]
+    fn a_list_where_keeps_only_elements_matching_every_filter() {
+        let w = where_list(vec![
+            eq_filter("/has_summary", true.into()),
+            null_filter("/dur"),
+        ]);
+        let d = r#"[
+            {"has_summary": true, "dur": null},
+            {"has_summary": true, "dur": 12},
+            {"has_summary": false, "dur": null},
+            {"has_summary": false, "dur": 3}
+        ]"#;
+        assert_eq!(selected(d, &w), Ok(1));
+        // A single-entry list behaves as the single filter.
+        let one = where_list(vec![eq_filter("/has_summary", true.into())]);
+        assert_eq!(selected(d, &one), Ok(2));
+    }
+
+    #[test]
+    fn every_filter_of_a_list_is_checked_for_a_missing_field_or_a_type_mismatch() {
+        let d = r#"[{"a": true, "b": "x"}, {"a": false, "b": "y"}]"#;
+        let mismatch = where_list(vec![
+            eq_filter("/a", true.into()),
+            eq_filter("/b", true.into()),
+        ]);
+        assert_eq!(
+            selected(d, &mismatch),
+            Err(ExtractError::FilterTypeMismatch {
+                field: "/b".into(),
+                expected: "boolean"
+            })
+        );
+        let missing = where_list(vec![eq_filter("/a", true.into()), null_filter("/nope")]);
+        assert_eq!(
+            selected(d, &missing),
+            Err(ExtractError::FilterFieldMissing("/nope".into()))
+        );
+        // Even when the first filter already matches nothing.
+        let none_then_mismatch = where_list(vec![
+            eq_filter("/a", FilterValue::Bool(true)),
+            eq_filter("/b", FilterValue::Number(1.0)),
+        ]);
+        assert!(matches!(
+            selected(d, &none_then_mismatch),
             Err(ExtractError::FilterTypeMismatch { .. })
         ));
     }
@@ -1564,6 +1678,7 @@ mod tests {
                 field: "/n".into(),
                 contains: None,
                 equals: Some(123.0.into()),
+                is_null: None,
             }),
         );
         let d = doc(r#"[{"n": 123}, {"n": 123.0}, {"n": 124}, {"n": null}, {}]"#);

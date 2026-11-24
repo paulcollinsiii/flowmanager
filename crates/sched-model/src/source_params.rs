@@ -177,7 +177,7 @@ pub struct ResponseCondition {
 /// Keeps only the array elements whose field matches. An element whose field holds a
 /// non-null value of another JSON type than the filter compares fails the poll (the
 /// source's demand becomes unknown) rather than silently not matching; `null` or a missing
-/// field is simply no match.
+/// field is simply no match. Exactly one of `contains`, `equals` and `is_null` is set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElementFilter {
@@ -189,6 +189,93 @@ pub struct ElementFilter {
     /// Exact match of a string, boolean or number field (see [`FilterValue`]).
     #[serde(default)]
     pub equals: Option<FilterValue>,
+    /// `true`: matches an element whose field is present and JSON `null`. A field of any
+    /// other type is no match (never a type error). `false` is refused.
+    #[serde(default)]
+    pub is_null: Option<bool>,
+}
+
+/// The `where` of a request or recovery list: one filter, or a list of filters that must
+/// all match. Written as either `where: {field: ..}` or `where: [{field: ..}, ..]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementFilters(pub Vec<ElementFilter>);
+
+impl From<ElementFilter> for ElementFilters {
+    fn from(f: ElementFilter) -> Self {
+        ElementFilters(vec![f])
+    }
+}
+
+impl Serialize for ElementFilters {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [one] => one.serialize(s),
+            many => many.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ElementFilters {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // A visitor rather than an untagged enum, so a bad filter keeps its own message.
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ElementFilters;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a filter ({ field, contains | equals | is_null }) or a list of them")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                m: A,
+            ) -> Result<Self::Value, A::Error> {
+                let f =
+                    ElementFilter::deserialize(serde::de::value::MapAccessDeserializer::new(m))?;
+                Ok(ElementFilters(vec![f]))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut s: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut v = Vec::new();
+                while let Some(f) = s.next_element::<ElementFilter>()? {
+                    v.push(f);
+                }
+                Ok(ElementFilters(v))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Load-time problems of a `where`, each prefixed with `at` (for example `list.where`). A
+/// list entry is indexed (`at[1]`).
+pub(crate) fn where_problems(at: &str, w: &ElementFilters) -> Vec<String> {
+    let mut out = Vec::new();
+    if w.0.is_empty() {
+        out.push(format!("{at}: the list is empty; give at least one filter"));
+    }
+    for (i, f) in w.0.iter().enumerate() {
+        let at = if w.0.len() == 1 {
+            at.to_string()
+        } else {
+            format!("{at}[{i}]")
+        };
+        out.extend(pointer_problem(&f.field).map(|m| format!("{at}: {m}")));
+        let set = usize::from(f.contains.is_some())
+            + usize::from(f.equals.is_some())
+            + usize::from(f.is_null.is_some());
+        if set != 1 {
+            out.push(format!(
+                "{at}: set exactly one of contains, equals and is_null"
+            ));
+        }
+        if f.is_null == Some(false) {
+            out.push(format!(
+                "{at}: is_null must be true (false has no meaning; use equals or contains)"
+            ));
+        }
+    }
+    out
 }
 
 /// Bounds a request by age: adds `param=<now - ago>` (ISO 8601, UTC) to its query, so
@@ -289,7 +376,7 @@ pub struct RequestSpec {
     pub length: Option<String>,
     /// With `length`: only count elements matching this.
     #[serde(default, rename = "where")]
-    pub filter: Option<ElementFilter>,
+    pub filter: Option<ElementFilters>,
     #[serde(default)]
     pub counts_as: CountsAs,
     /// With `length`: the most elements one response can hold (the page size in the URL).
@@ -643,12 +730,7 @@ fn http_problems(p: &HttpJsonParams, spec: &SourceSpec) -> Vec<String> {
             if r.length.is_none() {
                 out.push(format!("{at}: where is only valid with length"));
             }
-            out.extend(pointer_problem(&f.field).map(|m| format!("{at}.where: {m}")));
-            if f.contains.is_some() == f.equals.is_some() {
-                out.push(format!(
-                    "{at}.where: set exactly one of contains and equals"
-                ));
-            }
+            out.extend(where_problems(&format!("{at}.where"), f));
         }
     }
     if let Some(a) = &p.auth {
@@ -901,11 +983,12 @@ mod tests {
         assert_eq!(failed.length.as_deref(), Some("/recordings"));
         assert_eq!(
             failed.filter,
-            Some(super::ElementFilter {
+            Some(super::ElementFilters(vec![super::ElementFilter {
                 field: "/has_summary".into(),
                 contains: None,
                 equals: Some(super::FilterValue::Bool(false)),
-            })
+                is_null: None,
+            }]))
         );
         assert_eq!(failed.max_items, Some(100));
         assert!(failed.url.contains("per_page=100") && failed.url.contains("status=failed"));
@@ -1028,7 +1111,7 @@ mod tests {
             ),
             (
                 "url: http://x\n          length: /a\n          where: { field: /f }",
-                "exactly one of contains and equals",
+                "exactly one of contains, equals and is_null",
             ),
             (
                 "url: http://x\n          count: /a\n          counts_as: in_flight",
@@ -1221,7 +1304,9 @@ mod tests {
                 .filter
                 .clone()
                 .unwrap()
+                .0[0]
                 .equals
+                .clone()
         };
         assert_eq!(
             source(EXAMPLE_CONFIG),
@@ -1243,7 +1328,84 @@ mod tests {
             failed,
             "where: { field: /has_summary, equals: false, contains: x }",
         ));
-        assert!(has(&ps, "exactly one of contains and equals"), "{ps:?}");
+        assert!(
+            has(&ps, "exactly one of contains, equals and is_null"),
+            "{ps:?}"
+        );
+    }
+
+    #[test]
+    fn where_takes_one_filter_or_a_list_and_is_null_is_a_third_match_kind() {
+        let failed = "where: { field: /has_summary, equals: false }";
+        let requests = |w: &str| {
+            Config::from_yaml(&EXAMPLE_CONFIG.replace(failed, w))
+                .unwrap()
+                .source(&"speakr-pending".into())
+                .unwrap()
+                .http_json_params()
+                .unwrap()
+                .unwrap()
+                .requests[1]
+                .filter
+                .clone()
+                .unwrap()
+        };
+        // The single form still parses, as one filter.
+        assert_eq!(requests(failed).0.len(), 1);
+        // The list form parses, in order; is_null stands alone.
+        let list = requests(
+            "where: [ { field: /has_summary, equals: true }, { field: /dur, is_null: true } ]",
+        );
+        assert_eq!(list.0.len(), 2);
+        assert_eq!(list.0[0].equals, Some(true.into()));
+        assert_eq!(list.0[1].is_null, Some(true));
+        assert!(list.0[1].contains.is_none() && list.0[1].equals.is_none());
+        // Serialized, a one-filter list is the single form, and both round-trip.
+        for w in [&list, &requests(failed)] {
+            let json = serde_json::to_string(w).unwrap();
+            assert_eq!(
+                &serde_json::from_str::<super::ElementFilters>(&json).unwrap(),
+                w
+            );
+        }
+        assert!(
+            serde_json::to_string(&requests(failed))
+                .unwrap()
+                .starts_with('{')
+        );
+    }
+
+    #[test]
+    fn where_problems_name_the_filter_and_refuse_empty_lists_and_is_null_false() {
+        let failed = "where: { field: /has_summary, equals: false }";
+        let ps = problems_of(&EXAMPLE_CONFIG.replace(failed, "where: []"));
+        assert!(has(&ps, ".where: the list is empty"), "{ps:?}");
+        let ps = problems_of(
+            &EXAMPLE_CONFIG.replace(failed, "where: { field: /has_summary, is_null: false }"),
+        );
+        assert!(has(&ps, ".where: is_null must be true"), "{ps:?}");
+        for both in [
+            "{ field: /f, is_null: true, equals: x }",
+            "{ field: /f, is_null: true, contains: x }",
+            "{ field: /f }",
+        ] {
+            let ps = problems_of(&EXAMPLE_CONFIG.replace(failed, &format!("where: {both}")));
+            assert!(
+                has(
+                    &ps,
+                    ".where: set exactly one of contains, equals and is_null"
+                ),
+                "{both}: {ps:?}"
+            );
+        }
+        // List entries are indexed in the message.
+        let ps = problems_of(&EXAMPLE_CONFIG.replace(
+            failed,
+            "where: [ { field: /a, equals: true }, { field: nope, is_null: true }, { field: /b, is_null: false } ]",
+        ));
+        assert!(has(&ps, ".where[1]: "), "{ps:?}");
+        assert!(has(&ps, ".where[2]: is_null must be true"), "{ps:?}");
+        assert!(!has(&ps, ".where[0]"), "{ps:?}");
     }
 
     /// The example's basestar-probe params, as one line each.
@@ -1531,7 +1693,9 @@ mod tests {
                     .filter
                     .clone()
                     .unwrap()
+                    .0[0]
                     .equals
+                    .clone()
                     .unwrap()
             })
         };
@@ -1543,7 +1707,10 @@ mod tests {
         assert_eq!(equals("true").unwrap(), true.into());
         // `~` (null) is no value at all.
         let e = equals("~").unwrap_err().to_string();
-        assert!(e.contains("exactly one of contains and equals"), "{e}");
+        assert!(
+            e.contains("exactly one of contains, equals and is_null"),
+            "{e}"
+        );
         for bad in ["[1, 2]", "{ a: 1 }", ".nan", ".inf"] {
             let e = equals(bad).unwrap_err().to_string();
             assert!(

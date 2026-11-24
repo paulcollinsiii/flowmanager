@@ -48,9 +48,9 @@ pub use plan::{AllowedSet, Intent, PowerWant, PublishedAllowed, Step, WaitReason
 pub use power_params::{MacAddr, SshShutdown, WakeOnLan};
 pub use recovery_params::{HttpMethod, ListSpec, REQUEUE_FAILED, RequeueFailedParams, RequeueSpec};
 pub use source_params::{
-    AuthSpec, CountsAs, ElementFilter, ExtraCount, FilterValue, HttpJsonParams, KubeWatchParams,
-    MapValue, PrometheusParams, RequestSpec, ResponseCondition, SinceSpec, TcpProbeParams,
-    ValueMap, WebhookParams,
+    AuthSpec, CountsAs, ElementFilter, ElementFilters, ExtraCount, FilterValue, HttpJsonParams,
+    KubeWatchParams, MapValue, PrometheusParams, RequestSpec, ResponseCondition, SinceSpec,
+    TcpProbeParams, ValueMap, WebhookParams,
 };
 pub use state::{
     DrainMode, ModePhase, PowerPhase, PowerTransition, ResourceState, SchedState, Shutdown,
