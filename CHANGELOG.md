@@ -65,7 +65,8 @@ lost) and take the leases you still want again.
   (`min_off`, the `jobs:` section), and the build before queue-only switching rejects a gate
   class (a requirement on an exclusive resource with no model) and a config with no pods source.
   A build before `allowed` rejects a config that sets it (`allowed: with_work`), so remove the key
-  first.
+  first. A build before filter lists rejects a `where` (or `list.where`) given as a list, and a
+  filter with `is_null`, so rewrite those first.
 - **Discard what the older build cannot read.** A build before `scheduler_state` 4 and
   `lease_book` 2 reads neither: its ticks report an error until both are discarded with
   `discard_state`, which drops every lease. Rolling forward again needs nothing.
